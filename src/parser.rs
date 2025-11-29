@@ -226,11 +226,22 @@ impl DataType {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// Stores condition from LOOP WHILE/UNTIL for DO loops
+    last_loop_condition: Option<Expr>,
+    last_loop_is_until: bool,
+    /// Stores condition from ELSEIF for nested IF construction
+    last_elseif_condition: Option<Expr>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Parser { tokens, pos: 0 }
+        Parser {
+            tokens,
+            pos: 0,
+            last_loop_condition: None,
+            last_loop_is_until: false,
+            last_elseif_condition: None,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -375,12 +386,18 @@ impl Parser {
                     Token::While => {
                         self.advance();
                         let cond = self.parse_expression()?;
-                        Err(format!("LOOP WHILE:{:?}", cond))
+                        // Store condition for parse_do_loop to retrieve
+                        self.last_loop_condition = Some(cond);
+                        self.last_loop_is_until = false;
+                        Err("LOOP WHILE".to_string())
                     }
                     Token::Until => {
                         self.advance();
                         let cond = self.parse_expression()?;
-                        Err(format!("LOOP UNTIL:{:?}", cond))
+                        // Store condition for parse_do_loop to retrieve
+                        self.last_loop_condition = Some(cond);
+                        self.last_loop_is_until = true;
+                        Err("LOOP UNTIL".to_string())
                     }
                     _ => Err("LOOP".to_string()),
                 }
@@ -393,7 +410,8 @@ impl Parser {
                 self.advance();
                 let cond = self.parse_expression()?;
                 self.expect(Token::Then)?;
-                Err(format!("ELSEIF:{:?}", cond))
+                self.last_elseif_condition = Some(cond);
+                Err("ELSEIF".to_string())
             }
             Token::Select => self.parse_select_case(),
             Token::Case => {
@@ -659,41 +677,67 @@ impl Parser {
             });
         }
 
-        // Block IF
+        // Block IF - parse body, handling ELSEIF as nested IF
         self.skip_newlines();
-        let mut then_branch = Vec::new();
-        let mut else_branch: Option<Vec<Stmt>> = None;
-
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => {
-                    if let Some(ref mut eb) = else_branch {
-                        eb.push(stmt);
-                    } else {
-                        then_branch.push(stmt);
-                    }
-                }
-                Err(e) if e == "END IF" => break,
-                Err(e) if e == "ELSE" => {
-                    else_branch = Some(Vec::new());
-                }
-                Err(e) if e.starts_with("ELSEIF:") => {
-                    // Parse ELSEIF as nested IF in else branch
-                    // For now, treat ELSEIF simply by continuing parsing
-                    // This is a simplification; proper handling would be more complex
-                    let _ = &e[7..]; // condition string, unused for now
-                    else_branch = Some(Vec::new());
-                }
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let (then_branch, else_branch) = self.parse_if_body()?;
 
         Ok(Stmt::If {
             condition,
             then_branch,
             else_branch,
         })
+    }
+
+    /// Parse the body of an IF block, returning (then_branch, else_branch)
+    /// Handles ELSEIF by constructing nested IF statements in else_branch
+    fn parse_if_body(&mut self) -> Result<(Vec<Stmt>, Option<Vec<Stmt>>), String> {
+        let mut body = Vec::new();
+
+        loop {
+            match self.parse_statement() {
+                Ok(stmt) => {
+                    body.push(stmt);
+                }
+                Err(e) if e == "END IF" => {
+                    return Ok((body, None));
+                }
+                Err(e) if e == "ELSE" => {
+                    // Parse ELSE body until END IF
+                    self.skip_newlines();
+                    let mut else_body = Vec::new();
+                    loop {
+                        match self.parse_statement() {
+                            Ok(stmt) => else_body.push(stmt),
+                            Err(e) if e == "END IF" => break,
+                            Err(e) => return Err(e),
+                        }
+                        self.skip_newlines();
+                    }
+                    return Ok((body, Some(else_body)));
+                }
+                Err(e) if e == "ELSEIF" => {
+                    // Get the stored condition
+                    let elseif_condition = self
+                        .last_elseif_condition
+                        .take()
+                        .ok_or_else(|| "Internal error: ELSEIF condition not stored".to_string())?;
+
+                    // Recursively parse the rest as a nested IF
+                    self.skip_newlines();
+                    let (nested_then, nested_else) = self.parse_if_body()?;
+
+                    let nested_if = Stmt::If {
+                        condition: elseif_condition,
+                        then_branch: nested_then,
+                        else_branch: nested_else,
+                    };
+
+                    return Ok((body, Some(vec![nested_if])));
+                }
+                Err(e) => return Err(e),
+            }
+            self.skip_newlines();
+        }
     }
 
     fn parse_for(&mut self) -> Result<Stmt, String> {
@@ -774,19 +818,25 @@ impl Parser {
         self.skip_newlines();
 
         let mut body = Vec::new();
-        let end_condition = None;
+        let mut end_condition: Option<Expr> = None;
         let mut end_is_until = false;
+
+        // Clear any previous loop condition
+        self.last_loop_condition = None;
 
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
                 Err(e) if e == "LOOP" => break,
-                Err(e) if e.starts_with("LOOP WHILE:") => {
-                    // Parse condition from error message (hacky but simple)
+                Err(e) if e == "LOOP WHILE" => {
+                    // Retrieve condition stored by parse_statement
+                    end_condition = self.last_loop_condition.take();
                     end_is_until = false;
                     break;
                 }
-                Err(e) if e.starts_with("LOOP UNTIL:") => {
+                Err(e) if e == "LOOP UNTIL" => {
+                    // Retrieve condition stored by parse_statement
+                    end_condition = self.last_loop_condition.take();
                     end_is_until = true;
                     break;
                 }
@@ -795,8 +845,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        // If condition was at end, we need to get it
-        // For simplicity, we'll use condition from DO if specified
+        // Use end condition if no start condition, or start condition takes precedence
         let final_condition = condition.or(end_condition);
 
         Ok(Stmt::DoLoop {

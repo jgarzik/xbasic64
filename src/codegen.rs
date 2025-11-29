@@ -173,6 +173,11 @@ impl CodeGen {
             return DataType::Long;
         }
 
+        // Power (^) always produces Double (uses libm pow())
+        if op == BinaryOp::Pow {
+            return DataType::Double;
+        }
+
         // String concatenation
         if left == DataType::String && right == DataType::String {
             return DataType::String;
@@ -270,7 +275,7 @@ impl CodeGen {
         // Initialize GOSUB return stack if needed
         if self.gosub_used {
             self.emit("    # Initialize GOSUB return stack");
-            self.emit("    lea rax, [rbp - 8]");
+            self.emit("    lea rax, [rip + _gosub_stack + 8192]"); // Point to end (stack grows down)
             self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
@@ -289,7 +294,15 @@ impl CodeGen {
         self.emit("");
 
         // Patch stack reserve
-        let stack_size = (-self.stack_offset + 15) & !15; // Align to 16
+        // System V AMD64 ABI stack alignment rules:
+        // - On function entry (after call pushed return addr): rsp % 16 == 8
+        // - After push rbp: rsp % 16 == 0
+        // - Before any call: rsp % 16 == 0
+        //
+        // Since we use 16-byte sub/add for all temporaries in expression evaluation,
+        // we just need sub rsp, N where N is a multiple of 16 to maintain alignment.
+        let stack_needed = -self.stack_offset;
+        let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
         let old = "    sub rsp, 0         # STACK_RESERVE";
         let new = format!("    sub rsp, {}        # STACK_RESERVE", stack_size);
         self.output = self.output.replace(old, &new);
@@ -379,7 +392,11 @@ impl CodeGen {
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
+        // Reserve stack space FIRST (before storing params)
+        self.emit("    sub rsp, 64  # local vars");
+
         // Parameters are passed in registers (System V ABI)
+        // Store them in the reserved stack space
         let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         for (i, param) in params.iter().enumerate() {
             self.stack_offset -= 8;
@@ -411,9 +428,6 @@ impl CodeGen {
                 },
             );
         }
-
-        // Reserve stack space
-        self.emit("    sub rsp, 64  # local vars"); // Simple fixed allocation
 
         // Generate body
         for stmt in body {
@@ -1086,6 +1100,29 @@ impl CodeGen {
     fn gen_binary_expr(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> DataType {
         let result_type = self.promote_types(self.expr_type(left), self.expr_type(right), op);
 
+        // Handle string concatenation specially
+        if result_type == DataType::String && op == BinaryOp::Add {
+            // Evaluate left string (ptr in rax, len in rdx)
+            self.gen_expr(left);
+            // Save left string on stack (ptr, len)
+            self.emit("    push rdx"); // left len
+            self.emit("    push rax"); // left ptr
+
+            // Evaluate right string (ptr in rax, len in rdx)
+            self.gen_expr(right);
+            // Now: right ptr in rax, right len in rdx
+            // Stack: left ptr, left len
+
+            // Call runtime string concat: rt_strcat(left_ptr, left_len, right_ptr, right_len)
+            self.emit("    mov rcx, rdx"); // right len -> rcx (4th arg)
+            self.emit("    mov rdx, rax"); // right ptr -> rdx (3rd arg)
+            self.emit("    pop rdi"); // left ptr -> rdi (1st arg)
+            self.emit("    pop rsi"); // left len -> rsi (2nd arg)
+            self.emit("    call _rt_strcat");
+            // Result: ptr in rax, len in rdx
+            return DataType::String;
+        }
+
         // For comparison/logical ops, we'll work in the promoted type but return Long
         let work_type = if matches!(
             op,
@@ -1108,36 +1145,33 @@ impl CodeGen {
         let left_type = self.gen_expr(left);
         self.gen_coercion(left_type, work_type);
 
-        // Save left result
+        // Save left result - use 16 bytes to maintain 16-byte stack alignment
+        // This ensures any function calls while evaluating right operand have aligned stack
+        self.emit("    sub rsp, 16");
         if work_type.is_integer() {
-            self.emit("    push rax");
+            self.emit("    mov QWORD PTR [rsp], rax");
+        } else if work_type == DataType::Single {
+            self.emit("    movss DWORD PTR [rsp], xmm0");
         } else {
-            self.emit("    sub rsp, 8");
-            if work_type == DataType::Single {
-                self.emit("    movss DWORD PTR [rsp], xmm0");
-            } else {
-                self.emit("    movsd QWORD PTR [rsp], xmm0");
-            }
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
         }
 
         // Evaluate right operand and coerce to work type
         let right_type = self.gen_expr(right);
         self.gen_coercion(right_type, work_type);
 
-        // Move right to secondary register/location
+        // Move right to secondary register/location and restore left
         if work_type.is_integer() {
             self.emit("    mov ecx, eax"); // right in ecx
-            self.emit("    pop rax"); // left in eax
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left in rax
+        } else if work_type == DataType::Single {
+            self.emit("    movss xmm1, xmm0"); // right in xmm1
+            self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
         } else {
-            if work_type == DataType::Single {
-                self.emit("    movss xmm1, xmm0"); // right in xmm1
-                self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
-            } else {
-                self.emit("    movsd xmm1, xmm0"); // right in xmm1
-                self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
-            }
-            self.emit("    add rsp, 8");
+            self.emit("    movsd xmm1, xmm0"); // right in xmm1
+            self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
         }
+        self.emit("    add rsp, 16");
 
         // Generate operation
         match op {
@@ -1290,26 +1324,18 @@ impl CodeGen {
     }
 
     fn gen_print_expr(&mut self, expr: &Expr) {
-        // Check if string expression
-        if let Expr::Literal(Literal::String(s)) = expr {
-            let idx = self.add_string_literal(s);
-            self.emit(&format!("    lea rdi, [rip + _str_{}]", idx));
-            self.emit(&format!("    mov rsi, {}", s.len()));
+        // Check the expression type first
+        let expected_type = self.expr_type(expr);
+
+        if expected_type == DataType::String {
+            // String expression - evaluate and print as string
+            // gen_expr for strings puts ptr in rax, len in rdx
+            self.gen_expr(expr);
+            self.emit("    mov rdi, rax");
+            self.emit("    mov rsi, rdx");
             self.emit("    call _rt_print_string");
-        } else if let Expr::Variable(name) = expr {
-            if is_string_var(name) {
-                let offset = self.get_var_offset(name);
-                self.emit(&format!("    mov rdi, QWORD PTR [rbp + {}]", offset));
-                self.emit(&format!("    mov rsi, QWORD PTR [rbp + {}]", offset - 8));
-                self.emit("    call _rt_print_string");
-            } else {
-                let expr_type = self.gen_expr(expr);
-                // Convert to double for printing
-                self.gen_coercion(expr_type, DataType::Double);
-                self.emit("    call _rt_print_float");
-            }
         } else {
-            // Assume numeric - evaluate and convert to double for printing
+            // Numeric expression - evaluate and convert to double for printing
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
             self.emit("    call _rt_print_float");
@@ -1317,28 +1343,19 @@ impl CodeGen {
     }
 
     fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: i32) {
-        // Check if string expression
-        if let Expr::Literal(Literal::String(s)) = expr {
-            let idx = self.add_string_literal(s);
+        // Check the expression type first
+        let expected_type = self.expr_type(expr);
+
+        if expected_type == DataType::String {
+            // String expression - evaluate and print as string
+            // gen_expr for strings puts ptr in rax, len in rdx
+            self.gen_expr(expr);
             self.emit(&format!("    mov rdi, {}", file_num));
-            self.emit(&format!("    lea rsi, [rip + _str_{}]", idx));
-            self.emit(&format!("    mov rdx, {}", s.len()));
+            self.emit("    mov rsi, rax");
+            self.emit("    mov rdx, rdx"); // rdx already has length
             self.emit("    call _rt_file_print_string");
-        } else if let Expr::Variable(name) = expr {
-            if is_string_var(name) {
-                let offset = self.get_var_offset(name);
-                self.emit(&format!("    mov rdi, {}", file_num));
-                self.emit(&format!("    mov rsi, QWORD PTR [rbp + {}]", offset));
-                self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
-                self.emit("    call _rt_file_print_string");
-            } else {
-                let expr_type = self.gen_expr(expr);
-                self.gen_coercion(expr_type, DataType::Double);
-                self.emit(&format!("    mov rdi, {}", file_num));
-                self.emit("    call _rt_file_print_float");
-            }
         } else {
-            // Assume numeric
+            // Numeric expression - evaluate and convert to double for printing
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
             self.emit(&format!("    mov rdi, {}", file_num));
@@ -1495,8 +1512,10 @@ impl CodeGen {
                 self.emit("    mov rdi, rax");
                 self.emit("    mov rsi, rdx");
                 self.gen_expr(needle_arg);
-                self.emit("    mov rdx, rax");
-                self.emit("    mov rcx, rdx");
+                // rax = needle ptr, rdx = needle len
+                // Need: rdx = needle ptr, rcx = needle len
+                self.emit("    mov rcx, rdx"); // save needle len first
+                self.emit("    mov rdx, rax"); // then set needle ptr
                 self.emit("    call _rt_instr");
                 // Result is in rax, move to eax for Long return type
                 self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
@@ -1529,9 +1548,11 @@ impl CodeGen {
             }
             "CINT" | "CLNG" => {
                 let arg_type = self.gen_expr(&args[0]);
-                // Convert to integer - result in eax
+                // Convert to integer with rounding - result in eax
+                // BASIC CINT/CLNG round to nearest integer (not truncate)
                 if !arg_type.is_integer() {
-                    self.emit("    cvttsd2si eax, xmm0");
+                    // Use cvtsd2si which rounds using MXCSR mode (default: round-to-nearest)
+                    self.emit("    cvtsd2si eax, xmm0");
                 }
                 // Result is integer (Long) in eax
             }
@@ -1561,25 +1582,40 @@ impl CodeGen {
         let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
         // Save current xmm0 if we'll use it for args
+        // Use 16 bytes to maintain stack alignment during arg evaluation
         if !args.is_empty() {
-            self.emit("    sub rsp, 8");
+            self.emit("    sub rsp, 16");
             self.emit("    movsd QWORD PTR [rsp], xmm0");
         }
 
-        // For simplicity, pass all numeric args as floats in integer registers
-        for (i, arg) in args.iter().enumerate() {
+        // Pass args: numeric as doubles in integer registers, strings as ptr/len pairs
+        let mut reg_idx = 0;
+        for arg in args.iter() {
             let arg_type = self.gen_expr(arg);
-            // Coerce to double for passing to procedures
-            self.gen_coercion(arg_type, DataType::Double);
-            if i < int_regs.len() {
-                self.emit(&format!("    movq {}, xmm0", int_regs[i]));
+            if arg_type == DataType::String {
+                // String: ptr in rax, len in rdx - pass as two args
+                if reg_idx < int_regs.len() {
+                    self.emit(&format!("    mov {}, rax", int_regs[reg_idx]));
+                    reg_idx += 1;
+                }
+                if reg_idx < int_regs.len() {
+                    self.emit(&format!("    mov {}, rdx", int_regs[reg_idx]));
+                    reg_idx += 1;
+                }
+            } else {
+                // Numeric: coerce to double and pass in integer register
+                self.gen_coercion(arg_type, DataType::Double);
+                if reg_idx < int_regs.len() {
+                    self.emit(&format!("    movq {}, xmm0", int_regs[reg_idx]));
+                    reg_idx += 1;
+                }
             }
         }
 
         self.emit(&format!("    call _proc_{}", name));
 
         if !args.is_empty() {
-            self.emit("    add rsp, 8");
+            self.emit("    add rsp, 16");
         }
     }
 
@@ -1653,8 +1689,9 @@ impl CodeGen {
 
         // For each subsequent index, multiply by dimension bound and add
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
-            // Save current accumulated index
-            self.emit("    push rax");
+            // Save current accumulated index - use 16 bytes for alignment
+            self.emit("    sub rsp, 16");
+            self.emit("    mov QWORD PTR [rsp], rax");
             // Evaluate next index
             let idx_type = self.gen_expr(idx_expr);
             if idx_type.is_integer() {
@@ -1662,7 +1699,8 @@ impl CodeGen {
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
-            self.emit("    pop rax");
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    add rsp, 16");
             // rax = rax * dim[i] + indices[i]
             self.emit(&format!(
                 "    imul rax, QWORD PTR [rbp + {}]",
@@ -1700,14 +1738,17 @@ impl CodeGen {
         }
 
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
-            self.emit("    push rax");
+            // Save current accumulated index - use 16 bytes for alignment
+            self.emit("    sub rsp, 16");
+            self.emit("    mov QWORD PTR [rsp], rax");
             let idx_type = self.gen_expr(idx_expr);
             if idx_type.is_integer() {
                 self.emit("    movsxd rcx, eax");
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
-            self.emit("    pop rax");
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    add rsp, 16");
             self.emit(&format!(
                 "    imul rax, QWORD PTR [rbp + {}]",
                 dim_offsets[i]
@@ -1715,16 +1756,18 @@ impl CodeGen {
             self.emit("    add rax, rcx");
         }
 
-        // Compute final address and save it
+        // Compute final address and save it - use 16 bytes for alignment
         self.emit(&format!("    imul rax, {}", elem_size));
         self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
-        self.emit("    push rax"); // save address
+        self.emit("    sub rsp, 16");
+        self.emit("    mov QWORD PTR [rsp], rax"); // save address
 
         // Evaluate value
         let val_type = self.gen_expr(value);
 
         // Store value at computed address
-        self.emit("    pop rcx");
+        self.emit("    mov rcx, QWORD PTR [rsp]");
+        self.emit("    add rsp, 16");
         if is_string_var(name) {
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");

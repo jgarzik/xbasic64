@@ -97,13 +97,14 @@ _rt_instr:
     push r13
     push r14
     push r15
-    mov r12, rdi
-    mov r13, rsi
-    mov r14, rdx
-    mov r15, rcx
-    dec r8
-    add r12, r8
-    sub r13, r8
+    mov r12, rdi        # haystack ptr
+    mov r13, rsi        # haystack len
+    mov r14, rdx        # needle ptr
+    mov r15, rcx        # needle len
+    mov rbx, r8         # start position (use callee-saved rbx)
+    dec rbx             # convert to 0-based
+    add r12, rbx        # adjust haystack ptr
+    sub r13, rbx        # adjust remaining length
     test r15, r15
     jz .Linstr_at_start
 .Linstr_loop:
@@ -117,14 +118,14 @@ _rt_instr:
     jz .Linstr_found
     inc r12
     dec r13
-    inc r8
+    inc rbx
     jmp .Linstr_loop
 .Linstr_found:
-    mov rax, r8
+    mov rax, rbx
     add rax, 1
     jmp .Linstr_done
 .Linstr_at_start:
-    mov rax, r8
+    mov rax, rbx
     add rax, 1
     jmp .Linstr_done
 .Linstr_not_found:
@@ -135,5 +136,56 @@ _rt_instr:
     pop r13
     pop r12
     pop rbx
+    leave
+    ret
+
+# (ptr, len) = _rt_strcat(ptr rdi, len rsi, ptr rdx, len rcx)
+# Concatenates two strings, allocating new memory for result
+.globl _rt_strcat
+_rt_strcat:
+    push rbp
+    mov rbp, rsp
+    push r12
+    push r13
+    push r14
+    push r15
+
+    # Save args
+    mov r12, rdi        # left ptr
+    mov r13, rsi        # left len
+    mov r14, rdx        # right ptr
+    mov r15, rcx        # right len
+
+    # Allocate memory for result: malloc(left_len + right_len + 1)
+    lea rdi, [rsi + rcx + 1]
+    call {libc}malloc
+
+    # Copy left string
+    mov rdi, rax        # dest
+    mov rsi, r12        # src
+    mov rdx, r13        # len
+    push rax            # save result ptr
+    call {libc}memcpy
+
+    # Copy right string
+    pop rdi             # result ptr
+    push rdi            # save again
+    add rdi, r13        # dest = result + left_len
+    mov rsi, r14        # src = right ptr
+    mov rdx, r15        # len = right len
+    call {libc}memcpy
+
+    # Null terminate
+    pop rax             # result ptr
+    lea rcx, [r13 + r15]  # total len
+    mov BYTE PTR [rax + rcx], 0
+
+    # Return: ptr in rax, len in rdx
+    mov rdx, rcx
+
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     leave
     ret

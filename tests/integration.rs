@@ -423,3 +423,520 @@ END SELECT
     .unwrap();
     assert_eq!(output.trim(), "other");
 }
+
+// === Control Flow Tests ===
+
+#[test]
+fn test_do_loop_while() {
+    let output = compile_and_run(
+        r#"
+X = 1
+DO WHILE X <= 3
+    PRINT X
+    X = X + 1
+LOOP
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1", "2", "3"]);
+}
+
+#[test]
+fn test_do_loop_until() {
+    let output = compile_and_run(
+        r#"
+X = 1
+DO UNTIL X > 3
+    PRINT X
+    X = X + 1
+LOOP
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1", "2", "3"]);
+}
+
+#[test]
+fn test_do_loop_while_post() {
+    let output = compile_and_run(
+        r#"
+X = 1
+DO
+    PRINT X
+    X = X + 1
+LOOP WHILE X <= 3
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1", "2", "3"]);
+}
+
+#[test]
+fn test_goto() {
+    let output = compile_and_run(
+        r#"
+10 PRINT "A"
+20 GOTO 40
+30 PRINT "B"
+40 PRINT "C"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["A", "C"]);
+}
+
+#[test]
+fn test_gosub_return() {
+    let output = compile_and_run(
+        r#"
+10 PRINT "start"
+20 GOSUB 100
+30 PRINT "end"
+40 END
+100 PRINT "in sub"
+110 RETURN
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["start", "in sub", "end"]);
+}
+
+#[test]
+fn test_on_goto() {
+    let output = compile_and_run(
+        r#"
+10 X = 2
+20 ON X GOTO 100, 200, 300
+30 PRINT "none"
+40 END
+100 PRINT "first"
+110 END
+200 PRINT "second"
+210 END
+300 PRINT "third"
+310 END
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "second");
+}
+
+#[test]
+fn test_sub_definition() {
+    let output = compile_and_run(
+        r#"
+PrintHello
+PRINT "done"
+END
+
+SUB PrintHello
+    PRINT "Hello from sub"
+END SUB
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["Hello from sub", "done"]);
+}
+
+#[test]
+fn test_sub_with_params() {
+    let output = compile_and_run(
+        r#"
+AddPrint(10, 20)
+END
+
+SUB AddPrint(A, B)
+    PRINT A + B
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "30");
+}
+
+// === DATA/READ/RESTORE Tests ===
+
+#[test]
+fn test_data_read() {
+    let output = compile_and_run(
+        r#"
+DATA 10, 20, 30
+READ A
+READ B
+READ C
+PRINT A + B + C
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "60");
+}
+
+#[test]
+fn test_data_restore() {
+    let output = compile_and_run(
+        r#"
+DATA 5, 10
+READ A
+READ B
+RESTORE
+READ C
+PRINT A + B + C
+"#,
+    )
+    .unwrap();
+    // A=5, B=10, C=5 (restored)
+    assert_eq!(output.trim(), "20");
+}
+
+// === FOR STEP and ELSEIF Tests ===
+
+#[test]
+fn test_for_step_positive() {
+    let output = compile_and_run(
+        r#"
+FOR I = 0 TO 10 STEP 2
+    PRINT I
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["0", "2", "4", "6", "8", "10"]);
+}
+
+#[test]
+fn test_for_step_negative() {
+    let output = compile_and_run(
+        r#"
+FOR I = 5 TO 1 STEP -1
+    PRINT I
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["5", "4", "3", "2", "1"]);
+}
+
+#[test]
+fn test_elseif() {
+    let output = compile_and_run(
+        r#"
+X = 2
+IF X = 1 THEN
+    PRINT "one"
+ELSEIF X = 2 THEN
+    PRINT "two"
+ELSEIF X = 3 THEN
+    PRINT "three"
+ELSE
+    PRINT "other"
+END IF
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "two");
+}
+
+#[test]
+fn test_end_statement() {
+    let output = compile_and_run(
+        r#"
+PRINT "before"
+END
+PRINT "after"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "before");
+}
+
+// === Arithmetic and Logical Operator Tests ===
+
+#[test]
+fn test_arithmetic_division() {
+    let output = compile_and_run("PRINT 10 / 4").unwrap();
+    assert_eq!(output.trim(), "2.5");
+}
+
+#[test]
+fn test_arithmetic_integer_division() {
+    let output = compile_and_run("PRINT 10 \\ 4").unwrap();
+    assert_eq!(output.trim(), "2");
+}
+
+#[test]
+fn test_arithmetic_mod() {
+    let output = compile_and_run("PRINT 10 MOD 3").unwrap();
+    assert_eq!(output.trim(), "1");
+}
+
+#[test]
+fn test_arithmetic_power() {
+    let output = compile_and_run("PRINT 2 ^ 10").unwrap();
+    assert_eq!(output.trim(), "1024");
+}
+
+#[test]
+fn test_logical_and() {
+    let output = compile_and_run(
+        r#"
+IF 1 AND 1 THEN PRINT "yes"
+IF 1 AND 0 THEN PRINT "no"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "yes");
+}
+
+#[test]
+fn test_logical_or() {
+    let output = compile_and_run(
+        r#"
+IF 0 OR 1 THEN PRINT "yes"
+IF 0 OR 0 THEN PRINT "no"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "yes");
+}
+
+#[test]
+fn test_logical_not() {
+    let output = compile_and_run(
+        r#"
+IF NOT 0 THEN PRINT "yes"
+IF NOT 1 THEN PRINT "no"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "yes");
+}
+
+#[test]
+fn test_logical_xor() {
+    let output = compile_and_run(
+        r#"
+IF 1 XOR 0 THEN PRINT "a"
+IF 0 XOR 1 THEN PRINT "b"
+IF 1 XOR 1 THEN PRINT "c"
+IF 0 XOR 0 THEN PRINT "d"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["a", "b"]);
+}
+
+// === Math Function Tests ===
+
+#[test]
+fn test_int_function() {
+    let output = compile_and_run("PRINT INT(3.7)").unwrap();
+    assert_eq!(output.trim(), "3");
+}
+
+#[test]
+fn test_fix_function() {
+    // FIX truncates toward zero, INT floors
+    let output = compile_and_run("PRINT FIX(-3.7)").unwrap();
+    assert_eq!(output.trim(), "-3");
+}
+
+#[test]
+fn test_sgn_function() {
+    let output = compile_and_run(
+        r#"
+PRINT SGN(-5)
+PRINT SGN(0)
+PRINT SGN(5)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["-1", "0", "1"]);
+}
+
+#[test]
+fn test_sin_cos() {
+    let output = compile_and_run("PRINT INT(SIN(0) * 100), INT(COS(0) * 100)").unwrap();
+    // sin(0) = 0, cos(0) = 1
+    let values: Vec<&str> = output.split_whitespace().collect();
+    assert_eq!(values, vec!["0", "100"]);
+}
+
+#[test]
+fn test_tan_atn() {
+    let output = compile_and_run("PRINT INT(TAN(0) * 100), INT(ATN(0) * 100)").unwrap();
+    // tan(0) = 0, atn(0) = 0
+    let values: Vec<&str> = output.split_whitespace().collect();
+    assert_eq!(values, vec!["0", "0"]);
+}
+
+#[test]
+fn test_exp_log() {
+    let output = compile_and_run("PRINT INT(EXP(0)), INT(LOG(1))").unwrap();
+    // exp(0) = 1, log(1) = 0
+    let values: Vec<&str> = output.split_whitespace().collect();
+    assert_eq!(values, vec!["1", "0"]);
+}
+
+#[test]
+fn test_rnd_function() {
+    // RND returns a value between 0 and 1
+    let output = compile_and_run(
+        r#"
+X = RND(1)
+IF X >= 0 AND X < 1 THEN PRINT "ok"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "ok");
+}
+
+// === String Function Tests ===
+
+#[test]
+fn test_len_function() {
+    let output = compile_and_run(r#"PRINT LEN("Hello")"#).unwrap();
+    assert_eq!(output.trim(), "5");
+}
+
+#[test]
+fn test_left_right() {
+    let output = compile_and_run(
+        r#"
+PRINT LEFT$("Hello", 2)
+PRINT RIGHT$("Hello", 2)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["He", "lo"]);
+}
+
+#[test]
+fn test_mid_function() {
+    let output = compile_and_run(r#"PRINT MID$("Hello", 2, 3)"#).unwrap();
+    assert_eq!(output.trim(), "ell");
+}
+
+#[test]
+fn test_chr_asc() {
+    let output = compile_and_run(
+        r#"
+PRINT CHR$(65)
+PRINT ASC("A")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["A", "65"]);
+}
+
+#[test]
+fn test_val_str() {
+    let output = compile_and_run(
+        r#"
+X = VAL("42")
+PRINT X + 8
+PRINT STR$(100)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["50", "100"]);
+}
+
+#[test]
+fn test_instr_function() {
+    let output = compile_and_run(r#"PRINT INSTR("Hello World", "World")"#).unwrap();
+    assert_eq!(output.trim(), "7");
+}
+
+// === Conversion Function Tests ===
+
+#[test]
+fn test_cint_clng() {
+    let output = compile_and_run(
+        r#"
+PRINT CINT(3.7)
+PRINT CLNG(3.7)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["4", "4"]);
+}
+
+#[test]
+fn test_csng_cdbl() {
+    // These convert to float types; test that they work
+    let output = compile_and_run(
+        r#"
+X! = CSNG(3)
+Y# = CDBL(3)
+PRINT X! + Y#
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "6");
+}
+
+#[test]
+fn test_timer_function() {
+    // TIMER returns seconds since midnight; just verify it returns a number
+    let output = compile_and_run(
+        r#"
+T = TIMER
+IF T >= 0 THEN PRINT "ok"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "ok");
+}
+
+// === Type Suffix Tests ===
+
+#[test]
+fn test_integer_suffix() {
+    let output = compile_and_run(
+        r#"
+X% = 32000
+PRINT X%
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "32000");
+}
+
+#[test]
+fn test_long_suffix() {
+    let output = compile_and_run(
+        r#"
+X& = 100000
+PRINT X&
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "100000");
+}
+
+#[test]
+fn test_string_variable() {
+    let output = compile_and_run(
+        r#"
+X$ = "Hello"
+Y$ = " World"
+PRINT X$ + Y$
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "Hello World");
+}
