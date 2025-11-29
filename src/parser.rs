@@ -223,6 +223,7 @@ impl DataType {
 // Parser
 // ============================================================================
 
+#[derive(Default)]
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -237,10 +238,7 @@ impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Parser {
             tokens,
-            pos: 0,
-            last_loop_condition: None,
-            last_loop_is_until: false,
-            last_elseif_condition: None,
+            ..Default::default()
         }
     }
 

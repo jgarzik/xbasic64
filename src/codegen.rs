@@ -147,6 +147,12 @@
 use crate::parser::*;
 use std::collections::HashMap;
 
+/// Symbol prefix: underscore on macOS, empty on Linux
+#[cfg(target_os = "macos")]
+const PREFIX: &str = "_";
+#[cfg(not(target_os = "macos"))]
+const PREFIX: &str = "";
+
 fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
@@ -164,6 +170,7 @@ struct ArrayInfo {
     dim_offsets: Vec<i32>, // stack offsets where dimension bounds are stored
 }
 
+#[derive(Default)]
 pub struct CodeGen {
     output: String,
     vars: HashMap<String, VarInfo>, // variable name -> variable info
@@ -175,32 +182,9 @@ pub struct CodeGen {
     current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
     gosub_used: bool,               // whether GOSUB is used (need return stack)
-    prefix: &'static str,           // symbol prefix ("_" on macOS, "" on Linux)
 }
 
 impl CodeGen {
-    pub fn new() -> Self {
-        // On macOS, symbols need underscore prefix
-        #[cfg(target_os = "macos")]
-        let prefix = "_";
-        #[cfg(not(target_os = "macos"))]
-        let prefix = "";
-
-        CodeGen {
-            output: String::new(),
-            vars: HashMap::new(),
-            arrays: HashMap::new(),
-            stack_offset: 0,
-            label_counter: 0,
-            string_literals: Vec::new(),
-            data_items: Vec::new(),
-            current_proc: None,
-            proc_vars: HashMap::new(),
-            gosub_used: false,
-            prefix,
-        }
-    }
-
     fn emit(&mut self, s: &str) {
         self.output.push_str(s);
         self.output.push('\n');
@@ -395,7 +379,7 @@ impl CodeGen {
         // Emit assembly header
         self.emit(".intel_syntax noprefix");
         self.emit(".text");
-        let p = self.prefix;
+        let p = PREFIX;
         self.emit(&format!(".globl {}main", p));
         self.emit("");
 
@@ -1404,7 +1388,7 @@ impl CodeGen {
                     self.emit("    cvtss2sd xmm0, xmm0");
                     self.emit("    cvtss2sd xmm1, xmm1");
                 }
-                self.emit(&format!("    call {}pow", self.prefix));
+                self.emit(&format!("    call {}pow", PREFIX));
             }
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -1538,32 +1522,32 @@ impl CodeGen {
             "SIN" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}sin", self.prefix));
+                self.emit(&format!("    call {}sin", PREFIX));
             }
             "COS" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}cos", self.prefix));
+                self.emit(&format!("    call {}cos", PREFIX));
             }
             "TAN" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}tan", self.prefix));
+                self.emit(&format!("    call {}tan", PREFIX));
             }
             "ATN" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}atan", self.prefix));
+                self.emit(&format!("    call {}atan", PREFIX));
             }
             "EXP" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}exp", self.prefix));
+                self.emit(&format!("    call {}exp", PREFIX));
             }
             "LOG" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}log", self.prefix));
+                self.emit(&format!("    call {}log", PREFIX));
             }
             "SGN" => {
                 let arg_type = self.gen_expr(&args[0]);
@@ -1695,6 +1679,8 @@ impl CodeGen {
                 // Convert to integer with rounding - result in eax
                 // BASIC CINT/CLNG round to nearest integer (not truncate)
                 if !arg_type.is_integer() {
+                    // Coerce to Double first (handles Single -> Double conversion)
+                    self.gen_coercion(arg_type, DataType::Double);
                     // Use cvtsd2si which rounds using MXCSR mode (default: round-to-nearest)
                     self.emit("    cvtsd2si eax, xmm0");
                 }
@@ -1797,7 +1783,7 @@ impl CodeGen {
 
         // Allocate: total_elements * elem_size
         self.emit(&format!("    imul rdi, rax, {}", elem_size));
-        self.emit(&format!("    call {}malloc", self.prefix));
+        self.emit(&format!("    call {}malloc", PREFIX));
 
         // Store array pointer
         self.stack_offset -= 8;
@@ -1982,11 +1968,5 @@ impl CodeGen {
         if self.gosub_used {
             self.emit("_gosub_stack: .skip 8192  # GOSUB return stack");
         }
-    }
-}
-
-impl Default for CodeGen {
-    fn default() -> Self {
-        Self::new()
     }
 }

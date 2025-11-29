@@ -65,7 +65,7 @@ fn main() {
     };
 
     // Generate code
-    let mut codegen = codegen::CodeGen::new();
+    let mut codegen = codegen::CodeGen::default();
     let asm = codegen.generate(&program);
 
     // Add runtime
