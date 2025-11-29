@@ -41,6 +41,9 @@ pub enum Token {
     EndSub,
     Function,
     EndFunction,
+    Select,
+    Case,
+    EndSelect,
     End,
     Stop,
     Rem,
@@ -266,6 +269,9 @@ impl<'a> Lexer<'a> {
             "ENDSUB" => Token::EndSub,
             "FUNCTION" => Token::Function,
             "ENDFUNCTION" => Token::EndFunction,
+            "SELECT" => Token::Select,
+            "CASE" => Token::Case,
+            "ENDSELECT" => Token::EndSelect,
             "END" => Token::End,
             "STOP" => Token::Stop,
             "REM" => Token::Rem,
@@ -591,6 +597,15 @@ mod tests {
         assert_eq!(tokens[1], Token::EndSub);
         assert_eq!(tokens[2], Token::Function);
         assert_eq!(tokens[3], Token::EndFunction);
+    }
+
+    #[test]
+    fn test_keywords_select_case() {
+        let mut lexer = Lexer::new("SELECT CASE ENDSELECT");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Select);
+        assert_eq!(tokens[1], Token::Case);
+        assert_eq!(tokens[2], Token::EndSelect);
     }
 
     #[test]

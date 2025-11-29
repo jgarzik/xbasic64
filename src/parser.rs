@@ -81,6 +81,10 @@ pub enum Stmt {
     Read(Vec<String>),
     Restore(Option<GotoTarget>),
     Cls,
+    SelectCase {
+        expr: Expr,
+        cases: Vec<(Option<Expr>, Vec<Stmt>)>, // (None = ELSE, Some = value)
+    },
     End,
     Stop,
     // File I/O
@@ -310,7 +314,7 @@ impl Parser {
             Token::Close => self.parse_close(),
             Token::End => {
                 self.advance();
-                // Check for END IF, END SUB, END FUNCTION
+                // Check for END IF, END SUB, END FUNCTION, END SELECT
                 match self.peek() {
                     Token::If => {
                         self.advance();
@@ -324,6 +328,10 @@ impl Parser {
                     Token::Function => {
                         self.advance();
                         Err("END FUNCTION".to_string())
+                    }
+                    Token::Select => {
+                        self.advance();
+                        Err("END SELECT".to_string())
                     }
                     _ => Ok(Stmt::End),
                 }
@@ -339,6 +347,10 @@ impl Parser {
             Token::EndFunction => {
                 self.advance();
                 Err("END FUNCTION".to_string())
+            }
+            Token::EndSelect => {
+                self.advance();
+                Err("END SELECT".to_string())
             }
             Token::Stop => {
                 self.advance();
@@ -382,6 +394,19 @@ impl Parser {
                 let cond = self.parse_expression()?;
                 self.expect(Token::Then)?;
                 Err(format!("ELSEIF:{:?}", cond))
+            }
+            Token::Select => self.parse_select_case(),
+            Token::Case => {
+                self.advance();
+                // Check for CASE ELSE
+                if matches!(self.peek(), Token::Else) {
+                    self.advance();
+                    Err("CASE ELSE".to_string())
+                } else {
+                    // Parse the case value
+                    let value = self.parse_expression()?;
+                    Err(format!("CASE:{:?}", value))
+                }
             }
             Token::Ident(_) => self.parse_assignment_or_call(),
             Token::Newline => {
@@ -784,6 +809,64 @@ impl Parser {
             },
             body,
         })
+    }
+
+    fn parse_select_case(&mut self) -> Result<Stmt, String> {
+        self.advance(); // consume SELECT
+        self.expect(Token::Case)?;
+        let expr = self.parse_expression()?;
+        self.skip_newlines();
+
+        let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
+
+        // Parse CASE blocks until END SELECT
+        loop {
+            // Check for END SELECT
+            if matches!(self.peek(), Token::End | Token::EndSelect) {
+                // Consume END SELECT
+                if matches!(self.peek(), Token::End) {
+                    self.advance();
+                    self.expect(Token::Select)?;
+                } else {
+                    self.advance(); // consume ENDSELECT
+                }
+                break;
+            }
+
+            // Expect CASE keyword
+            self.expect(Token::Case)?;
+
+            // Check for CASE ELSE
+            let case_value = if matches!(self.peek(), Token::Else) {
+                self.advance();
+                None
+            } else {
+                Some(self.parse_expression()?)
+            };
+
+            self.skip_newlines();
+
+            // Parse case body until next CASE or END SELECT
+            let mut body = Vec::new();
+            loop {
+                // Check for terminators before parsing statement
+                match self.peek() {
+                    Token::Case | Token::End | Token::EndSelect => break,
+                    Token::Eof => break,
+                    _ => {}
+                }
+
+                match self.parse_statement() {
+                    Ok(stmt) => body.push(stmt),
+                    Err(e) => return Err(e),
+                }
+                self.skip_newlines();
+            }
+
+            cases.push((case_value, body));
+        }
+
+        Ok(Stmt::SelectCase { expr, cases })
     }
 
     fn parse_goto(&mut self) -> Result<Stmt, String> {
@@ -1682,6 +1765,62 @@ mod tests {
             assert!(*is_until);
         } else {
             panic!("Expected DoLoop");
+        }
+    }
+
+    // ===================
+    // SelectCase Tests
+    // ===================
+
+    #[test]
+    fn test_select_case_simple() {
+        let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nEND SELECT").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::SelectCase { expr, cases } = &prog.statements[0] {
+            assert!(matches!(expr, Expr::Variable(_)));
+            assert_eq!(cases.len(), 1);
+            assert!(cases[0].0.is_some()); // Has a value
+            assert_eq!(cases[0].1.len(), 1); // One statement in body
+        } else {
+            panic!("Expected SelectCase");
+        }
+    }
+
+    #[test]
+    fn test_select_case_multiple() {
+        let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nCASE 2\nPRINT 2\nEND SELECT").unwrap();
+        if let Stmt::SelectCase { cases, .. } = &prog.statements[0] {
+            assert_eq!(cases.len(), 2);
+        } else {
+            panic!("Expected SelectCase");
+        }
+    }
+
+    #[test]
+    fn test_select_case_with_else() {
+        let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nCASE ELSE\nPRINT 0\nEND SELECT").unwrap();
+        if let Stmt::SelectCase { cases, .. } = &prog.statements[0] {
+            assert_eq!(cases.len(), 2);
+            assert!(cases[0].0.is_some()); // CASE 1
+            assert!(cases[1].0.is_none()); // CASE ELSE
+        } else {
+            panic!("Expected SelectCase");
+        }
+    }
+
+    #[test]
+    fn test_select_case_string() {
+        let prog = parse("SELECT CASE A$\nCASE \"yes\"\nPRINT 1\nEND SELECT").unwrap();
+        if let Stmt::SelectCase { expr, cases } = &prog.statements[0] {
+            assert!(matches!(expr, Expr::Variable(_)));
+            assert_eq!(cases.len(), 1);
+            if let Some(Expr::Literal(Literal::String(s))) = &cases[0].0 {
+                assert_eq!(s, "yes");
+            } else {
+                panic!("Expected string literal in CASE");
+            }
+        } else {
+            panic!("Expected SelectCase");
         }
     }
 

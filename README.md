@@ -11,6 +11,7 @@ A BASIC-to-x86-64 compiler written in Rust, targeting early 1980s BASIC dialects
 - `INPUT` / `LINE INPUT` - user input with optional prompts
 - `LET` - variable assignment (optional keyword)
 - `IF...THEN...ELSE...END IF` - conditionals (block and single-line)
+- `SELECT CASE...CASE...CASE ELSE...END SELECT` - multi-way branching
 - `FOR...TO...STEP...NEXT` - counted loops
 - `WHILE...WEND` - conditional loops
 - `DO...LOOP` - with `WHILE`/`UNTIL` conditions
@@ -162,7 +163,6 @@ The runtime library (`src/runtime/`) provides support functions for I/O, string 
 - PEEK/POKE/DEF SEG (no direct memory access)
 - Error handling (ON ERROR, RESUME)
 - DEF FN (use FUNCTION instead)
-- SELECT CASE
 
 ## License
 

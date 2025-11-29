@@ -383,3 +383,43 @@ PRINT Cube(0, 0, 0) + Cube(1, 1, 1)
     // 1 + 8 = 9
     assert_eq!(output.trim(), "9");
 }
+
+#[test]
+fn test_select_case() {
+    let output = compile_and_run(
+        r#"
+X = 2
+SELECT CASE X
+    CASE 1
+        PRINT "one"
+    CASE 2
+        PRINT "two"
+    CASE 3
+        PRINT "three"
+    CASE ELSE
+        PRINT "other"
+END SELECT
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "two");
+}
+
+#[test]
+fn test_select_case_else() {
+    let output = compile_and_run(
+        r#"
+X = 99
+SELECT CASE X
+    CASE 1
+        PRINT "one"
+    CASE 2
+        PRINT "two"
+    CASE ELSE
+        PRINT "other"
+END SELECT
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "other");
+}

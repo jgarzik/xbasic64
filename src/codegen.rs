@@ -22,16 +22,16 @@ struct ArrayInfo {
 
 pub struct CodeGen {
     output: String,
-    vars: HashMap<String, VarInfo>,     // variable name -> variable info
+    vars: HashMap<String, VarInfo>, // variable name -> variable info
     arrays: HashMap<String, ArrayInfo>, // array name -> array metadata
-    stack_offset: i32,                  // current stack offset
-    label_counter: u32,                 // for generating unique labels
-    string_literals: Vec<String>,       // string constants
-    data_items: Vec<Literal>,           // DATA values
-    current_proc: Option<String>,       // current SUB/FUNCTION name
+    stack_offset: i32,              // current stack offset
+    label_counter: u32,             // for generating unique labels
+    string_literals: Vec<String>,   // string constants
+    data_items: Vec<Literal>,       // DATA values
+    current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
-    gosub_used: bool,                   // whether GOSUB is used (need return stack)
-    prefix: &'static str,               // symbol prefix ("_" on macOS, "" on Linux)
+    gosub_used: bool,               // whether GOSUB is used (need return stack)
+    prefix: &'static str,           // symbol prefix ("_" on macOS, "" on Linux)
 }
 
 impl CodeGen {
@@ -153,12 +153,7 @@ impl CodeGen {
         // Comparison operators always return Integer (0 or -1 for boolean)
         if matches!(
             op,
-            BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Gt
-                | BinaryOp::Le
-                | BinaryOp::Ge
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
         ) {
             return DataType::Long; // Boolean result as Long
         }
@@ -473,13 +468,22 @@ impl CodeGen {
                             self.emit(&format!("    mov WORD PTR [rbp + {}], ax", var_info.offset));
                         }
                         DataType::Long => {
-                            self.emit(&format!("    mov DWORD PTR [rbp + {}], eax", var_info.offset));
+                            self.emit(&format!(
+                                "    mov DWORD PTR [rbp + {}], eax",
+                                var_info.offset
+                            ));
                         }
                         DataType::Single => {
-                            self.emit(&format!("    movss DWORD PTR [rbp + {}], xmm0", var_info.offset));
+                            self.emit(&format!(
+                                "    movss DWORD PTR [rbp + {}], xmm0",
+                                var_info.offset
+                            ));
                         }
                         DataType::Double => {
-                            self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_info.offset));
+                            self.emit(&format!(
+                                "    movsd QWORD PTR [rbp + {}], xmm0",
+                                var_info.offset
+                            ));
                         }
                         DataType::String => {
                             // Should be handled by gen_string_assign above
@@ -844,6 +848,55 @@ impl CodeGen {
                 self.emit("    call _rt_cls");
             }
 
+            Stmt::SelectCase { expr, cases } => {
+                let end_label = self.new_label("endselect");
+
+                // Evaluate SELECT expression and save to temp
+                let expr_type = self.gen_expr(expr);
+                self.gen_coercion(expr_type, DataType::Double);
+                self.stack_offset -= 8;
+                let temp_offset = self.stack_offset;
+                self.emit(&format!(
+                    "    movsd QWORD PTR [rbp + {}], xmm0",
+                    temp_offset
+                ));
+
+                // Generate code for each case
+                for (i, (case_value, body)) in cases.iter().enumerate() {
+                    let next_case_label = if i + 1 < cases.len() {
+                        self.new_label("case")
+                    } else {
+                        end_label.clone()
+                    };
+
+                    if let Some(value) = case_value {
+                        // Evaluate case value and compare
+                        let val_type = self.gen_expr(value);
+                        self.gen_coercion(val_type, DataType::Double);
+                        self.emit(&format!(
+                            "    movsd xmm1, QWORD PTR [rbp + {}]",
+                            temp_offset
+                        ));
+                        self.emit("    ucomisd xmm0, xmm1");
+                        self.emit(&format!("    jne {}", next_case_label));
+                    }
+                    // CASE ELSE (None) falls through without comparison
+
+                    // Generate case body
+                    for stmt in body {
+                        self.gen_stmt(stmt);
+                    }
+
+                    // Jump to end (skip remaining cases)
+                    if i + 1 < cases.len() {
+                        self.emit(&format!("    jmp {}", end_label));
+                        self.emit_label(&next_case_label);
+                    }
+                }
+
+                self.emit_label(&end_label);
+            }
+
             Stmt::End | Stmt::Stop => {
                 self.emit("    xor eax, eax");
                 self.emit("    leave");
@@ -947,16 +1000,10 @@ impl CodeGen {
                 let info = self.get_var_info(name);
                 match info.data_type {
                     DataType::Integer => {
-                        self.emit(&format!(
-                            "    movsx eax, WORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", info.offset));
                     }
                     DataType::Long => {
-                        self.emit(&format!(
-                            "    mov eax, DWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", info.offset));
                     }
                     DataType::Single => {
                         self.emit(&format!(
@@ -971,10 +1018,7 @@ impl CodeGen {
                         ));
                     }
                     DataType::String => {
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", info.offset));
                         self.emit(&format!(
                             "    mov rdx, QWORD PTR [rbp + {}]",
                             info.offset - 8
@@ -1029,9 +1073,7 @@ impl CodeGen {
                 }
             }
 
-            Expr::Binary { op, left, right } => {
-                self.gen_binary_expr(*op, left, right)
-            }
+            Expr::Binary { op, left, right } => self.gen_binary_expr(*op, left, right),
 
             Expr::FnCall { name, args } => {
                 self.gen_fn_call(name, args);
@@ -1186,7 +1228,12 @@ impl CodeGen {
                 }
                 self.emit(&format!("    call {}pow", self.prefix));
             }
-            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::Le
+            | BinaryOp::Ge => {
                 let set_instr = match op {
                     BinaryOp::Eq => "sete",
                     BinaryOp::Ne => "setne",
