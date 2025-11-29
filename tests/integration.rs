@@ -12,7 +12,7 @@ fn compile_and_run(source: &str) -> Result<String, String> {
     fs::write(&bas_file, source).map_err(|e| e.to_string())?;
 
     // Compile
-    let compile_output = Command::new(env!("CARGO_BIN_EXE_basic-rs"))
+    let compile_output = Command::new(env!("CARGO_BIN_EXE_basic64"))
         .arg(&bas_file)
         .arg("-o")
         .arg(&exe_file)
@@ -233,7 +233,7 @@ where
     fs::write(&bas_file, source).map_err(|e| e.to_string())?;
 
     // Compile
-    let compile_output = Command::new(env!("CARGO_BIN_EXE_basic-rs"))
+    let compile_output = Command::new(env!("CARGO_BIN_EXE_basic64"))
         .arg(&bas_file)
         .arg("-o")
         .arg(&exe_file)

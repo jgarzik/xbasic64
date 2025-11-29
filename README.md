@@ -1,4 +1,4 @@
-# basic-rs
+# basic64
 
 A BASIC-to-x86-64 compiler written in Rust, targeting early 1980s BASIC dialects (Tandy/GW-BASIC/QuickBASIC style).
 
@@ -51,13 +51,13 @@ cargo build --release
 
 ```bash
 # Compile a BASIC program to executable
-basic-rs program.bas
+basic64 program.bas
 
 # Specify output file
-basic-rs program.bas -o myprogram
+basic64 program.bas -o myprogram
 
 # Emit assembly only (no linking)
-basic-rs -S program.bas
+basic64 -S program.bas
 ```
 
 ## Example Programs
