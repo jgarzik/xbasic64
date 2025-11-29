@@ -1,6 +1,6 @@
 # xbasic64
 
-A BASIC-to-x86_64 native code compiler written in Rust.
+A BASIC-to-x86_64 native code compiler.
 
 ## Overview
 
