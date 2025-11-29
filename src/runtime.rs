@@ -1,5 +1,6 @@
 //! Runtime support - generates assembly for runtime functions
-//! Uses libc functions for cross-platform compatibility
+//!
+//! Uses libc functions for cross-platform compatibility.
 //!
 //! Runtime is split into separate assembly files for maintainability:
 //! - data_defs.s: Data section definitions (format strings, buffers)
@@ -9,6 +10,9 @@
 //! - math.s: Math and utility functions
 //! - data.s: DATA/READ support functions
 //! - file.s: File I/O functions (OPEN, CLOSE, PRINT#, INPUT#)
+
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
 
 const DATA_DEFS: &str = include_str!("runtime/data_defs.s");
 const PRINT_FUNCS: &str = include_str!("runtime/print.s");

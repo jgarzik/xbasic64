@@ -144,6 +144,9 @@
 //!
 //! These use the same calling convention and are linked into the final executable.
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use crate::parser::*;
 use std::collections::HashMap;
 use std::sync::LazyLock;

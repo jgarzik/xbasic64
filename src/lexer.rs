@@ -1,5 +1,8 @@
 //! BASIC lexer - tokenizes source into tokens
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;

@@ -1,5 +1,8 @@
 //! File I/O tests
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use crate::common::compile_and_run_with_files;
 use std::fs;
 

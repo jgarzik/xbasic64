@@ -1,5 +1,8 @@
 //! Common test utilities for integration tests
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};

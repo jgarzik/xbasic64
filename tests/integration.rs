@@ -1,5 +1,8 @@
 //! Integration tests for the BASIC compiler
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 mod common;
 
 mod arithmetic;

@@ -1,5 +1,8 @@
 //! Type system tests (conversion, promotion, truncation)
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use crate::common::compile_and_run;
 
 // === Conversion Function Tests ===

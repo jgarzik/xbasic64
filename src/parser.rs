@@ -1,5 +1,8 @@
 //! BASIC parser - produces AST from tokens
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 use crate::lexer::Token;
 
 /// Binary operator precedence levels (higher = tighter binding)

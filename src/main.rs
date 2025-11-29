@@ -2,6 +2,9 @@
 //!
 //! Compiles 1980s-era BASIC programs to Linux x86-64 executables.
 
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
 mod codegen;
 mod lexer;
 mod parser;
