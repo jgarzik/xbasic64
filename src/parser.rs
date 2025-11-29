@@ -1111,32 +1111,980 @@ mod tests {
         parser.parse()
     }
 
+    // ===================
+    // Label Tests
+    // ===================
+
     #[test]
-    fn test_print() {
-        let prog = parse(r#"PRINT "Hello""#).unwrap();
-        assert_eq!(prog.statements.len(), 1);
+    fn test_label() {
+        let prog = parse("10 PRINT X").unwrap();
+        assert_eq!(prog.statements.len(), 2);
+        if let Stmt::Label(n) = &prog.statements[0] {
+            assert_eq!(*n, 10);
+        } else {
+            panic!("Expected Label");
+        }
     }
 
     #[test]
-    fn test_assignment() {
+    fn test_multiple_labels() {
+        let prog = parse("10 X = 1\n20 Y = 2\n30 END").unwrap();
+        assert_eq!(prog.statements.len(), 6); // 3 labels + 3 statements
+        assert!(matches!(&prog.statements[0], Stmt::Label(10)));
+        assert!(matches!(&prog.statements[2], Stmt::Label(20)));
+        assert!(matches!(&prog.statements[4], Stmt::Label(30)));
+    }
+
+    // ===================
+    // Let Tests
+    // ===================
+
+    #[test]
+    fn test_let_simple() {
         let prog = parse("X = 42").unwrap();
         assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Let {
+            name,
+            indices,
+            value,
+        } = &prog.statements[0]
+        {
+            assert_eq!(name, "X");
+            assert!(indices.is_none());
+            assert!(matches!(value, Expr::Literal(Literal::Integer(42))));
+        } else {
+            panic!("Expected Let");
+        }
     }
 
     #[test]
-    fn test_expression() {
+    fn test_let_with_keyword() {
+        let prog = parse("LET X = 42").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Let { name, .. } = &prog.statements[0] {
+            assert_eq!(name, "X");
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_let_array_assignment() {
+        let prog = parse("A(5) = 100").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Let {
+            name,
+            indices,
+            value,
+        } = &prog.statements[0]
+        {
+            assert_eq!(name, "A");
+            assert!(indices.is_some());
+            let idx = indices.as_ref().unwrap();
+            assert_eq!(idx.len(), 1);
+            assert!(matches!(value, Expr::Literal(Literal::Integer(100))));
+        } else {
+            panic!("Expected Let with array");
+        }
+    }
+
+    #[test]
+    fn test_let_expression() {
         let prog = parse("X = 1 + 2 * 3").unwrap();
         assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            // Should be 1 + (2 * 3) due to precedence
+            if let Expr::Binary { op, .. } = value {
+                assert_eq!(*op, BinaryOp::Add);
+            } else {
+                panic!("Expected binary expression");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    // ===================
+    // Print Tests
+    // ===================
+
+    #[test]
+    fn test_print_string() {
+        let prog = parse(r#"PRINT "Hello""#).unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Print { items, newline } = &prog.statements[0] {
+            assert_eq!(items.len(), 1);
+            assert!(*newline);
+        } else {
+            panic!("Expected Print");
+        }
     }
 
     #[test]
-    fn test_for_loop() {
+    fn test_print_multiple_items() {
+        let prog = parse(r#"PRINT "A"; B; C"#).unwrap();
+        if let Stmt::Print { items, .. } = &prog.statements[0] {
+            assert_eq!(items.len(), 5); // "A", Empty, B, Empty, C
+        } else {
+            panic!("Expected Print");
+        }
+    }
+
+    #[test]
+    fn test_print_with_tab() {
+        let prog = parse(r#"PRINT A, B"#).unwrap();
+        if let Stmt::Print { items, .. } = &prog.statements[0] {
+            assert!(items.iter().any(|i| matches!(i, PrintItem::Tab)));
+        } else {
+            panic!("Expected Print");
+        }
+    }
+
+    #[test]
+    fn test_print_no_newline() {
+        let prog = parse(r#"PRINT X;"#).unwrap();
+        if let Stmt::Print { newline, .. } = &prog.statements[0] {
+            assert!(!*newline);
+        } else {
+            panic!("Expected Print");
+        }
+    }
+
+    // ===================
+    // Input Tests
+    // ===================
+
+    #[test]
+    fn test_input_simple() {
+        let prog = parse("INPUT X").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Input { prompt, vars } = &prog.statements[0] {
+            assert!(prompt.is_none());
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0], "X");
+        } else {
+            panic!("Expected Input");
+        }
+    }
+
+    #[test]
+    fn test_input_with_prompt() {
+        let prog = parse(r#"INPUT "Enter value: ", X"#).unwrap();
+        if let Stmt::Input { prompt, vars } = &prog.statements[0] {
+            assert_eq!(prompt.as_ref().unwrap(), "Enter value: ");
+            assert_eq!(vars[0], "X");
+        } else {
+            panic!("Expected Input");
+        }
+    }
+
+    #[test]
+    fn test_input_multiple_vars() {
+        let prog = parse("INPUT A, B, C").unwrap();
+        if let Stmt::Input { vars, .. } = &prog.statements[0] {
+            assert_eq!(vars.len(), 3);
+        } else {
+            panic!("Expected Input");
+        }
+    }
+
+    // ===================
+    // LineInput Tests
+    // ===================
+
+    #[test]
+    fn test_line_input_simple() {
+        let prog = parse("LINE INPUT X$").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::LineInput { prompt, var } = &prog.statements[0] {
+            assert!(prompt.is_none());
+            assert_eq!(var, "X$");
+        } else {
+            panic!("Expected LineInput");
+        }
+    }
+
+    #[test]
+    fn test_line_input_with_prompt() {
+        let prog = parse(r#"LINE INPUT "Name: ", NAME$"#).unwrap();
+        if let Stmt::LineInput { prompt, var } = &prog.statements[0] {
+            assert_eq!(prompt.as_ref().unwrap(), "Name: ");
+            assert_eq!(var, "NAME$");
+        } else {
+            panic!("Expected LineInput");
+        }
+    }
+
+    // ===================
+    // If Tests
+    // ===================
+
+    #[test]
+    fn test_if_single_line() {
+        let prog = parse("IF X > 0 THEN PRINT X").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } = &prog.statements[0]
+        {
+            assert!(matches!(
+                condition,
+                Expr::Binary {
+                    op: BinaryOp::Gt,
+                    ..
+                }
+            ));
+            assert_eq!(then_branch.len(), 1);
+            assert!(else_branch.is_none());
+        } else {
+            panic!("Expected If");
+        }
+    }
+
+    #[test]
+    fn test_if_single_line_with_else() {
+        let prog = parse("IF X > 0 THEN PRINT X ELSE PRINT Y").unwrap();
+        if let Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &prog.statements[0]
+        {
+            assert_eq!(then_branch.len(), 1);
+            assert!(else_branch.is_some());
+            assert_eq!(else_branch.as_ref().unwrap().len(), 1);
+        } else {
+            panic!("Expected If");
+        }
+    }
+
+    #[test]
+    fn test_if_block() {
+        let prog = parse("IF X > 0 THEN\nPRINT X\nEND IF").unwrap();
+        if let Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &prog.statements[0]
+        {
+            assert_eq!(then_branch.len(), 1);
+            assert!(else_branch.is_none());
+        } else {
+            panic!("Expected If");
+        }
+    }
+
+    #[test]
+    fn test_if_block_with_else() {
+        let prog = parse("IF X > 0 THEN\nPRINT X\nELSE\nPRINT Y\nEND IF").unwrap();
+        if let Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } = &prog.statements[0]
+        {
+            assert_eq!(then_branch.len(), 1);
+            assert!(else_branch.is_some());
+        } else {
+            panic!("Expected If");
+        }
+    }
+
+    // ===================
+    // For Tests
+    // ===================
+
+    #[test]
+    fn test_for_simple() {
         let prog = parse("FOR I = 1 TO 10\nPRINT I\nNEXT I").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::For { body, .. } = &prog.statements[0] {
+        if let Stmt::For {
+            var,
+            start,
+            end,
+            step,
+            body,
+        } = &prog.statements[0]
+        {
+            assert_eq!(var, "I");
+            assert!(matches!(start, Expr::Literal(Literal::Integer(1))));
+            assert!(matches!(end, Expr::Literal(Literal::Integer(10))));
+            assert!(step.is_none());
             assert_eq!(body.len(), 1);
         } else {
-            panic!("Expected FOR statement");
+            panic!("Expected For");
         }
+    }
+
+    #[test]
+    fn test_for_with_step() {
+        let prog = parse("FOR I = 0 TO 100 STEP 10\nNEXT").unwrap();
+        if let Stmt::For { step, .. } = &prog.statements[0] {
+            assert!(step.is_some());
+            assert!(matches!(
+                step.as_ref().unwrap(),
+                Expr::Literal(Literal::Integer(10))
+            ));
+        } else {
+            panic!("Expected For");
+        }
+    }
+
+    #[test]
+    fn test_for_negative_step() {
+        let prog = parse("FOR I = 10 TO 1 STEP -1\nNEXT").unwrap();
+        if let Stmt::For { step, .. } = &prog.statements[0] {
+            assert!(step.is_some());
+        } else {
+            panic!("Expected For");
+        }
+    }
+
+    // ===================
+    // While Tests
+    // ===================
+
+    #[test]
+    fn test_while_simple() {
+        let prog = parse("WHILE X < 10\nX = X + 1\nWEND").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::While { condition, body } = &prog.statements[0] {
+            assert!(matches!(
+                condition,
+                Expr::Binary {
+                    op: BinaryOp::Lt,
+                    ..
+                }
+            ));
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Expected While");
+        }
+    }
+
+    // ===================
+    // DoLoop Tests
+    // ===================
+
+    #[test]
+    fn test_do_loop_simple() {
+        let prog = parse("DO\nX = X + 1\nLOOP").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::DoLoop {
+            condition,
+            cond_at_start,
+            body,
+            ..
+        } = &prog.statements[0]
+        {
+            assert!(condition.is_none());
+            assert!(!*cond_at_start);
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Expected DoLoop");
+        }
+    }
+
+    #[test]
+    fn test_do_while() {
+        let prog = parse("DO WHILE X < 10\nX = X + 1\nLOOP").unwrap();
+        if let Stmt::DoLoop {
+            condition,
+            cond_at_start,
+            is_until,
+            ..
+        } = &prog.statements[0]
+        {
+            assert!(condition.is_some());
+            assert!(*cond_at_start);
+            assert!(!*is_until);
+        } else {
+            panic!("Expected DoLoop");
+        }
+    }
+
+    #[test]
+    fn test_do_until() {
+        let prog = parse("DO UNTIL X >= 10\nX = X + 1\nLOOP").unwrap();
+        if let Stmt::DoLoop {
+            condition,
+            cond_at_start,
+            is_until,
+            ..
+        } = &prog.statements[0]
+        {
+            assert!(condition.is_some());
+            assert!(*cond_at_start);
+            assert!(*is_until);
+        } else {
+            panic!("Expected DoLoop");
+        }
+    }
+
+    // ===================
+    // Goto Tests
+    // ===================
+
+    #[test]
+    fn test_goto_line_number() {
+        let prog = parse("GOTO 100").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Goto(target) = &prog.statements[0] {
+            assert!(matches!(target, GotoTarget::Line(100)));
+        } else {
+            panic!("Expected Goto");
+        }
+    }
+
+    #[test]
+    fn test_goto_label() {
+        let prog = parse("GOTO MYLOOP").unwrap();
+        if let Stmt::Goto(target) = &prog.statements[0] {
+            if let GotoTarget::Label(name) = target {
+                assert_eq!(name, "MYLOOP");
+            } else {
+                panic!("Expected label target");
+            }
+        } else {
+            panic!("Expected Goto");
+        }
+    }
+
+    // ===================
+    // Gosub Tests
+    // ===================
+
+    #[test]
+    fn test_gosub_line_number() {
+        let prog = parse("GOSUB 1000").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Gosub(target) = &prog.statements[0] {
+            assert!(matches!(target, GotoTarget::Line(1000)));
+        } else {
+            panic!("Expected Gosub");
+        }
+    }
+
+    #[test]
+    fn test_gosub_label() {
+        let prog = parse("GOSUB MYSUB").unwrap();
+        if let Stmt::Gosub(target) = &prog.statements[0] {
+            assert!(matches!(target, GotoTarget::Label(_)));
+        } else {
+            panic!("Expected Gosub");
+        }
+    }
+
+    // ===================
+    // Return Tests
+    // ===================
+
+    #[test]
+    fn test_return() {
+        let prog = parse("RETURN").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        assert!(matches!(&prog.statements[0], Stmt::Return));
+    }
+
+    // ===================
+    // OnGoto Tests
+    // ===================
+
+    #[test]
+    fn test_on_goto() {
+        let prog = parse("ON X GOTO 10, 20, 30").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::OnGoto { expr, targets } = &prog.statements[0] {
+            assert!(matches!(expr, Expr::Variable(_)));
+            assert_eq!(targets.len(), 3);
+        } else {
+            panic!("Expected OnGoto");
+        }
+    }
+
+    // ===================
+    // Dim Tests
+    // ===================
+
+    #[test]
+    fn test_dim_single() {
+        let prog = parse("DIM A(10)").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Dim { arrays } = &prog.statements[0] {
+            assert_eq!(arrays.len(), 1);
+            assert_eq!(arrays[0].name, "A");
+            assert_eq!(arrays[0].dimensions.len(), 1);
+        } else {
+            panic!("Expected Dim");
+        }
+    }
+
+    #[test]
+    fn test_dim_multiple() {
+        let prog = parse("DIM A(10), B$(100), C(50)").unwrap();
+        if let Stmt::Dim { arrays } = &prog.statements[0] {
+            assert_eq!(arrays.len(), 3);
+            assert_eq!(arrays[0].name, "A");
+            assert_eq!(arrays[1].name, "B$");
+            assert_eq!(arrays[2].name, "C");
+        } else {
+            panic!("Expected Dim");
+        }
+    }
+
+    // ===================
+    // Sub Tests
+    // ===================
+
+    #[test]
+    fn test_sub_no_params() {
+        let prog = parse("SUB MySub\nPRINT X\nEND SUB").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Sub { name, params, body } = &prog.statements[0] {
+            assert_eq!(name, "MYSUB");
+            assert!(params.is_empty());
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Expected Sub");
+        }
+    }
+
+    #[test]
+    fn test_sub_with_params() {
+        let prog = parse("SUB MySub(A, B, C)\nPRINT A + B + C\nEND SUB").unwrap();
+        if let Stmt::Sub { params, .. } = &prog.statements[0] {
+            assert_eq!(params.len(), 3);
+        } else {
+            panic!("Expected Sub");
+        }
+    }
+
+    // ===================
+    // Function Tests
+    // ===================
+
+    #[test]
+    fn test_function_no_params() {
+        let prog = parse("FUNCTION GetValue\nGetValue = 42\nEND FUNCTION").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Function { name, params, body } = &prog.statements[0] {
+            assert_eq!(name, "GETVALUE");
+            assert!(params.is_empty());
+            assert_eq!(body.len(), 1);
+        } else {
+            panic!("Expected Function");
+        }
+    }
+
+    #[test]
+    fn test_function_with_params() {
+        let prog = parse("FUNCTION Add(A, B)\nAdd = A + B\nEND FUNCTION").unwrap();
+        if let Stmt::Function { name, params, .. } = &prog.statements[0] {
+            assert_eq!(name, "ADD");
+            assert_eq!(params.len(), 2);
+        } else {
+            panic!("Expected Function");
+        }
+    }
+
+    // ===================
+    // Call Tests
+    // ===================
+
+    #[test]
+    fn test_call_no_args() {
+        let prog = parse("MySub").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Call { name, args } = &prog.statements[0] {
+            assert_eq!(name, "MYSUB");
+            assert!(args.is_empty());
+        } else {
+            panic!("Expected Call");
+        }
+    }
+
+    #[test]
+    fn test_call_with_parens() {
+        let prog = parse("MySub(1, 2, 3)").unwrap();
+        if let Stmt::Call { name, args } = &prog.statements[0] {
+            assert_eq!(name, "MYSUB");
+            assert_eq!(args.len(), 3);
+        } else {
+            panic!("Expected Call");
+        }
+    }
+
+    #[test]
+    fn test_call_without_parens() {
+        let prog = parse("MySub 1, 2, 3").unwrap();
+        if let Stmt::Call { args, .. } = &prog.statements[0] {
+            assert_eq!(args.len(), 3);
+        } else {
+            panic!("Expected Call");
+        }
+    }
+
+    // ===================
+    // Data Tests
+    // ===================
+
+    #[test]
+    fn test_data_integers() {
+        let prog = parse("DATA 1, 2, 3, 4, 5").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Data(values) = &prog.statements[0] {
+            assert_eq!(values.len(), 5);
+            assert!(matches!(values[0], Literal::Integer(1)));
+        } else {
+            panic!("Expected Data");
+        }
+    }
+
+    #[test]
+    fn test_data_mixed() {
+        let prog = parse(r#"DATA 1, 3.14, "hello""#).unwrap();
+        if let Stmt::Data(values) = &prog.statements[0] {
+            assert_eq!(values.len(), 3);
+            assert!(matches!(values[0], Literal::Integer(1)));
+            assert!(matches!(values[1], Literal::Float(_)));
+            assert!(matches!(values[2], Literal::String(_)));
+        } else {
+            panic!("Expected Data");
+        }
+    }
+
+    #[test]
+    fn test_data_negative() {
+        let prog = parse("DATA -5, -3.14").unwrap();
+        if let Stmt::Data(values) = &prog.statements[0] {
+            assert!(matches!(values[0], Literal::Integer(-5)));
+        } else {
+            panic!("Expected Data");
+        }
+    }
+
+    // ===================
+    // Read Tests
+    // ===================
+
+    #[test]
+    fn test_read_single() {
+        let prog = parse("READ X").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Read(vars) = &prog.statements[0] {
+            assert_eq!(vars.len(), 1);
+            assert_eq!(vars[0], "X");
+        } else {
+            panic!("Expected Read");
+        }
+    }
+
+    #[test]
+    fn test_read_multiple() {
+        let prog = parse("READ A, B, C$").unwrap();
+        if let Stmt::Read(vars) = &prog.statements[0] {
+            assert_eq!(vars.len(), 3);
+        } else {
+            panic!("Expected Read");
+        }
+    }
+
+    // ===================
+    // Restore Tests
+    // ===================
+
+    #[test]
+    fn test_restore_simple() {
+        let prog = parse("RESTORE").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        if let Stmt::Restore(target) = &prog.statements[0] {
+            assert!(target.is_none());
+        } else {
+            panic!("Expected Restore");
+        }
+    }
+
+    #[test]
+    fn test_restore_with_target() {
+        let prog = parse("RESTORE 100").unwrap();
+        if let Stmt::Restore(target) = &prog.statements[0] {
+            assert!(target.is_some());
+        } else {
+            panic!("Expected Restore");
+        }
+    }
+
+    // ===================
+    // Cls Tests
+    // ===================
+
+    #[test]
+    fn test_cls() {
+        let prog = parse("CLS").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        assert!(matches!(&prog.statements[0], Stmt::Cls));
+    }
+
+    // ===================
+    // End Tests
+    // ===================
+
+    #[test]
+    fn test_end() {
+        let prog = parse("END").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        assert!(matches!(&prog.statements[0], Stmt::End));
+    }
+
+    // ===================
+    // Stop Tests
+    // ===================
+
+    #[test]
+    fn test_stop() {
+        let prog = parse("STOP").unwrap();
+        assert_eq!(prog.statements.len(), 1);
+        assert!(matches!(&prog.statements[0], Stmt::Stop));
+    }
+
+    // ===================
+    // Expression Tests
+    // ===================
+
+    #[test]
+    fn test_expr_precedence() {
+        // 2 + 3 * 4 should be 2 + (3 * 4) = 14, not (2 + 3) * 4 = 20
+        let prog = parse("X = 2 + 3 * 4").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::Binary { op, right, .. } = value {
+                assert_eq!(*op, BinaryOp::Add);
+                assert!(matches!(
+                    right.as_ref(),
+                    Expr::Binary {
+                        op: BinaryOp::Mul,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("Expected binary expression");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_power_right_associative() {
+        // 2 ^ 3 ^ 2 should be 2 ^ (3 ^ 2) = 512, not (2 ^ 3) ^ 2 = 64
+        let prog = parse("X = 2 ^ 3 ^ 2").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::Binary { op, right, .. } = value {
+                assert_eq!(*op, BinaryOp::Pow);
+                assert!(matches!(
+                    right.as_ref(),
+                    Expr::Binary {
+                        op: BinaryOp::Pow,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("Expected binary expression");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_parentheses() {
+        let prog = parse("X = (2 + 3) * 4").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::Binary { op, left, .. } = value {
+                assert_eq!(*op, BinaryOp::Mul);
+                assert!(matches!(
+                    left.as_ref(),
+                    Expr::Binary {
+                        op: BinaryOp::Add,
+                        ..
+                    }
+                ));
+            } else {
+                panic!("Expected binary expression");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_unary_neg() {
+        let prog = parse("X = -5").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            assert!(matches!(
+                value,
+                Expr::Unary {
+                    op: UnaryOp::Neg,
+                    ..
+                }
+            ));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_unary_not() {
+        let prog = parse("X = NOT Y").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            assert!(matches!(
+                value,
+                Expr::Unary {
+                    op: UnaryOp::Not,
+                    ..
+                }
+            ));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_logical_operators() {
+        let prog = parse("X = A AND B OR C XOR D").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            // OR has lowest precedence, then XOR, then AND
+            assert!(matches!(
+                value,
+                Expr::Binary {
+                    op: BinaryOp::Or,
+                    ..
+                }
+            ));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_comparison() {
+        let prog = parse("X = A < B").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            assert!(matches!(
+                value,
+                Expr::Binary {
+                    op: BinaryOp::Lt,
+                    ..
+                }
+            ));
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_all_comparison_ops() {
+        for (input, expected_op) in [
+            ("X = A = B", BinaryOp::Eq),
+            ("X = A <> B", BinaryOp::Ne),
+            ("X = A < B", BinaryOp::Lt),
+            ("X = A > B", BinaryOp::Gt),
+            ("X = A <= B", BinaryOp::Le),
+            ("X = A >= B", BinaryOp::Ge),
+        ] {
+            let prog = parse(input).unwrap();
+            if let Stmt::Let { value, .. } = &prog.statements[0] {
+                if let Expr::Binary { op, .. } = value {
+                    assert_eq!(*op, expected_op, "Failed for input: {}", input);
+                } else {
+                    panic!("Expected binary for: {}", input);
+                }
+            } else {
+                panic!("Expected Let for: {}", input);
+            }
+        }
+    }
+
+    #[test]
+    fn test_expr_all_arithmetic_ops() {
+        for (input, expected_op) in [
+            ("X = A + B", BinaryOp::Add),
+            ("X = A - B", BinaryOp::Sub),
+            ("X = A * B", BinaryOp::Mul),
+            ("X = A / B", BinaryOp::Div),
+            ("X = A \\ B", BinaryOp::IntDiv),
+            ("X = A MOD B", BinaryOp::Mod),
+            ("X = A ^ B", BinaryOp::Pow),
+        ] {
+            let prog = parse(input).unwrap();
+            if let Stmt::Let { value, .. } = &prog.statements[0] {
+                if let Expr::Binary { op, .. } = value {
+                    assert_eq!(*op, expected_op, "Failed for input: {}", input);
+                } else {
+                    panic!("Expected binary for: {}", input);
+                }
+            } else {
+                panic!("Expected Let for: {}", input);
+            }
+        }
+    }
+
+    #[test]
+    fn test_expr_function_call() {
+        let prog = parse("X = SIN(3.14)").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::FnCall { name, args } = value {
+                assert_eq!(name, "SIN");
+                assert_eq!(args.len(), 1);
+            } else {
+                panic!("Expected FnCall");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_expr_function_multiple_args() {
+        let prog = parse("X = MID$(A$, 1, 5)").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::FnCall { name, args } = value {
+                assert_eq!(name, "MID$");
+                assert_eq!(args.len(), 3);
+            } else {
+                panic!("Expected FnCall");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    // ===================
+    // Integration Tests
+    // ===================
+
+    #[test]
+    fn test_colon_separator() {
+        let prog = parse("X = 1 : Y = 2 : PRINT X").unwrap();
+        assert_eq!(prog.statements.len(), 3);
+    }
+
+    #[test]
+    fn test_complex_program() {
+        let prog = parse(
+            r#"
+            10 CLS
+            20 PRINT "Enter a number:"
+            30 INPUT N
+            40 FOR I = 1 TO N
+            50 PRINT I; " squared is "; I * I
+            60 NEXT I
+            70 END
+        "#,
+        )
+        .unwrap();
+        // Should have 7 labels + 7 statements = 14
+        assert!(prog.statements.len() >= 7);
     }
 }

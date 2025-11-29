@@ -7,58 +7,36 @@ mod lexer;
 mod parser;
 mod runtime;
 
-use std::env;
+use clap::Parser;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
+/// BASIC-to-x86_64 compiler
+#[derive(Parser)]
+#[command(name = "basic-rs")]
+#[command(about = "Compiles 1980s-era BASIC programs to x86-64 executables")]
+struct Args {
+    /// Input BASIC source file
+    input: String,
+
+    /// Output file name
+    #[arg(short, long)]
+    output: Option<String>,
+
+    /// Emit assembly only (don't assemble or link)
+    #[arg(short = 'S')]
+    asm_only: bool,
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
 
-    if args.len() < 2 {
-        eprintln!("Usage: {} <source.bas> [-o output]", args[0]);
-        eprintln!("       {} -S <source.bas>  # emit assembly only", args[0]);
-        std::process::exit(1);
-    }
-
-    let mut input_file = None;
-    let mut output_file = None;
-    let mut asm_only = false;
-
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-o" => {
-                i += 1;
-                if i < args.len() {
-                    output_file = Some(args[i].clone());
-                }
-            }
-            "-S" => {
-                asm_only = true;
-            }
-            arg if arg.starts_with('-') => {
-                eprintln!("Unknown option: {}", arg);
-                std::process::exit(1);
-            }
-            _ => {
-                input_file = Some(args[i].clone());
-            }
-        }
-        i += 1;
-    }
-
-    let input_file = match input_file {
-        Some(f) => f,
-        None => {
-            eprintln!("Error: No input file specified");
-            std::process::exit(1);
-        }
-    };
+    let input_file = &args.input;
 
     // Read source file
-    let source = match fs::read_to_string(&input_file) {
+    let source = match fs::read_to_string(input_file) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Error reading {}: {}", input_file, e);
@@ -100,7 +78,7 @@ fn main() {
     let stem = input_path.file_stem().unwrap().to_str().unwrap();
     let input_dir = input_path.parent().unwrap_or(Path::new("."));
 
-    let exe_file = output_file.unwrap_or_else(|| {
+    let exe_file = args.output.unwrap_or_else(|| {
         if cfg!(windows) {
             input_dir
                 .join(format!("{}.exe", stem))
@@ -138,7 +116,7 @@ fn main() {
         }
     }
 
-    if asm_only {
+    if args.asm_only {
         println!("Assembly written to {}", asm_file);
         return;
     }
