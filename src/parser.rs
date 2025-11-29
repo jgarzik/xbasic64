@@ -83,6 +83,31 @@ pub enum Stmt {
     Cls,
     End,
     Stop,
+    // File I/O
+    Open {
+        filename: Expr,
+        mode: FileMode,
+        file_num: i32,
+    },
+    Close {
+        file_num: i32,
+    },
+    PrintFile {
+        file_num: i32,
+        items: Vec<PrintItem>,
+        newline: bool,
+    },
+    InputFile {
+        file_num: i32,
+        vars: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FileMode {
+    Input,
+    Output,
+    Append,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +277,8 @@ impl Parser {
                 self.advance();
                 Ok(Stmt::Cls)
             }
+            Token::Open => self.parse_open(),
+            Token::Close => self.parse_close(),
             Token::End => {
                 self.advance();
                 // Check for END IF, END SUB, END FUNCTION
@@ -338,6 +365,22 @@ impl Parser {
 
     fn parse_print(&mut self) -> Result<Stmt, String> {
         self.advance(); // consume PRINT
+
+        // Check for PRINT #n (file output)
+        let file_num = if matches!(self.peek(), Token::Hash) {
+            self.advance(); // consume #
+            let num = match self.advance() {
+                Token::Integer(n) => n as i32,
+                tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+            };
+            if matches!(self.peek(), Token::Comma) {
+                self.advance(); // consume comma after file number
+            }
+            Some(num)
+        } else {
+            None
+        };
+
         let mut items = Vec::new();
         let mut newline = true;
 
@@ -360,11 +403,45 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::Print { items, newline })
+        if let Some(file_num) = file_num {
+            Ok(Stmt::PrintFile {
+                file_num,
+                items,
+                newline,
+            })
+        } else {
+            Ok(Stmt::Print { items, newline })
+        }
     }
 
     fn parse_input(&mut self) -> Result<Stmt, String> {
         self.advance(); // consume INPUT
+
+        // Check for INPUT #n (file input)
+        if matches!(self.peek(), Token::Hash) {
+            self.advance(); // consume #
+            let file_num = match self.advance() {
+                Token::Integer(n) => n as i32,
+                tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+            };
+            if matches!(self.peek(), Token::Comma) {
+                self.advance(); // consume comma after file number
+            }
+
+            let mut vars = Vec::new();
+            while let Token::Ident(name) = self.peek().clone() {
+                self.advance();
+                vars.push(name);
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+
+            return Ok(Stmt::InputFile { file_num, vars });
+        }
+
         let mut prompt = None;
         let mut vars = Vec::new();
 
@@ -887,6 +964,62 @@ impl Parser {
             None
         };
         Ok(Stmt::Restore(target))
+    }
+
+    fn parse_open(&mut self) -> Result<Stmt, String> {
+        self.advance(); // consume OPEN
+
+        // Parse filename expression
+        let filename = self.parse_expression()?;
+
+        // Expect FOR
+        self.expect(Token::For)?;
+
+        // Parse mode (INPUT, OUTPUT, APPEND)
+        let mode = match self.peek() {
+            Token::Input => {
+                self.advance();
+                FileMode::Input
+            }
+            Token::Output => {
+                self.advance();
+                FileMode::Output
+            }
+            Token::Append => {
+                self.advance();
+                FileMode::Append
+            }
+            tok => return Err(format!("Expected INPUT, OUTPUT, or APPEND, got {:?}", tok)),
+        };
+
+        // Expect AS
+        self.expect(Token::As)?;
+
+        // Expect #n
+        self.expect(Token::Hash)?;
+        let file_num = match self.advance() {
+            Token::Integer(n) => n as i32,
+            tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+        };
+
+        Ok(Stmt::Open {
+            filename,
+            mode,
+            file_num,
+        })
+    }
+
+    fn parse_close(&mut self) -> Result<Stmt, String> {
+        self.advance(); // consume CLOSE
+
+        // Expect #n
+        self.expect(Token::Hash)?;
+        let file_num = match self.advance() {
+            Token::Integer(n) => n as i32,
+            tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+        };
+
+        Ok(Stmt::Close { file_num })
     }
 
     // Expression parsing with precedence climbing
@@ -1631,6 +1764,57 @@ mod tests {
             assert_eq!(arrays[2].name, "C");
         } else {
             panic!("Expected Dim");
+        }
+    }
+
+    #[test]
+    fn test_dim_2d() {
+        let prog = parse("DIM A(10, 20)").unwrap();
+        if let Stmt::Dim { arrays } = &prog.statements[0] {
+            assert_eq!(arrays.len(), 1);
+            assert_eq!(arrays[0].name, "A");
+            assert_eq!(arrays[0].dimensions.len(), 2);
+        } else {
+            panic!("Expected Dim");
+        }
+    }
+
+    #[test]
+    fn test_dim_3d() {
+        let prog = parse("DIM Matrix(5, 10, 15)").unwrap();
+        if let Stmt::Dim { arrays } = &prog.statements[0] {
+            assert_eq!(arrays.len(), 1);
+            assert_eq!(arrays[0].name, "MATRIX");
+            assert_eq!(arrays[0].dimensions.len(), 3);
+        } else {
+            panic!("Expected Dim");
+        }
+    }
+
+    #[test]
+    fn test_array_access_2d() {
+        let prog = parse("X = A(1, 2)").unwrap();
+        if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let Expr::FnCall { name, args } = value {
+                assert_eq!(name, "A");
+                assert_eq!(args.len(), 2);
+            } else {
+                panic!("Expected FnCall (array access)");
+            }
+        } else {
+            panic!("Expected Let");
+        }
+    }
+
+    #[test]
+    fn test_array_assign_2d() {
+        let prog = parse("A(1, 2) = 42").unwrap();
+        if let Stmt::Let { name, indices, .. } = &prog.statements[0] {
+            assert_eq!(name, "A");
+            assert!(indices.is_some());
+            assert_eq!(indices.as_ref().unwrap().len(), 2);
+        } else {
+            panic!("Expected Let with indices");
         }
     }
 

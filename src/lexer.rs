@@ -48,6 +48,11 @@ pub enum Token {
     Read,
     Restore,
     Cls,
+    Open,
+    Close,
+    As,
+    Output,
+    Append,
     And,
     Or,
     Not,
@@ -74,6 +79,7 @@ pub enum Token {
     Comma,
     Semicolon,
     Colon,
+    Hash,
 
     // Special
     Newline,
@@ -267,6 +273,11 @@ impl<'a> Lexer<'a> {
             "READ" => Token::Read,
             "RESTORE" => Token::Restore,
             "CLS" => Token::Cls,
+            "OPEN" => Token::Open,
+            "CLOSE" => Token::Close,
+            "AS" => Token::As,
+            "OUTPUT" => Token::Output,
+            "APPEND" => Token::Append,
             "AND" => Token::And,
             "OR" => Token::Or,
             "NOT" => Token::Not,
@@ -334,6 +345,7 @@ impl<'a> Lexer<'a> {
             ',' => Ok(Token::Comma),
             ';' => Ok(Token::Semicolon),
             ':' => Ok(Token::Colon),
+            '#' => Ok(Token::Hash),
 
             '=' => Ok(Token::Eq),
             '<' => {

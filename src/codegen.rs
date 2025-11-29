@@ -7,18 +7,24 @@ fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
 
+/// Metadata for array storage
+struct ArrayInfo {
+    ptr_offset: i32,       // stack offset where array pointer is stored
+    dim_offsets: Vec<i32>, // stack offsets where dimension bounds are stored
+}
+
 pub struct CodeGen {
     output: String,
-    vars: HashMap<String, i32>,      // variable name -> stack offset
-    arrays: HashMap<String, i32>,    // array name -> stack offset (pointer)
-    stack_offset: i32,               // current stack offset
-    label_counter: u32,              // for generating unique labels
-    string_literals: Vec<String>,    // string constants
-    data_items: Vec<Literal>,        // DATA values
-    current_proc: Option<String>,    // current SUB/FUNCTION name
-    proc_vars: HashMap<String, i32>, // local variables for current proc
-    gosub_used: bool,                // whether GOSUB is used (need return stack)
-    prefix: &'static str,            // symbol prefix ("_" on macOS, "" on Linux)
+    vars: HashMap<String, i32>,         // variable name -> stack offset
+    arrays: HashMap<String, ArrayInfo>, // array name -> array metadata
+    stack_offset: i32,                  // current stack offset
+    label_counter: u32,                 // for generating unique labels
+    string_literals: Vec<String>,       // string constants
+    data_items: Vec<Literal>,           // DATA values
+    current_proc: Option<String>,       // current SUB/FUNCTION name
+    proc_vars: HashMap<String, i32>,    // local variables for current proc
+    gosub_used: bool,                   // whether GOSUB is used (need return stack)
+    prefix: &'static str,               // symbol prefix ("_" on macOS, "" on Linux)
 }
 
 impl CodeGen {
@@ -623,6 +629,71 @@ impl CodeGen {
                 self.emit("    leave");
                 self.emit("    ret");
             }
+
+            Stmt::Open {
+                filename,
+                mode,
+                file_num,
+            } => {
+                // Generate filename string (ptr in rax, len in rdx)
+                self.gen_expr(filename);
+                self.emit("    mov rdi, rax  # filename ptr");
+                self.emit("    mov rsi, rdx  # filename len");
+                let mode_num = match mode {
+                    FileMode::Input => 0,
+                    FileMode::Output => 1,
+                    FileMode::Append => 2,
+                };
+                self.emit(&format!("    mov rdx, {}  # mode", mode_num));
+                self.emit(&format!("    mov rcx, {}  # file number", file_num));
+                self.emit("    call _rt_file_open");
+            }
+
+            Stmt::Close { file_num } => {
+                self.emit(&format!("    mov rdi, {}", file_num));
+                self.emit("    call _rt_file_close");
+            }
+
+            Stmt::PrintFile {
+                file_num,
+                items,
+                newline,
+            } => {
+                for item in items {
+                    match item {
+                        PrintItem::Expr(expr) => {
+                            self.gen_print_expr_to_file(expr, *file_num);
+                        }
+                        PrintItem::Tab => {
+                            self.emit(&format!("    mov rdi, {}", file_num));
+                            self.emit("    mov rsi, 9  # tab");
+                            self.emit("    call _rt_file_print_char");
+                        }
+                        PrintItem::Empty => {}
+                    }
+                }
+                if *newline {
+                    self.emit(&format!("    mov rdi, {}", file_num));
+                    self.emit("    call _rt_file_print_newline");
+                }
+            }
+
+            Stmt::InputFile { file_num, vars } => {
+                for var in vars {
+                    if is_string_var(var) {
+                        self.emit(&format!("    mov rdi, {}", file_num));
+                        self.emit("    call _rt_file_input_string");
+                        let offset = self.get_var_offset(var);
+                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
+                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+                    } else {
+                        self.emit(&format!("    mov rdi, {}", file_num));
+                        self.emit("    call _rt_file_input_number");
+                        let offset = self.get_var_offset(var);
+                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
+                    }
+                }
+            }
         }
     }
 
@@ -807,6 +878,34 @@ impl CodeGen {
             // Assume numeric
             self.gen_expr(expr);
             self.emit("    call _rt_print_float");
+        }
+    }
+
+    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: i32) {
+        // Check if string expression
+        if let Expr::Literal(Literal::String(s)) = expr {
+            let idx = self.add_string_literal(s);
+            self.emit(&format!("    mov rdi, {}", file_num));
+            self.emit(&format!("    lea rsi, [rip + _str_{}]", idx));
+            self.emit(&format!("    mov rdx, {}", s.len()));
+            self.emit("    call _rt_file_print_string");
+        } else if let Expr::Variable(name) = expr {
+            if is_string_var(name) {
+                let offset = self.get_var_offset(name);
+                self.emit(&format!("    mov rdi, {}", file_num));
+                self.emit(&format!("    mov rsi, QWORD PTR [rbp + {}]", offset));
+                self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
+                self.emit("    call _rt_file_print_string");
+            } else {
+                self.gen_expr(expr);
+                self.emit(&format!("    mov rdi, {}", file_num));
+                self.emit("    call _rt_file_print_float");
+            }
+        } else {
+            // Assume numeric
+            self.gen_expr(expr);
+            self.emit(&format!("    mov rdi, {}", file_num));
+            self.emit("    call _rt_file_print_float");
         }
     }
 
@@ -1002,79 +1101,124 @@ impl CodeGen {
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
-        // Calculate total size and allocate
         let elem_size = if is_string_var(&arr.name) { 16 } else { 8 };
 
-        // For simplicity, evaluate dimensions at compile time if constant
-        // Otherwise, call runtime allocation
-        let total_elements = arr.dimensions.len(); // Simplified: 1 element per dimension bound
-        self.emit(&format!(
-            "    mov rdi, {}",
-            total_elements * elem_size * 100
-        )); // rough estimate
-        self.emit(&format!("    call {}malloc", self.prefix));
-
-        // Store pointer
-        self.stack_offset -= 8;
-        let offset = self.stack_offset;
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-        self.arrays.insert(arr.name.clone(), offset);
-
-        // Store dimension bounds
+        // First, evaluate and store all dimension bounds
+        // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
+        let mut dim_offsets = Vec::new();
         for dim in arr.dimensions.iter() {
             self.gen_expr(dim);
-            self.emit("    cvttsd2si rcx, xmm0");
+            self.emit("    cvttsd2si rax, xmm0");
+            self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
             self.stack_offset -= 8;
+            dim_offsets.push(self.stack_offset);
             self.emit(&format!(
-                "    mov QWORD PTR [rbp + {}], rcx",
+                "    mov QWORD PTR [rbp + {}], rax",
                 self.stack_offset
             ));
         }
+
+        // Calculate total elements: dim0 * dim1 * dim2 * ...
+        self.emit(&format!(
+            "    mov rax, QWORD PTR [rbp + {}]",
+            dim_offsets[0]
+        ));
+        for offset in dim_offsets.iter().skip(1) {
+            self.emit(&format!("    imul rax, QWORD PTR [rbp + {}]", offset));
+        }
+
+        // Allocate: total_elements * elem_size
+        self.emit(&format!("    imul rdi, rax, {}", elem_size));
+        self.emit(&format!("    call {}malloc", self.prefix));
+
+        // Store array pointer
+        self.stack_offset -= 8;
+        let ptr_offset = self.stack_offset;
+        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", ptr_offset));
+
+        // Record array info
+        self.arrays.insert(
+            arr.name.clone(),
+            ArrayInfo {
+                ptr_offset,
+                dim_offsets,
+            },
+        );
     }
 
     fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
-        // Get array base pointer
-        let base_offset = *self.arrays.get(name).unwrap_or(&0);
+        let arr_info = self.arrays.get(name).expect("Array not declared");
+        let ptr_offset = arr_info.ptr_offset;
+        let dim_offsets = arr_info.dim_offsets.clone();
+        let elem_size = if is_string_var(name) { 16 } else { 8 };
 
-        // Calculate offset: for 1D: index * 8, for 2D: (i * dim2 + j) * 8
+        // Calculate linear index using row-major order:
+        // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
+        // Start with first index
         self.gen_expr(&indices[0]);
-        self.emit("    cvttsd2si rax, xmm0");
+        self.emit("    cvttsd2si rax, xmm0"); // rax = indices[0]
 
-        // Bounds not checked for simplicity
-        self.emit(&format!("    mov rcx, QWORD PTR [rbp + {}]", base_offset));
-        if is_string_var(name) {
-            self.emit("    shl rax, 4"); // * 16
-        } else {
-            self.emit("    shl rax, 3"); // * 8
+        // For each subsequent index, multiply by dimension bound and add
+        for (i, idx_expr) in indices.iter().enumerate().skip(1) {
+            // Save current accumulated index
+            self.emit("    push rax");
+            // Evaluate next index
+            self.gen_expr(idx_expr);
+            self.emit("    cvttsd2si rcx, xmm0"); // rcx = indices[i]
+            self.emit("    pop rax");
+            // rax = rax * dim[i] + indices[i]
+            self.emit(&format!(
+                "    imul rax, QWORD PTR [rbp + {}]",
+                dim_offsets[i]
+            ));
+            self.emit("    add rax, rcx");
         }
-        self.emit("    add rcx, rax");
 
+        // Multiply by element size and add to base pointer
+        self.emit(&format!("    imul rax, {}", elem_size));
+        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+
+        // Load value from computed address
         if is_string_var(name) {
+            self.emit("    mov rcx, rax");
             self.emit("    mov rax, QWORD PTR [rcx]");
             self.emit("    mov rdx, QWORD PTR [rcx + 8]");
         } else {
-            self.emit("    movsd xmm0, QWORD PTR [rcx]");
+            self.emit("    movsd xmm0, QWORD PTR [rax]");
         }
     }
 
     fn gen_array_store(&mut self, name: &str, indices: &[Expr], value: &Expr) {
-        let base_offset = *self.arrays.get(name).unwrap_or(&0);
+        let arr_info = self.arrays.get(name).expect("Array not declared");
+        let ptr_offset = arr_info.ptr_offset;
+        let dim_offsets = arr_info.dim_offsets.clone();
+        let elem_size = if is_string_var(name) { 16 } else { 8 };
 
-        // Calculate address
+        // Calculate linear index using row-major order (same as gen_array_load)
         self.gen_expr(&indices[0]);
         self.emit("    cvttsd2si rax, xmm0");
-        self.emit(&format!("    mov rcx, QWORD PTR [rbp + {}]", base_offset));
-        if is_string_var(name) {
-            self.emit("    shl rax, 4");
-        } else {
-            self.emit("    shl rax, 3");
+
+        for (i, idx_expr) in indices.iter().enumerate().skip(1) {
+            self.emit("    push rax");
+            self.gen_expr(idx_expr);
+            self.emit("    cvttsd2si rcx, xmm0");
+            self.emit("    pop rax");
+            self.emit(&format!(
+                "    imul rax, QWORD PTR [rbp + {}]",
+                dim_offsets[i]
+            ));
+            self.emit("    add rax, rcx");
         }
-        self.emit("    add rcx, rax");
-        self.emit("    push rcx"); // save address
+
+        // Compute final address and save it
+        self.emit(&format!("    imul rax, {}", elem_size));
+        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+        self.emit("    push rax"); // save address
 
         // Evaluate value
         self.gen_expr(value);
 
+        // Store value at computed address
         self.emit("    pop rcx");
         if is_string_var(name) {
             self.emit("    mov QWORD PTR [rcx], rax");

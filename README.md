@@ -16,9 +16,10 @@ A BASIC-to-x86-64 compiler written in Rust, targeting early 1980s BASIC dialects
 - `DO...LOOP` - with `WHILE`/`UNTIL` conditions
 - `GOTO` / `GOSUB` / `RETURN` - control flow
 - `ON...GOTO` - computed jumps
-- `DIM` - array declarations
+- `DIM` - array declarations (1D, 2D, 3D, etc.)
 - `SUB` / `FUNCTION` / `END SUB` / `END FUNCTION` - procedures
 - `DATA` / `READ` / `RESTORE` - inline data
+- `OPEN` / `CLOSE` / `PRINT #` / `INPUT #` - file I/O
 - `CLS` - clear screen
 - `END` / `STOP` - program termination
 
@@ -98,6 +99,33 @@ INPUT "Enter your age: ", Age
 PRINT "Hello, "; Name$; "! You are"; Age; "years old."
 ```
 
+**File I/O:**
+```basic
+' Write to a file
+OPEN "data.txt" FOR OUTPUT AS #1
+PRINT #1, "Hello, File!"
+PRINT #1, 42
+CLOSE #1
+
+' Read from a file
+OPEN "numbers.txt" FOR INPUT AS #1
+INPUT #1, X
+INPUT #1, Y
+CLOSE #1
+PRINT "Sum: "; X + Y
+```
+
+**Multi-dimensional Arrays:**
+```basic
+DIM Grid(9, 9)
+FOR Row = 0 TO 9
+    FOR Col = 0 TO 9
+        Grid(Row, Col) = Row * 10 + Col
+    NEXT Col
+NEXT Row
+PRINT Grid(5, 7)
+```
+
 ## Architecture
 
 The compiler uses a simple three-stage pipeline:
@@ -132,11 +160,9 @@ The runtime library (`src/runtime/`) provides support functions for I/O, string 
 **Not Supported:**
 - Graphics (SCREEN, PSET, LINE, CIRCLE, etc.)
 - Sound (BEEP, SOUND, PLAY)
-- File I/O (OPEN, CLOSE, INPUT#, PRINT#)
-- PEEK/POKE/DEF SEG
+- PEEK/POKE/DEF SEG (no direct memory access)
 - Error handling (ON ERROR, RESUME)
 - DEF FN (use FUNCTION instead)
-- Multi-dimensional arrays (1D only currently)
 - SELECT CASE
 
 ## License
