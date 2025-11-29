@@ -1,7 +1,59 @@
 //! BASIC lexer - tokenizes source into tokens
 
+use phf::phf_map;
 use std::iter::Peekable;
 use std::str::Chars;
+
+/// Compile-time keyword lookup table
+static KEYWORDS: phf::Map<&'static str, Token> = phf_map! {
+    "PRINT" => Token::Print,
+    "INPUT" => Token::Input,
+    "LINE" => Token::Line,
+    "LET" => Token::Let,
+    "DIM" => Token::Dim,
+    "IF" => Token::If,
+    "THEN" => Token::Then,
+    "ELSE" => Token::Else,
+    "ELSEIF" => Token::ElseIf,
+    "ENDIF" => Token::EndIf,
+    "FOR" => Token::For,
+    "TO" => Token::To,
+    "STEP" => Token::Step,
+    "NEXT" => Token::Next,
+    "WHILE" => Token::While,
+    "WEND" => Token::Wend,
+    "DO" => Token::Do,
+    "LOOP" => Token::Loop,
+    "UNTIL" => Token::Until,
+    "GOTO" => Token::Goto,
+    "GOSUB" => Token::Gosub,
+    "RETURN" => Token::Return,
+    "ON" => Token::On,
+    "SUB" => Token::Sub,
+    "ENDSUB" => Token::EndSub,
+    "FUNCTION" => Token::Function,
+    "ENDFUNCTION" => Token::EndFunction,
+    "SELECT" => Token::Select,
+    "CASE" => Token::Case,
+    "ENDSELECT" => Token::EndSelect,
+    "END" => Token::End,
+    "STOP" => Token::Stop,
+    "REM" => Token::Rem,
+    "DATA" => Token::Data,
+    "READ" => Token::Read,
+    "RESTORE" => Token::Restore,
+    "CLS" => Token::Cls,
+    "OPEN" => Token::Open,
+    "CLOSE" => Token::Close,
+    "AS" => Token::As,
+    "OUTPUT" => Token::Output,
+    "APPEND" => Token::Append,
+    "AND" => Token::And,
+    "OR" => Token::Or,
+    "NOT" => Token::Not,
+    "XOR" => Token::Xor,
+    "MOD" => Token::Mod,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -238,59 +290,11 @@ impl<'a> Lexer<'a> {
     }
 
     fn keyword_or_ident(&self, s: &str) -> Token {
-        // Strip type suffix for keyword matching
         let base = s.trim_end_matches(['%', '&', '!', '#', '$']);
-
-        match base {
-            "PRINT" => Token::Print,
-            "INPUT" => Token::Input,
-            "LINE" => Token::Line,
-            "LET" => Token::Let,
-            "DIM" => Token::Dim,
-            "IF" => Token::If,
-            "THEN" => Token::Then,
-            "ELSE" => Token::Else,
-            "ELSEIF" => Token::ElseIf,
-            "ENDIF" => Token::EndIf,
-            "FOR" => Token::For,
-            "TO" => Token::To,
-            "STEP" => Token::Step,
-            "NEXT" => Token::Next,
-            "WHILE" => Token::While,
-            "WEND" => Token::Wend,
-            "DO" => Token::Do,
-            "LOOP" => Token::Loop,
-            "UNTIL" => Token::Until,
-            "GOTO" => Token::Goto,
-            "GOSUB" => Token::Gosub,
-            "RETURN" => Token::Return,
-            "ON" => Token::On,
-            "SUB" => Token::Sub,
-            "ENDSUB" => Token::EndSub,
-            "FUNCTION" => Token::Function,
-            "ENDFUNCTION" => Token::EndFunction,
-            "SELECT" => Token::Select,
-            "CASE" => Token::Case,
-            "ENDSELECT" => Token::EndSelect,
-            "END" => Token::End,
-            "STOP" => Token::Stop,
-            "REM" => Token::Rem,
-            "DATA" => Token::Data,
-            "READ" => Token::Read,
-            "RESTORE" => Token::Restore,
-            "CLS" => Token::Cls,
-            "OPEN" => Token::Open,
-            "CLOSE" => Token::Close,
-            "AS" => Token::As,
-            "OUTPUT" => Token::Output,
-            "APPEND" => Token::Append,
-            "AND" => Token::And,
-            "OR" => Token::Or,
-            "NOT" => Token::Not,
-            "XOR" => Token::Xor,
-            "MOD" => Token::Mod,
-            _ => Token::Ident(s.to_string()),
-        }
+        KEYWORDS
+            .get(base)
+            .cloned()
+            .unwrap_or_else(|| Token::Ident(s.to_string()))
     }
 
     pub fn next_token(&mut self) -> Result<Token, String> {

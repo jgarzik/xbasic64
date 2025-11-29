@@ -2,6 +2,37 @@
 
 use crate::lexer::Token;
 
+/// Binary operator precedence levels (higher = tighter binding)
+/// Returns (precedence, BinaryOp) or None if not a binary operator
+fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
+    match token {
+        // Precedence 1: logical OR (lowest)
+        Token::Or => Some((1, BinaryOp::Or)),
+        // Precedence 2: logical AND
+        Token::And => Some((2, BinaryOp::And)),
+        // Precedence 3: logical XOR
+        Token::Xor => Some((3, BinaryOp::Xor)),
+        // Precedence 4: comparison
+        Token::Eq => Some((4, BinaryOp::Eq)),
+        Token::Ne => Some((4, BinaryOp::Ne)),
+        Token::Lt => Some((4, BinaryOp::Lt)),
+        Token::Gt => Some((4, BinaryOp::Gt)),
+        Token::Le => Some((4, BinaryOp::Le)),
+        Token::Ge => Some((4, BinaryOp::Ge)),
+        // Precedence 5: additive
+        Token::Plus => Some((5, BinaryOp::Add)),
+        Token::Minus => Some((5, BinaryOp::Sub)),
+        // Precedence 6: multiplicative
+        Token::Star => Some((6, BinaryOp::Mul)),
+        Token::Slash => Some((6, BinaryOp::Div)),
+        Token::Backslash => Some((6, BinaryOp::IntDiv)),
+        Token::Mod => Some((6, BinaryOp::Mod)),
+        // Precedence 7: power (handled specially for right-associativity)
+        Token::Caret => Some((7, BinaryOp::Pow)),
+        _ => None,
+    }
+}
+
 // ============================================================================
 // AST Definitions
 // ============================================================================
@@ -1183,78 +1214,33 @@ impl Parser {
 
     // Expression parsing with precedence climbing
     fn parse_expression(&mut self) -> Result<Expr, String> {
-        self.parse_or()
+        self.parse_prec(1) // Start at lowest precedence
     }
 
-    fn parse_or(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_and()?;
-        while matches!(self.peek(), Token::Or) {
+    /// Precedence-climbing parser for binary expressions
+    /// min_prec: minimum precedence level to parse at this level
+    fn parse_prec(&mut self, min_prec: u8) -> Result<Expr, String> {
+        // Handle NOT prefix operator (binds tighter than binary ops)
+        let mut left = if matches!(self.peek(), Token::Not) {
             self.advance();
-            let right = self.parse_and()?;
-            left = Expr::Binary {
-                op: BinaryOp::Or,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_and(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_xor()?;
-        while matches!(self.peek(), Token::And) {
-            self.advance();
-            let right = self.parse_xor()?;
-            left = Expr::Binary {
-                op: BinaryOp::And,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_xor(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_not()?;
-        while matches!(self.peek(), Token::Xor) {
-            self.advance();
-            let right = self.parse_not()?;
-            left = Expr::Binary {
-                op: BinaryOp::Xor,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_not(&mut self) -> Result<Expr, String> {
-        if matches!(self.peek(), Token::Not) {
-            self.advance();
-            let operand = self.parse_not()?;
-            Ok(Expr::Unary {
+            let operand = self.parse_prec(min_prec)?; // NOT is right-associative
+            Expr::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
-            })
+            }
         } else {
-            self.parse_comparison()
-        }
-    }
+            self.parse_unary()?
+        };
 
-    fn parse_comparison(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_additive()?;
-        loop {
-            let op = match self.peek() {
-                Token::Eq => BinaryOp::Eq,
-                Token::Ne => BinaryOp::Ne,
-                Token::Lt => BinaryOp::Lt,
-                Token::Gt => BinaryOp::Gt,
-                Token::Le => BinaryOp::Le,
-                Token::Ge => BinaryOp::Ge,
-                _ => break,
-            };
+        // Parse binary operators with precedence climbing
+        while let Some((prec, op)) = binary_op_info(self.peek()) {
+            if prec < min_prec {
+                break;
+            }
             self.advance();
-            let right = self.parse_additive()?;
+            // Power is right-associative; others are left-associative
+            let next_min = if op == BinaryOp::Pow { prec } else { prec + 1 };
+            let right = self.parse_prec(next_min)?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -1262,62 +1248,6 @@ impl Parser {
             };
         }
         Ok(left)
-    }
-
-    fn parse_additive(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_multiplicative()?;
-        loop {
-            let op = match self.peek() {
-                Token::Plus => BinaryOp::Add,
-                Token::Minus => BinaryOp::Sub,
-                _ => break,
-            };
-            self.advance();
-            let right = self.parse_multiplicative()?;
-            left = Expr::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_multiplicative(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_power()?;
-        loop {
-            let op = match self.peek() {
-                Token::Star => BinaryOp::Mul,
-                Token::Slash => BinaryOp::Div,
-                Token::Backslash => BinaryOp::IntDiv,
-                Token::Mod => BinaryOp::Mod,
-                _ => break,
-            };
-            self.advance();
-            let right = self.parse_power()?;
-            left = Expr::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
-    }
-
-    fn parse_power(&mut self) -> Result<Expr, String> {
-        let base = self.parse_unary()?;
-        if matches!(self.peek(), Token::Caret) {
-            self.advance();
-            // Right-associative
-            let exp = self.parse_power()?;
-            Ok(Expr::Binary {
-                op: BinaryOp::Pow,
-                left: Box::new(base),
-                right: Box::new(exp),
-            })
-        } else {
-            Ok(base)
-        }
     }
 
     fn parse_unary(&mut self) -> Result<Expr, String> {

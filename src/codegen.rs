@@ -145,7 +145,27 @@
 //! These use the same calling convention and are linked into the final executable.
 
 use crate::parser::*;
+use phf::phf_map;
 use std::collections::HashMap;
+
+/// Simple math functions: BASIC name -> libc function name
+/// These take one Double arg in xmm0 and return Double in xmm0
+static LIBC_MATH_FNS: phf::Map<&'static str, &'static str> = phf_map! {
+    "SIN" => "sin",
+    "COS" => "cos",
+    "TAN" => "tan",
+    "ATN" => "atan",
+    "EXP" => "exp",
+    "LOG" => "log",
+};
+
+/// Inline math functions: BASIC name -> x86-64 instruction
+/// These take Double in xmm0 and produce Double in xmm0
+static INLINE_MATH_FNS: phf::Map<&'static str, &'static str> = phf_map! {
+    "SQR" => "sqrtsd xmm0, xmm0",
+    "INT" => "roundsd xmm0, xmm0, 1",
+    "FIX" => "roundsd xmm0, xmm0, 3",
+};
 
 /// Symbol prefix: underscore on macOS, empty on Linux
 #[cfg(target_os = "macos")]
@@ -188,6 +208,54 @@ impl CodeGen {
     fn emit(&mut self, s: &str) {
         self.output.push_str(s);
         self.output.push('\n');
+    }
+
+    /// Emit type-specific instruction for binary operations
+    fn emit_typed(
+        &mut self,
+        work_type: DataType,
+        int_instr: &str,
+        single_instr: &str,
+        double_instr: &str,
+    ) {
+        match work_type {
+            DataType::Integer | DataType::Long => self.emit(int_instr),
+            DataType::Single => self.emit(single_instr),
+            _ => self.emit(double_instr),
+        }
+    }
+
+    /// Convert float operands to integers (truncate). Used for IntDiv, Mod, logical ops.
+    fn emit_cvt_float_to_int(&mut self, work_type: DataType) {
+        if !work_type.is_integer() {
+            self.emit_typed(
+                work_type,
+                "",
+                "    cvttss2si eax, xmm0",
+                "    cvttsd2si eax, xmm0",
+            );
+            self.emit_typed(
+                work_type,
+                "",
+                "    cvttss2si ecx, xmm1",
+                "    cvttsd2si ecx, xmm1",
+            );
+        }
+    }
+
+    /// Convert integer/single operands to double. Used for Div, Pow.
+    fn emit_cvt_to_double(&mut self, work_type: DataType) {
+        match work_type {
+            DataType::Integer | DataType::Long => {
+                self.emit("    cvtsi2sd xmm0, eax");
+                self.emit("    cvtsi2sd xmm1, ecx");
+            }
+            DataType::Single => {
+                self.emit("    cvtss2sd xmm0, xmm0");
+                self.emit("    cvtss2sd xmm1, xmm1");
+            }
+            _ => {}
+        }
     }
 
     fn emit_label(&mut self, label: &str) {
@@ -372,8 +440,7 @@ impl CodeGen {
     pub fn generate(&mut self, program: &Program) -> String {
         // First pass: collect DATA statements and check for GOSUB
         for stmt in &program.statements {
-            self.collect_data(stmt);
-            self.check_gosub(stmt);
+            self.preprocess(stmt);
         }
 
         // Emit assembly header
@@ -441,71 +508,37 @@ impl CodeGen {
         self.output.clone()
     }
 
-    fn collect_data(&mut self, stmt: &Stmt) {
-        if let Stmt::Data(values) = stmt {
-            self.data_items.extend(values.clone());
+    /// Preprocess statement: collect DATA items and check for GOSUB usage
+    fn preprocess(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Data(values) => self.data_items.extend(values.clone()),
+            Stmt::Gosub(_) => self.gosub_used = true,
+            _ => {}
         }
         // Recurse into nested statements
-        match stmt {
+        let bodies: Vec<&[Stmt]> = match stmt {
             Stmt::If {
                 then_branch,
                 else_branch,
                 ..
             } => {
-                for s in then_branch {
-                    self.collect_data(s);
-                }
+                let mut v = vec![then_branch.as_slice()];
                 if let Some(eb) = else_branch {
-                    for s in eb {
-                        self.collect_data(s);
-                    }
+                    v.push(eb.as_slice());
                 }
+                v
             }
-            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::DoLoop { body, .. } => {
-                for s in body {
-                    self.collect_data(s);
-                }
+            Stmt::For { body, .. }
+            | Stmt::While { body, .. }
+            | Stmt::DoLoop { body, .. }
+            | Stmt::Sub { body, .. }
+            | Stmt::Function { body, .. } => vec![body.as_slice()],
+            _ => vec![],
+        };
+        for body in bodies {
+            for s in body {
+                self.preprocess(s);
             }
-            Stmt::Sub { body, .. } | Stmt::Function { body, .. } => {
-                for s in body {
-                    self.collect_data(s);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn check_gosub(&mut self, stmt: &Stmt) {
-        if let Stmt::Gosub(_) = stmt {
-            self.gosub_used = true;
-        }
-        // Recurse
-        match stmt {
-            Stmt::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                for s in then_branch {
-                    self.check_gosub(s);
-                }
-                if let Some(eb) = else_branch {
-                    for s in eb {
-                        self.check_gosub(s);
-                    }
-                }
-            }
-            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::DoLoop { body, .. } => {
-                for s in body {
-                    self.check_gosub(s);
-                }
-            }
-            Stmt::Sub { body, .. } | Stmt::Function { body, .. } => {
-                for s in body {
-                    self.check_gosub(s);
-                }
-            }
-            _ => {}
         }
     }
 
@@ -1303,91 +1336,41 @@ impl CodeGen {
 
         // Generate operation
         match op {
-            BinaryOp::Add => {
-                if work_type.is_integer() {
-                    self.emit("    add eax, ecx");
-                } else if work_type == DataType::Single {
-                    self.emit("    addss xmm0, xmm1");
-                } else {
-                    self.emit("    addsd xmm0, xmm1");
-                }
-            }
-            BinaryOp::Sub => {
-                if work_type.is_integer() {
-                    self.emit("    sub eax, ecx");
-                } else if work_type == DataType::Single {
-                    self.emit("    subss xmm0, xmm1");
-                } else {
-                    self.emit("    subsd xmm0, xmm1");
-                }
-            }
-            BinaryOp::Mul => {
-                if work_type.is_integer() {
-                    self.emit("    imul eax, ecx");
-                } else if work_type == DataType::Single {
-                    self.emit("    mulss xmm0, xmm1");
-                } else {
-                    self.emit("    mulsd xmm0, xmm1");
-                }
-            }
+            BinaryOp::Add => self.emit_typed(
+                work_type,
+                "    add eax, ecx",
+                "    addss xmm0, xmm1",
+                "    addsd xmm0, xmm1",
+            ),
+            BinaryOp::Sub => self.emit_typed(
+                work_type,
+                "    sub eax, ecx",
+                "    subss xmm0, xmm1",
+                "    subsd xmm0, xmm1",
+            ),
+            BinaryOp::Mul => self.emit_typed(
+                work_type,
+                "    imul eax, ecx",
+                "    mulss xmm0, xmm1",
+                "    mulsd xmm0, xmm1",
+            ),
             BinaryOp::Div => {
-                // Division always produces Double (GW-BASIC style)
-                // Coerce operands to Double if not already
-                if work_type.is_integer() {
-                    self.emit("    cvtsi2sd xmm0, eax");
-                    self.emit("    cvtsi2sd xmm1, ecx");
-                } else if work_type == DataType::Single {
-                    self.emit("    cvtss2sd xmm0, xmm0");
-                    self.emit("    cvtss2sd xmm1, xmm1");
-                }
+                self.emit_cvt_to_double(work_type);
                 self.emit("    divsd xmm0, xmm1");
             }
             BinaryOp::IntDiv => {
-                // Integer division produces Long
-                if work_type.is_integer() {
-                    self.emit("    cdq"); // sign-extend eax into edx:eax
-                    self.emit("    idiv ecx");
-                } else {
-                    // Convert to int, divide, result in eax
-                    if work_type == DataType::Single {
-                        self.emit("    cvttss2si eax, xmm0");
-                        self.emit("    cvttss2si ecx, xmm1");
-                    } else {
-                        self.emit("    cvttsd2si eax, xmm0");
-                        self.emit("    cvttsd2si ecx, xmm1");
-                    }
-                    self.emit("    cdq");
-                    self.emit("    idiv ecx");
-                }
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    cdq");
+                self.emit("    idiv ecx");
             }
             BinaryOp::Mod => {
-                // MOD produces Long (remainder)
-                if work_type.is_integer() {
-                    self.emit("    cdq");
-                    self.emit("    idiv ecx");
-                    self.emit("    mov eax, edx"); // remainder in edx
-                } else {
-                    if work_type == DataType::Single {
-                        self.emit("    cvttss2si eax, xmm0");
-                        self.emit("    cvttss2si ecx, xmm1");
-                    } else {
-                        self.emit("    cvttsd2si eax, xmm0");
-                        self.emit("    cvttsd2si ecx, xmm1");
-                    }
-                    self.emit("    cdq");
-                    self.emit("    idiv ecx");
-                    self.emit("    mov eax, edx");
-                }
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    cdq");
+                self.emit("    idiv ecx");
+                self.emit("    mov eax, edx");
             }
             BinaryOp::Pow => {
-                // Power always uses doubles
-                if work_type.is_integer() {
-                    self.emit("    cvtsi2sd xmm0, eax");
-                    self.emit("    cvtsi2sd xmm1, ecx");
-                } else if work_type == DataType::Single {
-                    self.emit("    cvtss2sd xmm0, xmm0");
-                    self.emit("    cvtss2sd xmm1, xmm1");
-                }
+                self.emit_cvt_to_double(work_type);
                 self.emit(&format!("    call {}pow", PREFIX));
             }
             BinaryOp::Eq
@@ -1396,55 +1379,40 @@ impl CodeGen {
             | BinaryOp::Gt
             | BinaryOp::Le
             | BinaryOp::Ge => {
-                let set_instr = match op {
-                    BinaryOp::Eq => "sete",
-                    BinaryOp::Ne => "setne",
-                    BinaryOp::Lt => "setb",
-                    BinaryOp::Gt => "seta",
-                    BinaryOp::Le => "setbe",
-                    BinaryOp::Ge => "setae",
+                // (signed_setcc, unsigned_setcc) - signed for integers, unsigned for floats
+                let (signed, unsigned) = match op {
+                    BinaryOp::Eq => ("sete", "sete"),
+                    BinaryOp::Ne => ("setne", "setne"),
+                    BinaryOp::Lt => ("setl", "setb"),
+                    BinaryOp::Gt => ("setg", "seta"),
+                    BinaryOp::Le => ("setle", "setbe"),
+                    BinaryOp::Ge => ("setge", "setae"),
                     _ => unreachable!(),
                 };
-                if work_type.is_integer() {
-                    self.emit("    cmp eax, ecx");
-                    // Use signed comparison flags for integers
-                    let set_instr = match op {
-                        BinaryOp::Eq => "sete",
-                        BinaryOp::Ne => "setne",
-                        BinaryOp::Lt => "setl",
-                        BinaryOp::Gt => "setg",
-                        BinaryOp::Le => "setle",
-                        BinaryOp::Ge => "setge",
-                        _ => unreachable!(),
-                    };
-                    self.emit(&format!("    {} al", set_instr));
-                } else if work_type == DataType::Single {
-                    self.emit("    ucomiss xmm0, xmm1");
-                    self.emit(&format!("    {} al", set_instr));
+                self.emit_typed(
+                    work_type,
+                    "    cmp eax, ecx",
+                    "    ucomiss xmm0, xmm1",
+                    "    ucomisd xmm0, xmm1",
+                );
+                let setcc = if work_type.is_integer() {
+                    signed
                 } else {
-                    self.emit("    ucomisd xmm0, xmm1");
-                    self.emit(&format!("    {} al", set_instr));
-                }
+                    unsigned
+                };
+                self.emit(&format!("    {} al", setcc));
                 self.emit("    movzx eax, al");
-                self.emit("    neg eax"); // 0 -> 0, 1 -> -1
+                self.emit("    neg eax");
             }
             BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                // Logical/bitwise ops work on integers
-                if !work_type.is_integer() {
-                    if work_type == DataType::Single {
-                        self.emit("    cvttss2si eax, xmm0");
-                        self.emit("    cvttss2si ecx, xmm1");
-                    } else {
-                        self.emit("    cvttsd2si eax, xmm0");
-                        self.emit("    cvttsd2si ecx, xmm1");
-                    }
-                }
-                match op {
-                    BinaryOp::And => self.emit("    and eax, ecx"),
-                    BinaryOp::Or => self.emit("    or eax, ecx"),
-                    BinaryOp::Xor => self.emit("    xor eax, ecx"),
+                self.emit_cvt_float_to_int(work_type);
+                let instr = match op {
+                    BinaryOp::And => "and",
+                    BinaryOp::Or => "or",
+                    BinaryOp::Xor => "xor",
                     _ => unreachable!(),
-                }
+                };
+                self.emit(&format!("    {} eax, ecx", instr));
             }
         }
 
@@ -1494,60 +1462,30 @@ impl CodeGen {
     fn gen_fn_call(&mut self, name: &str, args: &[Expr]) {
         let upper_name = name.to_uppercase();
 
-        // Check for built-in functions
+        // Table-driven: libc math functions (SIN, COS, TAN, ATN, EXP, LOG)
+        if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
+            let arg_type = self.gen_expr(&args[0]);
+            self.gen_coercion(arg_type, DataType::Double);
+            self.emit(&format!("    call {}{}", PREFIX, libc_fn));
+            return;
+        }
+
+        // Table-driven: inline math functions (SQR, INT, FIX)
+        if let Some(instr) = INLINE_MATH_FNS.get(upper_name.as_str()) {
+            let arg_type = self.gen_expr(&args[0]);
+            self.gen_coercion(arg_type, DataType::Double);
+            self.emit(&format!("    {}", instr));
+            return;
+        }
+
+        // Complex built-in functions
         match upper_name.as_str() {
             "ABS" => {
                 let arg_type = self.gen_expr(&args[0]);
-                // Convert to double and take absolute value
                 self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
                 self.emit("    movq xmm1, rax");
                 self.emit("    andpd xmm0, xmm1");
-            }
-            "INT" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    roundsd xmm0, xmm0, 1"); // floor
-            }
-            "FIX" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    roundsd xmm0, xmm0, 3"); // truncate
-            }
-            "SQR" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    sqrtsd xmm0, xmm0");
-            }
-            "SIN" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}sin", PREFIX));
-            }
-            "COS" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}cos", PREFIX));
-            }
-            "TAN" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}tan", PREFIX));
-            }
-            "ATN" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}atan", PREFIX));
-            }
-            "EXP" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}exp", PREFIX));
-            }
-            "LOG" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit(&format!("    call {}log", PREFIX));
             }
             "SGN" => {
                 let arg_type = self.gen_expr(&args[0]);
