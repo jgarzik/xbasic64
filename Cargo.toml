@@ -12,7 +12,6 @@ readme = "README.md"
 keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
 categories = ["compilers", "command-line-utilities", "development-tools"]
 rust-version = "1.80"
-exclude = ["tests/", "examples/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
