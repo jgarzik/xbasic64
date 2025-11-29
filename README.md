@@ -36,9 +36,8 @@ A BASIC-to-x86-64 compiler written in Rust, targeting early 1980s BASIC dialects
 - Other: `TIMER`
 
 **Variables:**
-- Numeric variables (stored as 64-bit floats)
-- String variables (suffix `$`)
-- Type suffixes supported: `%` (integer), `&` (long), `!` (single), `#` (double), `$` (string)
+- Type suffixes determine storage: `%` (16-bit int), `&` (32-bit int), `!` (32-bit float), `#` (64-bit float - default), `$` (string)
+- Unsuffixed numeric variables default to Double (64-bit float)
 - Line number labels
 
 ## Building
@@ -139,8 +138,8 @@ The runtime library (`src/runtime/`) provides support functions for I/O, string 
 ### Design Choices
 
 - **No IR** - Direct AST to assembly for simplicity
-- **Stack-based evaluation** - Expressions evaluated using the x87/SSE stack
-- **All numerics as doubles** - Simplified type system using 64-bit floats
+- **Type-aware codegen** - Integers in eax, floats in xmm0, with automatic type coercion
+- **GW-BASIC type semantics** - Division (`/`) always produces Double; integer division (`\`) produces Long
 - **Strings as (ptr, len) pairs** - Not null-terminated internally
 - **System V AMD64 ABI** - Standard calling convention for libc interop
 

@@ -186,6 +186,35 @@ pub enum BinaryOp {
     Xor,
 }
 
+/// BASIC data types following GW-BASIC/QuickBASIC conventions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataType {
+    Integer, // % - 16-bit signed (i16)
+    Long,    // & - 32-bit signed (i32)
+    Single,  // ! - 32-bit float (f32)
+    Double,  // # - 64-bit float (f64) - DEFAULT for unsuffixed
+    String,  // $ - heap-allocated string
+}
+
+impl DataType {
+    /// Determine type from variable name suffix
+    pub fn from_suffix(name: &str) -> DataType {
+        match name.chars().last() {
+            Some('%') => DataType::Integer,
+            Some('&') => DataType::Long,
+            Some('!') => DataType::Single,
+            Some('#') => DataType::Double,
+            Some('$') => DataType::String,
+            _ => DataType::Double, // DEFAULT for unsuffixed variables
+        }
+    }
+
+    /// Check if this is an integer type (Integer or Long)
+    pub fn is_integer(&self) -> bool {
+        matches!(self, DataType::Integer | DataType::Long)
+    }
+}
+
 // ============================================================================
 // Parser
 // ============================================================================

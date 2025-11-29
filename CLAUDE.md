@@ -47,15 +47,23 @@ The runtime (`src/runtime/`) is hand-written x86-64 assembly using libc for port
 
 ### Type System
 
-All numeric values are stored as 64-bit floats (doubles) internally. Type suffixes are parsed but effectively ignored:
-- `%` (integer), `&` (long), `!` (single), `#` (double) - all become f64
-- `$` (string) - heap-allocated, managed as (ptr, len) pairs
+Following GW-BASIC/QuickBASIC conventions with type suffixes:
+- `%` INTEGER - 16-bit signed (i16), stored in eax
+- `&` LONG - 32-bit signed (i32), stored in eax
+- `!` SINGLE - 32-bit float (f32), stored in xmm0
+- `#` DOUBLE - 64-bit float (f64), stored in xmm0 - **DEFAULT for unsuffixed variables**
+- `$` STRING - heap-allocated, managed as (ptr, len) pairs
+
+Division follows GW-BASIC semantics:
+- `/` always produces Double result
+- `\` integer division produces Long result
+
+Type coercion is automatic: Integer < Long < Single < Double. Comparisons return Long (-1 for true, 0 for false).
 
 ### Key Design Decisions
 
 - **No IR** - Direct AST to assembly for simplicity
-- **All numerics as f64** - Simplified type system
-- **Stack-based evaluation** - Expressions use x87 FPU stack
+- **Type-aware codegen** - Integers in eax, floats in xmm0 with automatic coercion
 - **Variables are global** - No local scoping except procedure parameters
 - **System V AMD64 ABI** - Standard calling convention for libc interop
 

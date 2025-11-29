@@ -7,6 +7,13 @@ fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
 
+/// Variable storage information
+#[derive(Clone)]
+struct VarInfo {
+    offset: i32,
+    data_type: DataType,
+}
+
 /// Metadata for array storage
 struct ArrayInfo {
     ptr_offset: i32,       // stack offset where array pointer is stored
@@ -15,14 +22,14 @@ struct ArrayInfo {
 
 pub struct CodeGen {
     output: String,
-    vars: HashMap<String, i32>,         // variable name -> stack offset
+    vars: HashMap<String, VarInfo>,     // variable name -> variable info
     arrays: HashMap<String, ArrayInfo>, // array name -> array metadata
     stack_offset: i32,                  // current stack offset
     label_counter: u32,                 // for generating unique labels
     string_literals: Vec<String>,       // string constants
     data_items: Vec<Literal>,           // DATA values
     current_proc: Option<String>,       // current SUB/FUNCTION name
-    proc_vars: HashMap<String, i32>,    // local variables for current proc
+    proc_vars: HashMap<String, VarInfo>, // local variables for current proc
     gosub_used: bool,                   // whether GOSUB is used (need return stack)
     prefix: &'static str,               // symbol prefix ("_" on macOS, "" on Linux)
 }
@@ -72,29 +79,166 @@ impl CodeGen {
         idx
     }
 
-    fn get_var_offset(&mut self, name: &str) -> i32 {
+    /// Get variable info, allocating if necessary
+    fn get_var_info(&mut self, name: &str) -> VarInfo {
         if self.current_proc.is_some() {
             // Check local variables first
-            if let Some(&offset) = self.proc_vars.get(name) {
-                return offset;
+            if let Some(info) = self.proc_vars.get(name) {
+                return info.clone();
             }
         }
 
-        if let Some(&offset) = self.vars.get(name) {
-            return offset;
+        if let Some(info) = self.vars.get(name) {
+            return info.clone();
         }
 
-        // Allocate new variable
-        self.stack_offset -= 8;
+        // Allocate new variable - determine type from suffix
+        let data_type = DataType::from_suffix(name);
+        self.stack_offset -= 8; // All types use 8 bytes for alignment
         let offset = self.stack_offset;
 
+        let info = VarInfo { offset, data_type };
+
         if self.current_proc.is_some() {
-            self.proc_vars.insert(name.to_string(), offset);
+            self.proc_vars.insert(name.to_string(), info.clone());
         } else {
-            self.vars.insert(name.to_string(), offset);
+            self.vars.insert(name.to_string(), info.clone());
         }
 
-        offset
+        info
+    }
+
+    /// Get just the stack offset for a variable (convenience method)
+    fn get_var_offset(&mut self, name: &str) -> i32 {
+        self.get_var_info(name).offset
+    }
+
+    /// Determine the result type of an expression
+    fn expr_type(&self, expr: &Expr) -> DataType {
+        match expr {
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(_) => DataType::Long, // Integer literals are Long
+                Literal::Float(_) => DataType::Double,
+                Literal::String(_) => DataType::String,
+            },
+            Expr::Variable(name) => DataType::from_suffix(name),
+            Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
+            Expr::FnCall { name, .. } => self.fn_return_type(name),
+            Expr::Unary { operand, .. } => self.expr_type(operand),
+            Expr::Binary { left, right, op } => {
+                let lt = self.expr_type(left);
+                let rt = self.expr_type(right);
+                self.promote_types(lt, rt, *op)
+            }
+        }
+    }
+
+    /// Get the return type of a function (built-in or user-defined)
+    fn fn_return_type(&self, name: &str) -> DataType {
+        // Built-in functions that return strings
+        let upper = name.to_uppercase();
+        if upper.ends_with('$') {
+            return DataType::String;
+        }
+        // Built-in functions that return integers
+        match upper.as_str() {
+            "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
+            // Most built-ins and user functions: check suffix, default to Double
+            _ => DataType::from_suffix(name),
+        }
+    }
+
+    /// Promote two types to a common type for binary operations
+    fn promote_types(&self, left: DataType, right: DataType, op: BinaryOp) -> DataType {
+        // Comparison operators always return Integer (0 or -1 for boolean)
+        if matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::Le
+                | BinaryOp::Ge
+        ) {
+            return DataType::Long; // Boolean result as Long
+        }
+
+        // Division (/) always produces Double per GW-BASIC
+        if op == BinaryOp::Div {
+            return DataType::Double;
+        }
+
+        // Integer division (\) always produces Long
+        if op == BinaryOp::IntDiv {
+            return DataType::Long;
+        }
+
+        // MOD produces integer type
+        if op == BinaryOp::Mod {
+            return DataType::Long;
+        }
+
+        // String concatenation
+        if left == DataType::String && right == DataType::String {
+            return DataType::String;
+        }
+
+        // Numeric promotion: Integer < Long < Single < Double
+        match (left, right) {
+            (DataType::Double, _) | (_, DataType::Double) => DataType::Double,
+            (DataType::Single, _) | (_, DataType::Single) => DataType::Single,
+            (DataType::Long, _) | (_, DataType::Long) => DataType::Long,
+            _ => DataType::Integer,
+        }
+    }
+
+    /// Generate code to coerce a value from one type to another.
+    /// Convention: integers in eax, floats in xmm0
+    fn gen_coercion(&mut self, from: DataType, to: DataType) {
+        if from == to {
+            return;
+        }
+
+        match (from, to) {
+            // Integer to Long (sign extension, but both in eax so just use movsxd conceptually)
+            (DataType::Integer, DataType::Long) => {
+                self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
+            }
+            // Long to Integer (truncation - just use lower 16 bits)
+            (DataType::Long, DataType::Integer) => {
+                // No-op in eax, value is truncated when stored
+            }
+            // Integer/Long to Single
+            (DataType::Integer | DataType::Long, DataType::Single) => {
+                self.emit("    cvtsi2ss xmm0, eax");
+            }
+            // Integer/Long to Double
+            (DataType::Integer | DataType::Long, DataType::Double) => {
+                self.emit("    cvtsi2sd xmm0, eax");
+            }
+            // Single to Double
+            (DataType::Single, DataType::Double) => {
+                self.emit("    cvtss2sd xmm0, xmm0");
+            }
+            // Double to Single
+            (DataType::Double, DataType::Single) => {
+                self.emit("    cvtsd2ss xmm0, xmm0");
+            }
+            // Single to Integer/Long (truncate)
+            (DataType::Single, DataType::Integer | DataType::Long) => {
+                self.emit("    cvttss2si eax, xmm0");
+            }
+            // Double to Integer/Long (truncate)
+            (DataType::Double, DataType::Integer | DataType::Long) => {
+                self.emit("    cvttsd2si eax, xmm0");
+            }
+            // String conversions are not supported implicitly
+            (DataType::String, _) | (_, DataType::String) => {
+                panic!("Cannot implicitly convert to/from String");
+            }
+            // Same type - no conversion needed (shouldn't reach here due to early return)
+            _ => {}
+        }
     }
 
     pub fn generate(&mut self, program: &Program) -> String {
@@ -244,7 +388,14 @@ impl CodeGen {
         let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
         for (i, param) in params.iter().enumerate() {
             self.stack_offset -= 8;
-            self.proc_vars.insert(param.clone(), self.stack_offset);
+            let data_type = DataType::from_suffix(param);
+            self.proc_vars.insert(
+                param.clone(),
+                VarInfo {
+                    offset: self.stack_offset,
+                    data_type,
+                },
+            );
             if i < int_regs.len() {
                 self.emit(&format!(
                     "    mov QWORD PTR [rbp + {}], {}",
@@ -256,7 +407,14 @@ impl CodeGen {
         // If function, allocate return value slot
         if is_function {
             self.stack_offset -= 8;
-            self.proc_vars.insert(name.to_string(), self.stack_offset);
+            let data_type = DataType::from_suffix(name);
+            self.proc_vars.insert(
+                name.to_string(),
+                VarInfo {
+                    offset: self.stack_offset,
+                    data_type,
+                },
+            );
         }
 
         // Reserve stack space
@@ -269,8 +427,12 @@ impl CodeGen {
 
         // Return
         if is_function {
-            let ret_offset = self.proc_vars[name];
-            self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", ret_offset));
+            let ret_info = &self.proc_vars[name];
+            // For now, return all values via xmm0 (will be type-aware later)
+            self.emit(&format!(
+                "    movsd xmm0, QWORD PTR [rbp + {}]",
+                ret_info.offset
+            ));
         }
 
         self.emit("    leave");
@@ -298,9 +460,32 @@ impl CodeGen {
                 } else if is_string_var(name) {
                     self.gen_string_assign(name, value);
                 } else {
-                    self.gen_expr(value);
-                    let offset = self.get_var_offset(name);
-                    self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
+                    // Evaluate expression and get its type
+                    let expr_type = self.gen_expr(value);
+                    let var_info = self.get_var_info(name);
+
+                    // Coerce to target type
+                    self.gen_coercion(expr_type, var_info.data_type);
+
+                    // Store based on target type
+                    match var_info.data_type {
+                        DataType::Integer => {
+                            self.emit(&format!("    mov WORD PTR [rbp + {}], ax", var_info.offset));
+                        }
+                        DataType::Long => {
+                            self.emit(&format!("    mov DWORD PTR [rbp + {}], eax", var_info.offset));
+                        }
+                        DataType::Single => {
+                            self.emit(&format!("    movss DWORD PTR [rbp + {}], xmm0", var_info.offset));
+                        }
+                        DataType::Double => {
+                            self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_info.offset));
+                        }
+                        DataType::String => {
+                            // Should be handled by gen_string_assign above
+                            unreachable!("String assignment should be handled separately");
+                        }
+                    }
                 }
             }
 
@@ -364,11 +549,16 @@ impl CodeGen {
                 let else_label = self.new_label("else");
                 let end_label = self.new_label("endif");
 
-                self.gen_expr(condition);
-                // Compare with 0
-                self.emit("    xorpd xmm1, xmm1");
-                self.emit("    ucomisd xmm0, xmm1");
-                self.emit(&format!("    je {}", else_label));
+                let cond_type = self.gen_expr(condition);
+                // Compare with 0 - conditions typically return Long (integer) now
+                if cond_type.is_integer() {
+                    self.emit("    test eax, eax");
+                    self.emit(&format!("    je {}", else_label));
+                } else {
+                    self.emit("    xorpd xmm1, xmm1");
+                    self.emit("    ucomisd xmm0, xmm1");
+                    self.emit(&format!("    je {}", else_label));
+                }
 
                 for s in then_branch {
                     self.gen_stmt(s);
@@ -396,21 +586,24 @@ impl CodeGen {
                 let end_label = self.new_label("endfor");
                 let var_offset = self.get_var_offset(var);
 
-                // Initialize loop variable
-                self.gen_expr(start);
+                // Initialize loop variable - coerce to double
+                let start_type = self.gen_expr(start);
+                self.gen_coercion(start_type, DataType::Double);
                 self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_offset));
 
-                // Store end value
+                // Store end value - coerce to double
                 self.stack_offset -= 8;
                 let end_offset = self.stack_offset;
-                self.gen_expr(end);
+                let end_type = self.gen_expr(end);
+                self.gen_coercion(end_type, DataType::Double);
                 self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", end_offset));
 
-                // Store step value
+                // Store step value - coerce to double
                 self.stack_offset -= 8;
                 let step_offset = self.stack_offset;
                 if let Some(s) = step {
-                    self.gen_expr(s);
+                    let step_type = self.gen_expr(s);
+                    self.gen_coercion(step_type, DataType::Double);
                 } else {
                     self.emit("    mov rax, 0x3FF0000000000000  # 1.0");
                     self.emit("    movq xmm0, rax");
@@ -468,10 +661,15 @@ impl CodeGen {
                 let end_label = self.new_label("endwhile");
 
                 self.emit_label(&start_label);
-                self.gen_expr(condition);
-                self.emit("    xorpd xmm1, xmm1");
-                self.emit("    ucomisd xmm0, xmm1");
-                self.emit(&format!("    je {}", end_label));
+                let cond_type = self.gen_expr(condition);
+                if cond_type.is_integer() {
+                    self.emit("    test eax, eax");
+                    self.emit(&format!("    je {}", end_label));
+                } else {
+                    self.emit("    xorpd xmm1, xmm1");
+                    self.emit("    ucomisd xmm0, xmm1");
+                    self.emit(&format!("    je {}", end_label));
+                }
 
                 for s in body {
                     self.gen_stmt(s);
@@ -494,13 +692,22 @@ impl CodeGen {
 
                 if *cond_at_start {
                     if let Some(cond) = condition {
-                        self.gen_expr(cond);
-                        self.emit("    xorpd xmm1, xmm1");
-                        self.emit("    ucomisd xmm0, xmm1");
-                        if *is_until {
-                            self.emit(&format!("    jne {}", end_label));
+                        let cond_type = self.gen_expr(cond);
+                        if cond_type.is_integer() {
+                            self.emit("    test eax, eax");
+                            if *is_until {
+                                self.emit(&format!("    jne {}", end_label));
+                            } else {
+                                self.emit(&format!("    je {}", end_label));
+                            }
                         } else {
-                            self.emit(&format!("    je {}", end_label));
+                            self.emit("    xorpd xmm1, xmm1");
+                            self.emit("    ucomisd xmm0, xmm1");
+                            if *is_until {
+                                self.emit(&format!("    jne {}", end_label));
+                            } else {
+                                self.emit(&format!("    je {}", end_label));
+                            }
                         }
                     }
                 }
@@ -511,13 +718,22 @@ impl CodeGen {
 
                 if !*cond_at_start {
                     if let Some(cond) = condition {
-                        self.gen_expr(cond);
-                        self.emit("    xorpd xmm1, xmm1");
-                        self.emit("    ucomisd xmm0, xmm1");
-                        if *is_until {
-                            self.emit(&format!("    je {}", start_label));
+                        let cond_type = self.gen_expr(cond);
+                        if cond_type.is_integer() {
+                            self.emit("    test eax, eax");
+                            if *is_until {
+                                self.emit(&format!("    je {}", start_label));
+                            } else {
+                                self.emit(&format!("    jne {}", start_label));
+                            }
                         } else {
-                            self.emit(&format!("    jne {}", start_label));
+                            self.emit("    xorpd xmm1, xmm1");
+                            self.emit("    ucomisd xmm0, xmm1");
+                            if *is_until {
+                                self.emit(&format!("    je {}", start_label));
+                            } else {
+                                self.emit(&format!("    jne {}", start_label));
+                            }
                         }
                     } else {
                         self.emit(&format!("    jmp {}", start_label));
@@ -563,9 +779,13 @@ impl CodeGen {
             }
 
             Stmt::OnGoto { expr, targets } => {
-                self.gen_expr(expr);
-                // Convert to integer
-                self.emit("    cvttsd2si rax, xmm0");
+                let expr_type = self.gen_expr(expr);
+                // Convert to integer in rax
+                if expr_type.is_integer() {
+                    self.emit("    movsxd rax, eax");
+                } else {
+                    self.emit("    cvttsd2si rax, xmm0");
+                }
                 // Create jump table
                 for (i, target) in targets.iter().enumerate() {
                     let label = match target {
@@ -697,164 +917,329 @@ impl CodeGen {
         }
     }
 
-    fn gen_expr(&mut self, expr: &Expr) {
+    /// Generate code for an expression.
+    /// Returns the DataType of the result.
+    /// Convention: integers in eax, floats in xmm0, strings in rax(ptr)/rdx(len)
+    fn gen_expr(&mut self, expr: &Expr) -> DataType {
         match expr {
-            Expr::Literal(lit) => {
-                match lit {
-                    Literal::Integer(n) => {
-                        // Load as float
-                        let bits = (*n as f64).to_bits();
-                        self.emit(&format!("    mov rax, 0x{:X}", bits));
-                        self.emit("    movq xmm0, rax");
-                    }
-                    Literal::Float(f) => {
-                        let bits = f.to_bits();
-                        self.emit(&format!("    mov rax, 0x{:X}", bits));
-                        self.emit("    movq xmm0, rax");
-                    }
-                    Literal::String(s) => {
-                        let idx = self.add_string_literal(s);
-                        self.emit(&format!("    lea rax, [rip + _str_{}]", idx));
-                        self.emit(&format!("    mov rdx, {}", s.len()));
-                    }
+            Expr::Literal(lit) => match lit {
+                Literal::Integer(n) => {
+                    // Load as integer into eax
+                    self.emit(&format!("    mov eax, {}", *n as i32));
+                    DataType::Long
                 }
-            }
+                Literal::Float(f) => {
+                    // Load as double into xmm0
+                    let bits = f.to_bits();
+                    self.emit(&format!("    mov rax, 0x{:X}", bits));
+                    self.emit("    movq xmm0, rax");
+                    DataType::Double
+                }
+                Literal::String(s) => {
+                    let idx = self.add_string_literal(s);
+                    self.emit(&format!("    lea rax, [rip + _str_{}]", idx));
+                    self.emit(&format!("    mov rdx, {}", s.len()));
+                    DataType::String
+                }
+            },
 
             Expr::Variable(name) => {
-                let offset = self.get_var_offset(name);
-                if is_string_var(name) {
-                    self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", offset));
-                    self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
-                } else {
-                    self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", offset));
+                let info = self.get_var_info(name);
+                match info.data_type {
+                    DataType::Integer => {
+                        self.emit(&format!(
+                            "    movsx eax, WORD PTR [rbp + {}]",
+                            info.offset
+                        ));
+                    }
+                    DataType::Long => {
+                        self.emit(&format!(
+                            "    mov eax, DWORD PTR [rbp + {}]",
+                            info.offset
+                        ));
+                    }
+                    DataType::Single => {
+                        self.emit(&format!(
+                            "    movss xmm0, DWORD PTR [rbp + {}]",
+                            info.offset
+                        ));
+                    }
+                    DataType::Double => {
+                        self.emit(&format!(
+                            "    movsd xmm0, QWORD PTR [rbp + {}]",
+                            info.offset
+                        ));
+                    }
+                    DataType::String => {
+                        self.emit(&format!(
+                            "    mov rax, QWORD PTR [rbp + {}]",
+                            info.offset
+                        ));
+                        self.emit(&format!(
+                            "    mov rdx, QWORD PTR [rbp + {}]",
+                            info.offset - 8
+                        ));
+                    }
                 }
+                info.data_type
             }
 
             Expr::ArrayAccess { name, indices } => {
                 self.gen_array_load(name, indices);
+                DataType::from_suffix(name)
             }
 
             Expr::Unary { op, operand } => {
-                self.gen_expr(operand);
+                let operand_type = self.gen_expr(operand);
                 match op {
                     UnaryOp::Neg => {
-                        // Negate by XORing sign bit
-                        self.emit("    mov rax, 0x8000000000000000");
-                        self.emit("    movq xmm1, rax");
-                        self.emit("    xorpd xmm0, xmm1");
+                        if operand_type.is_integer() {
+                            self.emit("    neg eax");
+                            operand_type
+                        } else {
+                            // Negate float by XORing sign bit
+                            if operand_type == DataType::Single {
+                                self.emit("    mov eax, 0x80000000");
+                                self.emit("    movd xmm1, eax");
+                                self.emit("    xorps xmm0, xmm1");
+                            } else {
+                                self.emit("    mov rax, 0x8000000000000000");
+                                self.emit("    movq xmm1, rax");
+                                self.emit("    xorpd xmm0, xmm1");
+                            }
+                            operand_type
+                        }
                     }
                     UnaryOp::Not => {
-                        // NOT: if 0 then -1, else 0
-                        self.emit("    xorpd xmm1, xmm1");
-                        self.emit("    ucomisd xmm0, xmm1");
+                        // NOT: if 0 then -1, else 0 - result is always Long
+                        if operand_type.is_integer() {
+                            self.emit("    test eax, eax");
+                        } else if operand_type == DataType::Single {
+                            self.emit("    xorps xmm1, xmm1");
+                            self.emit("    ucomiss xmm0, xmm1");
+                        } else {
+                            self.emit("    xorpd xmm1, xmm1");
+                            self.emit("    ucomisd xmm0, xmm1");
+                        }
                         self.emit("    sete al");
                         self.emit("    movzx eax, al");
                         self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
+                        DataType::Long
                     }
                 }
             }
 
             Expr::Binary { op, left, right } => {
-                // Evaluate left, push, evaluate right, pop, compute
-                self.gen_expr(left);
-                self.emit("    sub rsp, 8");
-                self.emit("    movsd QWORD PTR [rsp], xmm0");
-                self.gen_expr(right);
-                self.emit("    movsd xmm1, xmm0");
-                self.emit("    movsd xmm0, QWORD PTR [rsp]");
-                self.emit("    add rsp, 8");
-
-                match op {
-                    BinaryOp::Add => self.emit("    addsd xmm0, xmm1"),
-                    BinaryOp::Sub => self.emit("    subsd xmm0, xmm1"),
-                    BinaryOp::Mul => self.emit("    mulsd xmm0, xmm1"),
-                    BinaryOp::Div => self.emit("    divsd xmm0, xmm1"),
-                    BinaryOp::IntDiv => {
-                        self.emit("    divsd xmm0, xmm1");
-                        self.emit("    roundsd xmm0, xmm0, 3"); // truncate
-                    }
-                    BinaryOp::Mod => {
-                        // a MOD b = a - INT(a/b) * b
-                        self.emit("    movsd xmm2, xmm0"); // save a
-                        self.emit("    divsd xmm0, xmm1"); // a/b
-                        self.emit("    roundsd xmm0, xmm0, 3"); // INT(a/b)
-                        self.emit("    mulsd xmm0, xmm1"); // INT(a/b) * b
-                        self.emit("    subsd xmm2, xmm0"); // a - INT(a/b) * b
-                        self.emit("    movsd xmm0, xmm2");
-                    }
-                    BinaryOp::Pow => {
-                        // Call pow function (libc)
-                        self.emit(&format!("    call {}pow", self.prefix));
-                    }
-                    BinaryOp::Eq => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    sete al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::Ne => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    setne al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::Lt => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    setb al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::Gt => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    seta al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::Le => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    setbe al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::Ge => {
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit("    setae al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
-                        self.emit("    cvtsi2sd xmm0, eax");
-                    }
-                    BinaryOp::And => {
-                        // Bitwise AND of integer values
-                        self.emit("    cvttsd2si rax, xmm0");
-                        self.emit("    cvttsd2si rcx, xmm1");
-                        self.emit("    and rax, rcx");
-                        self.emit("    cvtsi2sd xmm0, rax");
-                    }
-                    BinaryOp::Or => {
-                        self.emit("    cvttsd2si rax, xmm0");
-                        self.emit("    cvttsd2si rcx, xmm1");
-                        self.emit("    or rax, rcx");
-                        self.emit("    cvtsi2sd xmm0, rax");
-                    }
-                    BinaryOp::Xor => {
-                        self.emit("    cvttsd2si rax, xmm0");
-                        self.emit("    cvttsd2si rcx, xmm1");
-                        self.emit("    xor rax, rcx");
-                        self.emit("    cvtsi2sd xmm0, rax");
-                    }
-                }
+                self.gen_binary_expr(*op, left, right)
             }
 
             Expr::FnCall { name, args } => {
                 self.gen_fn_call(name, args);
+                self.fn_return_type(name)
             }
         }
+    }
+
+    /// Generate code for a binary expression
+    fn gen_binary_expr(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> DataType {
+        let result_type = self.promote_types(self.expr_type(left), self.expr_type(right), op);
+
+        // For comparison/logical ops, we'll work in the promoted type but return Long
+        let work_type = if matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::Ne
+                | BinaryOp::Lt
+                | BinaryOp::Gt
+                | BinaryOp::Le
+                | BinaryOp::Ge
+                | BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::Xor
+        ) {
+            self.promote_types(self.expr_type(left), self.expr_type(right), BinaryOp::Add)
+        } else {
+            result_type
+        };
+
+        // Evaluate left operand and coerce to work type
+        let left_type = self.gen_expr(left);
+        self.gen_coercion(left_type, work_type);
+
+        // Save left result
+        if work_type.is_integer() {
+            self.emit("    push rax");
+        } else {
+            self.emit("    sub rsp, 8");
+            if work_type == DataType::Single {
+                self.emit("    movss DWORD PTR [rsp], xmm0");
+            } else {
+                self.emit("    movsd QWORD PTR [rsp], xmm0");
+            }
+        }
+
+        // Evaluate right operand and coerce to work type
+        let right_type = self.gen_expr(right);
+        self.gen_coercion(right_type, work_type);
+
+        // Move right to secondary register/location
+        if work_type.is_integer() {
+            self.emit("    mov ecx, eax"); // right in ecx
+            self.emit("    pop rax"); // left in eax
+        } else {
+            if work_type == DataType::Single {
+                self.emit("    movss xmm1, xmm0"); // right in xmm1
+                self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
+            } else {
+                self.emit("    movsd xmm1, xmm0"); // right in xmm1
+                self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
+            }
+            self.emit("    add rsp, 8");
+        }
+
+        // Generate operation
+        match op {
+            BinaryOp::Add => {
+                if work_type.is_integer() {
+                    self.emit("    add eax, ecx");
+                } else if work_type == DataType::Single {
+                    self.emit("    addss xmm0, xmm1");
+                } else {
+                    self.emit("    addsd xmm0, xmm1");
+                }
+            }
+            BinaryOp::Sub => {
+                if work_type.is_integer() {
+                    self.emit("    sub eax, ecx");
+                } else if work_type == DataType::Single {
+                    self.emit("    subss xmm0, xmm1");
+                } else {
+                    self.emit("    subsd xmm0, xmm1");
+                }
+            }
+            BinaryOp::Mul => {
+                if work_type.is_integer() {
+                    self.emit("    imul eax, ecx");
+                } else if work_type == DataType::Single {
+                    self.emit("    mulss xmm0, xmm1");
+                } else {
+                    self.emit("    mulsd xmm0, xmm1");
+                }
+            }
+            BinaryOp::Div => {
+                // Division always produces Double (GW-BASIC style)
+                // Coerce operands to Double if not already
+                if work_type.is_integer() {
+                    self.emit("    cvtsi2sd xmm0, eax");
+                    self.emit("    cvtsi2sd xmm1, ecx");
+                } else if work_type == DataType::Single {
+                    self.emit("    cvtss2sd xmm0, xmm0");
+                    self.emit("    cvtss2sd xmm1, xmm1");
+                }
+                self.emit("    divsd xmm0, xmm1");
+            }
+            BinaryOp::IntDiv => {
+                // Integer division produces Long
+                if work_type.is_integer() {
+                    self.emit("    cdq"); // sign-extend eax into edx:eax
+                    self.emit("    idiv ecx");
+                } else {
+                    // Convert to int, divide, result in eax
+                    if work_type == DataType::Single {
+                        self.emit("    cvttss2si eax, xmm0");
+                        self.emit("    cvttss2si ecx, xmm1");
+                    } else {
+                        self.emit("    cvttsd2si eax, xmm0");
+                        self.emit("    cvttsd2si ecx, xmm1");
+                    }
+                    self.emit("    cdq");
+                    self.emit("    idiv ecx");
+                }
+            }
+            BinaryOp::Mod => {
+                // MOD produces Long (remainder)
+                if work_type.is_integer() {
+                    self.emit("    cdq");
+                    self.emit("    idiv ecx");
+                    self.emit("    mov eax, edx"); // remainder in edx
+                } else {
+                    if work_type == DataType::Single {
+                        self.emit("    cvttss2si eax, xmm0");
+                        self.emit("    cvttss2si ecx, xmm1");
+                    } else {
+                        self.emit("    cvttsd2si eax, xmm0");
+                        self.emit("    cvttsd2si ecx, xmm1");
+                    }
+                    self.emit("    cdq");
+                    self.emit("    idiv ecx");
+                    self.emit("    mov eax, edx");
+                }
+            }
+            BinaryOp::Pow => {
+                // Power always uses doubles
+                if work_type.is_integer() {
+                    self.emit("    cvtsi2sd xmm0, eax");
+                    self.emit("    cvtsi2sd xmm1, ecx");
+                } else if work_type == DataType::Single {
+                    self.emit("    cvtss2sd xmm0, xmm0");
+                    self.emit("    cvtss2sd xmm1, xmm1");
+                }
+                self.emit(&format!("    call {}pow", self.prefix));
+            }
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+                let set_instr = match op {
+                    BinaryOp::Eq => "sete",
+                    BinaryOp::Ne => "setne",
+                    BinaryOp::Lt => "setb",
+                    BinaryOp::Gt => "seta",
+                    BinaryOp::Le => "setbe",
+                    BinaryOp::Ge => "setae",
+                    _ => unreachable!(),
+                };
+                if work_type.is_integer() {
+                    self.emit("    cmp eax, ecx");
+                    // Use signed comparison flags for integers
+                    let set_instr = match op {
+                        BinaryOp::Eq => "sete",
+                        BinaryOp::Ne => "setne",
+                        BinaryOp::Lt => "setl",
+                        BinaryOp::Gt => "setg",
+                        BinaryOp::Le => "setle",
+                        BinaryOp::Ge => "setge",
+                        _ => unreachable!(),
+                    };
+                    self.emit(&format!("    {} al", set_instr));
+                } else if work_type == DataType::Single {
+                    self.emit("    ucomiss xmm0, xmm1");
+                    self.emit(&format!("    {} al", set_instr));
+                } else {
+                    self.emit("    ucomisd xmm0, xmm1");
+                    self.emit(&format!("    {} al", set_instr));
+                }
+                self.emit("    movzx eax, al");
+                self.emit("    neg eax"); // 0 -> 0, 1 -> -1
+            }
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                // Logical/bitwise ops work on integers
+                if !work_type.is_integer() {
+                    if work_type == DataType::Single {
+                        self.emit("    cvttss2si eax, xmm0");
+                        self.emit("    cvttss2si ecx, xmm1");
+                    } else {
+                        self.emit("    cvttsd2si eax, xmm0");
+                        self.emit("    cvttsd2si ecx, xmm1");
+                    }
+                }
+                match op {
+                    BinaryOp::And => self.emit("    and eax, ecx"),
+                    BinaryOp::Or => self.emit("    or eax, ecx"),
+                    BinaryOp::Xor => self.emit("    xor eax, ecx"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        result_type
     }
 
     fn gen_print_expr(&mut self, expr: &Expr) {
@@ -871,12 +1256,15 @@ impl CodeGen {
                 self.emit(&format!("    mov rsi, QWORD PTR [rbp + {}]", offset - 8));
                 self.emit("    call _rt_print_string");
             } else {
-                self.gen_expr(expr);
+                let expr_type = self.gen_expr(expr);
+                // Convert to double for printing
+                self.gen_coercion(expr_type, DataType::Double);
                 self.emit("    call _rt_print_float");
             }
         } else {
-            // Assume numeric
-            self.gen_expr(expr);
+            // Assume numeric - evaluate and convert to double for printing
+            let expr_type = self.gen_expr(expr);
+            self.gen_coercion(expr_type, DataType::Double);
             self.emit("    call _rt_print_float");
         }
     }
@@ -897,13 +1285,15 @@ impl CodeGen {
                 self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
                 self.emit("    call _rt_file_print_string");
             } else {
-                self.gen_expr(expr);
+                let expr_type = self.gen_expr(expr);
+                self.gen_coercion(expr_type, DataType::Double);
                 self.emit(&format!("    mov rdi, {}", file_num));
                 self.emit("    call _rt_file_print_float");
             }
         } else {
             // Assume numeric
-            self.gen_expr(expr);
+            let expr_type = self.gen_expr(expr);
+            self.gen_coercion(expr_type, DataType::Double);
             self.emit(&format!("    mov rdi, {}", file_num));
             self.emit("    call _rt_file_print_float");
         }
@@ -915,49 +1305,61 @@ impl CodeGen {
         // Check for built-in functions
         match upper_name.as_str() {
             "ABS" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                // Convert to double and take absolute value
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
                 self.emit("    movq xmm1, rax");
                 self.emit("    andpd xmm0, xmm1");
             }
             "INT" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    roundsd xmm0, xmm0, 1"); // floor
             }
             "FIX" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    roundsd xmm0, xmm0, 3"); // truncate
             }
             "SQR" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    sqrtsd xmm0, xmm0");
             }
             "SIN" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}sin", self.prefix));
             }
             "COS" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}cos", self.prefix));
             }
             "TAN" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}tan", self.prefix));
             }
             "ATN" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}atan", self.prefix));
             }
             "EXP" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}exp", self.prefix));
             }
             "LOG" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit(&format!("    call {}log", self.prefix));
             }
             "SGN" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    xorpd xmm1, xmm1");
                 self.emit("    ucomisd xmm0, xmm1");
                 self.emit("    seta al");
@@ -969,40 +1371,57 @@ impl CodeGen {
             }
             "RND" => {
                 if !args.is_empty() {
-                    self.gen_expr(&args[0]);
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, DataType::Double);
                 }
                 self.emit("    call _rt_rnd");
             }
             "LEN" => {
                 self.gen_expr(&args[0]);
                 // String length is in rdx after gen_expr
-                self.emit("    cvtsi2sd xmm0, rdx");
+                self.emit("    mov eax, edx"); // LEN returns Long (integer)
             }
             "LEFT$" => {
                 self.gen_expr(&args[0]); // string: rax=ptr, rdx=len
                 self.emit("    mov rdi, rax");
                 self.emit("    mov rsi, rdx");
-                self.gen_expr(&args[1]); // count
-                self.emit("    cvttsd2si rdx, xmm0");
+                let count_type = self.gen_expr(&args[1]); // count
+                if count_type.is_integer() {
+                    self.emit("    movsxd rdx, eax");
+                } else {
+                    self.emit("    cvttsd2si rdx, xmm0");
+                }
                 self.emit("    call _rt_left");
             }
             "RIGHT$" => {
                 self.gen_expr(&args[0]);
                 self.emit("    mov rdi, rax");
                 self.emit("    mov rsi, rdx");
-                self.gen_expr(&args[1]);
-                self.emit("    cvttsd2si rdx, xmm0");
+                let count_type = self.gen_expr(&args[1]);
+                if count_type.is_integer() {
+                    self.emit("    movsxd rdx, eax");
+                } else {
+                    self.emit("    cvttsd2si rdx, xmm0");
+                }
                 self.emit("    call _rt_right");
             }
             "MID$" => {
                 self.gen_expr(&args[0]);
                 self.emit("    mov rdi, rax");
                 self.emit("    mov rsi, rdx");
-                self.gen_expr(&args[1]);
-                self.emit("    cvttsd2si rdx, xmm0");
+                let pos_type = self.gen_expr(&args[1]);
+                if pos_type.is_integer() {
+                    self.emit("    movsxd rdx, eax");
+                } else {
+                    self.emit("    cvttsd2si rdx, xmm0");
+                }
                 if args.len() > 2 {
-                    self.gen_expr(&args[2]);
-                    self.emit("    cvttsd2si rcx, xmm0");
+                    let len_type = self.gen_expr(&args[2]);
+                    if len_type.is_integer() {
+                        self.emit("    movsxd rcx, eax");
+                    } else {
+                        self.emit("    cvttsd2si rcx, xmm0");
+                    }
                 } else {
                     self.emit("    mov rcx, -1"); // rest of string
                 }
@@ -1016,8 +1435,12 @@ impl CodeGen {
                     (None, &args[0], &args[1])
                 };
                 if let Some(start) = start_arg {
-                    self.gen_expr(start);
-                    self.emit("    cvttsd2si r8, xmm0");
+                    let start_type = self.gen_expr(start);
+                    if start_type.is_integer() {
+                        self.emit("    movsxd r8, eax");
+                    } else {
+                        self.emit("    cvttsd2si r8, xmm0");
+                    }
                 } else {
                     self.emit("    mov r8, 1");
                 }
@@ -1028,16 +1451,21 @@ impl CodeGen {
                 self.emit("    mov rdx, rax");
                 self.emit("    mov rcx, rdx");
                 self.emit("    call _rt_instr");
-                self.emit("    cvtsi2sd xmm0, rax");
+                // Result is in rax, move to eax for Long return type
+                self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
             }
             "ASC" => {
                 self.gen_expr(&args[0]);
                 self.emit("    movzx eax, BYTE PTR [rax]");
-                self.emit("    cvtsi2sd xmm0, eax");
+                // ASC returns integer in eax (Long type)
             }
             "CHR$" => {
-                self.gen_expr(&args[0]);
-                self.emit("    cvttsd2si rdi, xmm0");
+                let arg_type = self.gen_expr(&args[0]);
+                if arg_type.is_integer() {
+                    self.emit("    movsxd rdi, eax");
+                } else {
+                    self.emit("    cvttsd2si rdi, xmm0");
+                }
                 self.emit("    call _rt_chr");
             }
             "VAL" => {
@@ -1047,17 +1475,23 @@ impl CodeGen {
                 self.emit("    call _rt_val");
             }
             "STR$" => {
-                self.gen_expr(&args[0]);
+                let arg_type = self.gen_expr(&args[0]);
+                // STR$ expects double in xmm0
+                self.gen_coercion(arg_type, DataType::Double);
                 self.emit("    call _rt_str");
             }
             "CINT" | "CLNG" => {
-                self.gen_expr(&args[0]);
-                self.emit("    cvttsd2si rax, xmm0");
-                self.emit("    cvtsi2sd xmm0, rax");
+                let arg_type = self.gen_expr(&args[0]);
+                // Convert to integer - result in eax
+                if !arg_type.is_integer() {
+                    self.emit("    cvttsd2si eax, xmm0");
+                }
+                // Result is integer (Long) in eax
             }
             "CSNG" | "CDBL" => {
-                self.gen_expr(&args[0]);
-                // Already a double
+                let arg_type = self.gen_expr(&args[0]);
+                // Convert to double
+                self.gen_coercion(arg_type, DataType::Double);
             }
             "TIMER" => {
                 self.emit("    call _rt_timer");
@@ -1087,7 +1521,9 @@ impl CodeGen {
 
         // For simplicity, pass all numeric args as floats in integer registers
         for (i, arg) in args.iter().enumerate() {
-            self.gen_expr(arg);
+            let arg_type = self.gen_expr(arg);
+            // Coerce to double for passing to procedures
+            self.gen_coercion(arg_type, DataType::Double);
             if i < int_regs.len() {
                 self.emit(&format!("    movq {}, xmm0", int_regs[i]));
             }
@@ -1107,8 +1543,13 @@ impl CodeGen {
         // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
         let mut dim_offsets = Vec::new();
         for dim in arr.dimensions.iter() {
-            self.gen_expr(dim);
-            self.emit("    cvttsd2si rax, xmm0");
+            let dim_type = self.gen_expr(dim);
+            if dim_type.is_integer() {
+                // Value already in eax, sign-extend to rax
+                self.emit("    movsxd rax, eax");
+            } else {
+                self.emit("    cvttsd2si rax, xmm0");
+            }
             self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
             self.stack_offset -= 8;
             dim_offsets.push(self.stack_offset);
@@ -1155,16 +1596,25 @@ impl CodeGen {
         // Calculate linear index using row-major order:
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
         // Start with first index
-        self.gen_expr(&indices[0]);
-        self.emit("    cvttsd2si rax, xmm0"); // rax = indices[0]
+        let idx_type = self.gen_expr(&indices[0]);
+        if idx_type.is_integer() {
+            // Already in eax, sign-extend to rax
+            self.emit("    movsxd rax, eax");
+        } else {
+            self.emit("    cvttsd2si rax, xmm0");
+        }
 
         // For each subsequent index, multiply by dimension bound and add
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
             // Save current accumulated index
             self.emit("    push rax");
             // Evaluate next index
-            self.gen_expr(idx_expr);
-            self.emit("    cvttsd2si rcx, xmm0"); // rcx = indices[i]
+            let idx_type = self.gen_expr(idx_expr);
+            if idx_type.is_integer() {
+                self.emit("    movsxd rcx, eax");
+            } else {
+                self.emit("    cvttsd2si rcx, xmm0");
+            }
             self.emit("    pop rax");
             // rax = rax * dim[i] + indices[i]
             self.emit(&format!(
@@ -1195,13 +1645,21 @@ impl CodeGen {
         let elem_size = if is_string_var(name) { 16 } else { 8 };
 
         // Calculate linear index using row-major order (same as gen_array_load)
-        self.gen_expr(&indices[0]);
-        self.emit("    cvttsd2si rax, xmm0");
+        let idx_type = self.gen_expr(&indices[0]);
+        if idx_type.is_integer() {
+            self.emit("    movsxd rax, eax");
+        } else {
+            self.emit("    cvttsd2si rax, xmm0");
+        }
 
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
             self.emit("    push rax");
-            self.gen_expr(idx_expr);
-            self.emit("    cvttsd2si rcx, xmm0");
+            let idx_type = self.gen_expr(idx_expr);
+            if idx_type.is_integer() {
+                self.emit("    movsxd rcx, eax");
+            } else {
+                self.emit("    cvttsd2si rcx, xmm0");
+            }
             self.emit("    pop rax");
             self.emit(&format!(
                 "    imul rax, QWORD PTR [rbp + {}]",
@@ -1216,7 +1674,7 @@ impl CodeGen {
         self.emit("    push rax"); // save address
 
         // Evaluate value
-        self.gen_expr(value);
+        let val_type = self.gen_expr(value);
 
         // Store value at computed address
         self.emit("    pop rcx");
@@ -1224,6 +1682,8 @@ impl CodeGen {
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
         } else {
+            // Coerce to double for array storage
+            self.gen_coercion(val_type, DataType::Double);
             self.emit("    movsd QWORD PTR [rcx], xmm0");
         }
     }
