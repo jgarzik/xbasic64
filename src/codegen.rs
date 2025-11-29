@@ -1,4 +1,148 @@
 //! Code generator - emits x86-64 assembly from AST
+//!
+//! # Architecture Overview
+//!
+//! This module translates the BASIC AST directly to x86-64 assembly using Intel syntax.
+//! There is no intermediate representation - we generate assembly in a single pass over
+//! the AST (after a preliminary pass to collect DATA statements).
+//!
+//! The generated code follows the System V AMD64 ABI for compatibility with libc functions.
+//! Output is assembled with the system assembler (`as`) and linked with `cc`.
+//!
+//! # Register Conventions
+//!
+//! We use a simple convention for where computed values live:
+//!
+//! | Type           | Primary Register | Notes                              |
+//! |----------------|------------------|------------------------------------|
+//! | Integer (i16)  | `eax` (low 16)   | Stored as i16, computed as i32     |
+//! | Long (i32)     | `eax`            | 32-bit signed integer              |
+//! | Single (f32)   | `xmm0`           | 32-bit float, uses SSE             |
+//! | Double (f64)   | `xmm0`           | 64-bit float, uses SSE             |
+//! | String         | `rax` + `rdx`    | (pointer, length) pair             |
+//!
+//! For binary operations, after evaluating both operands:
+//! - Left operand is restored to `eax`/`xmm0`
+//! - Right operand is placed in `ecx`/`xmm1`
+//!
+//! # Stack Frame Layout
+//!
+//! ```text
+//! High addresses
+//! ┌─────────────────────┐
+//! │   Return address    │  ← pushed by `call`, rsp+8 on entry
+//! ├─────────────────────┤
+//! │   Saved rbp         │  ← push rbp; mov rbp, rsp
+//! ├─────────────────────┤  ← rbp points here
+//! │   Local var 1       │  [rbp - 8]
+//! │   Local var 2       │  [rbp - 16]
+//! │   ...               │
+//! │   Local var N       │  [rbp - N*8]
+//! ├─────────────────────┤  ← rsp after prologue
+//! │   Temp space        │  (for expression evaluation)
+//! └─────────────────────┘
+//! Low addresses
+//! ```
+//!
+//! All local variables are allocated 8 bytes regardless of type (for alignment).
+//! Variable offsets are always negative relative to `rbp`.
+//!
+//! # Stack Alignment (Critical for ABI Compliance)
+//!
+//! The System V AMD64 ABI requires 16-byte stack alignment before `call` instructions.
+//! We maintain this invariant:
+//!
+//! 1. **Function entry**: After `call` pushes return address, `rsp % 16 == 8`
+//! 2. **After `push rbp`**: `rsp % 16 == 0`
+//! 3. **Prologue `sub rsp, N`**: N is rounded up to multiple of 16
+//! 4. **Temporaries**: We use `sub rsp, 16` / `add rsp, 16` (never 8-byte pushes for temps)
+//!
+//! This ensures the stack is always 16-byte aligned before any `call` instruction,
+//! which is required for SSE operations and varargs functions like `printf`.
+//!
+//! # Type Coercion
+//!
+//! BASIC performs automatic type promotion following this hierarchy:
+//!
+//! ```text
+//! Integer (%) → Long (&) → Single (!) → Double (#)
+//! ```
+//!
+//! Binary operations promote both operands to a common type. Special rules:
+//! - `/` (division) always produces Double
+//! - `\` (integer division) always produces Long
+//! - `^` (power) always produces Double (uses libm `pow`)
+//! - Comparisons return Long (-1 for true, 0 for false)
+//!
+//! Coercion instructions:
+//! - Int→Float: `cvtsi2sd xmm0, eax` (or `cvtsi2ss` for Single)
+//! - Float→Int: `cvttsd2si eax, xmm0` (truncation) or `cvtsd2si` (rounding)
+//! - Single↔Double: `cvtss2sd` / `cvtsd2ss`
+//!
+//! # String Representation
+//!
+//! Strings are represented as (pointer, length) pairs, NOT null-terminated internally.
+//! This allows efficient substring operations without copying.
+//!
+//! - String values: `rax` = pointer to characters, `rdx` = length
+//! - String variables: Two consecutive 8-byte slots at `[rbp - offset]` (ptr) and
+//!   `[rbp - offset - 8]` (len), but we use `[rbp - offset]` as the base offset
+//!   and the runtime expects ptr in first position when loading
+//!
+//! String literals are emitted in the `.data` section with labels `_str_N`.
+//!
+//! # Calling Convention (System V AMD64)
+//!
+//! For calling libc and runtime functions:
+//!
+//! | Argument # | Integer/Pointer | Float      |
+//! |------------|-----------------|------------|
+//! | 1          | `rdi`           | `xmm0`     |
+//! | 2          | `rsi`           | `xmm1`     |
+//! | 3          | `rdx`           | `xmm2`     |
+//! | 4          | `rcx`           | `xmm3`     |
+//! | 5          | `r8`            | `xmm4`     |
+//! | 6          | `r9`            | `xmm5`     |
+//!
+//! Return values: integers in `rax`, floats in `xmm0`.
+//!
+//! **Caller-saved** (may be clobbered by calls): `rax`, `rcx`, `rdx`, `rsi`, `rdi`,
+//! `r8`-`r11`, `xmm0`-`xmm15`
+//!
+//! **Callee-saved** (preserved across calls): `rbx`, `rbp`, `r12`-`r15`
+//!
+//! # Expression Evaluation Pattern
+//!
+//! Binary expressions follow this pattern to handle nested subexpressions safely:
+//!
+//! ```asm
+//! ; Evaluate left operand → result in eax/xmm0
+//! ; Save to stack (16-byte aligned temp):
+//!     sub rsp, 16
+//!     mov [rsp], eax          ; or movsd [rsp], xmm0
+//! ; Evaluate right operand → result in eax/xmm0
+//! ; Move right to secondary, restore left:
+//!     mov ecx, eax            ; right operand
+//!     mov eax, [rsp]          ; left operand
+//!     add rsp, 16
+//! ; Perform operation:
+//!     add eax, ecx            ; result in eax
+//! ```
+//!
+//! The 16-byte temp allocation (not 8) is critical: it maintains the 16-byte
+//! alignment invariant in case evaluating the right operand involves function calls.
+//!
+//! # Runtime Library
+//!
+//! The compiler embeds a runtime library (from `src/runtime/*.s`) that provides:
+//! - `_rt_print_*`: Output functions
+//! - `_rt_input_*`: Input functions
+//! - `_rt_*` string functions: `_rt_left`, `_rt_mid`, `_rt_right`, `_rt_instr`, etc.
+//! - `_rt_*` math functions: `_rt_rnd`, `_rt_timer`, etc.
+//! - `_rt_read_*`: DATA/READ support
+//! - `_rt_file_*`: File I/O
+//!
+//! These use the same calling convention and are linked into the final executable.
 
 use crate::parser::*;
 use std::collections::HashMap;
