@@ -15,7 +15,7 @@ use std::process::Command;
 
 /// BASIC-to-x86_64 compiler
 #[derive(Parser)]
-#[command(name = "basic64")]
+#[command(name = "xbasic64")]
 #[command(about = "Compiles 1980s-era BASIC programs to x86-64 executables")]
 struct Args {
     /// Input BASIC source file

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-basic64 is a BASIC-to-x86_64 native code compiler written in Rust. It targets 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC) and compiles to native executables using the System V AMD64 ABI.
+xbasic64 is a BASIC-to-x86_64 native code compiler written in Rust. It targets 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC) and compiles to native executables using the System V AMD64 ABI.
 
 ## Build Commands
 
@@ -19,9 +19,9 @@ cargo fmt             # Format code
 ## Usage
 
 ```bash
-basic64 program.bas              # Compile to executable
-basic64 program.bas -o output    # Specify output name
-basic64 -S program.bas           # Emit assembly only
+xbasic64 program.bas              # Compile to executable
+xbasic64 program.bas -o output    # Specify output name
+xbasic64 -S program.bas           # Emit assembly only
 ```
 
 ## Architecture

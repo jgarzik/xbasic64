@@ -1,7 +1,18 @@
 [package]
-name = "basic64"
+name = "xbasic64"
 version = "0.1.0"
 edition = "2021"
+authors = ["Jeff Garzik <jgarzik@pobox.com>"]
+description = "A BASIC-to-x86_64 native code compiler targeting 1980s-era BASIC dialects"
+license = "MIT"
+repository = "https://github.com/jgarzik/xbasic64"
+homepage = "https://github.com/jgarzik/xbasic64"
+documentation = "https://github.com/jgarzik/xbasic64"
+readme = "README.md"
+keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
+categories = ["compilers", "command-line-utilities", "development-tools"]
+rust-version = "1.80"
+exclude = ["tests/", "examples/", ".github/"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

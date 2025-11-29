@@ -1,6 +1,6 @@
-# basic64
+# xbasic64
 
-A BASIC-to-x86-64 compiler written in Rust, targeting early 1980s BASIC dialects (Tandy/GW-BASIC/QuickBASIC style).
+A BASIC-to-x86_64 native code compiler written in Rust, targeting 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC).
 
 ## Features
 
@@ -51,13 +51,13 @@ cargo build --release
 
 ```bash
 # Compile a BASIC program to executable
-basic64 program.bas
+xbasic64 program.bas
 
 # Specify output file
-basic64 program.bas -o myprogram
+xbasic64 program.bas -o myprogram
 
 # Emit assembly only (no linking)
-basic64 -S program.bas
+xbasic64 -S program.bas
 ```
 
 ## Example Programs
