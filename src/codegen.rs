@@ -145,27 +145,29 @@
 //! These use the same calling convention and are linked into the final executable.
 
 use crate::parser::*;
-use phf::phf_map;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 /// Simple math functions: BASIC name -> libc function name
-/// These take one Double arg in xmm0 and return Double in xmm0
-static LIBC_MATH_FNS: phf::Map<&'static str, &'static str> = phf_map! {
-    "SIN" => "sin",
-    "COS" => "cos",
-    "TAN" => "tan",
-    "ATN" => "atan",
-    "EXP" => "exp",
-    "LOG" => "log",
-};
+static LIBC_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("SIN", "sin"),
+        ("COS", "cos"),
+        ("TAN", "tan"),
+        ("ATN", "atan"),
+        ("EXP", "exp"),
+        ("LOG", "log"),
+    ])
+});
 
 /// Inline math functions: BASIC name -> x86-64 instruction
-/// These take Double in xmm0 and produce Double in xmm0
-static INLINE_MATH_FNS: phf::Map<&'static str, &'static str> = phf_map! {
-    "SQR" => "sqrtsd xmm0, xmm0",
-    "INT" => "roundsd xmm0, xmm0, 1",
-    "FIX" => "roundsd xmm0, xmm0, 3",
-};
+static INLINE_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
+    HashMap::from([
+        ("SQR", "sqrtsd xmm0, xmm0"),
+        ("INT", "roundsd xmm0, xmm0, 1"),
+        ("FIX", "roundsd xmm0, xmm0, 3"),
+    ])
+});
 
 /// Symbol prefix: underscore on macOS, empty on Linux
 #[cfg(target_os = "macos")]
