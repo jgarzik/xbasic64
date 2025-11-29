@@ -1,10 +1,15 @@
 //! Integration tests for the BASIC compiler
 
 use std::fs;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 fn compile_and_run(source: &str) -> Result<String, String> {
+    compile_and_run_with_stdin(source, "")
+}
+
+fn compile_and_run_with_stdin(source: &str, stdin_input: &str) -> Result<String, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let bas_file = tmp.path().join("test.bas");
     let exe_file = tmp.path().join("test");
@@ -27,10 +32,24 @@ fn compile_and_run(source: &str) -> Result<String, String> {
         ));
     }
 
-    // Run
-    let run_output = Command::new(&exe_file)
-        .output()
+    // Run with optional stdin
+    let mut child = Command::new(&exe_file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to run executable: {}", e))?;
+
+    if !stdin_input.is_empty() {
+        let child_stdin = child.stdin.as_mut().unwrap();
+        child_stdin
+            .write_all(stdin_input.as_bytes())
+            .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+    }
+
+    let run_output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for executable: {}", e))?;
 
     if !run_output.status.success() {
         return Err(format!(
@@ -939,4 +958,93 @@ PRINT X$ + Y$
     )
     .unwrap();
     assert_eq!(output.trim(), "Hello World");
+}
+
+// === Comment Tests ===
+
+#[test]
+fn test_rem_comment() {
+    let output = compile_and_run(
+        r#"
+REM This is a comment
+PRINT "before"
+REM Another comment
+PRINT "after"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "before\nafter");
+}
+
+// === STOP Statement Tests ===
+
+#[test]
+fn test_stop_statement() {
+    let output = compile_and_run(
+        r#"
+PRINT "before"
+STOP
+PRINT "after"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "before");
+}
+
+// === DIM Array Declaration Tests ===
+
+#[test]
+fn test_dim_single_array() {
+    let output = compile_and_run(
+        r#"
+DIM A(5)
+A(1) = 10
+A(3) = 30
+PRINT A(1)
+PRINT A(3)
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "10\n30");
+}
+
+// === INPUT Statement Tests ===
+
+#[test]
+fn test_input_number() {
+    let output = compile_and_run_with_stdin(
+        r#"
+INPUT X
+PRINT X * 2
+"#,
+        "21\n",
+    )
+    .unwrap();
+    assert!(output.contains("42"));
+}
+
+#[test]
+fn test_input_string() {
+    let output = compile_and_run_with_stdin(
+        r#"
+INPUT A$
+PRINT "Hello, "; A$
+"#,
+        "World\n",
+    )
+    .unwrap();
+    assert!(output.contains("Hello, World"));
+}
+
+#[test]
+fn test_line_input() {
+    let output = compile_and_run_with_stdin(
+        r#"
+LINE INPUT A$
+PRINT A$
+"#,
+        "Hello, World!\n",
+    )
+    .unwrap();
+    assert!(output.contains("Hello, World!"));
 }
