@@ -412,7 +412,7 @@ PRINT "Back from subroutine"
 END
 
 1000 PRINT "In subroutine"
-1000 RETURN
+1010 RETURN
 ```
 
 ### ON...GOTO
