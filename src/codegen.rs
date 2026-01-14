@@ -85,9 +85,9 @@
 //! This allows efficient substring operations without copying.
 //!
 //! - String values: `rax` = pointer to characters, `rdx` = length
-//! - String variables: Two consecutive 8-byte slots at `[rbp - offset]` (ptr) and
-//!   `[rbp - offset - 8]` (len), but we use `[rbp - offset]` as the base offset
-//!   and the runtime expects ptr in first position when loading
+//! - String variables: Two consecutive 8-byte slots at `[rbp + offset]` (ptr) and
+//!   `[rbp + offset - 8]` (len), where offset is negative (e.g., -8, -16).
+//!   The ptr is at higher address, len at lower address (stack grows downward).
 //!
 //! String literals are emitted in the `.data` section with labels `_str_N`.
 //!
