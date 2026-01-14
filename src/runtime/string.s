@@ -245,6 +245,7 @@ _rt_instr:
     push r13
     push r14
     push r15
+    sub rsp, 8              # Align stack for calls (6 pushes = 48 bytes, need +8 for 16-byte alignment)
     # Move arguments to callee-saved registers
     mov r12, rdi            # haystack ptr
     mov r13, rsi            # haystack len
@@ -286,7 +287,8 @@ _rt_instr:
 .Linstr_not_found:
     xor rax, rax            # return 0
 .Linstr_done:
-    # Restore callee-saved registers
+    # Restore stack and callee-saved registers
+    add rsp, 8              # Restore stack alignment
     pop r15
     pop r14
     pop r13
@@ -328,6 +330,7 @@ _rt_strcat:
     push r13
     push r14
     push r15
+    sub rsp, 16             # Allocate aligned space for temp storage
 
     # Save arguments in callee-saved registers
     mov r12, rdi            # left ptr
@@ -341,28 +344,28 @@ _rt_strcat:
     call {libc}malloc       # returns ptr in rax
 
     # Copy left string: memcpy(result, left, left_len)
+    mov QWORD PTR [rsp], rax    # save result ptr (aligned)
     mov rdi, rax            # dest = malloc result
     mov rsi, r12            # src = left ptr
     mov rdx, r13            # len = left len
-    push rax                # save result ptr
     call {libc}memcpy
 
     # Copy right string: memcpy(result + left_len, right, right_len)
-    pop rdi                 # result ptr
-    push rdi                # save again
+    mov rdi, QWORD PTR [rsp]    # restore result ptr
     add rdi, r13            # dest = result + left_len
     mov rsi, r14            # src = right ptr
     mov rdx, r15            # len = right len
     call {libc}memcpy
 
     # Null terminate (for safety)
-    pop rax                 # result ptr
+    mov rax, QWORD PTR [rsp]    # restore result ptr
     lea rcx, [r13 + r15]    # total length
     mov BYTE PTR [rax + rcx], 0
 
     # Return: rax = ptr (already set), rdx = total length
     mov rdx, rcx
 
+    add rsp, 16             # Deallocate temp storage
     pop r15
     pop r14
     pop r13

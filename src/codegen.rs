@@ -85,9 +85,9 @@
 //! This allows efficient substring operations without copying.
 //!
 //! - String values: `rax` = pointer to characters, `rdx` = length
-//! - String variables: Two consecutive 8-byte slots at `[rbp - offset]` (ptr) and
-//!   `[rbp - offset - 8]` (len), but we use `[rbp - offset]` as the base offset
-//!   and the runtime expects ptr in first position when loading
+//! - String variables: Two consecutive 8-byte slots at `[rbp + offset]` (ptr) and
+//!   `[rbp + offset - 8]` (len), where offset is negative (e.g., -8, -16).
+//!   The ptr is at higher address, len at lower address (stack grows downward).
 //!
 //! String literals are emitted in the `.data` section with labels `_str_N`.
 //!
@@ -558,8 +558,9 @@ impl CodeGen {
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
-        // Reserve stack space FIRST (before storing params)
-        self.emit("    sub rsp, 64  # local vars");
+        // Reserve stack space (will patch later with actual size)
+        let placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
+        self.emit(&placeholder);
 
         // Parameters are passed in registers (System V ABI)
         // Store them in the reserved stack space
@@ -600,19 +601,45 @@ impl CodeGen {
             self.gen_stmt(stmt);
         }
 
-        // Return
+        // Return - load return value into appropriate register based on type
         if is_function {
             let ret_info = &self.proc_vars[name];
-            // For now, return all values via xmm0 (will be type-aware later)
-            self.emit(&format!(
-                "    movsd xmm0, QWORD PTR [rbp + {}]",
-                ret_info.offset
-            ));
+            let offset = ret_info.offset;
+            let data_type = ret_info.data_type;
+            match data_type {
+                DataType::Integer => {
+                    self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", offset));
+                }
+                DataType::Long => {
+                    self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", offset));
+                }
+                DataType::Single => {
+                    self.emit(&format!("    movss xmm0, DWORD PTR [rbp + {}]", offset));
+                }
+                DataType::Double => {
+                    self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", offset));
+                }
+                DataType::String => {
+                    // Load string (ptr, len) into rax, rdx
+                    self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
+                }
+            }
         }
 
         self.emit("    leave");
         self.emit("    ret");
         self.emit("");
+
+        // Patch the stack reserve placeholder with actual size
+        let stack_needed = -self.stack_offset;
+        let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
+        let old_placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
+        let new_instruction = format!(
+            "    sub rsp, {}        # STACK_RESERVE_PROC_{}",
+            stack_size, name
+        );
+        self.output = self.output.replace(&old_placeholder, &new_instruction);
 
         self.current_proc = None;
         self.stack_offset = old_stack_offset;
