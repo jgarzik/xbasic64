@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::Token;
+use std::collections::HashSet;
 
 /// Binary operator precedence levels (higher = tighter binding)
 /// Returns (precedence, BinaryOp) or None if not a binary operator
@@ -171,7 +172,6 @@ pub enum GotoTarget {
 pub enum Expr {
     Literal(Literal),
     Variable(String),
-    #[allow(dead_code)] // Part of AST, will be used when multi-dimensional arrays are implemented
     ArrayAccess {
         name: String,
         indices: Vec<Expr>,
@@ -266,6 +266,8 @@ pub struct Parser {
     last_loop_is_until: bool,
     /// Stores condition from ELSEIF for nested IF construction
     last_elseif_condition: Option<Expr>,
+    /// Tracks declared array names for distinguishing array access from function calls
+    declared_arrays: HashSet<String>,
 }
 
 impl Parser {
@@ -1004,6 +1006,9 @@ impl Parser {
             let dimensions = self.parse_expr_list()?;
             self.expect(Token::RParen)?;
 
+            // Track this array name for later use in parse_primary
+            self.declared_arrays.insert(name.to_uppercase());
+
             arrays.push(ArrayDecl { name, dimensions });
 
             if matches!(self.peek(), Token::Comma) {
@@ -1292,10 +1297,15 @@ impl Parser {
                     let args = self.parse_expr_list()?;
                     self.expect(Token::RParen)?;
 
-                    // Could be array access or function call
-                    // We'll treat everything as function call for now
-                    // and distinguish during codegen based on known functions
-                    Ok(Expr::FnCall { name, args })
+                    // Distinguish array access from function call based on DIM declarations
+                    if self.declared_arrays.contains(&name.to_uppercase()) {
+                        Ok(Expr::ArrayAccess {
+                            name,
+                            indices: args,
+                        })
+                    } else {
+                        Ok(Expr::FnCall { name, args })
+                    }
                 } else {
                     Ok(Expr::Variable(name))
                 }
