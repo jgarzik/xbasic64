@@ -63,7 +63,6 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 ## Documentation
 
 - **[Language Reference](LANGREF.md)** - Complete guide to the supported BASIC dialect
-- **[Design Specification](design.md)** - Internal compiler architecture and design decisions
 
 ## Architecture
 
