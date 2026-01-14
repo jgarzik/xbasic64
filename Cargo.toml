@@ -1,7 +1,7 @@
 [package]
 name = "xbasic64"
 version = "1.0.1"
-edition = "2021"
+edition = "2024"
 authors = ["Jeff Garzik <jgarzik@pobox.com>"]
 description = "A BASIC-to-x86_64 native code compiler targeting 1980s-era BASIC dialects"
 license = "MIT"
@@ -11,10 +11,13 @@ documentation = "https://docs.rs/xbasic64"
 readme = "README.md"
 keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
 categories = ["compilers", "command-line-utilities", "development-tools"]
-rust-version = "1.80"
+rust-version = "1.85"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+lto = true
