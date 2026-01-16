@@ -444,9 +444,9 @@ mod tests {
 
     #[test]
     fn test_float_literal_decimal() {
-        let mut lexer = Lexer::new("X = 3.14159");
+        let mut lexer = Lexer::new("X = 1.23456");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[2], Token::Float(3.14159));
+        assert_eq!(tokens[2], Token::Float(1.23456));
     }
 
     #[test]
@@ -783,13 +783,13 @@ mod tests {
 
     #[test]
     fn test_function_call() {
-        let mut lexer = Lexer::new("X = SIN(3.14) + COS(0)");
+        let mut lexer = Lexer::new("X = SIN(1.23) + COS(0)");
         let tokens = lexer.tokenize().unwrap();
         assert_eq!(tokens[0], Token::Ident("X".to_string()));
         assert_eq!(tokens[1], Token::Eq);
         assert_eq!(tokens[2], Token::Ident("SIN".to_string()));
         assert_eq!(tokens[3], Token::LParen);
-        assert_eq!(tokens[4], Token::Float(3.14));
+        assert_eq!(tokens[4], Token::Float(1.23));
         assert_eq!(tokens[5], Token::RParen);
         assert_eq!(tokens[6], Token::Plus);
         assert_eq!(tokens[7], Token::Ident("COS".to_string()));

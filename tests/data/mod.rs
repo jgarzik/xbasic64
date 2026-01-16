@@ -1,4 +1,4 @@
-//! DATA/READ/RESTORE tests
+//! DATA/READ/RESTORE tests (consolidated)
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -6,7 +6,8 @@
 use crate::common::compile_and_run;
 
 #[test]
-fn test_data_read() {
+fn test_data_read_restore() {
+    // Test DATA/READ and RESTORE
     let output = compile_and_run(
         r#"
 DATA 10, 20, 30
@@ -14,25 +15,14 @@ READ A
 READ B
 READ C
 PRINT A + B + C
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "60");
-}
-
-#[test]
-fn test_data_restore() {
-    let output = compile_and_run(
-        r#"
 DATA 5, 10
-READ A
-READ B
 RESTORE
-READ C
-PRINT A + B + C
+READ D
+PRINT D
 "#,
     )
     .unwrap();
-    // A=5, B=10, C=5 (restored)
-    assert_eq!(output.trim(), "20");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "60", "data read sum");
+    assert_eq!(lines[1], "10", "restore reads first data");
 }

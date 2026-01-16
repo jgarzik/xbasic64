@@ -1,4 +1,4 @@
-//! String function tests
+//! String function tests (consolidated)
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -6,96 +6,37 @@
 use crate::common::compile_and_run;
 
 #[test]
-fn test_len_function() {
-    let output = compile_and_run(r#"PRINT LEN("Hello")"#).unwrap();
-    assert_eq!(output.trim(), "5");
-}
-
-#[test]
-fn test_left_right() {
+fn test_string_functions() {
+    // Test LEN, LEFT$, RIGHT$, MID$, CHR$, ASC, VAL, STR$, INSTR
     let output = compile_and_run(
         r#"
+PRINT LEN("Hello")
 PRINT LEFT$("Hello", 2)
 PRINT RIGHT$("Hello", 2)
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["He", "lo"]);
-}
-
-#[test]
-fn test_mid_function() {
-    let output = compile_and_run(r#"PRINT MID$("Hello", 2, 3)"#).unwrap();
-    assert_eq!(output.trim(), "ell");
-}
-
-#[test]
-fn test_chr_asc() {
-    let output = compile_and_run(
-        r#"
+PRINT MID$("Hello", 2, 3)
 PRINT CHR$(65)
 PRINT ASC("A")
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["A", "65"]);
-}
-
-#[test]
-fn test_val_str() {
-    let output = compile_and_run(
-        r#"
-X = VAL("42")
-PRINT X + 8
+X = VAL("42"): PRINT X + 8
 PRINT STR$(100)
+PRINT INSTR("Hello World", "World")
 "#,
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["50", "100"]);
+    assert_eq!(lines[0], "5", "len");
+    assert_eq!(lines[1], "He", "left$");
+    assert_eq!(lines[2], "lo", "right$");
+    assert_eq!(lines[3], "ell", "mid$");
+    assert_eq!(lines[4], "A", "chr$");
+    assert_eq!(lines[5], "65", "asc");
+    assert_eq!(lines[6], "50", "val");
+    assert_eq!(lines[7], "100", "str$");
+    assert_eq!(lines[8], "7", "instr");
 }
 
 #[test]
-fn test_instr_function() {
-    let output = compile_and_run(r#"PRINT INSTR("Hello World", "World")"#).unwrap();
-    assert_eq!(output.trim(), "7");
-}
-
-#[test]
-fn test_left_with_nested_call() {
-    // Test LEFT$ with nested function call in count argument
-    let output = compile_and_run(
-        r#"
-A$ = "HELLO"
-B$ = "WORLD"
-PRINT LEFT$(A$ + B$, LEN(A$))
-"#,
-    )
-    .unwrap();
-    // A$+B$ = "HELLOWORLD", LEN(A$) = 5, LEFT$ takes first 5 chars
-    assert_eq!(output.trim(), "HELLO");
-}
-
-#[test]
-fn test_right_with_nested_call() {
-    // Test RIGHT$ with nested function call in count argument
-    let output = compile_and_run(
-        r#"
-A$ = "HELLO"
-B$ = "WORLD"
-PRINT RIGHT$(A$ + B$, LEN(B$))
-"#,
-    )
-    .unwrap();
-    // A$+B$ = "HELLOWORLD", LEN(B$) = 5, RIGHT$ takes last 5 chars
-    assert_eq!(output.trim(), "WORLD");
-}
-
-#[test]
-fn test_mid_with_nested_calls() {
-    // Test MID$ with nested function calls in position and count arguments
+fn test_nested_string_calls() {
+    // Test LEFT$, RIGHT$, MID$ with nested function calls
     let output = compile_and_run(
         r#"
 FUNCTION GetStart()
@@ -106,12 +47,18 @@ FUNCTION GetLen()
     GetLen = 3
 END FUNCTION
 
+A$ = "HELLO"
+B$ = "WORLD"
+PRINT LEFT$(A$ + B$, LEN(A$))
+PRINT RIGHT$(A$ + B$, LEN(B$))
 PRINT MID$("ABCDEF", GetStart(), GetLen())
 "#,
     )
     .unwrap();
-    // MID$("ABCDEF", 2, 3) = "BCD"
-    assert_eq!(output.trim(), "BCD");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "HELLO", "left$ with len()");
+    assert_eq!(lines[1], "WORLD", "right$ with len()");
+    assert_eq!(lines[2], "BCD", "mid$ with functions");
 }
 
 #[test]
