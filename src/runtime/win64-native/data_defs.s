@@ -17,5 +17,5 @@ _fmt_float: .asciz "%g"
 
 # Error messages
 _gosub_overflow_msg: .ascii "Error: GOSUB stack overflow\r\n"
-.equ _gosub_overflow_msg_len, 29
+.equ _gosub_overflow_msg_len, 30
 
