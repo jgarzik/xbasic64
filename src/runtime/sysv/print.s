@@ -130,3 +130,22 @@ _rt_print_float:
 .Lprint_float_done:
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_gosub_overflow - Handle GOSUB stack overflow error
+# ------------------------------------------------------------------------------
+# Called when the GOSUB return stack is exhausted. Prints an error message
+# and terminates the program with exit code 1.
+#
+# Arguments: none
+# Returns: never (calls exit)
+# ------------------------------------------------------------------------------
+.globl _rt_gosub_overflow
+_rt_gosub_overflow:
+    push rbp
+    mov rbp, rsp
+    lea rdi, [rip + _gosub_overflow_msg]
+    xor eax, eax
+    call {libc}printf
+    mov edi, 1              # exit code 1
+    call {libc}exit

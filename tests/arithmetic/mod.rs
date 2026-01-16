@@ -1,4 +1,4 @@
-//! Arithmetic and operator tests
+//! Arithmetic and operator tests (consolidated)
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -6,114 +6,70 @@
 use crate::common::compile_and_run;
 
 #[test]
-fn test_arithmetic_add() {
-    let output = compile_and_run("PRINT 10 + 5").unwrap();
-    assert_eq!(output.trim(), "15");
-}
-
-#[test]
-fn test_arithmetic_sub() {
-    let output = compile_and_run("PRINT 10 - 3").unwrap();
-    assert_eq!(output.trim(), "7");
-}
-
-#[test]
-fn test_arithmetic_mul() {
-    let output = compile_and_run("PRINT 6 * 7").unwrap();
-    assert_eq!(output.trim(), "42");
-}
-
-#[test]
-fn test_expression_precedence() {
-    let output = compile_and_run("PRINT 2 + 3 * 4").unwrap();
-    assert_eq!(output.trim(), "14");
-}
-
-#[test]
-fn test_parentheses() {
-    let output = compile_and_run("PRINT (2 + 3) * 4").unwrap();
-    assert_eq!(output.trim(), "20");
-}
-
-#[test]
-fn test_negative_numbers() {
-    let output = compile_and_run("PRINT -5 + 10").unwrap();
-    assert_eq!(output.trim(), "5");
-}
-
-#[test]
-fn test_arithmetic_division() {
-    let output = compile_and_run("PRINT 10 / 4").unwrap();
-    assert_eq!(output.trim(), "2.5");
-}
-
-#[test]
-fn test_arithmetic_integer_division() {
-    let output = compile_and_run("PRINT 10 \\ 4").unwrap();
-    assert_eq!(output.trim(), "2");
-}
-
-#[test]
-fn test_arithmetic_mod() {
-    let output = compile_and_run("PRINT 10 MOD 3").unwrap();
-    assert_eq!(output.trim(), "1");
-}
-
-#[test]
-fn test_arithmetic_power() {
-    let output = compile_and_run("PRINT 2 ^ 10").unwrap();
-    assert_eq!(output.trim(), "1024");
-}
-
-#[test]
-fn test_logical_and() {
+fn test_basic_arithmetic() {
+    // Tests: add, sub, mul, division, integer_division, mod, power
     let output = compile_and_run(
         r#"
-IF 1 AND 1 THEN PRINT "yes"
-IF 1 AND 0 THEN PRINT "no"
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "yes");
-}
-
-#[test]
-fn test_logical_or() {
-    let output = compile_and_run(
-        r#"
-IF 0 OR 1 THEN PRINT "yes"
-IF 0 OR 0 THEN PRINT "no"
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "yes");
-}
-
-#[test]
-fn test_logical_not() {
-    let output = compile_and_run(
-        r#"
-IF NOT 0 THEN PRINT "yes"
-IF NOT 1 THEN PRINT "no"
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "yes");
-}
-
-#[test]
-fn test_logical_xor() {
-    let output = compile_and_run(
-        r#"
-IF 1 XOR 0 THEN PRINT "a"
-IF 0 XOR 1 THEN PRINT "b"
-IF 1 XOR 1 THEN PRINT "c"
-IF 0 XOR 0 THEN PRINT "d"
+PRINT 10 + 5
+PRINT 10 - 3
+PRINT 6 * 7
+PRINT 10 / 4
+PRINT 10 \ 4
+PRINT 10 MOD 3
+PRINT 2 ^ 10
 "#,
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["a", "b"]);
+    assert_eq!(lines[0], "15", "add");
+    assert_eq!(lines[1], "7", "sub");
+    assert_eq!(lines[2], "42", "mul");
+    assert_eq!(lines[3], "2.5", "division");
+    assert_eq!(lines[4], "2", "integer division");
+    assert_eq!(lines[5], "1", "mod");
+    assert_eq!(lines[6], "1024", "power");
+}
+
+#[test]
+fn test_expressions() {
+    // Tests: precedence, parentheses, negative numbers
+    let output = compile_and_run(
+        r#"
+PRINT 2 + 3 * 4
+PRINT (2 + 3) * 4
+PRINT -5 + 10
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "14", "precedence");
+    assert_eq!(lines[1], "20", "parentheses");
+    assert_eq!(lines[2], "5", "negative");
+}
+
+#[test]
+fn test_logical_operators() {
+    // Tests: AND, OR, NOT, XOR
+    let output = compile_and_run(
+        r#"
+IF 1 AND 1 THEN PRINT "and-yes"
+IF 1 AND 0 THEN PRINT "and-no"
+IF 0 OR 1 THEN PRINT "or-yes"
+IF 0 OR 0 THEN PRINT "or-no"
+IF NOT 0 THEN PRINT "not-yes"
+IF NOT 1 THEN PRINT "not-no"
+IF 1 XOR 0 THEN PRINT "xor-a"
+IF 0 XOR 1 THEN PRINT "xor-b"
+IF 1 XOR 1 THEN PRINT "xor-c"
+IF 0 XOR 0 THEN PRINT "xor-d"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["and-yes", "or-yes", "not-yes", "xor-a", "xor-b"]
+    );
 }
 
 #[test]
@@ -133,379 +89,102 @@ IF 5 <> 6 THEN PRINT "ok6"
     assert_eq!(lines.len(), 6);
 }
 
-// ============================================
-// Same-type arithmetic tests for Integer (%)
-// ============================================
-
 #[test]
-fn test_integer_add() {
+fn test_integer_arithmetic() {
+    // Tests: Integer (%) add, sub, mul, div, intdiv, mod, power, neg
     let output = compile_and_run(
         r#"
-A% = 100
-B% = 50
-PRINT A% + B%
+A% = 100: B% = 50: PRINT A% + B%
+A% = 100: B% = 30: PRINT A% - B%
+A% = 12: B% = 5: PRINT A% * B%
+A% = 7: B% = 2: PRINT A% / B%
+A% = 17: B% = 5: PRINT A% \ B%
+A% = 17: B% = 5: PRINT A% MOD B%
+A% = 2: B% = 8: PRINT A% ^ B%
+A% = 42: PRINT -A%
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "150");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "150", "int add");
+    assert_eq!(lines[1], "70", "int sub");
+    assert_eq!(lines[2], "60", "int mul");
+    assert_eq!(lines[3], "3.5", "int div");
+    assert_eq!(lines[4], "3", "int intdiv");
+    assert_eq!(lines[5], "2", "int mod");
+    assert_eq!(lines[6], "256", "int power");
+    assert_eq!(lines[7], "-42", "int neg");
 }
 
 #[test]
-fn test_integer_sub() {
+fn test_long_arithmetic() {
+    // Tests: Long (&) add, sub, mul, div, intdiv, mod, power, neg
     let output = compile_and_run(
         r#"
-A% = 100
-B% = 30
-PRINT A% - B%
+A& = 100000: B& = 50000: PRINT A& + B&
+A& = 100000: B& = 30000: PRINT A& - B&
+A& = 1000: B& = 500: PRINT A& * B&
+A& = 7: B& = 2: PRINT A& / B&
+A& = 100: B& = 30: PRINT A& \ B&
+A& = 100: B& = 30: PRINT A& MOD B&
+A& = 3: B& = 5: PRINT A& ^ B&
+A& = 12345: PRINT -A&
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "70");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "150000", "long add");
+    assert_eq!(lines[1], "70000", "long sub");
+    assert_eq!(lines[2], "500000", "long mul");
+    assert_eq!(lines[3], "3.5", "long div");
+    assert_eq!(lines[4], "3", "long intdiv");
+    assert_eq!(lines[5], "10", "long mod");
+    assert_eq!(lines[6], "243", "long power");
+    assert_eq!(lines[7], "-12345", "long neg");
 }
 
 #[test]
-fn test_integer_mul() {
+fn test_single_arithmetic() {
+    // Tests: Single (!) add, sub, mul, div, power, neg
     let output = compile_and_run(
         r#"
-A% = 12
-B% = 5
-PRINT A% * B%
+A! = 1.5: B! = 2.5: PRINT A! + B!
+A! = 5.5: B! = 2.25: PRINT A! - B!
+A! = 2.5: B! = 4.0: PRINT A! * B!
+A! = 10.0: B! = 4.0: PRINT A! / B!
+A! = 2.0: B! = 3.0: PRINT A! ^ B!
+A! = 3.14: PRINT -A!
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "60");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "4", "single add");
+    assert_eq!(lines[1], "3.25", "single sub");
+    assert_eq!(lines[2], "10", "single mul");
+    assert_eq!(lines[3], "2.5", "single div");
+    assert_eq!(lines[4], "8", "single power");
+    assert_eq!(lines[5], "-3.14", "single neg");
 }
 
 #[test]
-fn test_integer_div() {
-    // Division always produces Double
+fn test_double_arithmetic() {
+    // Tests: Double (#) add, sub, mul, div, power, neg
     let output = compile_and_run(
         r#"
-A% = 7
-B% = 2
-PRINT A% / B%
+A# = 1.5: B# = 2.5: PRINT A# + B#
+A# = 100.75: B# = 50.25: PRINT A# - B#
+A# = 3.5: B# = 2.0: PRINT A# * B#
+A# = 15.0: B# = 4.0: PRINT A# / B#
+A# = 2.0: B# = 10.0: PRINT A# ^ B#
+A# = 2.71828: PRINT -A#
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "3.5");
-}
-
-#[test]
-fn test_integer_intdiv() {
-    let output = compile_and_run(
-        r#"
-A% = 17
-B% = 5
-PRINT A% \ B%
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "3");
-}
-
-#[test]
-fn test_integer_mod() {
-    let output = compile_and_run(
-        r#"
-A% = 17
-B% = 5
-PRINT A% MOD B%
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "2");
-}
-
-#[test]
-fn test_integer_power() {
-    let output = compile_and_run(
-        r#"
-A% = 2
-B% = 8
-PRINT A% ^ B%
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "256");
-}
-
-#[test]
-fn test_integer_neg() {
-    let output = compile_and_run(
-        r#"
-A% = 42
-PRINT -A%
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "-42");
-}
-
-// ============================================
-// Same-type arithmetic tests for Long (&)
-// ============================================
-
-#[test]
-fn test_long_add() {
-    let output = compile_and_run(
-        r#"
-A& = 100000
-B& = 50000
-PRINT A& + B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "150000");
-}
-
-#[test]
-fn test_long_sub() {
-    let output = compile_and_run(
-        r#"
-A& = 100000
-B& = 30000
-PRINT A& - B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "70000");
-}
-
-#[test]
-fn test_long_mul() {
-    let output = compile_and_run(
-        r#"
-A& = 1000
-B& = 500
-PRINT A& * B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "500000");
-}
-
-#[test]
-fn test_long_div() {
-    let output = compile_and_run(
-        r#"
-A& = 7
-B& = 2
-PRINT A& / B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "3.5");
-}
-
-#[test]
-fn test_long_intdiv() {
-    let output = compile_and_run(
-        r#"
-A& = 100
-B& = 30
-PRINT A& \ B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "3");
-}
-
-#[test]
-fn test_long_mod() {
-    let output = compile_and_run(
-        r#"
-A& = 100
-B& = 30
-PRINT A& MOD B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "10");
-}
-
-#[test]
-fn test_long_power() {
-    let output = compile_and_run(
-        r#"
-A& = 3
-B& = 5
-PRINT A& ^ B&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "243");
-}
-
-#[test]
-fn test_long_neg() {
-    let output = compile_and_run(
-        r#"
-A& = 12345
-PRINT -A&
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "-12345");
-}
-
-// ============================================
-// Same-type arithmetic tests for Single (!)
-// ============================================
-
-#[test]
-fn test_single_add() {
-    let output = compile_and_run(
-        r#"
-A! = 1.5
-B! = 2.5
-PRINT A! + B!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "4");
-}
-
-#[test]
-fn test_single_sub() {
-    let output = compile_and_run(
-        r#"
-A! = 5.5
-B! = 2.25
-PRINT A! - B!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "3.25");
-}
-
-#[test]
-fn test_single_mul() {
-    let output = compile_and_run(
-        r#"
-A! = 2.5
-B! = 4.0
-PRINT A! * B!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "10");
-}
-
-#[test]
-fn test_single_div() {
-    let output = compile_and_run(
-        r#"
-A! = 10.0
-B! = 4.0
-PRINT A! / B!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "2.5");
-}
-
-#[test]
-fn test_single_power() {
-    let output = compile_and_run(
-        r#"
-A! = 2.0
-B! = 3.0
-PRINT A! ^ B!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "8");
-}
-
-#[test]
-fn test_single_neg() {
-    let output = compile_and_run(
-        r#"
-A! = 3.14
-PRINT -A!
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "-3.14");
-}
-
-// ============================================
-// Same-type arithmetic tests for Double (#)
-// ============================================
-
-#[test]
-fn test_double_add() {
-    let output = compile_and_run(
-        r#"
-A# = 1.5
-B# = 2.5
-PRINT A# + B#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "4");
-}
-
-#[test]
-fn test_double_sub() {
-    let output = compile_and_run(
-        r#"
-A# = 100.75
-B# = 50.25
-PRINT A# - B#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "50.5");
-}
-
-#[test]
-fn test_double_mul() {
-    let output = compile_and_run(
-        r#"
-A# = 3.5
-B# = 2.0
-PRINT A# * B#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "7");
-}
-
-#[test]
-fn test_double_div() {
-    let output = compile_and_run(
-        r#"
-A# = 15.0
-B# = 4.0
-PRINT A# / B#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "3.75");
-}
-
-#[test]
-fn test_double_power() {
-    let output = compile_and_run(
-        r#"
-A# = 2.0
-B# = 10.0
-PRINT A# ^ B#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "1024");
-}
-
-#[test]
-fn test_double_neg() {
-    let output = compile_and_run(
-        r#"
-A# = 2.71828
-PRINT -A#
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "-2.71828");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "4", "double add");
+    assert_eq!(lines[1], "50.5", "double sub");
+    assert_eq!(lines[2], "7", "double mul");
+    assert_eq!(lines[3], "3.75", "double div");
+    assert_eq!(lines[4], "1024", "double power");
+    assert_eq!(lines[5], "-2.71828", "double neg");
 }

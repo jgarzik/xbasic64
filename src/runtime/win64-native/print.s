@@ -178,3 +178,33 @@ _rt_print_float:
 
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_gosub_overflow - Handle GOSUB stack overflow error
+# ------------------------------------------------------------------------------
+# Called when the GOSUB return stack is exhausted. Prints an error message
+# and terminates the program with exit code 1.
+#
+# Arguments: none
+# Returns: never (calls ExitProcess)
+# ------------------------------------------------------------------------------
+.globl _rt_gosub_overflow
+_rt_gosub_overflow:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48
+
+    # Get stdout handle
+    lea rax, [rip + _stdout_handle]
+    mov rcx, [rax]
+
+    # WriteFile(handle, message, length, &bytesWritten, NULL)
+    lea rdx, [rip + _gosub_overflow_msg]
+    mov r8, _gosub_overflow_msg_len
+    lea r9, [rip + _bytes_written]
+    mov QWORD PTR [rsp + 32], 0
+    call WriteFile
+
+    # ExitProcess(1)
+    mov ecx, 1
+    call ExitProcess

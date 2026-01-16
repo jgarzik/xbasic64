@@ -1,4 +1,4 @@
-//! Control flow tests
+//! Control flow tests (consolidated)
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -6,45 +6,20 @@
 use crate::common::compile_and_run;
 
 #[test]
-fn test_for_loop() {
+fn test_for_loops() {
+    // Test FOR loop, STEP positive, STEP negative
     let output = compile_and_run(
         r#"
-FOR I = 1 TO 5
-    PRINT I
-NEXT I
+FOR I = 1 TO 3: PRINT I: NEXT I
+FOR I = 0 TO 6 STEP 2: PRINT I: NEXT I
+FOR I = 3 TO 1 STEP -1: PRINT I: NEXT I
 "#,
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["1", "2", "3", "4", "5"]);
-}
-
-#[test]
-fn test_for_step_positive() {
-    let output = compile_and_run(
-        r#"
-FOR I = 0 TO 10 STEP 2
-    PRINT I
-NEXT I
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["0", "2", "4", "6", "8", "10"]);
-}
-
-#[test]
-fn test_for_step_negative() {
-    let output = compile_and_run(
-        r#"
-FOR I = 5 TO 1 STEP -1
-    PRINT I
-NEXT I
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["5", "4", "3", "2", "1"]);
+    assert_eq!(&lines[0..3], &["1", "2", "3"], "for basic");
+    assert_eq!(&lines[3..7], &["0", "2", "4", "6"], "for step+");
+    assert_eq!(&lines[7..10], &["3", "2", "1"], "for step-");
 }
 
 #[test]
@@ -64,7 +39,8 @@ WEND
 }
 
 #[test]
-fn test_do_loop_while() {
+fn test_do_loops() {
+    // Test DO WHILE, DO UNTIL, DO...LOOP WHILE
     let output = compile_and_run(
         r#"
 X = 1
@@ -72,33 +48,11 @@ DO WHILE X <= 3
     PRINT X
     X = X + 1
 LOOP
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["1", "2", "3"]);
-}
-
-#[test]
-fn test_do_loop_until() {
-    let output = compile_and_run(
-        r#"
 X = 1
 DO UNTIL X > 3
     PRINT X
     X = X + 1
 LOOP
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["1", "2", "3"]);
-}
-
-#[test]
-fn test_do_loop_while_post() {
-    let output = compile_and_run(
-        r#"
 X = 1
 DO
     PRINT X
@@ -108,11 +62,14 @@ LOOP WHILE X <= 3
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["1", "2", "3"]);
+    assert_eq!(&lines[0..3], &["1", "2", "3"], "do while");
+    assert_eq!(&lines[3..6], &["1", "2", "3"], "do until");
+    assert_eq!(&lines[6..9], &["1", "2", "3"], "do...loop while");
 }
 
 #[test]
-fn test_if_then_else() {
+fn test_if_statements() {
+    // Test IF/THEN/ELSE and ELSEIF
     let output = compile_and_run(
         r#"
 X = 10
@@ -121,32 +78,12 @@ IF X > 5 THEN
 ELSE
     PRINT "small"
 END IF
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "big");
-}
-
-#[test]
-fn test_if_then_else_false() {
-    let output = compile_and_run(
-        r#"
 X = 3
 IF X > 5 THEN
     PRINT "big"
 ELSE
     PRINT "small"
 END IF
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "small");
-}
-
-#[test]
-fn test_elseif() {
-    let output = compile_and_run(
-        r#"
 X = 2
 IF X = 1 THEN
     PRINT "one"
@@ -160,63 +97,49 @@ END IF
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "two");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "big", "if true");
+    assert_eq!(lines[1], "small", "if false");
+    assert_eq!(lines[2], "two", "elseif");
 }
 
 #[test]
-fn test_goto() {
+fn test_goto_gosub() {
+    // Test GOTO, GOSUB/RETURN, ON GOTO
     let output = compile_and_run(
         r#"
 10 PRINT "A"
 20 GOTO 40
 30 PRINT "B"
 40 PRINT "C"
-"#,
-    )
-    .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["A", "C"]);
-}
-
-#[test]
-fn test_gosub_return() {
-    let output = compile_and_run(
-        r#"
-10 PRINT "start"
-20 GOSUB 100
-30 PRINT "end"
-40 END
+50 GOSUB 100
+60 PRINT "end"
+70 X = 2
+80 ON X GOTO 200, 300, 400
+90 PRINT "none"
+95 END
 100 PRINT "in sub"
 110 RETURN
+200 PRINT "first"
+210 END
+300 PRINT "second"
+310 END
+400 PRINT "third"
+410 END
 "#,
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["start", "in sub", "end"]);
-}
-
-#[test]
-fn test_on_goto() {
-    let output = compile_and_run(
-        r#"
-10 X = 2
-20 ON X GOTO 100, 200, 300
-30 PRINT "none"
-40 END
-100 PRINT "first"
-110 END
-200 PRINT "second"
-210 END
-300 PRINT "third"
-310 END
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "second");
+    assert_eq!(lines[0], "A", "before goto");
+    assert_eq!(lines[1], "C", "after goto");
+    assert_eq!(lines[2], "in sub", "gosub");
+    assert_eq!(lines[3], "end", "after return");
+    assert_eq!(lines[4], "second", "on goto");
 }
 
 #[test]
 fn test_select_case() {
+    // Test SELECT CASE and CASE ELSE
     let output = compile_and_run(
         r#"
 X = 2
@@ -230,16 +153,6 @@ SELECT CASE X
     CASE ELSE
         PRINT "other"
 END SELECT
-"#,
-    )
-    .unwrap();
-    assert_eq!(output.trim(), "two");
-}
-
-#[test]
-fn test_select_case_else() {
-    let output = compile_and_run(
-        r#"
 X = 99
 SELECT CASE X
     CASE 1
@@ -252,11 +165,14 @@ END SELECT
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "other");
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "two", "case match");
+    assert_eq!(lines[1], "other", "case else");
 }
 
 #[test]
-fn test_end_statement() {
+fn test_end_stop() {
+    // Test END and STOP statements
     let output = compile_and_run(
         r#"
 PRINT "before"
@@ -265,12 +181,9 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "before");
-}
+    assert_eq!(output.trim(), "before", "end");
 
-#[test]
-fn test_stop_statement() {
-    let output = compile_and_run(
+    let output2 = compile_and_run(
         r#"
 PRINT "before"
 STOP
@@ -278,5 +191,46 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "before");
+    assert_eq!(output2.trim(), "before", "stop");
+}
+
+#[test]
+fn test_gosub_stress() {
+    // Test GOSUB with many calls and nested calls
+    let output = compile_and_run(
+        r#"
+X = 0
+FOR I = 1 TO 500
+    GOSUB 100
+NEXT I
+PRINT X
+GOSUB 200
+PRINT "done"
+END
+
+100 X = X + 1
+RETURN
+
+200 PRINT "L1 start"
+GOSUB 300
+PRINT "L1 end"
+RETURN
+
+300 PRINT "L2 start"
+GOSUB 400
+PRINT "L2 end"
+RETURN
+
+400 PRINT "L3"
+RETURN
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "500", "many gosub");
+    assert_eq!(
+        &lines[1..7],
+        &["L1 start", "L2 start", "L3", "L2 end", "L1 end", "done"],
+        "nested gosub"
+    );
 }

@@ -12,3 +12,4 @@ _chr_buf: .skip 2
 _str_buf: .skip 64
 _rng_state: .quad 0x12345678DEADBEEF
 _cls_seq: .asciz "\033[2J\033[H"
+_gosub_overflow_msg: .asciz "Error: GOSUB stack overflow\n"
