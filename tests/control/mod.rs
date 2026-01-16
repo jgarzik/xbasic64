@@ -280,3 +280,54 @@ PRINT "after"
     .unwrap();
     assert_eq!(output.trim(), "before");
 }
+
+#[test]
+fn test_gosub_many_calls() {
+    // Test GOSUB with many calls to stress the return stack
+    let output = compile_and_run(
+        r#"
+X = 0
+FOR I = 1 TO 500
+    GOSUB 100
+NEXT I
+PRINT X
+END
+
+100 X = X + 1
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "500");
+}
+
+#[test]
+fn test_gosub_nested() {
+    // Test nested GOSUB calls
+    let output = compile_and_run(
+        r#"
+GOSUB 100
+PRINT "done"
+END
+
+100 PRINT "L1 start"
+GOSUB 200
+PRINT "L1 end"
+RETURN
+
+200 PRINT "L2 start"
+GOSUB 300
+PRINT "L2 end"
+RETURN
+
+300 PRINT "L3"
+RETURN
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["L1 start", "L2 start", "L3", "L2 end", "L1 end", "done"]
+    );
+}

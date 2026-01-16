@@ -191,6 +191,12 @@ const WIN64_5TH_ARG_OFFSET: i32 = 32;
 /// Stack space for temporary values (must be 16-byte aligned)
 const STACK_TEMP_SPACE: i32 = 16;
 
+/// Maximum expression nesting depth before warning (each level uses 16 bytes of stack)
+const MAX_EXPR_DEPTH: u32 = 256;
+
+/// GOSUB stack size in bytes (64K entries * 8 bytes = 512KB)
+const GOSUB_STACK_SIZE: i32 = 524288;
+
 /// ASCII character codes
 const ASCII_TAB: i64 = 9;
 
@@ -223,6 +229,7 @@ pub struct CodeGen {
     current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
     gosub_used: bool,               // whether GOSUB is used (need return stack)
+    expr_depth: u32,                // current expression nesting depth
 }
 
 impl CodeGen {
@@ -532,7 +539,10 @@ impl CodeGen {
         // Initialize GOSUB return stack if needed
         if self.gosub_used {
             self.emit("    # Initialize GOSUB return stack");
-            self.emit("    lea rax, [rip + _gosub_stack + 8192]"); // Point to end (stack grows down)
+            self.emit(&format!(
+                "    lea rax, [rip + _gosub_stack + {}]",
+                GOSUB_STACK_SIZE
+            )); // Point to end (stack grows down)
             self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
@@ -628,8 +638,10 @@ impl CodeGen {
         self.emit(&placeholder);
 
         // Parameters are passed in registers (per platform ABI)
-        // Store them in the reserved stack space
+        // First N params in registers, rest on stack at [rbp+16], [rbp+24], etc.
+        // Store them all in our local stack space
         let int_regs = PlatformAbi::INT_ARG_REGS;
+        let max_reg_args = int_regs.len();
         for (i, param) in params.iter().enumerate() {
             self.stack_offset -= 8;
             let data_type = DataType::from_suffix(param);
@@ -640,10 +652,23 @@ impl CodeGen {
                     data_type,
                 },
             );
-            if i < int_regs.len() {
+            if i < max_reg_args {
+                // Parameter in register - store to our local stack
                 self.emit(&format!(
                     "    mov QWORD PTR [rbp + {}], {}",
                     self.stack_offset, int_regs[i]
+                ));
+            } else {
+                // Parameter on call stack - copy to our local stack
+                // Overflow args are at [rbp+16], [rbp+24], etc. (after saved rbp and ret addr)
+                let stack_arg_offset = 16 + (i - max_reg_args) * 8;
+                self.emit(&format!(
+                    "    mov rax, QWORD PTR [rbp + {}]",
+                    stack_arg_offset
+                ));
+                self.emit(&format!(
+                    "    mov QWORD PTR [rbp + {}], rax",
+                    self.stack_offset
                 ));
             }
         }
@@ -1035,10 +1060,14 @@ impl CodeGen {
                     GotoTarget::Label(s) => format!("_label_{}", s),
                 };
                 let ret_label = self.new_label("gosub_ret");
-                // Push return address to GOSUB stack (use rcx - caller-saved on both ABIs)
-                self.emit(&format!("    lea rax, [rip + {}]", ret_label));
+                // Check for stack overflow before push
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
                 self.emit("    sub rcx, 8");
+                self.emit("    lea rax, [rip + _gosub_stack]");
+                self.emit("    cmp rcx, rax");
+                self.emit("    jb _rt_gosub_overflow");
+                // Push return address to GOSUB stack
+                self.emit(&format!("    lea rax, [rip + {}]", ret_label));
                 self.emit("    mov QWORD PTR [rcx], rax");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
                 self.emit(&format!("    jmp {}", label));
@@ -1356,34 +1385,45 @@ impl CodeGen {
 
     /// Generate code for a binary expression
     fn gen_binary_expr(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> DataType {
+        // Track expression nesting depth and warn if too deep
+        self.expr_depth += 1;
+        if self.expr_depth == MAX_EXPR_DEPTH + 1 {
+            eprintln!(
+                "Warning: Expression nesting exceeds {} levels, stack overflow risk",
+                MAX_EXPR_DEPTH
+            );
+        }
+
         let result_type = self.promote_types(self.expr_type(left), self.expr_type(right), op);
 
         // Handle string concatenation specially
         if result_type == DataType::String && op == BinaryOp::Add {
             // Evaluate left string (ptr in rax, len in rdx)
             self.gen_expr(left);
-            // Save left string on stack (ptr, len)
-            self.emit("    push rdx"); // left len
-            self.emit("    push rax"); // left ptr
+            // Save left string on stack using consistent sub rsp pattern (16-byte aligned)
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
+            self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
 
             // Evaluate right string (ptr in rax, len in rdx)
             self.gen_expr(right);
             // Now: right ptr in rax, right len in rdx
-            // Stack: left ptr, left len
 
             // Call runtime string concat: rt_strcat(left_ptr, left_len, right_ptr, right_len)
             // Save right string temporarily
             self.emit("    mov r8, rax"); // right ptr
             self.emit("    mov r9, rdx"); // right len
-            // Pop left string (LIFO: ptr popped first since it was pushed last)
-            self.emit("    pop rax"); // left ptr from stack
-            self.emit("    pop rdx"); // left len from stack
+            // Restore left string from stack
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             self.emit_arg_reg(0, "rax"); // left ptr
             self.emit_arg_reg(1, "rdx"); // left len
             self.emit_arg_reg(2, "r8"); // right ptr
             self.emit_arg_reg(3, "r9"); // right len
             self.emit("    call _rt_strcat");
             // Result: ptr in rax, len in rdx
+            self.expr_depth -= 1;
             return DataType::String;
         }
 
@@ -1519,6 +1559,7 @@ impl CodeGen {
             }
         }
 
+        self.expr_depth -= 1;
         result_type
     }
 
@@ -1618,47 +1659,64 @@ impl CodeGen {
             }
             "LEFT$" => {
                 // _rt_left(ptr, len, count)
+                // Use callee-saved registers to preserve string across count evaluation
+                self.emit("    push r12");
+                self.emit("    push r13");
                 self.gen_expr(&args[0]); // string: rax=ptr, rdx=len
-                self.emit_arg_reg(0, "rax"); // ptr
-                self.emit_arg_reg(1, "rdx"); // len
-                let count_type = self.gen_expr(&args[1]); // count
+                self.emit("    mov r12, rax"); // save ptr
+                self.emit("    mov r13, rdx"); // save len
+                let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
                     self.emit(&format!("    movsxd {}, eax", arg2));
                 } else {
                     self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
                 }
+                self.emit_arg_reg(0, "r12"); // ptr
+                self.emit_arg_reg(1, "r13"); // len
                 self.emit("    call _rt_left");
+                self.emit("    pop r13");
+                self.emit("    pop r12");
             }
             "RIGHT$" => {
                 // _rt_right(ptr, len, count)
+                // Use callee-saved registers to preserve string across count evaluation
+                self.emit("    push r12");
+                self.emit("    push r13");
                 self.gen_expr(&args[0]);
-                self.emit_arg_reg(0, "rax"); // ptr
-                self.emit_arg_reg(1, "rdx"); // len
-                let count_type = self.gen_expr(&args[1]);
+                self.emit("    mov r12, rax"); // save ptr
+                self.emit("    mov r13, rdx"); // save len
+                let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
                     self.emit(&format!("    movsxd {}, eax", arg2));
                 } else {
                     self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
                 }
+                self.emit_arg_reg(0, "r12"); // ptr
+                self.emit_arg_reg(1, "r13"); // len
                 self.emit("    call _rt_right");
+                self.emit("    pop r13");
+                self.emit("    pop r12");
             }
             "MID$" => {
                 // _rt_mid(ptr, len, start, count)
+                // Use callee-saved registers to preserve string across position/count evaluation
+                self.emit("    push r12");
+                self.emit("    push r13");
+                self.emit("    push r14");
                 self.gen_expr(&args[0]);
-                self.emit_arg_reg(0, "rax"); // ptr
-                self.emit_arg_reg(1, "rdx"); // len
-                let pos_type = self.gen_expr(&args[1]);
-                let arg2 = Self::arg_reg(2);
+                self.emit("    mov r12, rax"); // save ptr
+                self.emit("    mov r13, rdx"); // save len
+                let pos_type = self.gen_expr(&args[1]); // start position - safe now
                 if pos_type.is_integer() {
-                    self.emit(&format!("    movsxd {}, eax", arg2));
+                    self.emit("    movsxd r14, eax"); // save start
                 } else {
-                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
+                    self.emit("    cvttsd2si r14, xmm0"); // save start
                 }
                 let arg3 = Self::arg_reg(3);
                 if args.len() > 2 {
-                    let len_type = self.gen_expr(&args[2]);
+                    let len_type = self.gen_expr(&args[2]); // count - safe now
                     if len_type.is_integer() {
                         self.emit(&format!("    movsxd {}, eax", arg3));
                     } else {
@@ -1667,7 +1725,13 @@ impl CodeGen {
                 } else {
                     self.emit(&format!("    mov {}, -1", arg3)); // rest of string
                 }
+                self.emit_arg_reg(0, "r12"); // ptr
+                self.emit_arg_reg(1, "r13"); // len
+                self.emit_arg_reg(2, "r14"); // start
                 self.emit("    call _rt_mid");
+                self.emit("    pop r14");
+                self.emit("    pop r13");
+                self.emit("    pop r12");
             }
             "INSTR" => {
                 // INSTR([start,] haystack$, needle$)
@@ -1798,45 +1862,181 @@ impl CodeGen {
     }
 
     fn gen_call(&mut self, name: &str, args: &[Expr]) {
-        // Push args in registers (per platform ABI)
         let int_regs = PlatformAbi::INT_ARG_REGS;
+        let max_reg_args = int_regs.len();
 
-        // Save current xmm0 if we'll use it for args
-        // Use 16 bytes to maintain stack alignment during arg evaluation
-        if !args.is_empty() {
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        if args.is_empty() {
+            self.emit(&format!("    call _proc_{}", name));
+            return;
         }
 
-        // Pass args: numeric as doubles in integer registers, strings as ptr/len pairs
-        let mut reg_idx = 0;
+        // Phase 1: Evaluate ALL arguments to stack temporaries
+        // This prevents clobbering of registers when args contain nested function calls
+        // Each arg needs 8 bytes (numeric as double bits, string ptr only - len follows)
+        let mut arg_info: Vec<(DataType, i32)> = Vec::new(); // (type, stack_offset)
+
+        // Calculate total slots needed (strings need 2 slots: ptr + len)
+        let mut total_slots = 0;
         for arg in args.iter() {
-            let arg_type = self.gen_expr(arg);
+            let arg_type = self.expr_type(arg);
             if arg_type == DataType::String {
-                // String: ptr in rax, len in rdx - pass as two args
-                if reg_idx < int_regs.len() {
-                    self.emit(&format!("    mov {}, rax", int_regs[reg_idx]));
-                    reg_idx += 1;
-                }
-                if reg_idx < int_regs.len() {
-                    self.emit(&format!("    mov {}, rdx", int_regs[reg_idx]));
-                    reg_idx += 1;
-                }
+                total_slots += 2; // ptr + len
             } else {
-                // Numeric: coerce to double and pass in integer register
-                self.gen_coercion(arg_type, DataType::Double);
-                if reg_idx < int_regs.len() {
-                    self.emit(&format!("    movq {}, xmm0", int_regs[reg_idx]));
-                    reg_idx += 1;
-                }
+                total_slots += 1;
             }
         }
 
+        // Allocate stack space (16-byte aligned)
+        let stack_space = (total_slots * 8 + 15) & !15;
+        self.emit(&format!("    sub rsp, {}", stack_space));
+
+        // Evaluate each argument and save to stack
+        let mut slot_offset = 0i32;
+        for arg in args.iter() {
+            let arg_type = self.gen_expr(arg);
+            if arg_type == DataType::String {
+                // String: save ptr and len to consecutive slots
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", slot_offset));
+                self.emit(&format!(
+                    "    mov QWORD PTR [rsp + {}], rdx",
+                    slot_offset + 8
+                ));
+                arg_info.push((arg_type, slot_offset));
+                slot_offset += 16;
+            } else {
+                // Numeric: coerce to double and save
+                self.gen_coercion(arg_type, DataType::Double);
+                self.emit(&format!(
+                    "    movsd QWORD PTR [rsp + {}], xmm0",
+                    slot_offset
+                ));
+                arg_info.push((arg_type, slot_offset));
+                slot_offset += 8;
+            }
+        }
+
+        // Phase 2: Count register slots used
+        let mut reg_slots_used: usize = 0;
+        for (arg_type, _) in arg_info.iter() {
+            if *arg_type == DataType::String {
+                reg_slots_used += 2; // ptr + len
+            } else {
+                reg_slots_used += 1;
+            }
+        }
+
+        // Calculate overflow args (those that don't fit in registers)
+        let overflow_slots = reg_slots_used.saturating_sub(max_reg_args);
+
+        // Phase 3: Handle overflow args (push to call stack for >6 params)
+        let overflow_space = if overflow_slots > 0 {
+            let space = ((overflow_slots * 8 + 15) & !15) as i32;
+            self.emit(&format!("    sub rsp, {}", space));
+
+            // Copy overflow args from temp stack to call stack
+            let mut reg_count = 0;
+            let mut overflow_idx = 0;
+            for (arg_type, temp_offset) in arg_info.iter() {
+                if *arg_type == DataType::String {
+                    // String takes 2 register slots
+                    if reg_count >= max_reg_args {
+                        // Both ptr and len are overflow
+                        self.emit(&format!(
+                            "    mov rax, QWORD PTR [rsp + {} + {}]",
+                            space, temp_offset
+                        ));
+                        self.emit(&format!(
+                            "    mov QWORD PTR [rsp + {}], rax",
+                            overflow_idx * 8
+                        ));
+                        overflow_idx += 1;
+                        self.emit(&format!(
+                            "    mov rax, QWORD PTR [rsp + {} + {}]",
+                            space,
+                            temp_offset + 8
+                        ));
+                        self.emit(&format!(
+                            "    mov QWORD PTR [rsp + {}], rax",
+                            overflow_idx * 8
+                        ));
+                        overflow_idx += 1;
+                    } else if reg_count + 1 >= max_reg_args {
+                        // Only len is overflow (ptr fits in last register)
+                        reg_count += 1; // ptr in register
+                        self.emit(&format!(
+                            "    mov rax, QWORD PTR [rsp + {} + {}]",
+                            space,
+                            temp_offset + 8
+                        ));
+                        self.emit(&format!(
+                            "    mov QWORD PTR [rsp + {}], rax",
+                            overflow_idx * 8
+                        ));
+                        overflow_idx += 1;
+                    }
+                    reg_count += 2;
+                } else {
+                    if reg_count >= max_reg_args {
+                        // This arg is overflow
+                        self.emit(&format!(
+                            "    mov rax, QWORD PTR [rsp + {} + {}]",
+                            space, temp_offset
+                        ));
+                        self.emit(&format!(
+                            "    mov QWORD PTR [rsp + {}], rax",
+                            overflow_idx * 8
+                        ));
+                        overflow_idx += 1;
+                    }
+                    reg_count += 1;
+                }
+            }
+            space
+        } else {
+            0
+        };
+
+        // Phase 4: Load arguments into registers (immediately before call)
+        let mut reg_idx = 0;
+        let base_offset = overflow_space; // Offset to temp stack from current rsp
+        for (arg_type, temp_offset) in arg_info.iter() {
+            if reg_idx >= max_reg_args {
+                break;
+            }
+            if *arg_type == DataType::String {
+                // String: load ptr and len into consecutive registers
+                if reg_idx < max_reg_args {
+                    self.emit(&format!(
+                        "    mov {}, QWORD PTR [rsp + {} + {}]",
+                        int_regs[reg_idx], base_offset, temp_offset
+                    ));
+                    reg_idx += 1;
+                }
+                if reg_idx < max_reg_args {
+                    self.emit(&format!(
+                        "    mov {}, QWORD PTR [rsp + {} + {}]",
+                        int_regs[reg_idx],
+                        base_offset,
+                        temp_offset + 8
+                    ));
+                    reg_idx += 1;
+                }
+            } else {
+                // Numeric: load as 64-bit value
+                self.emit(&format!(
+                    "    mov {}, QWORD PTR [rsp + {} + {}]",
+                    int_regs[reg_idx], base_offset, temp_offset
+                ));
+                reg_idx += 1;
+            }
+        }
+
+        // Make the call
         self.emit(&format!("    call _proc_{}", name));
 
-        if !args.is_empty() {
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-        }
+        // Clean up: overflow space + temp stack space
+        let total_cleanup = overflow_space + stack_space;
+        self.emit(&format!("    add rsp, {}", total_cleanup));
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
@@ -2057,7 +2257,10 @@ impl CodeGen {
         self.emit(".bss");
         // GOSUB stack (if needed)
         if self.gosub_used {
-            self.emit("_gosub_stack: .skip 8192  # GOSUB return stack");
+            self.emit(&format!(
+                "_gosub_stack: .skip {}  # GOSUB return stack (64K entries)",
+                GOSUB_STACK_SIZE
+            ));
         }
     }
 }
