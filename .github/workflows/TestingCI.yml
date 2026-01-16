@@ -20,3 +20,22 @@ jobs:
         run: cargo test --release --verbose
       - name: Run fmt check
         run: cargo fmt --all -- --check
+
+  windows-native:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install LLVM/Clang
+        run: choco install llvm -y
+      - name: Add LLVM to PATH
+        run: echo "C:\Program Files\LLVM\bin" >> $env:GITHUB_PATH
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test --release --verbose

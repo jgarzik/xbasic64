@@ -10,20 +10,43 @@
 //! - math.s: Math and utility functions
 //! - data.s: DATA/READ support functions
 //! - file.s: File I/O functions (OPEN, CLOSE, PRINT#, INPUT#)
+//!
+//! Platform-specific runtimes:
+//! - sysv/: System V AMD64 ABI (Linux, macOS, BSD)
+//! - win64/: Windows x64 ABI
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-const DATA_DEFS: &str = include_str!("runtime/data_defs.s");
-const PRINT_FUNCS: &str = include_str!("runtime/print.s");
-const INPUT_FUNCS: &str = include_str!("runtime/input.s");
-const STRING_FUNCS: &str = include_str!("runtime/string.s");
-const MATH_FUNCS: &str = include_str!("runtime/math.s");
-const DATA_FUNCS: &str = include_str!("runtime/data.s");
-const FILE_FUNCS: &str = include_str!("runtime/file.s");
+// System V ABI runtime (Linux, macOS, BSD)
+#[cfg(not(windows))]
+mod runtime_files {
+    pub const DATA_DEFS: &str = include_str!("runtime/sysv/data_defs.s");
+    pub const PRINT_FUNCS: &str = include_str!("runtime/sysv/print.s");
+    pub const INPUT_FUNCS: &str = include_str!("runtime/sysv/input.s");
+    pub const STRING_FUNCS: &str = include_str!("runtime/sysv/string.s");
+    pub const MATH_FUNCS: &str = include_str!("runtime/sysv/math.s");
+    pub const DATA_FUNCS: &str = include_str!("runtime/sysv/data.s");
+    pub const FILE_FUNCS: &str = include_str!("runtime/sysv/file.s");
+}
+
+// Windows x64 Native runtime (pure Win32 API, no MinGW)
+#[cfg(windows)]
+mod runtime_files {
+    pub const DATA_DEFS: &str = include_str!("runtime/win64-native/data_defs.s");
+    pub const PRINT_FUNCS: &str = include_str!("runtime/win64-native/print.s");
+    pub const INPUT_FUNCS: &str = include_str!("runtime/win64-native/input.s");
+    pub const STRING_FUNCS: &str = include_str!("runtime/win64-native/string.s");
+    pub const MATH_FUNCS: &str = include_str!("runtime/win64-native/math.s");
+    pub const DATA_FUNCS: &str = include_str!("runtime/win64-native/data.s");
+    pub const FILE_FUNCS: &str = include_str!("runtime/win64-native/file.s");
+}
+
+use runtime_files::*;
 
 pub fn generate_runtime() -> String {
     // On macOS, C library functions need underscore prefix
+    // On Linux and Windows, no prefix
     #[cfg(target_os = "macos")]
     let libc_prefix = "_";
     #[cfg(not(target_os = "macos"))]

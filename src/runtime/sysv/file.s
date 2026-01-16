@@ -151,14 +151,32 @@ _rt_file_open:
 _rt_file_close:
     push rbp
     mov rbp, rsp
+    push rbx
+    sub rsp, 8              # Alignment
+
+    mov ebx, edi            # save file number
 
     # Get FILE* from handle table
     lea rax, [rip + _file_handles]
-    mov rdi, [rax + rdi*8]  # rdi = FILE*
+    mov rdi, [rax + rbx*8]  # rdi = FILE*
     test rdi, rdi           # Check for NULL (already closed or never opened)
     jz .Lclose_done
+
+    # Flush before close
+    call {libc}fflush
+
+    # Close file
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]  # rdi = FILE*
     call {libc}fclose
+
+    # Clear handle from table
+    lea rax, [rip + _file_handles]
+    mov QWORD PTR [rax + rbx*8], 0
+
 .Lclose_done:
+    add rsp, 8
+    pop rbx
     leave
     ret
 
@@ -298,11 +316,11 @@ _rt_file_print_newline:
 
     mov ebx, edi            # save file number
 
+    # Use fputc('\n', file) - simpler than fprintf
     lea rax, [rip + _file_handles]
-    mov rdi, [rax + rbx*8]  # FILE*
-    lea rsi, [rip + _file_fmt_newline]
-    xor eax, eax
-    call {libc}fprintf
+    mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
+    mov edi, 10             # '\n' → edi (1st arg)
+    call {libc}fputc
 
     add rsp, 8
     pop rbx

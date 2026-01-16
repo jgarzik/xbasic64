@@ -111,3 +111,8 @@ where
 
     Ok((String::from_utf8_lossy(&run_output.stdout).to_string(), tmp))
 }
+
+/// Normalize line endings for cross-platform test assertions (CRLF -> LF)
+pub fn normalize_output(s: &str) -> String {
+    s.trim().replace("\r\n", "\n")
+}

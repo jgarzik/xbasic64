@@ -1,10 +1,12 @@
 //! BASIC-to-x86_64 Compiler
 //!
-//! Compiles 1980s-era BASIC programs to Linux x86-64 executables.
+//! Compiles 1980s-era BASIC programs to x86-64 executables.
+//! Supports Linux, macOS, and Windows (MinGW).
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
+mod abi;
 mod codegen;
 mod lexer;
 mod parser;
@@ -124,7 +126,13 @@ fn main() {
         return;
     }
 
-    // Assemble
+    // Assemble - use clang on Windows, GNU as elsewhere
+    #[cfg(windows)]
+    let as_status = Command::new("clang")
+        .args(["-c", "-o", &obj_file, &asm_file])
+        .status();
+
+    #[cfg(not(windows))]
     let as_status = Command::new("as")
         .args(["-o", &obj_file, &asm_file])
         .status();
@@ -141,15 +149,31 @@ fn main() {
         }
     }
 
-    // Link - use appropriate flags for the platform
-    #[allow(unused_mut)] // mut needed on Linux for -no-pie
-    let mut cc_args = vec!["-o", &exe_file, &obj_file, "-lm"];
+    // Link - Windows uses link.exe with UCRT, others use cc
+    // msvcrt.lib provides CRT startup (mainCRTStartup) and imports CRT DLL
+    #[cfg(windows)]
+    let cc_status = Command::new("link.exe")
+        .args([
+            &format!("/OUT:{}", exe_file),
+            &obj_file,
+            "/SUBSYSTEM:CONSOLE",
+            "/DEFAULTLIB:msvcrt.lib",
+            "/DEFAULTLIB:ucrt.lib",
+            "/DEFAULTLIB:kernel32.lib",
+            "/DEFAULTLIB:legacy_stdio_definitions.lib",
+        ])
+        .status();
 
-    // Add -no-pie on Linux to avoid PIE issues
-    #[cfg(target_os = "linux")]
-    cc_args.push("-no-pie");
+    #[cfg(not(windows))]
+    let cc_status = {
+        #[allow(unused_mut)]
+        let mut cc_args = vec!["-o", &exe_file, &obj_file, "-lm"];
 
-    let cc_status = Command::new("cc").args(&cc_args).status();
+        #[cfg(target_os = "linux")]
+        cc_args.push("-no-pie");
+
+        Command::new("cc").args(&cc_args).status()
+    };
 
     match cc_status {
         Ok(status) if status.success() => {}

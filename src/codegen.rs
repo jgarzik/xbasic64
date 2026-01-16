@@ -147,6 +147,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
+use crate::abi::{Abi, PlatformAbi};
 use crate::parser::*;
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -172,11 +173,26 @@ static INLINE_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock
     ])
 });
 
-/// Symbol prefix: underscore on macOS, empty on Linux
-#[cfg(target_os = "macos")]
-const PREFIX: &str = "_";
-#[cfg(not(target_os = "macos"))]
-const PREFIX: &str = "";
+/// Symbol prefix from platform ABI (underscore on macOS, empty on Linux/Windows)
+const PREFIX: &str = PlatformAbi::SYMBOL_PREFIX;
+
+/// Win64 ABI requires 32 bytes of shadow space before each call
+#[cfg(windows)]
+const WIN64_SHADOW_SPACE: i32 = 32;
+
+/// Win64: stack space for calls with 5 args (shadow + 5th arg + alignment)
+#[cfg(windows)]
+const WIN64_5ARG_STACK_SPACE: i32 = 48;
+
+/// Win64: offset to 5th argument on stack (after shadow space)
+#[cfg(windows)]
+const WIN64_5TH_ARG_OFFSET: i32 = 32;
+
+/// Stack space for temporary values (must be 16-byte aligned)
+const STACK_TEMP_SPACE: i32 = 16;
+
+/// ASCII character codes
+const ASCII_TAB: i64 = 9;
 
 fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
@@ -213,6 +229,47 @@ impl CodeGen {
     fn emit(&mut self, s: &str) {
         self.output.push_str(s);
         self.output.push('\n');
+    }
+
+    /// Get the integer argument register for a given argument position (0-based)
+    fn arg_reg(n: usize) -> &'static str {
+        PlatformAbi::INT_ARG_REGS
+            .get(n)
+            .expect("argument index out of bounds")
+    }
+
+    /// Emit a mov instruction to set up an integer argument from a register
+    fn emit_arg_reg(&mut self, arg_n: usize, src_reg: &str) {
+        let dst = Self::arg_reg(arg_n);
+        if dst != src_reg {
+            self.emit(&format!("    mov {}, {}", dst, src_reg));
+        }
+    }
+
+    /// Emit a mov instruction to set up an integer argument from an immediate
+    fn emit_arg_imm(&mut self, arg_n: usize, value: i64) {
+        let dst = Self::arg_reg(arg_n);
+        self.emit(&format!("    mov {}, {}", dst, value));
+    }
+
+    /// Emit a lea instruction to set up an integer argument from a memory reference
+    fn emit_arg_lea(&mut self, arg_n: usize, mem: &str) {
+        let dst = Self::arg_reg(arg_n);
+        self.emit(&format!("    lea {}, {}", dst, mem));
+    }
+
+    /// Call a libc function with proper shadow space on Win64
+    fn emit_call_libc(&mut self, func: &str) {
+        #[cfg(windows)]
+        {
+            self.emit(&format!("    sub rsp, {}", WIN64_SHADOW_SPACE));
+            self.emit(&format!("    call {}{}", PREFIX, func));
+            self.emit(&format!("    add rsp, {}", WIN64_SHADOW_SPACE));
+        }
+        #[cfg(not(windows))]
+        {
+            self.emit(&format!("    call {}{}", PREFIX, func));
+        }
     }
 
     /// Emit type-specific instruction for binary operations
@@ -479,6 +536,14 @@ impl CodeGen {
             self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
+        // Windows: Initialize console handles for Win32 API
+        #[cfg(windows)]
+        {
+            self.emit("    # Initialize Windows console handles");
+            self.emit("    call _rt_init_console");
+            self.emit("    call _rt_init_input");
+        }
+
         // Generate main body
         for stmt in &program.statements {
             match stmt {
@@ -562,9 +627,9 @@ impl CodeGen {
         let placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
         self.emit(&placeholder);
 
-        // Parameters are passed in registers (System V ABI)
+        // Parameters are passed in registers (per platform ABI)
         // Store them in the reserved stack space
-        let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        let int_regs = PlatformAbi::INT_ARG_REGS;
         for (i, param) in params.iter().enumerate() {
             self.stack_offset -= 8;
             let data_type = DataType::from_suffix(param);
@@ -707,7 +772,7 @@ impl CodeGen {
                             self.gen_print_expr(expr);
                         }
                         PrintItem::Tab => {
-                            self.emit("    mov rdi, 9  # tab");
+                            self.emit_arg_imm(0, ASCII_TAB);
                             self.emit("    call _rt_print_char");
                         }
                         PrintItem::Empty => {}
@@ -721,8 +786,8 @@ impl CodeGen {
             Stmt::Input { prompt, vars } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
-                    self.emit(&format!("    lea rdi, [rip + _str_{}]", idx));
-                    self.emit(&format!("    mov rsi, {}", pstr.len()));
+                    self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
+                    self.emit_arg_imm(1, pstr.len() as i64);
                     self.emit("    call _rt_print_string");
                 }
                 for var in vars {
@@ -742,8 +807,8 @@ impl CodeGen {
             Stmt::LineInput { prompt, var } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
-                    self.emit(&format!("    lea rdi, [rip + _str_{}]", idx));
-                    self.emit(&format!("    mov rsi, {}", pstr.len()));
+                    self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
+                    self.emit_arg_imm(1, pstr.len() as i64);
                     self.emit("    call _rt_print_string");
                 }
                 self.emit("    call _rt_input_string");
@@ -970,22 +1035,22 @@ impl CodeGen {
                     GotoTarget::Label(s) => format!("_label_{}", s),
                 };
                 let ret_label = self.new_label("gosub_ret");
-                // Push return address to GOSUB stack
+                // Push return address to GOSUB stack (use rcx - caller-saved on both ABIs)
                 self.emit(&format!("    lea rax, [rip + {}]", ret_label));
-                self.emit("    mov rdi, QWORD PTR [rip + _gosub_sp]");
-                self.emit("    sub rdi, 8");
-                self.emit("    mov QWORD PTR [rdi], rax");
-                self.emit("    mov QWORD PTR [rip + _gosub_sp], rdi");
+                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+                self.emit("    sub rcx, 8");
+                self.emit("    mov QWORD PTR [rcx], rax");
+                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
                 self.emit(&format!("    jmp {}", label));
                 self.emit_label(&ret_label);
             }
 
             Stmt::Return => {
-                // Pop return address from GOSUB stack and jump
-                self.emit("    mov rdi, QWORD PTR [rip + _gosub_sp]");
-                self.emit("    mov rax, QWORD PTR [rdi]");
-                self.emit("    add rdi, 8");
-                self.emit("    mov QWORD PTR [rip + _gosub_sp], rdi");
+                // Pop return address from GOSUB stack and jump (use rcx - caller-saved on both ABIs)
+                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+                self.emit("    mov rax, QWORD PTR [rcx]");
+                self.emit("    add rcx, 8");
+                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
                 self.emit("    jmp rax");
             }
 
@@ -1047,7 +1112,7 @@ impl CodeGen {
                 } else {
                     0
                 };
-                self.emit(&format!("    mov rdi, {}", idx));
+                self.emit_arg_imm(0, idx);
                 self.emit("    call _rt_restore");
             }
 
@@ -1115,22 +1180,22 @@ impl CodeGen {
                 mode,
                 file_num,
             } => {
-                // Generate filename string (ptr in rax, len in rdx)
+                // _rt_file_open(filename_ptr, filename_len, mode, file_num)
                 self.gen_expr(filename);
-                self.emit("    mov rdi, rax  # filename ptr");
-                self.emit("    mov rsi, rdx  # filename len");
+                self.emit_arg_reg(0, "rax"); // filename ptr
+                self.emit_arg_reg(1, "rdx"); // filename len
                 let mode_num = match mode {
                     FileMode::Input => 0,
                     FileMode::Output => 1,
                     FileMode::Append => 2,
                 };
-                self.emit(&format!("    mov rdx, {}  # mode", mode_num));
-                self.emit(&format!("    mov rcx, {}  # file number", file_num));
+                self.emit_arg_imm(2, mode_num);
+                self.emit_arg_imm(3, *file_num as i64);
                 self.emit("    call _rt_file_open");
             }
 
             Stmt::Close { file_num } => {
-                self.emit(&format!("    mov rdi, {}", file_num));
+                self.emit_arg_imm(0, *file_num as i64);
                 self.emit("    call _rt_file_close");
             }
 
@@ -1145,15 +1210,15 @@ impl CodeGen {
                             self.gen_print_expr_to_file(expr, *file_num);
                         }
                         PrintItem::Tab => {
-                            self.emit(&format!("    mov rdi, {}", file_num));
-                            self.emit("    mov rsi, 9  # tab");
+                            self.emit_arg_imm(0, *file_num as i64);
+                            self.emit_arg_imm(1, ASCII_TAB);
                             self.emit("    call _rt_file_print_char");
                         }
                         PrintItem::Empty => {}
                     }
                 }
                 if *newline {
-                    self.emit(&format!("    mov rdi, {}", file_num));
+                    self.emit_arg_imm(0, *file_num as i64);
                     self.emit("    call _rt_file_print_newline");
                 }
             }
@@ -1161,13 +1226,13 @@ impl CodeGen {
             Stmt::InputFile { file_num, vars } => {
                 for var in vars {
                     if is_string_var(var) {
-                        self.emit(&format!("    mov rdi, {}", file_num));
+                        self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_string");
                         let offset = self.get_var_offset(var);
                         self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
                         self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
                     } else {
-                        self.emit(&format!("    mov rdi, {}", file_num));
+                        self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_number");
                         let offset = self.get_var_offset(var);
                         self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
@@ -1307,10 +1372,16 @@ impl CodeGen {
             // Stack: left ptr, left len
 
             // Call runtime string concat: rt_strcat(left_ptr, left_len, right_ptr, right_len)
-            self.emit("    mov rcx, rdx"); // right len -> rcx (4th arg)
-            self.emit("    mov rdx, rax"); // right ptr -> rdx (3rd arg)
-            self.emit("    pop rdi"); // left ptr -> rdi (1st arg)
-            self.emit("    pop rsi"); // left len -> rsi (2nd arg)
+            // Save right string temporarily
+            self.emit("    mov r8, rax"); // right ptr
+            self.emit("    mov r9, rdx"); // right len
+            // Pop left string (LIFO: ptr popped first since it was pushed last)
+            self.emit("    pop rax"); // left ptr from stack
+            self.emit("    pop rdx"); // left len from stack
+            self.emit_arg_reg(0, "rax"); // left ptr
+            self.emit_arg_reg(1, "rdx"); // left len
+            self.emit_arg_reg(2, "r8"); // right ptr
+            self.emit_arg_reg(3, "r9"); // right len
             self.emit("    call _rt_strcat");
             // Result: ptr in rax, len in rdx
             return DataType::String;
@@ -1340,7 +1411,7 @@ impl CodeGen {
 
         // Save left result - use 16 bytes to maintain 16-byte stack alignment
         // This ensures any function calls while evaluating right operand have aligned stack
-        self.emit("    sub rsp, 16");
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
         if work_type.is_integer() {
             self.emit("    mov QWORD PTR [rsp], rax");
         } else if work_type == DataType::Single {
@@ -1364,7 +1435,7 @@ impl CodeGen {
             self.emit("    movsd xmm1, xmm0"); // right in xmm1
             self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
         }
-        self.emit("    add rsp, 16");
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
 
         // Generate operation
         match op {
@@ -1403,7 +1474,7 @@ impl CodeGen {
             }
             BinaryOp::Pow => {
                 self.emit_cvt_to_double(work_type);
-                self.emit(&format!("    call {}pow", PREFIX));
+                self.emit_call_libc("pow");
             }
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -1459,8 +1530,8 @@ impl CodeGen {
             // String expression - evaluate and print as string
             // gen_expr for strings puts ptr in rax, len in rdx
             self.gen_expr(expr);
-            self.emit("    mov rdi, rax");
-            self.emit("    mov rsi, rdx");
+            self.emit_arg_reg(0, "rax"); // ptr
+            self.emit_arg_reg(1, "rdx"); // len
             self.emit("    call _rt_print_string");
         } else {
             // Numeric expression - evaluate and convert to double for printing
@@ -1478,15 +1549,17 @@ impl CodeGen {
             // String expression - evaluate and print as string
             // gen_expr for strings puts ptr in rax, len in rdx
             self.gen_expr(expr);
-            self.emit(&format!("    mov rdi, {}", file_num));
-            self.emit("    mov rsi, rax");
-            self.emit("    mov rdx, rdx"); // rdx already has length
+            // On Win64, arg1=rdx, arg2=r8. Must save rdx (len) to r8 BEFORE
+            // clobbering rdx with ptr. Order matters to avoid register conflicts.
+            self.emit_arg_reg(2, "rdx"); // len → r8 (on Win64) or rdx (on SysV, no-op)
+            self.emit_arg_reg(1, "rax"); // ptr → rdx (on Win64) or rsi (on SysV)
+            self.emit_arg_imm(0, file_num as i64); // file_num → rcx or rdi
             self.emit("    call _rt_file_print_string");
         } else {
             // Numeric expression - evaluate and convert to double for printing
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
-            self.emit(&format!("    mov rdi, {}", file_num));
+            self.emit_arg_imm(0, file_num as i64);
             self.emit("    call _rt_file_print_float");
         }
     }
@@ -1498,7 +1571,7 @@ impl CodeGen {
         if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
             let arg_type = self.gen_expr(&args[0]);
             self.gen_coercion(arg_type, DataType::Double);
-            self.emit(&format!("    call {}{}", PREFIX, libc_fn));
+            self.emit_call_libc(libc_fn);
             return;
         }
 
@@ -1544,78 +1617,122 @@ impl CodeGen {
                 self.emit("    mov eax, edx"); // LEN returns Long (integer)
             }
             "LEFT$" => {
+                // _rt_left(ptr, len, count)
                 self.gen_expr(&args[0]); // string: rax=ptr, rdx=len
-                self.emit("    mov rdi, rax");
-                self.emit("    mov rsi, rdx");
+                self.emit_arg_reg(0, "rax"); // ptr
+                self.emit_arg_reg(1, "rdx"); // len
                 let count_type = self.gen_expr(&args[1]); // count
+                let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
-                    self.emit("    movsxd rdx, eax");
+                    self.emit(&format!("    movsxd {}, eax", arg2));
                 } else {
-                    self.emit("    cvttsd2si rdx, xmm0");
+                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
                 }
                 self.emit("    call _rt_left");
             }
             "RIGHT$" => {
+                // _rt_right(ptr, len, count)
                 self.gen_expr(&args[0]);
-                self.emit("    mov rdi, rax");
-                self.emit("    mov rsi, rdx");
+                self.emit_arg_reg(0, "rax"); // ptr
+                self.emit_arg_reg(1, "rdx"); // len
                 let count_type = self.gen_expr(&args[1]);
+                let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
-                    self.emit("    movsxd rdx, eax");
+                    self.emit(&format!("    movsxd {}, eax", arg2));
                 } else {
-                    self.emit("    cvttsd2si rdx, xmm0");
+                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
                 }
                 self.emit("    call _rt_right");
             }
             "MID$" => {
+                // _rt_mid(ptr, len, start, count)
                 self.gen_expr(&args[0]);
-                self.emit("    mov rdi, rax");
-                self.emit("    mov rsi, rdx");
+                self.emit_arg_reg(0, "rax"); // ptr
+                self.emit_arg_reg(1, "rdx"); // len
                 let pos_type = self.gen_expr(&args[1]);
+                let arg2 = Self::arg_reg(2);
                 if pos_type.is_integer() {
-                    self.emit("    movsxd rdx, eax");
+                    self.emit(&format!("    movsxd {}, eax", arg2));
                 } else {
-                    self.emit("    cvttsd2si rdx, xmm0");
+                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
                 }
+                let arg3 = Self::arg_reg(3);
                 if args.len() > 2 {
                     let len_type = self.gen_expr(&args[2]);
                     if len_type.is_integer() {
-                        self.emit("    movsxd rcx, eax");
+                        self.emit(&format!("    movsxd {}, eax", arg3));
                     } else {
-                        self.emit("    cvttsd2si rcx, xmm0");
+                        self.emit(&format!("    cvttsd2si {}, xmm0", arg3));
                     }
                 } else {
-                    self.emit("    mov rcx, -1"); // rest of string
+                    self.emit(&format!("    mov {}, -1", arg3)); // rest of string
                 }
                 self.emit("    call _rt_mid");
             }
             "INSTR" => {
                 // INSTR([start,] haystack$, needle$)
+                // Args: haystack_ptr, haystack_len, needle_ptr, needle_len, start
                 let (start_arg, hay_arg, needle_arg) = if args.len() == 3 {
                     (Some(&args[0]), &args[1], &args[2])
                 } else {
                     (None, &args[0], &args[1])
                 };
+
+                // Evaluate and save start position
+                self.emit("    push rbx"); // save callee-saved reg
                 if let Some(start) = start_arg {
                     let start_type = self.gen_expr(start);
                     if start_type.is_integer() {
-                        self.emit("    movsxd r8, eax");
+                        self.emit("    movsxd rbx, eax");
                     } else {
-                        self.emit("    cvttsd2si r8, xmm0");
+                        self.emit("    cvttsd2si rbx, xmm0");
                     }
                 } else {
-                    self.emit("    mov r8, 1");
+                    self.emit("    mov rbx, 1");
                 }
+
+                // Evaluate haystack and save
+                self.emit("    push r12");
+                self.emit("    push r13");
                 self.gen_expr(hay_arg);
-                self.emit("    mov rdi, rax");
-                self.emit("    mov rsi, rdx");
+                self.emit("    mov r12, rax"); // haystack ptr
+                self.emit("    mov r13, rdx"); // haystack len
+
+                // Evaluate needle
                 self.gen_expr(needle_arg);
                 // rax = needle ptr, rdx = needle len
-                // Need: rdx = needle ptr, rcx = needle len
-                self.emit("    mov rcx, rdx"); // save needle len first
-                self.emit("    mov rdx, rax"); // then set needle ptr
-                self.emit("    call _rt_instr");
-                // Result is in rax, move to eax for Long return type
+
+                // Set up arguments based on ABI
+                // SysV: rdi=hay_ptr, rsi=hay_len, rdx=needle_ptr, rcx=needle_len, r8=start
+                // Win64: rcx=hay_ptr, rdx=hay_len, r8=needle_ptr, r9=needle_len, [rsp+32]=start
+                #[cfg(windows)]
+                {
+                    self.emit(&format!("    sub rsp, {}", WIN64_5ARG_STACK_SPACE));
+                    self.emit(&format!(
+                        "    mov QWORD PTR [rsp + {}], rbx",
+                        WIN64_5TH_ARG_OFFSET
+                    )); // 5th arg: start
+                    self.emit("    mov r9, rdx"); // needle len
+                    self.emit("    mov r8, rax"); // needle ptr
+                    self.emit("    mov rdx, r13"); // haystack len
+                    self.emit("    mov rcx, r12"); // haystack ptr
+                    self.emit("    call _rt_instr");
+                    self.emit(&format!("    add rsp, {}", WIN64_5ARG_STACK_SPACE));
+                }
+                #[cfg(not(windows))]
+                {
+                    self.emit("    mov r8, rbx"); // start
+                    self.emit("    mov rcx, rdx"); // needle len
+                    self.emit("    mov rdx, rax"); // needle ptr
+                    self.emit("    mov rsi, r13"); // haystack len
+                    self.emit("    mov rdi, r12"); // haystack ptr
+                    self.emit("    call _rt_instr");
+                }
+
+                self.emit("    pop r13");
+                self.emit("    pop r12");
+                self.emit("    pop rbx");
+                // Result is in rax
                 self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
             }
             "ASC" => {
@@ -1624,18 +1741,21 @@ impl CodeGen {
                 // ASC returns integer in eax (Long type)
             }
             "CHR$" => {
+                // _rt_chr(char_code)
                 let arg_type = self.gen_expr(&args[0]);
+                let arg0 = Self::arg_reg(0);
                 if arg_type.is_integer() {
-                    self.emit("    movsxd rdi, eax");
+                    self.emit(&format!("    movsxd {}, eax", arg0));
                 } else {
-                    self.emit("    cvttsd2si rdi, xmm0");
+                    self.emit(&format!("    cvttsd2si {}, xmm0", arg0));
                 }
                 self.emit("    call _rt_chr");
             }
             "VAL" => {
+                // _rt_val(ptr, len)
                 self.gen_expr(&args[0]);
-                self.emit("    mov rdi, rax");
-                self.emit("    mov rsi, rdx");
+                self.emit_arg_reg(0, "rax"); // ptr
+                self.emit_arg_reg(1, "rdx"); // len
                 self.emit("    call _rt_val");
             }
             "STR$" => {
@@ -1678,13 +1798,13 @@ impl CodeGen {
     }
 
     fn gen_call(&mut self, name: &str, args: &[Expr]) {
-        // Push args in registers (System V ABI)
-        let int_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+        // Push args in registers (per platform ABI)
+        let int_regs = PlatformAbi::INT_ARG_REGS;
 
         // Save current xmm0 if we'll use it for args
         // Use 16 bytes to maintain stack alignment during arg evaluation
         if !args.is_empty() {
-            self.emit("    sub rsp, 16");
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
             self.emit("    movsd QWORD PTR [rsp], xmm0");
         }
 
@@ -1715,7 +1835,7 @@ impl CodeGen {
         self.emit(&format!("    call _proc_{}", name));
 
         if !args.is_empty() {
-            self.emit("    add rsp, 16");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
         }
     }
 
@@ -1752,8 +1872,9 @@ impl CodeGen {
         }
 
         // Allocate: total_elements * elem_size
-        self.emit(&format!("    imul rdi, rax, {}", elem_size));
-        self.emit(&format!("    call {}malloc", PREFIX));
+        let arg0 = Self::arg_reg(0);
+        self.emit(&format!("    imul {}, rax, {}", arg0, elem_size));
+        self.emit_call_libc("malloc");
 
         // Store array pointer
         self.stack_offset -= 8;
@@ -1790,7 +1911,7 @@ impl CodeGen {
         // For each subsequent index, multiply by dimension bound and add
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
             // Save current accumulated index - use 16 bytes for alignment
-            self.emit("    sub rsp, 16");
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
             self.emit("    mov QWORD PTR [rsp], rax");
             // Evaluate next index
             let idx_type = self.gen_expr(idx_expr);
@@ -1800,7 +1921,7 @@ impl CodeGen {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
-            self.emit("    add rsp, 16");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
             self.emit(&format!(
                 "    imul rax, QWORD PTR [rbp + {}]",
@@ -1839,7 +1960,7 @@ impl CodeGen {
 
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
             // Save current accumulated index - use 16 bytes for alignment
-            self.emit("    sub rsp, 16");
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
             self.emit("    mov QWORD PTR [rsp], rax");
             let idx_type = self.gen_expr(idx_expr);
             if idx_type.is_integer() {
@@ -1848,7 +1969,7 @@ impl CodeGen {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
-            self.emit("    add rsp, 16");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             self.emit(&format!(
                 "    imul rax, QWORD PTR [rbp + {}]",
                 dim_offsets[i]
@@ -1859,7 +1980,7 @@ impl CodeGen {
         // Compute final address and save it - use 16 bytes for alignment
         self.emit(&format!("    imul rax, {}", elem_size));
         self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
-        self.emit("    sub rsp, 16");
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
         self.emit("    mov QWORD PTR [rsp], rax"); // save address
 
         // Evaluate value
@@ -1867,7 +1988,7 @@ impl CodeGen {
 
         // Store value at computed address
         self.emit("    mov rcx, QWORD PTR [rsp]");
-        self.emit("    add rsp, 16");
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
         if is_string_var(name) {
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");

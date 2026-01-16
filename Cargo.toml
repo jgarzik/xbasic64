@@ -13,6 +13,9 @@ keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
 categories = ["compilers", "command-line-utilities", "development-tools"]
 rust-version = "1.85"
 
+[features]
+default = []
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 

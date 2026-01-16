@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, normalize_output};
 
 #[test]
 fn test_dim_single_array() {
@@ -17,7 +17,7 @@ PRINT A(3)
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "10\n30");
+    assert_eq!(normalize_output(&output), "10\n30");
 }
 
 #[test]
