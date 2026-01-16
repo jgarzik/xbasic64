@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, normalize_output};
 
 #[test]
 fn test_variable_assignment() {
@@ -97,5 +97,5 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim(), "before\nafter");
+    assert_eq!(normalize_output(&output), "before\nafter");
 }
