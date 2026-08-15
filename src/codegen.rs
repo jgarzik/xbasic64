@@ -1184,6 +1184,44 @@ impl CodeGen {
         self.emit_check("jb", RtError::Subscript);
     }
 
+    /// A LBOUND/UBOUND dimension known at compile time.
+    ///
+    /// The descriptor's word 0 holds the element pointer and word i the i'th
+    /// dimension's count, so a constant dimension is a fixed offset.
+    fn const_dim(&self, e: &Expr) -> Option<i32> {
+        let lit = match e {
+            Expr::Literal(l) => l.clone(),
+            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase())?.clone(),
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => i32::try_from(n).ok(),
+            _ => None,
+        }
+    }
+
+    /// Evaluate a computed dimension into `rax`, checked against `rank`.
+    ///
+    /// Dimensions are 1-based, so an unsigned compare of `dim - 1` against the
+    /// rank catches zero and negative values in the same branch.
+    fn gen_dim_index(&mut self, dim: &Expr, rank: i64) {
+        let ty = self.gen_expr(dim);
+        self.gen_coercion(ty, DataType::Long);
+        self.emit("    movsxd rax, eax");
+        self.emit("    dec rax");
+        self.emit(&format!("    cmp rax, {}", rank));
+        self.emit_check("jae", RtError::Subscript);
+        self.emit("    inc rax");
+    }
+
+    /// The scope semantic analysis would name for the code being generated.
+    fn sema_scope(&self) -> SemaScope {
+        match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        }
+    }
+
     /// Emit a check: branch to the error trampoline when `cond` holds.
     ///
     /// The fast path costs only the caller's compare plus this never-taken
@@ -3899,28 +3937,52 @@ impl CodeGen {
             // Array bounds. The descriptor stores each dimension's element
             // count, so UBOUND is that minus one and LBOUND is always 0.
             "LBOUND" | "UBOUND" => {
-                let arr = match &args[0] {
-                    Expr::Variable(n) => n.to_uppercase(),
-                    Expr::FnCall { name, .. } => name.to_uppercase(),
-                    Expr::ArrayAccess { name, .. } => name.to_uppercase(),
-                    _ => unreachable!("sema requires an array name here"),
+                let Expr::Variable(arr) = &args[0] else {
+                    unreachable!("sema requires an array name here")
                 };
-                let dim = match args.get(1) {
-                    Some(Expr::Literal(Literal::Integer(n))) => *n as i32,
-                    _ => 1,
-                };
+                let arr = arr.to_uppercase();
+                let rank = self
+                    .symbols
+                    .lookup_array(&self.sema_scope(), &arr)
+                    .expect("sema checked the array exists")
+                    .rank as i64;
+
+                // The lower bound does not depend on which dimension is asked
+                // for, but an out-of-range dimension is still an error.
                 if upper_name == "LBOUND" {
-                    let base = self.symbols.option_base;
-                    self.emit(&format!("    mov eax, {}", base));
-                } else {
-                    let loc = self
-                        .lookup_array(&arr)
-                        .expect("sema checked the array exists")
-                        .loc
-                        .clone();
-                    self.emit(&format!("    mov rax, {}", loc.q(dim)));
-                    self.emit("    dec rax");
+                    if let Some(dim) = args.get(1) {
+                        if self.const_dim(dim).is_none() {
+                            self.gen_dim_index(dim, rank);
+                        }
+                    }
+                    self.emit(&format!("    mov eax, {}", self.symbols.option_base));
+                    return;
                 }
+
+                let loc = self
+                    .lookup_array(&arr)
+                    .expect("sema checked the array exists")
+                    .loc
+                    .clone();
+
+                match args.get(1).map(|d| (d, self.const_dim(d))) {
+                    // The usual case: a literal or CONST dimension, resolved
+                    // to a fixed descriptor slot.
+                    None | Some((_, Some(_))) => {
+                        let dim = args.get(1).and_then(|d| self.const_dim(d)).unwrap_or(1);
+                        self.emit(&format!("    mov rax, {}", loc.q(dim)));
+                    }
+                    // A computed dimension indexes the descriptor at run time.
+                    Some((dim, None)) => {
+                        self.gen_dim_index(dim, rank);
+                        match &loc {
+                            Loc::Global(sym) => self.emit(&format!("    lea rcx, [rip + {}]", sym)),
+                            Loc::Frame(off) => self.emit(&format!("    lea rcx, [rbp + {}]", off)),
+                        }
+                        self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
+                    }
+                }
+                self.emit("    dec rax");
             }
             // File status. Both take a file number and return a number.
             "EOF" | "LOF" => {

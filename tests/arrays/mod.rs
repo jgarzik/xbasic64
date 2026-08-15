@@ -171,3 +171,22 @@ fn test_redim_preserve_strings() {
     .unwrap();
     assert_eq!(output.trim(), "keep4");
 }
+
+/// LBOUND and UBOUND take an array *name*, so a string array is fine.
+#[test]
+fn test_bounds_of_string_array() {
+    let output = compile_and_run("DIM N$(5)\nPRINT LBOUND(N$); UBOUND(N$)\n").unwrap();
+    assert_eq!(output.trim(), "05");
+}
+
+/// The dimension may be computed, not only written as a literal.
+///
+/// A non-literal dimension used to be silently treated as dimension 1.
+#[test]
+fn test_bounds_with_computed_dimension() {
+    let output = compile_and_run(
+        "DIM A(2,5)\nCONST D = 2\nK = 2\nPRINT UBOUND(A, K); UBOUND(A, D); UBOUND(A, 1)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "552");
+}

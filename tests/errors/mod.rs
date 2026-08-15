@@ -624,3 +624,42 @@ fn test_sub_cannot_be_declared_as_a_type() {
     assert!(err.is_clean_rejection(), "{}", err.stderr);
     assert!(err.stderr.contains("no return value"), "{}", err.stderr);
 }
+
+/// A dimension the array does not have is an error, not a read past the
+/// descriptor.
+#[test]
+fn test_bounds_dimension_out_of_range() {
+    let err = compile_only("DIM A(4)\nPRINT UBOUND(A, 3)\n").expect_err("should be rejected");
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(
+        err.stderr.contains("dimension 3 does not exist"),
+        "{}",
+        err.stderr
+    );
+}
+
+/// The same check at run time, when the dimension is computed.
+#[test]
+fn test_bounds_computed_dimension_out_of_range() {
+    let run = compile_and_run_raw("DIM A(4)\nK = 3\nPRINT UBOUND(A, K)\n", "").unwrap();
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Subscript out of range"),
+        "{}",
+        run.stderr
+    );
+}
+
+/// LBOUND/UBOUND need an array, and a dimension that is a number.
+#[test]
+fn test_bounds_argument_diagnostics() {
+    let err = compile_only("PRINT UBOUND(Z)\n").expect_err("should be rejected");
+    assert!(
+        err.stderr.contains("not a declared array"),
+        "{}",
+        err.stderr
+    );
+
+    let err = compile_only("DIM A(4)\nPRINT UBOUND(A, \"x\")\n").expect_err("should be rejected");
+    assert!(err.stderr.contains("must be numeric"), "{}", err.stderr);
+}

@@ -792,6 +792,39 @@ impl Analyzer {
     /// Codegen coerces builtin arguments without checking, so a string passed
     /// where a number belongs used to abort the compiler.
     fn builtin_arg_type_error(&self, name: &str, args: &[Expr], scope: &Scope) -> Option<String> {
+        // LBOUND and UBOUND take an array *name*, whose element type says
+        // nothing about the call -- `LBOUND(N$)` used to be rejected for
+        // passing a string.
+        if let ("LBOUND" | "UBOUND", Some(first)) = (name, args.first()) {
+            let Expr::Variable(arr) = first else {
+                return Some(format!("argument 1 of '{}' must be an array name", name));
+            };
+            let Some(info) = self.symbols.lookup_array(scope, &arr.to_uppercase()) else {
+                return Some(format!("'{}' is not a declared array", arr));
+            };
+            let rank = info.rank;
+
+            let dim = args.get(1)?;
+            if self.expr_is_string(dim, scope) == Some(true) {
+                return Some(format!("argument 2 of '{}' must be numeric", name));
+            }
+            // A constant dimension is checked here; a computed one is checked
+            // at run time, where reading past the descriptor used to return
+            // whatever happened to follow it.
+            if let Some(Literal::Integer(n)) = self.const_eval(dim) {
+                if n < 1 || n as usize > rank {
+                    return Some(format!(
+                        "'{}' has {} dimension{}, so dimension {} does not exist",
+                        arr,
+                        rank,
+                        if rank == 1 { "" } else { "s" },
+                        n
+                    ));
+                }
+            }
+            return None;
+        }
+
         // Which arguments must be strings; every other one must be numeric.
         let string_args: &[usize] = match name {
             "LEN" | "ASC" | "VAL" | "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => &[0],
