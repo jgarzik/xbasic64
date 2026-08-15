@@ -204,6 +204,36 @@ fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
 
+/// Every nested statement body directly contained by `stmt`.
+///
+/// This is the single place that knows which `Stmt` variants carry child
+/// statements. Any pass that walks the AST must go through it, so that adding a
+/// block-bearing statement cannot silently leave a walker behind: omitting
+/// `SelectCase` here previously caused `GOSUB` inside a `SELECT CASE` to fail to
+/// link and `DATA` inside one to be dropped.
+fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
+    match stmt {
+        Stmt::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut v = vec![then_branch.as_slice()];
+            if let Some(eb) = else_branch {
+                v.push(eb.as_slice());
+            }
+            v
+        }
+        Stmt::SelectCase { cases, .. } => cases.iter().map(|(_, body)| body.as_slice()).collect(),
+        Stmt::For { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::DoLoop { body, .. }
+        | Stmt::Sub { body, .. }
+        | Stmt::Function { body, .. } => vec![body.as_slice()],
+        _ => vec![],
+    }
+}
+
 /// Variable storage information
 #[derive(Clone)]
 struct VarInfo {
@@ -596,26 +626,7 @@ impl CodeGen {
             _ => {}
         }
         // Recurse into nested statements
-        let bodies: Vec<&[Stmt]> = match stmt {
-            Stmt::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                let mut v = vec![then_branch.as_slice()];
-                if let Some(eb) = else_branch {
-                    v.push(eb.as_slice());
-                }
-                v
-            }
-            Stmt::For { body, .. }
-            | Stmt::While { body, .. }
-            | Stmt::DoLoop { body, .. }
-            | Stmt::Sub { body, .. }
-            | Stmt::Function { body, .. } => vec![body.as_slice()],
-            _ => vec![],
-        };
-        for body in bodies {
+        for body in child_bodies(stmt) {
             for s in body {
                 self.preprocess(s);
             }

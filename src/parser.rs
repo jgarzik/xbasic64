@@ -939,10 +939,7 @@ impl Parser {
                     _ => {}
                 }
 
-                match self.parse_statement() {
-                    Ok(stmt) => body.push(stmt),
-                    Err(e) => return Err(e),
-                }
+                body.push(self.parse_statement()?);
                 self.skip_newlines();
             }
 

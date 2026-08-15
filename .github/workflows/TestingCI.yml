@@ -39,3 +39,5 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      - name: Run fmt check
+        run: cargo fmt --all -- --check

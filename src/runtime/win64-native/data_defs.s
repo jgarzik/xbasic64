@@ -16,6 +16,8 @@ _fmt_int: .asciz "%lld"
 _fmt_float: .asciz "%g"
 
 # Error messages
+# Lengths are computed by the assembler (. - label), never hand-counted: a
+# hand-counted value here was wrong by one, making WriteFile emit a stray byte.
 _gosub_overflow_msg: .ascii "Error: GOSUB stack overflow\r\n"
-.equ _gosub_overflow_msg_len, 30
+.equ _gosub_overflow_msg_len, . - _gosub_overflow_msg
 
