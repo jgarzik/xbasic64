@@ -663,3 +663,15 @@ fn test_bounds_argument_diagnostics() {
     let err = compile_only("DIM A(4)\nPRINT UBOUND(A, \"x\")\n").expect_err("should be rejected");
     assert!(err.stderr.contains("must be numeric"), "{}", err.stderr);
 }
+
+/// LET still needs an assignment, not a bare call.
+#[test]
+fn test_let_requires_an_assignment() {
+    let err = compile_only("SUB T\nPRINT 1\nEND SUB\nLET T\n").expect_err("should be rejected");
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(
+        err.stderr.contains("LET needs an assignment"),
+        "{}",
+        err.stderr
+    );
+}

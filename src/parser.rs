@@ -1152,34 +1152,16 @@ impl Parser {
 
     fn parse_let(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LET
-        self.parse_assignment()
-    }
 
-    fn parse_assignment(&mut self) -> PResult<StmtKind> {
-        let name = if let Token::Ident(n) = self.advance() {
-            n
-        } else {
-            return err("Expected variable name");
-        };
-
-        // Check for array subscript
-        let indices = if matches!(self.peek(), Token::LParen) {
-            self.advance();
-            let idx = self.parse_expr_list()?;
-            self.expect(Token::RParen)?;
-            Some(idx)
-        } else {
-            None
-        };
-
-        self.expect(Token::Eq)?;
-        let value = self.parse_expression()?;
-
-        Ok(StmtKind::Let {
-            name,
-            indices,
-            value,
-        })
+        // LET introduces exactly the assignments that may also be written
+        // without it, so it shares their parser rather than reimplementing a
+        // subset -- which is why `LET Q.X = 3` and `LET MID$(S$,1,2) = "HE"`
+        // used to be rejected.
+        let stmt = self.parse_assignment_or_call()?;
+        if let StmtKind::Call { name, .. } = &stmt {
+            return err(format!("LET needs an assignment, but '{}' is a call", name));
+        }
+        Ok(stmt)
     }
 
     fn parse_assignment_or_call(&mut self) -> PResult<StmtKind> {

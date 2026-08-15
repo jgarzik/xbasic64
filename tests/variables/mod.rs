@@ -130,3 +130,17 @@ fn test_leading_dot_literals() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["0.5", "0.5", "5"]);
 }
+
+/// LET accepts every assignment form the bare syntax does.
+///
+/// The LET path was a cut-down parser that knew only `name` and `name(i)`, so
+/// `LET Q.X = 3` and `LET MID$(S$,1,2) = "HE"` were both rejected.
+#[test]
+fn test_let_accepts_every_assignment_form() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\nDIM A(3)\nDIM R(3) AS P\nLET X = 5\nLET A(1) = 7\nLET Q.X = 3\nLET R(1).X = 4\nS$ = \"xxllo\"\nLET MID$(S$,1,2) = \"HE\"\nPRINT X; A(1); Q.X; R(1).X\nPRINT S$\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["5734", "HEllo"]);
+}
