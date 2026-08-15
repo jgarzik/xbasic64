@@ -75,31 +75,51 @@ _rt_rnd:
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_timer - Get seconds since midnight (TIMER function)
+# _rt_timer - TIMER: seconds since midnight, UTC
 # ------------------------------------------------------------------------------
-# Returns seconds based on GetTickCount64 (milliseconds since system start).
-# Note: This differs from classic BASIC which returns seconds since midnight.
-# For compatibility, we use GetTickCount64 / 1000.0 which gives elapsed time.
+# This used to return GetTickCount64() / 1000, which is seconds since the
+# machine booted -- not what LANGREF documents, not what the System V runtime
+# returns, and not what any BASIC program expects. A CI runner three minutes
+# old reported 208.437 where the time of day was wanted.
+#
+# GetSystemTime gives UTC, matching the System V twin, with millisecond
+# resolution. SYSTEMTIME is eight WORDs: wYear, wMonth, wDayOfWeek, wDay,
+# wHour, wMinute, wSecond, wMilliseconds.
 #
 # Arguments: none
 #
 # Returns:
-#   xmm0 = seconds as double
+#   xmm0 = seconds since midnight (double, 0 <= t < 86400)
 # ------------------------------------------------------------------------------
+.equ ST_HOUR,   8
+.equ ST_MINUTE, 10
+.equ ST_SECOND, 12
+.equ ST_MSEC,   14
+
 .globl _rt_timer
 _rt_timer:
     push rbp
     mov rbp, rsp
-    sub rsp, 32             # Shadow space
+    sub rsp, 48             # shadow space, then a 16-byte SYSTEMTIME above it
 
-    # GetTickCount64() returns milliseconds since system start
-    call GetTickCount64     # returns uint64 in rax
+    lea rcx, [rsp + 32]
+    call GetSystemTime
 
-    # Convert to double and divide by 1000
-    cvtsi2sd xmm0, rax      # milliseconds as double
-    mov rax, 0x408F400000000000  # 1000.0 in IEEE 754
-    movq xmm1, rax
-    divsd xmm0, xmm1        # seconds = ms / 1000.0
+    movzx eax, WORD PTR [rsp + 32 + ST_HOUR]
+    imul eax, eax, 3600
+    movzx ecx, WORD PTR [rsp + 32 + ST_MINUTE]
+    imul ecx, ecx, 60
+    add eax, ecx
+    movzx ecx, WORD PTR [rsp + 32 + ST_SECOND]
+    add eax, ecx
+    cvtsi2sd xmm0, eax
+
+    movzx ecx, WORD PTR [rsp + 32 + ST_MSEC]
+    cvtsi2sd xmm1, ecx
+    mov rax, 0x408F400000000000     # 1000.0
+    movq xmm2, rax
+    divsd xmm1, xmm2
+    addsd xmm0, xmm1
 
     leave
     ret

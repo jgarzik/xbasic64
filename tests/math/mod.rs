@@ -229,7 +229,8 @@ A! = 3.5: B# = CDBL(A!): PRINT B#
 /// Asserting only `TIMER >= 0` could not fail: a bare `TIMER` used to read an
 /// uninitialized variable of that name, which is 0, and 0 passes that test.
 /// Comparing against the clock this test can read itself is what makes the
-/// assertion mean something.
+/// assertion mean something -- and it is what caught the Win64 runtime
+/// returning seconds since *boot* rather than since midnight.
 #[test]
 fn test_timer_matches_the_host_clock() {
     let before = seconds_since_midnight_utc();
@@ -237,30 +238,41 @@ fn test_timer_matches_the_host_clock() {
     let after = seconds_since_midnight_utc();
 
     for (i, line) in output.trim().lines().enumerate() {
-        let t: i64 = line
+        // TIMER counts fractional seconds, as GW-BASIC's does.
+        let t: f64 = line
             .parse()
             .unwrap_or_else(|e| panic!("TIMER printed {line:?}: {e}"));
         assert!(
-            (0..86_400).contains(&t),
+            (0.0..86_400.0).contains(&t),
             "TIMER must be a second-of-day, got {t}"
         );
         // Compiling and running takes a moment, and the day may roll over in
         // between, so compare modulo a day with a generous window.
         let skew = (t - before)
-            .rem_euclid(86_400)
-            .min((after - t).rem_euclid(86_400));
+            .rem_euclid(86_400.0)
+            .min((after - t).rem_euclid(86_400.0));
         assert!(
-            skew < 120,
+            skew < 120.0,
             "form {i}: TIMER said {t}, but the clock read {before}..{after}"
         );
     }
 }
 
+/// TIMER never goes backwards within a run.
+#[test]
+fn test_timer_does_not_go_backwards() {
+    let output = compile_and_run(
+        "A = TIMER\nFOR I = 1 TO 2000000\nX = X + 1\nNEXT I\nB = TIMER\nPRINT (B >= A)\nPRINT (B - A < 60)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["-1", "-1"]);
+}
+
 /// Seconds since midnight UTC, the same quantity TIMER reports.
-fn seconds_since_midnight_utc() -> i64 {
-    let secs = std::time::SystemTime::now()
+fn seconds_since_midnight_utc() -> f64 {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after 1970")
-        .as_secs();
-    (secs % 86_400) as i64
+        .expect("the clock is after 1970");
+    (now.as_secs() % 86_400) as f64 + f64::from(now.subsec_millis()) / 1000.0
 }

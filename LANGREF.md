@@ -769,13 +769,16 @@ MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 
 | Function      | Description                                    |
 |---------------|------------------------------------------------|
-| `TIMER`       | Seconds since midnight (Double)                |
+| `TIMER`       | Seconds since midnight, UTC, fractional (Double) |
 | `LBOUND(a[,d])` | Lowest subscript of an array, of dimension d |
 | `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
 | `EOF(n)`      | True once file n has been read to the end      |
 | `LOF(n)`      | Length of file n in bytes                      |
 | `TAB(n)`      | In PRINT: advance to column n                  |
 | `SPC(n)`      | In PRINT: emit n spaces                        |
+
+`TIMER` counts fractional seconds since midnight UTC on every platform, so
+subtracting two readings times a section of code.
 
 `LBOUND` and `UBOUND` take an array *name*, of any element type. The
 dimension may be any numeric expression; asking for one the array does
