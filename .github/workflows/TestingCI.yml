@@ -20,6 +20,20 @@ jobs:
         run: cargo test --release --verbose
       - name: Run fmt check
         run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # The examples are the only programs compiled and run end to end through
+      # the real driver -- shelling out to the assembler and linker -- rather
+      # than through the test harness.
+      - name: Compile and run the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.bas; do
+            echo "== $f"
+            ./target/release/xbasic64 "$f" -o /tmp/example
+            /tmp/example </dev/null >/dev/null
+          done
 
   windows-native:
     runs-on: windows-latest
@@ -41,3 +55,17 @@ jobs:
         run: cargo test --release --verbose
       - name: Run fmt check
         run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # Worth repeating here rather than trusting the Linux job: this is the
+      # only step that drives link.exe over whole programs, and the Win64
+      # runtime is the half that cannot be run anywhere else.
+      - name: Compile and run the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.bas; do
+            echo "== $f"
+            ./target/release/xbasic64.exe "$f" -o example.exe
+            ./example.exe </dev/null >/dev/null
+          done

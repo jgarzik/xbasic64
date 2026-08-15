@@ -16,8 +16,14 @@ pub trait Abi {
 }
 
 /// System V AMD64 ABI (Linux, macOS, BSD)
+///
+/// Compiled in on a Windows host only under test, mirroring [`Win64`]: each is
+/// dead code in a release build for the other platform, and the unit tests
+/// below check both.
+#[cfg(any(not(windows), test))]
 pub struct SysV64;
 
+#[cfg(any(not(windows), test))]
 impl Abi for SysV64 {
     const INT_ARG_REGS: &'static [&'static str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
 
