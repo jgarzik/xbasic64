@@ -251,6 +251,49 @@ fn test_crlf_file_reads_without_stray_carriage_returns() {
     assert_eq!(lines[1], "335", "no line may keep its carriage return");
 }
 
+/// A SINGLE written to a file reads back the way the console prints it.
+///
+/// `gen_print_expr` picks `_rt_print_single` for a SINGLE so that only the ~7
+/// digits it carries are shown; `gen_print_expr_to_file`, a copy that never
+/// got that fix, always used the double helper, so `PRINT #1, A!` wrote
+/// 0.3333333432674408 where `PRINT A!` gives 0.33333334.
+#[test]
+#[ignore = "unified in phase 2"]
+fn test_print_file_single_matches_console() {
+    let output = compile_and_run_with_files(
+        "A! = 1 / 3\nPRINT A!\nOPEN \"s.txt\" FOR OUTPUT AS #1\nPRINT #1, A!\nCLOSE #1\nOPEN \"s.txt\" FOR INPUT AS #1\nLINE INPUT #1, L$\nCLOSE #1\nPRINT L$\n",
+        |_| Ok(()),
+    )
+    .unwrap()
+    .0;
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines[0], lines[1],
+        "a SINGLE must render the same to a file as to the console"
+    );
+}
+
+/// TAB and SPC position within a file, and write nothing to the console.
+///
+/// Only the console printer special-cases them; the file copy evaluated
+/// `TAB(10)` as an ordinary call, which positioned *stdout* and then wrote the
+/// call's dummy 0 into the file, giving "a0b0c".
+#[test]
+#[ignore = "unified in phase 2"]
+fn test_print_file_tab_spc() {
+    let output = compile_and_run_with_files(
+        "OPEN \"t.txt\" FOR OUTPUT AS #1\nPRINT #1, \"a\"; TAB(10); \"b\"; SPC(3); \"c\"\nCLOSE #1\nOPEN \"t.txt\" FOR INPUT AS #1\nLINE INPUT #1, L$\nCLOSE #1\nPRINT \"[\"; L$; \"]\"\n",
+        |_| Ok(()),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        output.trim(),
+        "[a        b   c]",
+        "TAB/SPC must pad the file, and must not write to the console"
+    );
+}
+
 /// Numbers too: a CRLF file must not leave a CR to derail the next field.
 #[test]
 fn test_crlf_numeric_fields() {

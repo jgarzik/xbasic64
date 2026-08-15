@@ -559,6 +559,21 @@ fn test_whole_record_is_not_a_value() {
     expect_rejected(&format!("{ty}PRINT Q + 1\n"), "has no value");
 }
 
+/// ...including on the way to a file.
+///
+/// Sema's `PrintFile` arm is a copy of the `Print` one that never called
+/// `reject_record_value`, so `PRINT #1, Q` compiled and wrote garbage while
+/// `PRINT Q` was correctly refused.
+#[test]
+#[ignore = "unified in phase 2"]
+fn test_whole_record_is_not_a_value_to_a_file() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\n";
+    expect_rejected(
+        &format!("{ty}OPEN \"r.txt\" FOR OUTPUT AS #1\nPRINT #1, Q\n"),
+        "has no value",
+    );
+}
+
 /// Using an array before its DIM has executed is a runtime error, not a
 /// compiler panic: the descriptor exists from the start, with a null element
 /// pointer until the DIM runs.
