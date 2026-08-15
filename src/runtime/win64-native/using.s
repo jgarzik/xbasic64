@@ -98,19 +98,6 @@ _rt_print_using_num:
     movq xmm1, rax
     xorpd xmm0, xmm1
     movsd QWORD PTR [rbp - 72], xmm0
-
-    # Clamp both to what the buffers below are sized for. The compiler already
-    # clamps them, so this only guards against a hand-written or future caller;
-    # without it a value such as 1D300 in a "##.##" field ran sprintf past the
-    # end of _using_raw and destroyed everything after it in .data.
-    cmp r13, USING_MAX_DEC
-    jbe .Luse_num_dec_ok
-    mov r13, USING_MAX_DEC
-.Luse_num_dec_ok:
-    cmp r12, USING_MAX_WIDTH
-    jbe .Luse_num_width_ok
-    mov r12, USING_MAX_WIDTH
-.Luse_num_width_ok:
     jmp .Luse_num_format
 .Luse_num_positive:
     test r14, USING_FORCE_SIGN
