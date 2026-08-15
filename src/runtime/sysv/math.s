@@ -84,7 +84,7 @@ _rt_timer:
 
     mov rdi, rsp            # &tv
     xor esi, esi            # timezone = NULL
-    call {libc}gettimeofday
+    call gettimeofday
 
     # tv_sec mod 86400
     mov rax, QWORD PTR [rsp]
@@ -119,6 +119,6 @@ _rt_cls:
     mov rbp, rsp
     lea rdi, [rip + _cls_seq]   # ANSI escape sequence
     xor eax, eax                # no vector args
-    call {libc}printf
+    call printf
     leave
     ret

@@ -97,7 +97,7 @@ _rt_file_open:
     lea rdi, [rip + _file_name_buf]
     mov rsi, r12
     mov rdx, r13
-    call {libc}memcpy
+    call memcpy
     # Null-terminate
     lea rax, [rip + _file_name_buf]
     mov BYTE PTR [rax + r13], 0
@@ -119,7 +119,7 @@ _rt_file_open:
 .Ldo_fopen:
     # fopen(filename, mode)
     lea rdi, [rip + _file_name_buf]
-    call {libc}fopen        # returns FILE* in rax (or NULL on error)
+    call fopen        # returns FILE* in rax (or NULL on error)
 
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
@@ -160,12 +160,12 @@ _rt_file_close:
     jz .Lclose_done
 
     # Flush before close
-    call {libc}fflush
+    call fflush
 
     # Close file
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # rdi = FILE*
-    call {libc}fclose
+    call fclose
 
     # Clear handle from table
     lea rax, [rip + _file_handles]
@@ -210,7 +210,7 @@ _rt_file_print_string:
     mov rdx, r8             # len (precision for %.*s) → 3rd arg
     # rcx already has ptr    → 4th arg
     xor eax, eax            # no vector args
-    call {libc}fprintf
+    call fprintf
 
     lea rax, [rip + _file_col]
     add QWORD PTR [rax + rbx*8], r12
@@ -393,7 +393,7 @@ _rt_file_print_char:
     lea rsi, [rip + _file_fmt_char]
     mov rdx, r12            # char
     xor eax, eax
-    call {libc}fprintf
+    call fprintf
 
     lea rax, [rip + _file_col]
     inc QWORD PTR [rax + rbx*8]
@@ -423,7 +423,7 @@ _rt_file_print_newline:
     lea rax, [rip + _file_handles]
     mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
     mov edi, 10             # '\n' → edi (1st arg)
-    call {libc}fputc
+    call fputc
 
     lea rax, [rip + _file_col]
     mov QWORD PTR [rax + rbx*8], 0
@@ -464,7 +464,7 @@ _rt_file_getc:
     mov rdi, [rax + rdi*8]
     test rdi, rdi
     jz .Lfile_getc_eof
-    call {libc}fgetc
+    call fgetc
     leave
     ret
 .Lfile_getc_eof:
@@ -592,7 +592,7 @@ _rt_file_input_number:
     call _rt_file_read_field
     mov rdi, rax                # NUL-terminated by _rt_file_read_field
     xor esi, esi                # endptr = NULL
-    call {libc}strtod
+    call strtod
 
     add rsp, 16
     leave
@@ -630,7 +630,7 @@ _rt_file_line_input:
     mov rsi, 1023                        # max chars (leave room for null)
     lea rax, [rip + _file_handles]
     mov rdx, [rax + rbx*8]              # FILE*
-    call {libc}fgets
+    call fgets
 
     # Check for EOF/error (fgets returns NULL)
     test rax, rax
@@ -638,7 +638,7 @@ _rt_file_line_input:
 
     # Calculate length using strlen
     lea rdi, [rip + _file_input_buf]
-    call {libc}strlen
+    call strlen
     mov rdx, rax            # length → rdx
 
     # Strip the trailing newline, and the CR before it in a file written on a
@@ -696,10 +696,10 @@ _rt_file_close_all:
     mov rdi, [rax + rbx*8]
     test rdi, rdi
     jz .Lclose_all_next
-    call {libc}fflush
+    call fflush
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]
-    call {libc}fclose
+    call fclose
     lea rax, [rip + _file_handles]
     mov QWORD PTR [rax + rbx*8], 0
 .Lclose_all_next:
@@ -733,7 +733,7 @@ _rt_file_eof:
     test rdi, rdi
     jz .Leof_true           # never opened: treat as at end
 
-    call {libc}fgetc
+    call fgetc
     cmp eax, -1
     je .Leof_true
 
@@ -741,7 +741,7 @@ _rt_file_eof:
     mov edi, eax
     lea rax, [rip + _file_handles]
     mov rsi, [rax + rbx*8]
-    call {libc}ungetc
+    call ungetc
     xor eax, eax            # 0 = false
     jmp .Leof_done
 
@@ -775,18 +775,18 @@ _rt_file_lof:
     jz .Llof_zero
 
     # Remember the position, seek to the end, read it, then restore.
-    call {libc}ftell
+    call ftell
     mov r12, rax                    # saved position
 
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]
     xor esi, esi
     mov edx, 2                      # SEEK_END
-    call {libc}fseek
+    call fseek
 
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]
-    call {libc}ftell
+    call ftell
     mov QWORD PTR [rbp - 24], rax   # length; pushing it here would misalign
                                     # rsp for the fseek below
 
@@ -794,7 +794,7 @@ _rt_file_lof:
     mov rdi, [rax + rbx*8]
     mov rsi, r12
     xor edx, edx                    # SEEK_SET
-    call {libc}fseek
+    call fseek
 
     mov rax, QWORD PTR [rbp - 24]
     cvtsi2sd xmm0, rax

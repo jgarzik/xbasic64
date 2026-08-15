@@ -100,13 +100,13 @@ Key design choices:
 ## Requirements
 
 - Rust toolchain
-- System assembler (`as`)
-- System C compiler/linker (`cc`) with libc
+- Linux: system assembler (`as`) and C compiler/linker (`cc`) with libc
+- Windows: Clang (used to assemble) and the MSVC linker (`link.exe`)
 
 ## Platforms
 
-- macOS (x86-64, ARM64 via Rosetta)
 - Linux (x86-64)
+- Windows (x86-64)
 
 ## License
 

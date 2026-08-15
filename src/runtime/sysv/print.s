@@ -8,24 +8,21 @@
 #   - Callee-saved: rbx, rbp, r12-r15
 #   - Caller-saved: rax, rcx, rdx, rsi, rdi, r8-r11, xmm0-xmm15
 #   - Return values: rax (int), xmm0 (float)
-#
-# The {libc} placeholder is replaced with "_" on macOS, "" on Linux, and
-# {stdout} with the libc symbol holding the standard output stream.
 
 # _rt_platform_init - Prepare the console for output
 # The console is file handle 0, so every print helper reaches it the same way
 # it reaches an OPENed file. Seeding the slot is all that takes here; Windows
 # has to ask the OS for its handles instead.
 #
+# stdout is external *data*, reached through the GOT: a direct PC-relative
+# load would resolve only because the driver passes -no-pie, letting ld
+# synthesize a copy relocation, and that coupling is not worth one saved
+# instruction.
+#
 # Arguments: none      Returns: nothing
-# The stream is external *data*, which must be reached through the GOT. A
-# direct PC-relative load links on Linux only because the driver passes
-# -no-pie, letting ld synthesize a copy relocation; mach-o executables are
-# always PIE and ld64 has no such relocation, so that form fails to link
-# every program on macOS -- a platform no CI job builds for.
 .globl _rt_platform_init
 _rt_platform_init:
-    mov rax, QWORD PTR [rip + {stdout}@GOTPCREL]
+    mov rax, QWORD PTR [rip + stdout@GOTPCREL]
     mov rax, QWORD PTR [rax]
     mov QWORD PTR [rip + _file_handles], rax
     ret
@@ -71,7 +68,7 @@ _rt_fmt_double:
     lea rsi, [rip + _fmt_int]
     mov rdx, rax
     xor eax, eax
-    call {libc}sprintf
+    call sprintf
     jmp .Lfd_done
 
 .Lfd_fractional:
@@ -81,12 +78,12 @@ _rt_fmt_double:
     lea rdi, [rip + _num_buf]
     movsd xmm0, QWORD PTR [rbp - 24]
     mov eax, 1              # one vector register argument
-    call {libc}sprintf
+    call sprintf
 
     # Does it read back as the same value?
     lea rdi, [rip + _num_buf]
     xor esi, esi
-    call {libc}strtod
+    call strtod
     movsd xmm1, QWORD PTR [rbp - 24]
     test r12d, r12d
     jz .Lfd_cmp_double
@@ -105,7 +102,7 @@ _rt_fmt_double:
 
 .Lfd_len:
     lea rdi, [rip + _num_buf]
-    call {libc}strlen
+    call strlen
 
 .Lfd_done:
     # sprintf and strlen both leave the length in rax.
@@ -130,4 +127,4 @@ _rt_end:
     push rbp
     mov rbp, rsp
     xor edi, edi            # exit code 0
-    call {libc}exit
+    call exit

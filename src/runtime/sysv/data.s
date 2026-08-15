@@ -73,7 +73,7 @@ _rt_read_number:
     # String: parse with strtod
     mov rdi, QWORD PTR [rcx + 8]        # string pointer
     xor rsi, rsi                        # endptr = NULL
-    call {libc}strtod                   # returns double in xmm0
+    call strtod                   # returns double in xmm0
     inc QWORD PTR [rip + _data_ptr]     # advance to next entry
     leave
     ret
@@ -103,7 +103,7 @@ _rt_read_string:
     mov rax, QWORD PTR [rcx + 8]        # rax = string pointer
     # Calculate length using strlen (DATA strings are null-terminated)
     mov rdi, rax                        # string pointer for strlen
-    call {libc}strlen                   # returns length in rax
+    call strlen                   # returns length in rax
     mov rdx, rax                        # length → rdx
     # Reload string pointer (strlen clobbered rax)
     mov rax, QWORD PTR [rip + _data_ptr]

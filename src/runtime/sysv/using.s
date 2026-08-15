@@ -113,7 +113,7 @@ _rt_print_using_num:
     mov edx, r13d               # precision
     movsd xmm0, QWORD PTR [rbp - 56]
     mov eax, 1
-    call {libc}sprintf
+    call sprintf
     mov rbx, rax                # rbx = length of the raw text
 
     # Copy into the work buffer, inserting commas in the integer part when

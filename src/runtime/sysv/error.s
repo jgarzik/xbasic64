@@ -50,22 +50,22 @@ _rt_error:
     # Flush stdout first, so output written before the error is not lost when
     # the process exits.
     xor edi, edi
-    call {libc}fflush
+    call fflush
 
-    mov rdi, QWORD PTR [rip + {libc}stderr]
+    mov rdi, QWORD PTR [rip + stderr]
     mov rdx, rbx            # message -> 3rd arg
     test r12, r12
     jz .Lerr_bare
     lea rsi, [rip + _err_fmt_line]
     mov rcx, r12            # line -> 4th arg
     xor eax, eax
-    call {libc}fprintf
+    call fprintf
     jmp .Lerr_exit
 .Lerr_bare:
     lea rsi, [rip + _err_fmt_bare]
     xor eax, eax
-    call {libc}fprintf
+    call fprintf
 
 .Lerr_exit:
     mov edi, 1
-    call {libc}exit
+    call exit

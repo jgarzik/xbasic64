@@ -1,7 +1,7 @@
 //! BASIC-to-x86_64 Compiler
 //!
 //! Compiles 1980s-era BASIC programs to x86-64 executables.
-//! Supports Linux, macOS, and Windows (MinGW).
+//! Supports Linux (system `as` and `cc`) and Windows (Clang and MSVC `link.exe`).
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -216,15 +216,9 @@ fn main() {
         .output();
 
     #[cfg(not(windows))]
-    let cc_output = {
-        #[allow(unused_mut)]
-        let mut cc_args = vec!["-o", &exe_file, &obj_file, "-lm"];
-
-        #[cfg(target_os = "linux")]
-        cc_args.push("-no-pie");
-
-        Command::new("cc").args(&cc_args).output()
-    };
+    let cc_output = Command::new("cc")
+        .args(["-o", &exe_file, &obj_file, "-lm", "-no-pie"])
+        .output();
 
     match cc_output {
         Ok(out) if out.status.success() => {

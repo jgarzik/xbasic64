@@ -43,7 +43,7 @@ _rt_val:
     mov rbp, rsp
     xor rsi, rsi            # endptr = NULL (2nd arg)
     # rdi already has string ptr (1st arg)
-    call {libc}strtod       # returns double in xmm0
+    call strtod       # returns double in xmm0
     leave
     ret
 
@@ -67,7 +67,7 @@ _rt_str:
     lea rdi, [rip + _str_buf]       # destination buffer (1st arg)
     lea rsi, [rip + _fmt_float]     # format string (2nd arg)
     mov eax, 1                      # 1 vector register arg (xmm0)
-    call {libc}sprintf
+    call sprintf
     # Calculate result length
     lea rax, [rip + _str_buf]
     mov rdx, rax                    # save ptr
@@ -243,7 +243,7 @@ _rt_instr:
     mov rdi, r12            # current position in haystack
     mov rsi, r14            # needle
     mov rdx, r15            # needle length
-    call {libc}memcmp
+    call memcmp
     test eax, eax
     jz .Linstr_found        # memcmp returns 0 if equal
     # Not found at this position, advance
@@ -314,21 +314,21 @@ _rt_strcat:
     # Allocate memory: malloc(left_len + right_len + 1)
     # +1 for null terminator (for safety, though we track length)
     lea rdi, [rsi + rcx + 1]
-    call {libc}malloc       # returns ptr in rax
+    call malloc       # returns ptr in rax
 
     # Copy left string: memcpy(result, left, left_len)
     mov QWORD PTR [rsp], rax    # save result ptr (aligned)
     mov rdi, rax            # dest = malloc result
     mov rsi, r12            # src = left ptr
     mov rdx, r13            # len = left len
-    call {libc}memcpy
+    call memcpy
 
     # Copy right string: memcpy(result + left_len, right, right_len)
     mov rdi, QWORD PTR [rsp]    # restore result ptr
     add rdi, r13            # dest = result + left_len
     mov rsi, r14            # src = right ptr
     mov rdx, r15            # len = right len
-    call {libc}memcpy
+    call memcpy
 
     # Null terminate (for safety)
     mov rax, QWORD PTR [rsp]    # restore result ptr
@@ -428,14 +428,14 @@ _rt_space:
     xor rbx, rbx            # a negative count yields the empty string
 .Lspace_ok:
     lea rdi, [rbx + 1]
-    call {libc}malloc
+    call malloc
 
     # memset returns its destination, so the pointer needs no saving -- and
     # saving it with a bare push would leave rsp misaligned for the call.
     mov rdi, rax            # dest
     mov esi, ' '            # fill byte
     mov rdx, rbx            # count
-    call {libc}memset
+    call memset
     mov rdx, rbx
 
     add rsp, 8
@@ -460,13 +460,13 @@ _rt_string_n:
     xor rbx, rbx
 .Lstringn_ok:
     lea rdi, [rbx + 1]
-    call {libc}malloc
+    call malloc
 
     # memset returns its destination; see _rt_space.
     mov rdi, rax
     mov esi, r12d
     mov rdx, rbx
-    call {libc}memset
+    call memset
     mov rdx, rbx
 
     pop r12
@@ -537,7 +537,7 @@ _rt_case_convert:
     mov r13d, r8d           # direction
 
     lea rdi, [r12 + 1]
-    call {libc}malloc
+    call malloc
 
     xor rcx, rcx
 .Lcase_loop:
@@ -584,7 +584,7 @@ _rt_hex:
     lea rdi, [rip + _str_buf]
     lea rsi, [rip + _fmt_hex]
     xor eax, eax
-    call {libc}sprintf
+    call sprintf
     mov rdx, rax
     lea rax, [rip + _str_buf]
     leave
@@ -599,7 +599,7 @@ _rt_oct:
     lea rdi, [rip + _str_buf]
     lea rsi, [rip + _fmt_oct]
     xor eax, eax
-    call {libc}sprintf
+    call sprintf
     mov rdx, rax
     lea rax, [rip + _str_buf]
     leave
@@ -624,13 +624,13 @@ _rt_strdup:
     mov r12, rsi
 
     lea rdi, [r12 + 1]
-    call {libc}malloc
+    call malloc
 
     # memcpy returns its destination; see _rt_space.
     mov rdi, rax
     mov rsi, rbx
     mov rdx, r12
-    call {libc}memcpy
+    call memcpy
     mov rdx, r12
 
     pop r12

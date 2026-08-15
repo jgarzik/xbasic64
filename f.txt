@@ -1,0 +1,56 @@
+src/sema.rs
+Comment on lines +614 to +625
+            StmtKind::Input {
+                file_num: Some(file_num),
+                ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+            }
+            StmtKind::LineInput {
+                file_num: Some(file_num),
+                ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+            }
+Copilot commented 12 minutes ago
+Copilot
+Copilot
+AI
+12m ago
+Medium
+Semantic analysis currently only validates file numbers for INPUT/LINE INPUT when a file number is present, but does not validate the destination lvalues at all (including for console INPUT/LINE INPUT). This can allow invalid lvalues (e.g., string subscripts) and whole-record targets to compile, and can miscompile LINE INPUT into a numeric target (codegen always reads a string). Add lvalue validation for both console and file forms, and ensure LINE INPUT targets are string-typed.
+
+Suggested changeset 1 (1)
+src/sema.rs
+Copilot uses AI. Check for mistakes.
+@jgarzik	Reply...
+src/runtime/win64-native/file.s
+Comment on lines 162 to 164
+.globl _rt_file_close
+_rt_file_close:
+    push rbp
+Copilot commented 12 minutes ago
+Copilot
+Copilot
+AI
+12m ago
+Medium
+_file_col is used to track the current output column for TAB/SPC, but the slot is never reset when a file is closed. If the same file number is later reopened, TAB() can inherit a stale column value and pad incorrectly. Reset the column slot during CLOSE while the file number is still available in the argument register.
+
+Copilot uses AI. Check for mistakes.
+@jgarzik	Reply...
+src/runtime/sysv/file.s
+Comment on lines 142 to 144
+.globl _rt_file_close
+_rt_file_close:
+    push rbp
+Copilot commented 12 minutes ago
+Copilot
+Copilot
+AI
+12m ago
+Medium
+_file_col is used to track the current output column for TAB/SPC, but the slot is never reset when a file is closed. If the same file number is later reopened, TAB() can inherit a stale column value and pad incorrectly. Reset the column slot during CLOSE while the file number is still available in the argument register.
+
+Copilot uses AI. Check for mistakes.
+

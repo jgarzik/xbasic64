@@ -267,9 +267,6 @@ static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| 
     ])
 });
 
-/// Symbol prefix from platform ABI (underscore on macOS, empty on Linux/Windows)
-const PREFIX: &str = PlatformAbi::SYMBOL_PREFIX;
-
 /// Stack space for temporary values (must be 16-byte aligned)
 const STACK_TEMP_SPACE: i32 = 16;
 
@@ -550,8 +547,7 @@ impl CodeGen {
 
     /// Call a libc function, whose arguments are already in place.
     fn emit_call_libc(&mut self, func: &str) {
-        let sym = format!("{}{}", PREFIX, func);
-        self.emit_call_with_args(&sym, &[]);
+        self.emit_call_with_args(func, &[]);
     }
 
     /// Call `sym` with `srcs` as its integer arguments, in order.
@@ -1052,8 +1048,7 @@ impl CodeGen {
         // Emit assembly header
         self.emit(".intel_syntax noprefix");
         self.emit(".text");
-        let p = PREFIX;
-        self.emit(&format!(".globl {}main", p));
+        self.emit(".globl main");
         self.emit("");
 
         // Procedures
@@ -1118,8 +1113,7 @@ impl CodeGen {
     /// Emit `main`: prologue, module-level statements, epilogue.
     fn gen_main(&mut self, program: &Program) {
         self.reserve_array_descriptors(&SemaScope::Module);
-        let p = PREFIX;
-        self.emit_label(&format!("{}main", p));
+        self.emit_label("main");
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
