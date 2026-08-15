@@ -659,7 +659,7 @@ impl CodeGen {
     fn param_data_type(p: &Param) -> DataType {
         match &p.ty {
             Some(TypeRef::Record(_)) => DataType::Long, // a pointer
-            Some(t) => Self::data_type_of(t),
+            Some(t) => DataType::from_type_ref(t),
             None => DataType::from_suffix(&p.name),
         }
     }
@@ -783,7 +783,7 @@ impl CodeGen {
                 None => match self.lookup_var(name) {
                     Some(info) => info.data_type,
                     None => match self.typed_var(name) {
-                        Some(t) => Self::data_type_of(&t),
+                        Some(t) => DataType::from_type_ref(&t),
                         None => DataType::from_suffix(name),
                     },
                 },
@@ -819,9 +819,35 @@ impl CodeGen {
         self.fn_return_type(name)
     }
 
+    /// Result type of a user-defined FUNCTION.
+    ///
+    /// `FUNCTION F(X) AS INTEGER` used to be parsed and then thrown away, so
+    /// the result fell back to the name's suffix -- Double for an unsuffixed
+    /// name, which printed 3.5 where the program asked for 3.
+    fn proc_return_type(&self, name: &str) -> DataType {
+        match self
+            .symbols
+            .procs
+            .get(&name.to_uppercase())
+            .and_then(|p| p.ret_ty.as_ref())
+        {
+            Some(ty) => DataType::from_type_ref(ty),
+            None => DataType::from_suffix(name),
+        }
+    }
+
     fn fn_return_type(&self, name: &str) -> DataType {
         // Built-in functions that return strings
         let upper = name.to_uppercase();
+
+        // A user-defined FUNCTION's declared type wins over any name-based
+        // guess, including the built-in table below.
+        if let Some(proc) = self.symbols.procs.get(&upper) {
+            if let Some(ty) = &proc.ret_ty {
+                return DataType::from_type_ref(ty);
+            }
+        }
+
         if upper.ends_with('$') {
             return DataType::String;
         }
@@ -965,7 +991,10 @@ impl CodeGen {
         for stmt in &program.statements {
             if let StmtKind::Sub { name, params, body } = &stmt.kind {
                 self.gen_procedure(name, params, body, false);
-            } else if let StmtKind::Function { name, params, body } = &stmt.kind {
+            } else if let StmtKind::Function {
+                name, params, body, ..
+            } = &stmt.kind
+            {
                 self.gen_procedure(name, params, body, true);
             }
         }
@@ -1336,7 +1365,7 @@ impl CodeGen {
 
         // If function, allocate return value slot
         if is_function {
-            let data_type = DataType::from_suffix(name);
+            let data_type = self.proc_return_type(name);
             self.stack_offset -= 8 * Self::words_for(data_type);
             self.proc_vars.insert(
                 name.to_string(),
@@ -2762,20 +2791,10 @@ impl CodeGen {
             };
             ty = f.ty.clone();
         }
-        Self::data_type_of(&ty)
+        DataType::from_type_ref(&ty)
     }
 
     /// The value representation of a declared type.
-    fn data_type_of(ty: &TypeRef) -> DataType {
-        match ty {
-            TypeRef::Integer => DataType::Integer,
-            TypeRef::Long => DataType::Long,
-            TypeRef::Single => DataType::Single,
-            TypeRef::Double => DataType::Double,
-            TypeRef::FixedString(_) => DataType::String,
-            TypeRef::Record(_) => DataType::Double,
-        }
-    }
 
     /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
     fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
@@ -2905,7 +2924,7 @@ impl CodeGen {
                 // Evaluate the value first, then the address, since computing
                 // the address clobbers the value registers.
                 let vt = self.gen_expr(v);
-                if Self::data_type_of(&ty) == DataType::String {
+                if DataType::from_type_ref(&ty) == DataType::String {
                     self.emit_string_copy();
                     self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
                     self.emit("    mov QWORD PTR [rsp], rax");
@@ -2920,7 +2939,7 @@ impl CodeGen {
                 self.emit(&format!("    add rax, {}", byte_offset));
                 self.emit("    mov rcx, rax");
 
-                if Self::data_type_of(&ty) == DataType::String {
+                if DataType::from_type_ref(&ty) == DataType::String {
                     self.emit("    mov rax, QWORD PTR [rsp]");
                     self.emit("    mov rdx, QWORD PTR [rsp + 8]");
                     self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
@@ -2929,7 +2948,7 @@ impl CodeGen {
                 } else {
                     self.emit("    movsd xmm0, QWORD PTR [rsp]");
                     self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-                    self.gen_coercion(DataType::Double, Self::data_type_of(&ty));
+                    self.gen_coercion(DataType::Double, DataType::from_type_ref(&ty));
                     match ty {
                         TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
                         TypeRef::Long => self.emit("    mov DWORD PTR [rcx], eax"),

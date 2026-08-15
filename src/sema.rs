@@ -84,6 +84,9 @@ fn builtin(name: &str) -> Option<&'static (&'static str, usize, usize)> {
 pub struct ProcInfo {
     pub is_function: bool,
     pub params: Vec<Param>,
+    /// Result type from `FUNCTION f AS T`; None means the name's suffix
+    /// decides, which is also the only option for a SUB.
+    pub ret_ty: Option<TypeRef>,
     pub line: u32,
 }
 
@@ -415,6 +418,26 @@ impl Analyzer {
                     name, params, body, ..
                 } => {
                     let is_function = matches!(stmt.kind, StmtKind::Function { .. });
+                    let ret_ty = match &stmt.kind {
+                        StmtKind::Function { ret_ty, .. } => ret_ty.clone(),
+                        _ => None,
+                    };
+
+                    // A declared result type and a type suffix must agree, or
+                    // there is no telling which the program meant.
+                    if let Some(ty) = &ret_ty {
+                        let declared = DataType::from_type_ref(ty);
+                        let suffixed = DataType::from_suffix(name);
+                        if name.ends_with(|c| "%&!#$".contains(c)) && declared != suffixed {
+                            self.error(
+                                stmt.line,
+                                format!(
+                                    "'{}' is declared AS a different type than its name's suffix",
+                                    name
+                                ),
+                            );
+                        }
+                    }
                     if scope != &Scope::Module {
                         self.error(
                             stmt.line,
@@ -434,6 +457,7 @@ impl Analyzer {
                         ProcInfo {
                             is_function,
                             params: params.clone(),
+                            ret_ty,
                             line: stmt.line,
                         },
                     );

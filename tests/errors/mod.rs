@@ -606,3 +606,21 @@ fn test_record_parameter_rejects_wrong_type() {
         err.stderr
     );
 }
+
+/// A declared result type that contradicts the name's suffix is ambiguous.
+#[test]
+fn test_function_type_conflicts_with_suffix() {
+    let err = compile_only("FUNCTION M$(X) AS INTEGER\nM$ = \"a\"\nEND FUNCTION\nPRINT M$(1)\n")
+        .expect_err("should be rejected");
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(err.stderr.contains("suffix"), "{}", err.stderr);
+}
+
+/// A SUB has no result, so an AS clause on one describes nothing.
+#[test]
+fn test_sub_cannot_be_declared_as_a_type() {
+    let err = compile_only("SUB T(X) AS INTEGER\nPRINT X\nEND SUB\nT 1\n")
+        .expect_err("should be rejected");
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(err.stderr.contains("no return value"), "{}", err.stderr);
+}

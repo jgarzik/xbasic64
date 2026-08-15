@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::Token;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Binary operator precedence levels (higher = tighter binding)
 /// Returns (precedence, BinaryOp) or None if not a binary operator
@@ -134,6 +134,9 @@ pub enum StmtKind {
     Function {
         name: String,
         params: Vec<Param>,
+        /// Result type from an `AS` clause, when one was given; otherwise the
+        /// type comes from the name's suffix.
+        ret_ty: Option<TypeRef>,
         body: Vec<Stmt>,
     },
     Call {
@@ -388,6 +391,21 @@ impl DataType {
         }
     }
 
+    /// The storage class of a declared type.
+    ///
+    /// A record has no scalar class of its own; callers that can encounter one
+    /// check for `TypeRef::Record` before asking.
+    pub fn from_type_ref(ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => DataType::Integer,
+            TypeRef::Long => DataType::Long,
+            TypeRef::Single => DataType::Single,
+            TypeRef::Double => DataType::Double,
+            TypeRef::FixedString(_) => DataType::String,
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
     /// Check if this is an integer type (Integer or Long)
     pub fn is_integer(&self) -> bool {
         matches!(self, DataType::Integer | DataType::Long)
@@ -555,8 +573,6 @@ pub struct Parser {
     /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
     /// start of a line is not mistaken for a label definition.
     declared_procs: HashSet<String>,
-    /// Declared result types from `FUNCTION f AS T`.
-    function_types: HashMap<String, TypeRef>,
 }
 
 impl Parser {
@@ -982,6 +998,7 @@ impl Parser {
         Ok(StmtKind::Function {
             name: name.clone(),
             params,
+            ret_ty: None,
             body: vec![Stmt {
                 line,
                 kind: StmtKind::Let {
@@ -1812,17 +1829,12 @@ impl Parser {
             Vec::new()
         };
 
-        // `FUNCTION f AS T` gives the result a declared type.
+        // A SUB has no result, so an `AS` clause here has nothing to describe.
         if matches!(self.peek(), Token::As) {
-            self.advance();
-            let ty = self.parse_type_ref()?;
-            if let TypeRef::Record(r) = &ty {
-                return err(format!(
-                    "a FUNCTION cannot return the record type '{}'; use a SUB with a record parameter",
-                    r
-                ));
-            }
-            self.function_types.insert(name.to_uppercase(), ty);
+            return err(format!(
+                "a SUB has no return value, so '{}' cannot be declared AS a type; use a FUNCTION",
+                name
+            ));
         }
 
         self.skip_newlines();
@@ -1858,7 +1870,10 @@ impl Parser {
             Vec::new()
         };
 
-        // `FUNCTION f AS T` gives the result a declared type.
+        // `FUNCTION f AS T` gives the result a declared type. This used to be
+        // recorded in a parser-local map that nothing ever read, so the result
+        // silently fell back to the name's suffix -- Double, in most cases.
+        let mut ret_ty = None;
         if matches!(self.peek(), Token::As) {
             self.advance();
             let ty = self.parse_type_ref()?;
@@ -1868,7 +1883,7 @@ impl Parser {
                     r
                 ));
             }
-            self.function_types.insert(name.to_uppercase(), ty);
+            ret_ty = Some(ty);
         }
 
         self.skip_newlines();
@@ -1883,7 +1898,12 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(StmtKind::Function { name, params, body })
+        Ok(StmtKind::Function {
+            name,
+            params,
+            ret_ty,
+            body,
+        })
     }
 
     fn parse_param_list(&mut self) -> PResult<Vec<Param>> {
@@ -2879,7 +2899,10 @@ mod tests {
     fn test_function_no_params() {
         let prog = parse("FUNCTION GetValue\nGetValue = 42\nEND FUNCTION").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Function { name, params, body } = &prog.statements[0].kind {
+        if let StmtKind::Function {
+            name, params, body, ..
+        } = &prog.statements[0].kind
+        {
             assert_eq!(name, "GETVALUE");
             assert!(params.is_empty());
             assert_eq!(body.len(), 1);

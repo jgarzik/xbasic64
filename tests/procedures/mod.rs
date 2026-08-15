@@ -375,3 +375,24 @@ fn test_option_base_defaults_to_zero() {
     let output = compile_and_run("DIM A(3)\nA(0) = 5\nPRINT A(0); LBOUND(A)\n").unwrap();
     assert_eq!(output.trim(), "50");
 }
+
+/// `FUNCTION f(...) AS T` must actually give the result type T.
+///
+/// The declared type was parsed into a map nothing read, so the result fell
+/// back to the name's suffix -- Double for an unsuffixed name.
+#[test]
+fn test_function_declared_return_type() {
+    let output = compile_and_run(
+        "FUNCTION F(X) AS INTEGER\nF = X / 2\nEND FUNCTION\nFUNCTION G(X) AS LONG\nG = X * 1000\nEND FUNCTION\nPRINT F(7)\nPRINT G(3)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["3", "3000"]);
+}
+
+/// Without an AS clause the suffix still decides, as before.
+#[test]
+fn test_function_return_type_without_as() {
+    let output = compile_and_run("FUNCTION K(X)\nK = X / 2\nEND FUNCTION\nPRINT K(7)\n").unwrap();
+    assert_eq!(output.trim(), "3.5");
+}
