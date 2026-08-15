@@ -18,9 +18,15 @@
 # has to ask the OS for its handles instead.
 #
 # Arguments: none      Returns: nothing
+# The stream is external *data*, which must be reached through the GOT. A
+# direct PC-relative load links on Linux only because the driver passes
+# -no-pie, letting ld synthesize a copy relocation; mach-o executables are
+# always PIE and ld64 has no such relocation, so that form fails to link
+# every program on macOS -- a platform no CI job builds for.
 .globl _rt_platform_init
 _rt_platform_init:
-    mov rax, QWORD PTR [rip + {stdout}]
+    mov rax, QWORD PTR [rip + {stdout}@GOTPCREL]
+    mov rax, QWORD PTR [rax]
     mov QWORD PTR [rip + _file_handles], rax
     ret
 

@@ -292,6 +292,27 @@ fn test_print_file_tab_spc() {
     );
 }
 
+/// A fresh file starts at column 1, whatever the last one on that number left.
+///
+/// The column tracker is indexed by file number, so closing a file part-way
+/// through a line and opening another on the same number handed the new file
+/// the old column: TAB then thought it had to start a line, and wrote a
+/// newline into a file nothing had written to yet.
+#[test]
+fn test_open_resets_the_column() {
+    let output = compile_and_run_with_files(
+        "OPEN \"c1.txt\" FOR OUTPUT AS #1\nPRINT #1, \"hello\";\nCLOSE #1\nOPEN \"c2.txt\" FOR OUTPUT AS #1\nPRINT #1, TAB(3); \"x\"\nCLOSE #1\nOPEN \"c2.txt\" FOR INPUT AS #1\nLINE INPUT #1, A$\nCLOSE #1\nPRINT \"[\"; A$; \"]\"\n",
+        |_| Ok(()),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(
+        output.trim(),
+        "[  x]",
+        "TAB measured from the new file's start"
+    );
+}
+
 /// Numbers too: a CRLF file must not leave a CR to derail the next field.
 #[test]
 fn test_crlf_numeric_fields() {

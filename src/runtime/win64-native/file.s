@@ -132,6 +132,11 @@ _rt_file_open:
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
 
+    # A new file starts at column 1, whatever the last one on this number
+    # left behind.
+    lea rcx, [rip + _file_col]
+    mov QWORD PTR [rcx + rbx*8], 0
+
     # If APPEND mode, seek to end
     cmp r14d, MODE_APPEND
     jne .Lfile_open_done

@@ -969,6 +969,13 @@ impl Analyzer {
     /// table at run time. A non-constant is checked by codegen instead.
     fn check_file_num(&mut self, e: &Expr, scope: &Scope, line: u32) {
         self.check_expr(e, scope, line);
+        self.check_file_num_value(e, scope, line);
+    }
+
+    /// The range half of [`Self::check_file_num`], for a caller that has
+    /// already walked the expression. Walking it twice reports anything wrong
+    /// inside it twice.
+    fn check_file_num_value(&mut self, e: &Expr, scope: &Scope, line: u32) {
         self.require_numeric(e, scope, line, "a file number");
         if let Some(n) = self.const_eval(e).and_then(|l| match l {
             Literal::Integer(n) => Some(n),
@@ -1172,7 +1179,8 @@ impl Analyzer {
                     ),
                 );
             } else if matches!(upper.as_str(), "EOF" | "LOF") {
-                self.check_file_num(&args[0], scope, line);
+                // check_expr has already walked the argument on the way here.
+                self.check_file_num_value(&args[0], scope, line);
             }
             return;
         }
