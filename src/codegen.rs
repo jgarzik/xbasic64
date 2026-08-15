@@ -1682,6 +1682,12 @@ impl CodeGen {
                 self.emit("    call _rt_restore");
             }
 
+            StmtKind::Redim { arrays, preserve } => {
+                for arr in arrays {
+                    self.gen_array_alloc(arr, *preserve);
+                }
+            }
+
             StmtKind::MidAssign {
                 target,
                 start,
@@ -3133,19 +3139,45 @@ impl CodeGen {
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
-        let elem_size = Self::elem_size(&arr.name);
+        self.gen_array_alloc(arr, false);
+    }
 
-        // Reserve the descriptor as one contiguous block: word 0 is the element
-        // pointer, word 1+i is dimension i's element count. A module-level DIM
-        // gets static storage so procedures can reach the same array; a DIM
-        // inside a procedure is local to it.
+    /// Allocate or reallocate an array's storage.
+    ///
+    /// The descriptor -- word 0 the element pointer, word 1+i dimension i's
+    /// element count -- is reused when the array already exists, so REDIM
+    /// resizes in place rather than orphaning it, and a repeated DIM does not
+    /// leak a second descriptor.
+    ///
+    /// With `preserve`, the block is grown with realloc and the new tail
+    /// zeroed; otherwise fresh zeroed storage is allocated.
+    fn gen_array_alloc(&mut self, arr: &ArrayDecl, preserve: bool) {
+        let elem_size = Self::elem_size(&arr.name);
         let ndims = arr.dimensions.len();
-        let loc = if self.current_proc.is_some() {
-            self.stack_offset -= 8 * (1 + ndims as i32);
-            Loc::Frame(self.stack_offset)
-        } else {
-            Loc::Global(format!("_arr_{}", mangle(&arr.name)))
+
+        // Reuse the existing descriptor, or reserve one. A module-level array
+        // gets static storage so procedures can reach it; one declared inside a
+        // procedure is local to it.
+        let loc = match self.lookup_array(&arr.name).map(|i| i.loc.clone()) {
+            Some(existing) => existing,
+            None if self.current_proc.is_some() => {
+                self.stack_offset -= 8 * (1 + ndims as i32);
+                Loc::Frame(self.stack_offset)
+            }
+            None => Loc::Global(format!("_arr_{}", mangle(&arr.name))),
         };
+
+        // With PRESERVE, the old element count is needed to know where the
+        // newly added tail begins.
+        if preserve {
+            self.emit(&format!("    mov rax, {}", loc.q(1)));
+            for i in 1..ndims {
+                self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+            }
+            self.emit(&format!("    imul rax, {}", elem_size));
+            self.emit("    push rax"); // old size in bytes
+            self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+        }
 
         // Evaluate and store all dimension bounds.
         // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
@@ -3166,11 +3198,26 @@ impl CodeGen {
         for i in 1..ndims {
             self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
         }
+        self.emit(&format!("    imul rax, {}", elem_size));
 
-        // Allocate: total_elements * elem_size
-        let arg0 = Self::arg_reg(0);
-        self.emit(&format!("    imul {}, rax, {}", arg0, elem_size));
-        self.emit_call_libc("malloc");
+        if preserve {
+            // realloc(old_ptr, new_size)
+            self.emit("    mov r10, rax"); // new size in bytes
+            self.emit("    push r10");
+            self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned across the call
+            self.emit(&format!("    mov {}, {}", Self::arg_reg(0), loc.q(0)));
+            self.emit_arg_reg(1, "r10");
+            self.emit_call_libc("realloc");
+            self.emit("    add rsp, 8");
+            self.emit("    pop r10"); // new size
+        } else {
+            // calloc(1, size): BASIC guarantees a fresh array reads as 0 / "",
+            // which malloc alone does not.
+            self.emit(&format!("    mov {}, 1", Self::arg_reg(0)));
+            self.emit_arg_reg(1, "rax");
+            self.emit_call_libc("calloc");
+        }
+
         if self.opts.checks {
             // A null result would otherwise be written into the descriptor and
             // dereferenced on first use.
@@ -3180,6 +3227,22 @@ impl CodeGen {
 
         // Store array pointer
         self.emit(&format!("    mov {}, rax", loc.q(0)));
+
+        if preserve {
+            // Zero the newly added tail, from the old size up to the new one.
+            self.emit("    add rsp, 8");
+            self.emit("    pop r11"); // old size in bytes
+            self.emit("    mov rcx, r11");
+            let loop_label = self.new_label("preserve_zero");
+            let done_label = self.new_label("preserve_done");
+            self.emit_label(&loop_label);
+            self.emit("    cmp rcx, r10");
+            self.emit(&format!("    jae {}", done_label));
+            self.emit("    mov BYTE PTR [rax + rcx], 0");
+            self.emit("    inc rcx");
+            self.emit(&format!("    jmp {}", loop_label));
+            self.emit_label(&done_label);
+        }
 
         // Record array info
         let info = ArrayInfo { loc, ndims };

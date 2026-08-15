@@ -120,6 +120,12 @@ pub enum StmtKind {
     Dim {
         arrays: Vec<ArrayDecl>,
     },
+    /// `REDIM [PRESERVE] A(bounds)` -- resize an existing array.
+    Redim {
+        arrays: Vec<ArrayDecl>,
+        /// Keep the existing contents (only the last dimension may change).
+        preserve: bool,
+    },
     Sub {
         name: String,
         params: Vec<String>,
@@ -656,6 +662,7 @@ impl Parser {
             }
             Token::On => self.parse_on_goto(),
             Token::Dim => self.parse_dim(),
+            Token::Redim => self.parse_redim(),
             Token::Sub => self.parse_sub(),
             Token::Function => self.parse_function(),
             Token::Data => self.parse_data(),
@@ -1445,13 +1452,18 @@ impl Parser {
 
     fn parse_dim(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DIM
+        self.parse_dim_list()
+    }
+
+    /// Parse the `name(bounds), name(bounds), ...` part shared by DIM and REDIM.
+    fn parse_dim_list(&mut self) -> PResult<StmtKind> {
         let mut arrays = Vec::new();
 
         loop {
             let name = if let Token::Ident(n) = self.advance() {
                 n
             } else {
-                return err("Expected array name after DIM");
+                return err("Expected an array name");
             };
 
             self.expect(Token::LParen)?;
@@ -1471,6 +1483,21 @@ impl Parser {
         }
 
         Ok(StmtKind::Dim { arrays })
+    }
+
+    /// `REDIM [PRESERVE] A(bounds), B(bounds), ...`
+    fn parse_redim(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume REDIM
+        let preserve = if matches!(self.peek(), Token::Preserve) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let StmtKind::Dim { arrays } = self.parse_dim_list()? else {
+            unreachable!("parse_dim_list yields a Dim")
+        };
+        Ok(StmtKind::Redim { arrays, preserve })
     }
 
     fn parse_sub(&mut self) -> PResult<StmtKind> {

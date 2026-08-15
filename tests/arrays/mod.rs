@@ -119,3 +119,55 @@ PRINT ""
     assert_eq!(lines[0], "579");
     assert_eq!(lines[1], "014916");
 }
+
+/// A fresh array reads as 0 / "": allocation is zeroed, which plain malloc
+/// does not guarantee.
+#[test]
+fn test_arrays_start_zeroed() {
+    let output =
+        compile_and_run("DIM A(5)\nDIM S$(2)\nPRINT A(0); A(3); A(5)\nPRINT LEN(S$(1))\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["000", "0"]);
+}
+
+/// REDIM resizes an existing array, reusing its descriptor, and clears it.
+#[test]
+fn test_redim() {
+    let output = compile_and_run(
+        "DIM A(2)\nA(0) = 7\nREDIM A(5)\nPRINT A(0)\nA(5) = 9\nPRINT A(5); UBOUND(A)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["0", "95"], "contents cleared, bound updated");
+}
+
+/// REDIM PRESERVE keeps the existing elements and zeroes the new tail.
+#[test]
+fn test_redim_preserve() {
+    let output = compile_and_run(
+        "DIM A(2)\nA(0) = 7\nA(1) = 8\nREDIM PRESERVE A(5)\nPRINT A(0); A(1); A(5)\nPRINT UBOUND(A)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["780", "5"]);
+}
+
+/// Growing an array a step at a time, which is what PRESERVE is for.
+#[test]
+fn test_redim_preserve_in_loop() {
+    let output = compile_and_run(
+        "DIM A(1)\nFOR I = 1 TO 3\nREDIM PRESERVE A(I)\nA(I) = I * 10\nNEXT I\nPRINT A(1); A(2); A(3)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "102030");
+}
+
+/// String arrays survive PRESERVE too.
+#[test]
+fn test_redim_preserve_strings() {
+    let output = compile_and_run(
+        "DIM S$(1)\nS$(0) = \"keep\"\nREDIM PRESERVE S$(3)\nPRINT S$(0); LEN(S$(0))\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "keep4");
+}

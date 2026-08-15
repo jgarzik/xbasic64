@@ -66,6 +66,8 @@ static KEYWORDS: LazyLock<HashMap<&'static str, Token>> = LazyLock::new(|| {
         ("DEF", Token::Def),
         ("OPTION", Token::Option),
         ("BASE", Token::Base),
+        ("REDIM", Token::Redim),
+        ("PRESERVE", Token::Preserve),
     ])
 });
 
@@ -135,6 +137,8 @@ pub enum Token {
     Def,
     Option,
     Base,
+    Redim,
+    Preserve,
 
     // Operators
     Plus,

@@ -220,14 +220,26 @@ impl Analyzer {
                         ),
                     }
                 }
-                StmtKind::Dim { arrays } => {
+                // REDIM may also introduce an array, so both are collected.
+                StmtKind::Dim { arrays } | StmtKind::Redim { arrays, .. } => {
+                    let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
                     for arr in arrays {
                         let key = (scope.clone(), arr.name.clone());
-                        if self.symbols.arrays.contains_key(&key) {
-                            self.error(
-                                stmt.line,
-                                format!("array '{}' is already declared", arr.name),
-                            );
+                        if let Some(prev) = self.symbols.arrays.get(&key) {
+                            if !is_redim {
+                                self.error(
+                                    stmt.line,
+                                    format!("array '{}' is already declared", arr.name),
+                                );
+                            } else if prev.rank != arr.dimensions.len() {
+                                self.error(
+                                    stmt.line,
+                                    format!(
+                                        "REDIM of '{}' must keep its {} dimension(s)",
+                                        arr.name, prev.rank
+                                    ),
+                                );
+                            }
                         }
                         self.symbols.arrays.insert(
                             key,
@@ -392,6 +404,25 @@ impl Analyzer {
                 for arr in arrays {
                     for d in &arr.dimensions {
                         self.check_expr(d, scope, line);
+                    }
+                }
+            }
+            StmtKind::Redim { arrays, preserve } => {
+                for arr in arrays {
+                    for d in &arr.dimensions {
+                        self.check_expr(d, scope, line);
+                    }
+                    // Only the last dimension may change under PRESERVE, which
+                    // is QuickBASIC's own rule: any other change would need the
+                    // elements remapped rather than the block simply grown.
+                    if *preserve && arr.dimensions.len() > 1 {
+                        self.error(
+                            line,
+                            format!(
+                                "REDIM PRESERVE of '{}' may only change its last dimension",
+                                arr.name
+                            ),
+                        );
                     }
                 }
             }

@@ -488,3 +488,15 @@ fn test_option_base_rules() {
     assert!(run.stderr.contains("Subscript out of range"));
     assert_eq!(run.exit_code, Some(1));
 }
+
+/// REDIM must keep the array's rank, and PRESERVE may only change the last
+/// dimension -- QuickBASIC's own rule, since any other change would need the
+/// elements remapped rather than the block simply grown.
+#[test]
+fn test_redim_rules() {
+    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimension(s)");
+    expect_rejected(
+        "DIM A(2,2)\nREDIM PRESERVE A(2,3)\n",
+        "may only change its last dimension",
+    );
+}
