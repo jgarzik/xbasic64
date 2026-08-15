@@ -39,8 +39,8 @@ fn basic_blocks(markdown: &str) -> Vec<String> {
 
 /// Compile every example in one documentation file.
 fn check_doc(path: &str) {
-    let markdown = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("could not read {path}: {e}"));
+    let markdown =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("could not read {path}: {e}"));
     let blocks = basic_blocks(&markdown);
     assert!(
         !blocks.is_empty(),
