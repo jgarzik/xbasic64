@@ -260,36 +260,19 @@ _rt_file_print_float:
 
     mov ebx, ecx            # save file number
 
-    # Check if value is a whole number
-    cvttsd2si rax, xmm0     # truncate to integer
-    cvtsi2sd xmm1, rax      # convert back
-    ucomisd xmm0, xmm1      # compare
-    jne .Lfile_print_as_float
-
-    # Format as integer using sprintf
-    lea rcx, [rip + _file_output_buf]
-    lea rdx, [rip + _file_fmt_int]
-    mov r8, rax             # integer value
-    call sprintf
-    jmp .Lfile_print_formatted
-
-.Lfile_print_as_float:
-    # Format as float using sprintf
-    lea rcx, [rip + _file_output_buf]
-    lea rdx, [rip + _file_fmt_float]
-    movsd xmm2, xmm0        # value in xmm2
-    movq r8, xmm0           # also in r8 for varargs
-    call sprintf
-
-.Lfile_print_formatted:
-    mov r12, rax            # save length from sprintf
+    # Format through the shared helper, so file output matches console output
+    # digit for digit.
+    lea rcx, [rip + _fmt_g_table]
+    xor edx, edx
+    call _rt_fmt_double
+    mov r12, rax            # length
 
     # Get HANDLE from table
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
 
     # WriteFile(hFile, buffer, length, &bytesWritten, NULL)
-    lea rdx, [rip + _file_output_buf]
+    lea rdx, [rip + _num_buf]
     mov r8, r12             # length
     lea r9, [rip + _file_bytes_written]
     mov QWORD PTR [rsp + 32], 0

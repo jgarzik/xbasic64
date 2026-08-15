@@ -142,61 +142,56 @@ _rt_print_newline:
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_print_float / _rt_print_single - Print a numeric value
+# _rt_fmt_double - Format a number into _num_buf
 # ------------------------------------------------------------------------------
-# GW-BASIC convention: a whole number prints without a decimal point.
+# Shared by console and file output so both render numbers identically.
 #
-# For fractional values, print the *shortest* decimal that reads back as the
-# same value: try successively longer %g precisions and keep the first whose
-# text strtod's back unchanged. A plain %g gives 6 significant digits, which
-# for a dialect whose default type is Double discards most of the value.
-# _rt_print_single compares at 32-bit precision and starts from a shorter
-# format, since a SINGLE carries only ~7 significant digits.
+# GW-BASIC convention: a whole number is written without a decimal point. For
+# fractional values, write the *shortest* decimal that reads back as the same
+# value, trying each format in the given table until one round-trips. A plain
+# %g gives only 6 significant digits, which for a dialect whose default type is
+# Double discards most of the value.
+#
+# This is a private helper, so it uses its own argument convention rather than
+# the positional one: the value stays in xmm0 and the other two arguments take
+# the first integer registers.
 #
 # Arguments:
-#   xmm0 = value to print (double; a SINGLE arrives already widened)
+#   xmm0 = value (a SINGLE arrives already widened to double)
+#   rcx  = pointer to a NULL-terminated table of format-string pointers
+#   rdx  = nonzero to compare at SINGLE precision
+#
+# Returns:
+#   rax = length of the text in _num_buf
 # ------------------------------------------------------------------------------
-.globl _rt_print_float
-_rt_print_float:
+.globl _rt_fmt_double
+_rt_fmt_double:
     push rbp
     mov rbp, rsp
     push rbx
     push rsi
     sub rsp, 56             # shadow space + locals, keeps rsp 16-byte aligned
+
     movsd QWORD PTR [rbp - 32], xmm0    # original value
-    lea rbx, [rip + _fmt_g_table]
-    xor esi, esi            # esi = 0: compare at double precision
-    jmp .Lpf_common
+    mov rbx, rcx            # table cursor
+    mov rsi, rdx            # precision flag
 
-.globl _rt_print_single
-_rt_print_single:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    push rsi
-    sub rsp, 56
-    movsd QWORD PTR [rbp - 32], xmm0
-    lea rbx, [rip + _fmt_g_single_table]
-    mov esi, 1              # esi = 1: compare at single precision
-
-.Lpf_common:
-    # Whole number? Print as an integer.
-    movsd xmm0, QWORD PTR [rbp - 32]
+    # Whole number? Format as an integer.
     cvttsd2si rax, xmm0
     cvtsi2sd xmm1, rax
     ucomisd xmm0, xmm1
-    jne .Lpf_fractional
-    jp .Lpf_fractional
+    jne .Lfd_fractional
+    jp .Lfd_fractional
     lea rcx, [rip + _num_buf]
     lea rdx, [rip + _fmt_int]
     mov r8, rax
     call sprintf
-    jmp .Lpf_write
+    jmp .Lfd_done
 
-.Lpf_fractional:
+.Lfd_fractional:
     mov rdx, QWORD PTR [rbx]
     test rdx, rdx
-    jz .Lpf_write           # table exhausted: write the last attempt
+    jz .Lfd_len             # table exhausted: keep the last attempt
     lea rcx, [rip + _num_buf]
     movsd xmm2, QWORD PTR [rbp - 32]
     movq r8, xmm2
@@ -207,37 +202,75 @@ _rt_print_single:
     xor edx, edx
     call strtod
     movsd xmm1, QWORD PTR [rbp - 32]
-    test esi, esi
-    jz .Lpf_cmp_double
+    test rsi, rsi
+    jz .Lfd_cmp_double
     cvtsd2ss xmm0, xmm0
     cvtsd2ss xmm1, xmm1
     ucomiss xmm0, xmm1
-    jmp .Lpf_cmp_done
-.Lpf_cmp_double:
+    jmp .Lfd_cmp_done
+.Lfd_cmp_double:
     ucomisd xmm0, xmm1
-.Lpf_cmp_done:
-    jp .Lpf_next
-    je .Lpf_write
-.Lpf_next:
+.Lfd_cmp_done:
+    jp .Lfd_next            # unordered: keep trying
+    je .Lfd_len
+.Lfd_next:
     add rbx, 8
-    jmp .Lpf_fractional
+    jmp .Lfd_fractional
 
-.Lpf_write:
-    # WriteFile(stdout, _num_buf, strlen(_num_buf), &bytesWritten, NULL)
+.Lfd_len:
     lea rcx, [rip + _num_buf]
     call lstrlenA
-    mov r8, rax             # length
-    lea rax, [rip + _stdout_handle]
-    mov rcx, [rax]
-    lea rdx, [rip + _num_buf]
-    lea r9, [rip + _bytes_written]
-    mov QWORD PTR [rsp + 32], 0
-    call WriteFile
 
-    lea rsp, [rbp - 16]
+.Lfd_done:
+    # sprintf and lstrlenA both leave the length in rax.
+    add rsp, 56
     pop rsi
     pop rbx
-    pop rbp
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_float - Print a DOUBLE (or an untyped numeric value)
+# ------------------------------------------------------------------------------
+# Arguments: xmm0 = value        Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_float
+_rt_print_float:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    lea rcx, [rip + _fmt_g_table]
+    xor edx, edx
+    call _rt_fmt_double
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax
+    call _rt_print_string
+    add rsp, 32
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_single - Print a SINGLE
+# ------------------------------------------------------------------------------
+# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
+# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
+# print as 3.1415901184082: at 15 digits even a float's value round-trips.
+#
+# Arguments: xmm0 = value, already widened to double     Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_single
+_rt_print_single:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    lea rcx, [rip + _fmt_g_single_table]
+    mov edx, 1
+    call _rt_fmt_double
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax
+    call _rt_print_string
+    add rsp, 32
+    leave
     ret
 
 # ------------------------------------------------------------------------------
