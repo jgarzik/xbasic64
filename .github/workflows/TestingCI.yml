@@ -20,6 +20,20 @@ jobs:
         run: cargo test --release --verbose
       - name: Run fmt check
         run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # The examples are the only programs compiled and run end to end through
+      # the real driver -- shelling out to the assembler and linker -- rather
+      # than through the test harness.
+      - name: Compile and run the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.bas; do
+            echo "== $f"
+            ./target/release/xbasic64 "$f" -o /tmp/example
+            /tmp/example </dev/null >/dev/null
+          done
 
   windows-native:
     runs-on: windows-latest
@@ -39,3 +53,25 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # Worth repeating here rather than trusting the Linux job: this is the
+      # only step that drives link.exe over whole programs, and the Win64
+      # runtime is the half that cannot be run anywhere else.
+      #
+      # Deliberately PowerShell, the shell the rest of this job uses. Under
+      # `shell: bash` the PATH leads with Git for Windows' usr/bin, whose GNU
+      # coreutils `link.exe` shadows the MSVC linker -- the compiler then hands
+      # MSVC flags to coreutils and gets "extra operand '/SUBSYSTEM:CONSOLE'".
+      - name: Compile and run the examples
+        shell: pwsh
+        run: |
+          Get-ChildItem examples/*.bas | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            & ./target/release/xbasic64.exe $_.FullName -o example.exe
+            if ($LASTEXITCODE -ne 0) { throw "compile failed: $($_.Name)" }
+            & ./example.exe | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "run failed: $($_.Name)" }
+          }

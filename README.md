@@ -14,14 +14,22 @@ xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBA
 
 ## Features
 
-- Classic BASIC syntax with line numbers or structured code
+- Classic BASIC syntax with line numbers, named labels, or structured code
 - Numeric types: Integer, Long, Single, Double (with type suffixes)
-- String handling with standard functions (LEFT$, MID$, etc.)
-- Control flow: IF/THEN/ELSE, FOR/NEXT, WHILE/WEND, DO/LOOP, SELECT CASE
-- Procedures: SUB and FUNCTION with recursion support
-- File I/O: Sequential file reading and writing
-- DATA/READ/RESTORE for inline data
-- Full expression support with proper operator precedence
+- Strings with the standard function set (`LEFT$`, `MID$`, `UCASE$`, `INSTR`, ...),
+  including `MID$` as an assignment target
+- Control flow: `IF`/`THEN`/`ELSE`, `FOR`/`NEXT`, `WHILE`/`WEND`, `DO`/`LOOP`,
+  `SELECT CASE` with ranges, lists and `IS` comparisons, and `EXIT`
+- Procedures: `SUB` and `FUNCTION` with recursion; `DEF FN` for one-liners
+- Arrays with `REDIM`, `REDIM PRESERVE`, `OPTION BASE`, and `LBOUND`/`UBOUND`
+- User-defined record types with `TYPE`, including nesting and arrays of records
+- File I/O: sequential reading and writing, with `EOF` and `LOF`
+- `DATA`/`READ`/`RESTORE` for inline data
+- Formatted output with `PRINT USING`
+- Runtime checks for out-of-range subscripts and division by zero, with
+  `--unsafe` to remove them
+- Diagnostics that name the file, line and problem rather than failing at link
+  time
 
 ## Quick Start
 
@@ -42,6 +50,9 @@ xbasic64 program.bas -o myprogram
 
 # Emit assembly only (no linking)
 xbasic64 -S program.bas
+
+# Omit the runtime safety checks
+xbasic64 --unsafe program.bas
 ```
 
 ### Example
@@ -66,16 +77,18 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 
 ## Architecture
 
-The compiler uses a three-stage pipeline:
+The compiler is a four-stage pipeline:
 
 ```
-Source → Lexer → Parser → Code Generator → Assembly → Executable
-              (tokens)   (AST)          (x86-64)
+Source → Lexer → Parser → Semantic Analysis → Code Generator → Assembly → Executable
+              (tokens)   (AST)              (symbols)        (x86-64)
 ```
 
 1. **Lexer** - Tokenizes BASIC source (case-insensitive keywords, line numbers, type suffixes)
 2. **Parser** - Recursive descent parser producing an AST
-3. **Code Generator** - Direct AST-to-x86-64 assembly translation
+3. **Semantic analysis** - Resolves names, checks types and argument counts, and
+   reports problems with a source line
+4. **Code Generator** - Direct AST-to-x86-64 assembly translation
 
 The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability.
 

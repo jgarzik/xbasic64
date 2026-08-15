@@ -372,3 +372,363 @@ _rt_strcat:
     pop r12
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_strcmp - Compare two BASIC strings
+# ------------------------------------------------------------------------------
+# BASIC strings are (ptr, len) pairs and are not null-terminated, so libc strcmp
+# cannot be used. Compares lexicographically by unsigned byte value, then by
+# length when one string is a prefix of the other -- so "ab" < "abc".
+#
+# Arguments:
+#   rdi = left pointer,  rsi = left length
+#   rdx = right pointer, rcx = right length
+#
+# Returns:
+#   eax < 0 if left < right, 0 if equal, > 0 if left > right (like memcmp)
+#
+# A length of 0 is valid and means the empty string; the pointer is then never
+# dereferenced, so an unassigned (NULL, 0) string compares correctly.
+# ------------------------------------------------------------------------------
+.globl _rt_strcmp
+_rt_strcmp:
+    push rbp
+    mov rbp, rsp
+
+    # r8 = number of bytes to compare = min(left_len, right_len)
+    mov r8, rsi
+    cmp r8, rcx
+    jbe .Lstrcmp_have_min
+    mov r8, rcx
+.Lstrcmp_have_min:
+
+    xor r9, r9              # r9 = byte index
+    jmp .Lstrcmp_check
+.Lstrcmp_loop:
+    movzx eax, BYTE PTR [rdi + r9]
+    movzx r10d, BYTE PTR [rdx + r9]
+    cmp eax, r10d
+    jne .Lstrcmp_differ
+    inc r9
+.Lstrcmp_check:
+    cmp r9, r8
+    jb .Lstrcmp_loop
+
+    # Common prefix is equal: the shorter string sorts first.
+    xor eax, eax
+    cmp rsi, rcx
+    je .Lstrcmp_done        # same length -> equal
+    jb .Lstrcmp_shorter
+    mov eax, 1              # left is longer -> greater
+    jmp .Lstrcmp_done
+.Lstrcmp_shorter:
+    mov eax, -1
+    jmp .Lstrcmp_done
+
+.Lstrcmp_differ:
+    # eax and r10d hold the differing bytes; return their difference.
+    sub eax, r10d
+
+.Lstrcmp_done:
+    leave
+    ret
+
+# ==============================================================================
+# Additional string functions
+# ==============================================================================
+#
+# These were all reachable only through the old "unknown $-suffixed call must
+# be an array" heuristic, so every one of them aborted the compiler.
+#
+# Functions that shorten a string (LTRIM$, RTRIM$) return an interior pointer
+# into the original rather than allocating, which is sound because BASIC
+# strings are (ptr, len) pairs and are never mutated in place.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# _rt_space - SPACE$(n): a string of n spaces
+# ------------------------------------------------------------------------------
+# Arguments: rdi = count
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_space
+_rt_space:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov rbx, rdi
+    cmp rbx, 0
+    jge .Lspace_ok
+    xor rbx, rbx            # a negative count yields the empty string
+.Lspace_ok:
+    lea rdi, [rbx + 1]
+    call {libc}malloc
+
+    # memset returns its destination, so the pointer needs no saving -- and
+    # saving it with a bare push would leave rsp misaligned for the call.
+    mov rdi, rax            # dest
+    mov esi, ' '            # fill byte
+    mov rdx, rbx            # count
+    call {libc}memset
+    mov rdx, rbx
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_string_n - STRING$(n, ch): a string of n copies of one character
+# ------------------------------------------------------------------------------
+# Arguments: rdi = count, rsi = character code
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_string_n
+_rt_string_n:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    mov rbx, rdi
+    mov r12, rsi
+    cmp rbx, 0
+    jge .Lstringn_ok
+    xor rbx, rbx
+.Lstringn_ok:
+    lea rdi, [rbx + 1]
+    call {libc}malloc
+
+    # memset returns its destination; see _rt_space.
+    mov rdi, rax
+    mov esi, r12d
+    mov rdx, rbx
+    call {libc}memset
+    mov rdx, rbx
+
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_ltrim - LTRIM$(s): drop leading spaces
+# ------------------------------------------------------------------------------
+# Arguments: rdi = pointer, rsi = length
+# Returns:   rax = pointer, rdx = length (an interior view, not a copy)
+# ------------------------------------------------------------------------------
+.globl _rt_ltrim
+_rt_ltrim:
+    xor rcx, rcx
+.Lltrim_loop:
+    cmp rcx, rsi
+    jae .Lltrim_done
+    cmp BYTE PTR [rdi + rcx], ' '
+    jne .Lltrim_done
+    inc rcx
+    jmp .Lltrim_loop
+.Lltrim_done:
+    lea rax, [rdi + rcx]
+    mov rdx, rsi
+    sub rdx, rcx
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_rtrim - RTRIM$(s): drop trailing spaces
+# ------------------------------------------------------------------------------
+# Arguments: rdi = pointer, rsi = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_rtrim
+_rt_rtrim:
+    mov rdx, rsi
+.Lrtrim_loop:
+    test rdx, rdx
+    jz .Lrtrim_done
+    cmp BYTE PTR [rdi + rdx - 1], ' '
+    jne .Lrtrim_done
+    dec rdx
+    jmp .Lrtrim_loop
+.Lrtrim_done:
+    mov rax, rdi
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_ucase / _rt_lcase - UCASE$(s) / LCASE$(s)
+# ------------------------------------------------------------------------------
+# These must copy: the source may be a .data literal shared with other uses.
+#
+# Arguments: rdi = pointer, rsi = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_ucase
+_rt_ucase:
+    mov r8b, 1              # r8b != 0 selects upper-casing
+    jmp _rt_case_convert
+
+.globl _rt_lcase
+_rt_lcase:
+    xor r8b, r8b
+
+_rt_case_convert:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov rbx, rdi            # source
+    mov r12, rsi            # length
+    mov r13d, r8d           # direction
+
+    lea rdi, [r12 + 1]
+    call {libc}malloc
+
+    xor rcx, rcx
+.Lcase_loop:
+    cmp rcx, r12
+    jae .Lcase_done
+    mov dl, BYTE PTR [rbx + rcx]
+    test r13b, r13b
+    jz .Lcase_lower
+    cmp dl, 'a'
+    jb .Lcase_store
+    cmp dl, 'z'
+    ja .Lcase_store
+    sub dl, 32
+    jmp .Lcase_store
+.Lcase_lower:
+    cmp dl, 'A'
+    jb .Lcase_store
+    cmp dl, 'Z'
+    ja .Lcase_store
+    add dl, 32
+.Lcase_store:
+    mov BYTE PTR [rax + rcx], dl
+    inc rcx
+    jmp .Lcase_loop
+.Lcase_done:
+    mov rdx, r12
+
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
+# ------------------------------------------------------------------------------
+# Arguments: rdi = value (already truncated to an integer)
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_hex
+_rt_hex:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov rdx, rdi
+    lea rdi, [rip + _str_buf]
+    lea rsi, [rip + _fmt_hex]
+    xor eax, eax
+    call {libc}sprintf
+    mov rdx, rax
+    lea rax, [rip + _str_buf]
+    leave
+    ret
+
+.globl _rt_oct
+_rt_oct:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    mov rdx, rdi
+    lea rdi, [rip + _str_buf]
+    lea rsi, [rip + _fmt_oct]
+    xor eax, eax
+    call {libc}sprintf
+    mov rdx, rax
+    lea rax, [rip + _str_buf]
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_strdup - Copy a string onto the heap
+# ------------------------------------------------------------------------------
+# String assignment copies, so that mutating one variable cannot be seen
+# through another -- or, worse, through the shared .data literal a string
+# constant points at. Without this, MID$(A$,1,1) = "J" after A$ = "HELLO"
+# would rewrite the literal for every other use of "HELLO" in the program.
+#
+# Arguments: rdi = pointer, rsi = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_strdup
+_rt_strdup:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    mov rbx, rdi
+    mov r12, rsi
+
+    lea rdi, [r12 + 1]
+    call {libc}malloc
+
+    # memcpy returns its destination; see _rt_space.
+    mov rdi, rax
+    mov rsi, rbx
+    mov rdx, r12
+    call {libc}memcpy
+    mov rdx, r12
+
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_mid_assign - MID$(s, start [, len]) = value
+# ------------------------------------------------------------------------------
+# Overwrites characters of the target in place. The target's length never
+# changes: at most `len` characters are replaced, and never past the end.
+# Positions are 1-based.
+#
+# Arguments:
+#   rdi = target pointer, rsi = target length
+#   rdx = start (1-based), rcx = maximum characters to replace
+#   r8  = source pointer,  r9  = source length
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_mid_assign
+_rt_mid_assign:
+    # Clamp the count to the source length.
+    cmp rcx, r9
+    jbe .Lmid_have_count
+    mov rcx, r9
+.Lmid_have_count:
+
+    # Convert the 1-based start to an index; a start below 1 writes nothing.
+    cmp rdx, 1
+    jl .Lmid_done
+    dec rdx
+
+    xor r10, r10            # characters copied
+.Lmid_loop:
+    cmp r10, rcx
+    jae .Lmid_done
+    lea r11, [rdx + r10]
+    cmp r11, rsi            # stop at the end of the target
+    jae .Lmid_done
+    mov al, BYTE PTR [r8 + r10]
+    mov BYTE PTR [rdi + r11], al
+    inc r10
+    jmp .Lmid_loop
+.Lmid_done:
+    ret

@@ -75,3 +75,183 @@ PRINT A$ + B$ + C$
     .unwrap();
     assert_eq!(output.trim(), "Hello World");
 }
+
+/// Every relational operator on strings. These used to compile to a
+/// floating-point compare of registers that never held the operands, so `<`,
+/// `>`, `<=` and `>=` always yielded false and `=` always yielded true.
+#[test]
+fn test_string_comparison_operators() {
+    let output = compile_and_run(
+        r#"
+PRINT ("abc" < "abd")
+PRINT ("abd" < "abc")
+PRINT ("abc" > "abd")
+PRINT ("abd" > "abc")
+PRINT ("abc" = "abc")
+PRINT ("abc" = "abd")
+PRINT ("abc" <> "abd")
+PRINT ("abc" <> "abc")
+PRINT ("abc" <= "abc")
+PRINT ("abc" >= "abc")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-1", "0", "0", "-1", "-1", "0", "-1", "0", "-1", "-1"],
+        "BASIC booleans are -1 for true, 0 for false"
+    );
+}
+
+/// A prefix sorts before the longer string, comparison is by byte value (so
+/// case-sensitive), and the empty/unassigned string compares as empty.
+#[test]
+fn test_string_comparison_edge_cases() {
+    let output = compile_and_run(
+        r#"
+IF "ab" < "abc" THEN PRINT "prefix-lt" ELSE PRINT "prefix-bad"
+IF "A" < "a" THEN PRINT "case-lt" ELSE PRINT "case-bad"
+E$ = ""
+IF E$ < "a" THEN PRINT "empty-lt" ELSE PRINT "empty-bad"
+IF Z$ = "" THEN PRINT "unassigned-empty" ELSE PRINT "unassigned-bad"
+IF "ab" + "c" = "abc" THEN PRINT "concat-eq" ELSE PRINT "concat-bad"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "prefix-lt",
+            "case-lt",
+            "empty-lt",
+            "unassigned-empty",
+            "concat-eq"
+        ]
+    );
+}
+
+/// String comparison in anger: sorting an array, which is what silently
+/// produced wrong answers before.
+#[test]
+fn test_string_sort() {
+    let output = compile_and_run(
+        r#"
+DIM S$(4)
+S$(0) = "pear"
+S$(1) = "apple"
+S$(2) = "fig"
+S$(3) = "cherry"
+S$(4) = "banana"
+FOR I = 0 TO 3
+FOR J = 0 TO 3 - I
+IF S$(J) > S$(J+1) THEN
+T$ = S$(J)
+S$(J) = S$(J+1)
+S$(J+1) = T$
+END IF
+NEXT J
+NEXT I
+FOR I = 0 TO 4
+PRINT S$(I)
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["apple", "banana", "cherry", "fig", "pear"],
+        "bubble sort by string comparison"
+    );
+}
+
+/// String builtins that used to abort the compiler: every unrecognized
+/// $-suffixed call was assumed to be an array access.
+#[test]
+fn test_string_builders() {
+    let output = compile_and_run(
+        "PRINT \"[\"; SPACE$(3); \"]\"\nPRINT STRING$(5, 42)\nPRINT STRING$(3, \"x\")\nPRINT LEN(SPACE$(4))\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["[   ]", "*****", "xxx", "4"]);
+}
+
+/// Trimming and case conversion.
+#[test]
+fn test_string_trim_and_case() {
+    let output = compile_and_run(
+        "PRINT \"[\"; LTRIM$(\"   abc\"); \"]\"\nPRINT \"[\"; RTRIM$(\"abc   \"); \"]\"\nPRINT UCASE$(\"Hello, World!\")\nPRINT LCASE$(\"Hello, World!\")\nA$ = \"  Mixed  \"\nPRINT \"[\" + LTRIM$(RTRIM$(A$)) + \"]\"\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "[abc]",
+            "[abc]",
+            "HELLO, WORLD!",
+            "hello, world!",
+            "[Mixed]"
+        ]
+    );
+}
+
+/// UCASE$ must copy rather than modify in place: the source may be a shared
+/// .data literal.
+#[test]
+fn test_case_conversion_does_not_mutate_source() {
+    let output =
+        compile_and_run("A$ = \"abc\"\nB$ = UCASE$(A$)\nPRINT A$\nPRINT B$\nPRINT \"abc\"\n")
+            .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["abc", "ABC", "abc"]);
+}
+
+/// Radix conversions.
+#[test]
+fn test_hex_and_oct() {
+    let output = compile_and_run("PRINT HEX$(255)\nPRINT OCT$(15)\nPRINT HEX$(16)\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["FF", "17", "10"]);
+}
+
+/// String assignment copies, so mutating one variable is not visible through
+/// another, and a string constant's shared .data literal can never be written
+/// through.
+#[test]
+fn test_string_assignment_copies() {
+    let output = compile_and_run(
+        "A$ = \"HELLO\"\nB$ = A$\nMID$(A$,1,1) = \"J\"\nPRINT A$\nPRINT B$\nPRINT \"HELLO\"\nC$ = \"HELLO\"\nPRINT C$\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["JELLO", "HELLO", "HELLO", "HELLO"],
+        "only A$ changed; the literal is intact"
+    );
+}
+
+/// MID$ as an assignment target overwrites in place and never changes the
+/// target's length.
+#[test]
+fn test_mid_assignment() {
+    let output = compile_and_run(
+        "A$ = \"hello\"\nMID$(A$,1,1) = \"J\"\nPRINT A$\nB$ = \"hello\"\nMID$(B$,2) = \"XY\"\nPRINT B$\nC$ = \"abc\"\nMID$(C$,2) = \"ZZZZZ\"\nPRINT C$\nPRINT LEN(C$)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["Jello", "hXYlo", "aZZ", "3"]);
+}
+
+/// MID$ assignment works on an array element too.
+#[test]
+fn test_mid_assignment_into_array() {
+    let output =
+        compile_and_run("DIM S$(2)\nS$(0) = \"hello\"\nMID$(S$(0),1,1) = \"J\"\nPRINT S$(0)\n")
+            .unwrap();
+    assert_eq!(output.trim(), "Jello");
+}

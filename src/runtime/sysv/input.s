@@ -88,11 +88,40 @@ _rt_input_number:
     push rbp
     mov rbp, rsp
     sub rsp, 16                     # Space for local double + alignment
+
+.Linput_num_try:
     # Read double: scanf("%lf", &result)
     lea rsi, [rbp - 8]              # address of local variable (2nd arg)
     lea rdi, [rip + _fmt_input]     # format string "%lf" (1st arg)
     xor eax, eax                    # no vector args
     call {libc}scanf
+    # scanf returns the number of items converted; EOF (-1) means the input
+    # ended, and 0 means the text was not a number.
+    cmp eax, 1
+    je .Linput_num_ok
+    cmp eax, -1
+    je .Linput_num_eof
+
+    # Not a number: discard the rest of the line and ask again, as GW-BASIC
+    # does. Without this, typing text silently yielded 0.
+.Linput_num_flush:
+    call {libc}getchar
+    cmp eax, -1
+    je .Linput_num_eof
+    cmp eax, 10                     # newline
+    jne .Linput_num_flush
+    lea rdi, [rip + _redo_msg]
+    xor eax, eax
+    call {libc}printf
+    jmp .Linput_num_try
+
+.Linput_num_eof:
+    # At end of input, yield 0 rather than looping forever.
+    xorpd xmm0, xmm0
+    leave
+    ret
+
+.Linput_num_ok:
     # Consume trailing newline
     call {libc}getchar
     # Load result into xmm0

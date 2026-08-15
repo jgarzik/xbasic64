@@ -72,38 +72,43 @@ _rt_rnd:
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_timer - Get seconds since midnight (TIMER function)
+# _rt_timer - TIMER: seconds since midnight, UTC
 # ------------------------------------------------------------------------------
-# Returns the number of seconds elapsed since midnight, as a floating-point
-# number. This matches GW-BASIC's TIMER function.
+# GW-BASIC's TIMER counts fractional seconds since midnight, so this uses
+# gettimeofday rather than time(): whole seconds alone made a program that
+# times a short loop always read zero.
+#
+# The basis is UTC, which both runtimes share; see the Win64 twin.
 #
 # Arguments: none
 #
 # Returns:
-#   xmm0 = seconds since midnight (double, 0-86399)
-#
-# Implementation:
-#   1. Call time(NULL) to get Unix timestamp (seconds since 1970)
-#   2. Compute timestamp mod 86400 (seconds per day)
-#   3. Convert to double
-#
-# Note: This gives UTC-based "seconds since midnight", not local time.
-# For most timing purposes (measuring elapsed time), this doesn't matter.
+#   xmm0 = seconds since midnight (double, 0 <= t < 86400)
 # ------------------------------------------------------------------------------
 .globl _rt_timer
 _rt_timer:
     push rbp
     mov rbp, rsp
-    sub rsp, 16             # Stack alignment
-    # time(NULL) returns seconds since epoch
-    xor rdi, rdi            # NULL pointer (1st arg)
-    call {libc}time         # returns time_t in rax
-    # Compute seconds mod 86400 (seconds per day)
-    xor rdx, rdx            # Clear rdx for division
-    mov rcx, 86400          # divisor = seconds per day
-    div rcx                 # rax = quotient, rdx = remainder
-    # Convert remainder to double
-    cvtsi2sd xmm0, rdx      # rdx = seconds since midnight
+    sub rsp, 32             # struct timeval, and keeps rsp 16-byte aligned
+
+    mov rdi, rsp            # &tv
+    xor esi, esi            # timezone = NULL
+    call {libc}gettimeofday
+
+    # tv_sec mod 86400
+    mov rax, QWORD PTR [rsp]
+    xor edx, edx
+    mov rcx, 86400
+    div rcx                 # rdx = seconds since midnight
+    cvtsi2sd xmm0, rdx
+
+    # ... plus tv_usec / 1000000
+    cvtsi2sd xmm1, QWORD PTR [rsp + 8]
+    mov rax, 0x412E848000000000     # 1000000.0
+    movq xmm2, rax
+    divsd xmm1, xmm2
+    addsd xmm0, xmm1
+
     leave
     ret
 

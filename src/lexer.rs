@@ -58,6 +58,18 @@ static KEYWORDS: LazyLock<HashMap<&'static str, Token>> = LazyLock::new(|| {
         ("NOT", Token::Not),
         ("XOR", Token::Xor),
         ("MOD", Token::Mod),
+        ("USING", Token::Using),
+        ("SWAP", Token::Swap),
+        ("CONST", Token::Const),
+        ("WRITE", Token::Write),
+        ("EXIT", Token::Exit),
+        ("DEF", Token::Def),
+        ("OPTION", Token::Option),
+        ("BASE", Token::Base),
+        ("REDIM", Token::Redim),
+        ("PRESERVE", Token::Preserve),
+        ("TYPE", Token::Type),
+        ("ENDTYPE", Token::EndType),
     ])
 });
 
@@ -119,6 +131,18 @@ pub enum Token {
     Not,
     Xor,
     Mod,
+    Using,
+    Swap,
+    Const,
+    Write,
+    Exit,
+    Def,
+    Option,
+    Base,
+    Redim,
+    Preserve,
+    Type,
+    EndType,
 
     // Operators
     Plus,
@@ -141,6 +165,7 @@ pub enum Token {
     Semicolon,
     Colon,
     Hash,
+    Dot,
 
     // Special
     Newline,
@@ -154,6 +179,8 @@ pub struct Lexer<'a> {
     pos: usize,
     line: u32,
     at_line_start: bool,
+    /// Source line of each token produced by `tokenize`, parallel to its output.
+    lines: Vec<u32>,
 }
 
 impl<'a> Lexer<'a> {
@@ -164,6 +191,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             at_line_start: true,
+            lines: Vec::new(),
         }
     }
 
@@ -222,11 +250,17 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
-    fn read_number(&mut self, first: char) -> Token {
+    /// Scan a decimal number.
+    ///
+    /// An integer too large for LONG becomes a Double rather than silently
+    /// wrapping, which is what MS BASIC does; a malformed number is an error
+    /// rather than a silent 0.
+    fn read_number(&mut self, first: char) -> Result<Token, String> {
         let mut s = String::new();
         s.push(first);
 
-        let mut is_float = false;
+        // A leading '.' means the decimal point is already consumed.
+        let mut is_float = first == '.';
         let mut has_exponent = false;
 
         while let Some(c) = self.peek() {
@@ -254,23 +288,50 @@ impl<'a> Lexer<'a> {
         let s = s.replace(['d', 'D'], "e");
 
         if is_float {
-            Token::Float(s.parse().unwrap_or(0.0))
-        } else {
-            Token::Integer(s.parse().unwrap_or(0))
+            return s
+                .parse::<f64>()
+                .map(Token::Float)
+                .map_err(|_| format!("malformed number '{}'", s));
+        }
+
+        match s.parse::<i32>() {
+            Ok(n) => Ok(Token::Integer(n as i64)),
+            // Outside LONG range: widen to Double, as MS BASIC does, rather
+            // than truncating to 32 bits.
+            Err(_) => s
+                .parse::<f64>()
+                .map(Token::Float)
+                .map_err(|_| format!("number '{}' is too large", s)),
         }
     }
 
-    fn read_hex(&mut self) -> Token {
+    /// Scan the digits of a radix literal (`&H`, `&O`, `&B`, or bare `&`).
+    ///
+    /// GW-BASIC treats these as 32-bit values, so `&HFFFFFFFF` is -1. An empty
+    /// digit run or an out-of-range value is an error; both used to yield 0.
+    fn read_radix(&mut self, radix: u32, sigil: &str) -> Result<Token, String> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_hexdigit() {
+            if c.is_digit(radix) {
                 s.push(self.advance().unwrap());
             } else {
                 break;
             }
         }
-        let val = i64::from_str_radix(&s, 16).unwrap_or(0);
-        Token::Integer(val)
+        if s.is_empty() {
+            return Err(format!(
+                "'{}' must be followed by at least one digit",
+                sigil
+            ));
+        }
+        // An optional type suffix may follow the digits, e.g. &HFFFF&
+        if matches!(self.peek(), Some('%') | Some('&')) {
+            self.advance();
+        }
+        match u32::from_str_radix(&s, radix) {
+            Ok(v) => Ok(Token::Integer(v as i32 as i64)),
+            Err(_) => Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        }
     }
 
     fn read_identifier(&mut self, first: char) -> String {
@@ -295,10 +356,19 @@ impl<'a> Lexer<'a> {
         s
     }
 
+    /// Classify a scanned word as a keyword or an identifier.
+    ///
+    /// A word carrying a type suffix is always an identifier: keywords have no
+    /// type, so `Line$` is a string variable, not the LINE keyword. Stripping
+    /// the suffix before the lookup -- as this used to -- made every variable
+    /// whose name matched a keyword unusable, which is why LANGREF's own
+    /// `LINE INPUT #1, Line$` example did not compile.
     fn keyword_or_ident(&self, s: &str) -> Token {
-        let base = s.trim_end_matches(['%', '&', '!', '#', '$']);
+        if s.ends_with(['%', '&', '!', '#', '$']) {
+            return Token::Ident(s.to_string());
+        }
         KEYWORDS
-            .get(base)
+            .get(s)
             .cloned()
             .unwrap_or_else(|| Token::Ident(s.to_string()))
     }
@@ -359,6 +429,16 @@ impl<'a> Lexer<'a> {
             '(' => Ok(Token::LParen),
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
+            // A '.' introduces a number when a digit follows (`.5`), and
+            // otherwise separates a record variable from a field. Numbers that
+            // start with a digit consume their own '.' in read_number.
+            '.' => {
+                if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.read_number('.')
+                } else {
+                    Ok(Token::Dot)
+                }
+            }
             ';' => Ok(Token::Semicolon),
             ':' => Ok(Token::Colon),
             '#' => Ok(Token::Hash),
@@ -384,17 +464,28 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            '&' => {
-                if self.peek() == Some('H') || self.peek() == Some('h') {
+            // Radix literals. GW-BASIC spells these &H (hex), &O (octal) and
+            // &B (binary); a bare & followed by digits is octal. Previously
+            // only &H was recognized, so &O17 lexed as Ident("&") plus
+            // Ident("O17") and silently produced garbage.
+            '&' => match self.peek() {
+                Some('H') | Some('h') => {
                     self.advance();
-                    Ok(self.read_hex())
-                } else {
-                    // & alone could be long suffix but we handle that in identifiers
-                    Ok(Token::Ident("&".to_string()))
+                    self.read_radix(16, "&H")
                 }
-            }
+                Some('O') | Some('o') => {
+                    self.advance();
+                    self.read_radix(8, "&O")
+                }
+                Some('B') | Some('b') => {
+                    self.advance();
+                    self.read_radix(2, "&B")
+                }
+                Some(d) if d.is_digit(8) => self.read_radix(8, "&"),
+                _ => Err("stray '&': expected &H, &O, &B or octal digits".to_string()),
+            },
 
-            _ if c.is_ascii_digit() => Ok(self.read_number(c)),
+            _ if c.is_ascii_digit() => self.read_number(c),
 
             _ if c.is_ascii_alphabetic() => {
                 let ident = self.read_identifier(c);
@@ -414,15 +505,34 @@ impl<'a> Lexer<'a> {
 
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
+        self.lines.clear();
         loop {
+            // Capture the line *before* scanning: consuming a newline advances
+            // the counter, so afterwards a Newline token would report the line
+            // it begins rather than the one it ends.
+            let line = self.line;
             let tok = self.next_token()?;
             let is_eof = tok == Token::Eof;
             tokens.push(tok);
+            self.lines.push(line);
             if is_eof {
                 break;
             }
         }
         Ok(tokens)
+    }
+
+    /// Source line of each token from the last `tokenize` call.
+    ///
+    /// Kept alongside the token vector rather than inside `Token` so that the
+    /// token type stays comparable and the lexer's own tests keep working.
+    pub fn line_map(&self) -> &[u32] {
+        &self.lines
+    }
+
+    /// The line the lexer is currently on, for error reporting.
+    pub fn current_line(&self) -> u32 {
+        self.line
     }
 }
 

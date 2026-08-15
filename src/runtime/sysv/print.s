@@ -41,12 +41,23 @@
 _rt_print_string:
     push rbp
     mov rbp, rsp
+    sub rsp, 16
+    mov QWORD PTR [rbp - 8], rsi    # remember the length for the column tracker
+    # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
+    # prologue both leave it that way. Printing nothing is the correct result,
+    # and returning early avoids passing NULL to printf, which is undefined.
+    test rsi, rsi
+    jz .Lprint_str_done
     # Rearrange arguments for printf("%.*s", len, ptr)
     mov rdx, rdi        # ptr → rdx (3rd arg to printf)
     # rsi already has len (2nd arg to printf, as precision)
     lea rdi, [rip + _fmt_str]   # format string → rdi (1st arg)
     xor eax, eax        # no vector registers used (required for varargs)
     call {libc}printf
+    # Advance the column tracker by the number of characters written.
+    mov rax, QWORD PTR [rbp - 8]
+    add QWORD PTR [rip + _print_col], rax
+.Lprint_str_done:
     leave
     ret
 
@@ -68,6 +79,7 @@ _rt_print_char:
     lea rdi, [rip + _fmt_char]  # format → rdi (1st arg)
     xor eax, eax        # no vector registers
     call {libc}printf
+    inc QWORD PTR [rip + _print_col]
     leave
     ret
 
@@ -86,66 +98,220 @@ _rt_print_newline:
     lea rdi, [rip + _fmt_newline]
     xor eax, eax
     call {libc}printf
+    mov QWORD PTR [rip + _print_col], 0
     leave
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_print_float - Print a numeric value (integer or floating point)
+# _rt_fmt_double - Format a number into _num_buf
 # ------------------------------------------------------------------------------
-# GW-BASIC convention: if a number is a whole number, print without decimal.
-# We achieve this by:
-#   1. Truncate to integer and convert back to double
-#   2. Compare with original: if equal, it's a whole number
-#   3. Print as integer (%ld) or float (%g) accordingly
+# Shared by console and file output so both render numbers identically.
+#
+# GW-BASIC convention: a whole number is written without a decimal point. For
+# fractional values, write the *shortest* decimal that reads back as the same
+# value: try each format in the given table in turn and keep the first whose
+# text strtod's back unchanged. A plain %g gives only 6 significant digits,
+# which for a dialect whose default type is Double discards most of the value
+# (1/3 became 0.333333); going straight to %.17g instead would render 3.14159
+# as 3.1415899999999999.
 #
 # Arguments:
-#   xmm0 = value to print (double)
+#   xmm0 = value (a SINGLE arrives already widened to double)
+#   rdi  = pointer to a NULL-terminated table of format-string pointers
+#   esi  = nonzero to compare at SINGLE precision
 #
-# Returns: nothing
-#
-# Note: %g format automatically chooses between %f and %e notation and
-# strips trailing zeros, giving clean output like "3.14159" not "3.141590".
+# Returns:
+#   rax = length of the text in _num_buf
+# ------------------------------------------------------------------------------
+.globl _rt_fmt_double
+_rt_fmt_double:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16             # rsp stays 16-byte aligned across the calls below
+    movsd QWORD PTR [rbp - 24], xmm0    # original value
+    mov rbx, rdi            # table cursor
+    mov r12d, esi           # precision flag
+
+    # Whole number? Format as an integer.
+    # Out-of-range values saturate in cvttsd2si and so fail this test, which is
+    # what sends 1e300 down the floating-point path.
+    cvttsd2si rax, xmm0
+    cvtsi2sd xmm1, rax
+    ucomisd xmm0, xmm1
+    jne .Lfd_fractional
+    jp .Lfd_fractional
+    lea rdi, [rip + _num_buf]
+    lea rsi, [rip + _fmt_int]
+    mov rdx, rax
+    xor eax, eax
+    call {libc}sprintf
+    jmp .Lfd_done
+
+.Lfd_fractional:
+    mov rsi, QWORD PTR [rbx]
+    test rsi, rsi
+    jz .Lfd_len             # table exhausted: keep the last attempt
+    lea rdi, [rip + _num_buf]
+    movsd xmm0, QWORD PTR [rbp - 24]
+    mov eax, 1              # one vector register argument
+    call {libc}sprintf
+
+    # Does it read back as the same value?
+    lea rdi, [rip + _num_buf]
+    xor esi, esi
+    call {libc}strtod
+    movsd xmm1, QWORD PTR [rbp - 24]
+    test r12d, r12d
+    jz .Lfd_cmp_double
+    cvtsd2ss xmm0, xmm0
+    cvtsd2ss xmm1, xmm1
+    ucomiss xmm0, xmm1
+    jmp .Lfd_cmp_done
+.Lfd_cmp_double:
+    ucomisd xmm0, xmm1
+.Lfd_cmp_done:
+    jp .Lfd_next            # unordered: keep trying
+    je .Lfd_len
+.Lfd_next:
+    add rbx, 8
+    jmp .Lfd_fractional
+
+.Lfd_len:
+    lea rdi, [rip + _num_buf]
+    call {libc}strlen
+
+.Lfd_done:
+    # sprintf and strlen both leave the length in rax.
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_float - Print a DOUBLE (or an untyped numeric value)
+# ------------------------------------------------------------------------------
+# Arguments: xmm0 = value        Returns: nothing
 # ------------------------------------------------------------------------------
 .globl _rt_print_float
 _rt_print_float:
     push rbp
     mov rbp, rsp
-    sub rsp, 16         # Stack alignment for potential printf call
-    # Check if value is a whole number
-    cvttsd2si rax, xmm0     # truncate to integer
-    cvtsi2sd xmm1, rax      # convert back to double
-    ucomisd xmm0, xmm1      # compare original with truncated
-    jne .Lprint_as_float    # if different, has fractional part
-    # Print as integer (cleaner output)
-    mov rsi, rax            # integer value → rsi (2nd arg)
-    lea rdi, [rip + _fmt_int]
+    lea rdi, [rip + _fmt_g_table]
+    xor esi, esi
+    call _rt_fmt_double
+    lea rdi, [rip + _fmt_str]   # "%.*s"
+    mov rsi, rax                # length
+    lea rdx, [rip + _num_buf]
     xor eax, eax
     call {libc}printf
-    jmp .Lprint_float_done
-.Lprint_as_float:
-    # Print as floating point - value still in xmm0
-    lea rdi, [rip + _fmt_float]
-    mov eax, 1              # 1 = one vector register argument (xmm0)
-    call {libc}printf
-.Lprint_float_done:
     leave
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_gosub_overflow - Handle GOSUB stack overflow error
+# _rt_print_single - Print a SINGLE
 # ------------------------------------------------------------------------------
-# Called when the GOSUB return stack is exhausted. Prints an error message
-# and terminates the program with exit code 1.
+# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
+# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
+# print as 3.1415901184082: at 15 digits even a float's value round-trips.
 #
-# Arguments: none
-# Returns: never (calls exit)
+# Arguments: xmm0 = value, already widened to double     Returns: nothing
 # ------------------------------------------------------------------------------
-.globl _rt_gosub_overflow
-_rt_gosub_overflow:
+.globl _rt_print_single
+_rt_print_single:
     push rbp
     mov rbp, rsp
-    lea rdi, [rip + _gosub_overflow_msg]
+    lea rdi, [rip + _fmt_g_single_table]
+    mov esi, 1
+    call _rt_fmt_double
+    lea rdi, [rip + _fmt_str]
+    mov rsi, rax
+    lea rdx, [rip + _num_buf]
     xor eax, eax
     call {libc}printf
-    mov edi, 1              # exit code 1
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_end - Terminate the program normally (END / STOP)
+# ------------------------------------------------------------------------------
+# Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
+# `leave; ret` for END only terminates when it appears in main; inside a
+# procedure it merely returns to the caller and execution continues.
+#
+# Uses exit() rather than _exit() so stdio buffers -- printf output and any
+# FILE* opened by file.s -- are flushed.
+#
+# Arguments: none
+# Returns: never
+# ------------------------------------------------------------------------------
+.globl _rt_end
+_rt_end:
+    push rbp
+    mov rbp, rsp
+    xor edi, edi            # exit code 0
     call {libc}exit
+
+# ------------------------------------------------------------------------------
+# _rt_print_spc - SPC(n): print n spaces
+# ------------------------------------------------------------------------------
+# Arguments: rdi = count      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_spc
+_rt_print_spc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+    mov rbx, rdi
+.Lspc_loop:
+    cmp rbx, 0
+    jle .Lspc_done
+    mov edi, ' '
+    call _rt_print_char
+    dec rbx
+    jmp .Lspc_loop
+.Lspc_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_tab - TAB(n): advance to column n
+# ------------------------------------------------------------------------------
+# Columns are 1-based, as in GW-BASIC. If output is already at or past the
+# requested column, a newline is emitted first and the tab applies to the new
+# line.
+#
+# Arguments: rdi = target column      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_tab
+_rt_print_tab:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov rbx, rdi
+    cmp rbx, 1
+    jge .Ltab_have_target
+    mov rbx, 1
+.Ltab_have_target:
+    dec rbx                 # 1-based column -> count of characters before it
+
+    cmp rbx, QWORD PTR [rip + _print_col]
+    jge .Ltab_pad
+    call _rt_print_newline
+
+.Ltab_pad:
+    mov rdi, rbx
+    sub rdi, QWORD PTR [rip + _print_col]
+    call _rt_print_spc
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret

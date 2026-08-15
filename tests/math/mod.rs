@@ -180,14 +180,19 @@ fn test_rnd_timer() {
         r#"
 X = RND(1)
 IF X >= 0 AND X < 1 THEN PRINT "rnd-ok"
-T = TIMER
-IF T >= 0 THEN PRINT "timer-ok"
+Y = RND
+IF Y >= 0 AND Y < 1 THEN PRINT "bare-rnd-ok"
+IF X <> Y THEN PRINT "advances"
 "#,
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines[0], "rnd-ok");
-    assert_eq!(lines[1], "timer-ok");
+    assert_eq!(
+        lines[1], "bare-rnd-ok",
+        "a bare RND is a call, not a variable"
+    );
+    assert_eq!(lines[2], "advances");
 }
 
 #[test]
@@ -217,4 +222,57 @@ A! = 3.5: B# = CDBL(A!): PRINT B#
     assert_eq!(lines[6], "42", "cdbl integer");
     assert_eq!(lines[7], "12345", "cdbl long");
     assert_eq!(lines[8], "3.5", "cdbl single");
+}
+
+/// TIMER returns the host's seconds since midnight, UTC.
+///
+/// Asserting only `TIMER >= 0` could not fail: a bare `TIMER` used to read an
+/// uninitialized variable of that name, which is 0, and 0 passes that test.
+/// Comparing against the clock this test can read itself is what makes the
+/// assertion mean something -- and it is what caught the Win64 runtime
+/// returning seconds since *boot* rather than since midnight.
+#[test]
+fn test_timer_matches_the_host_clock() {
+    let before = seconds_since_midnight_utc();
+    let output = compile_and_run("PRINT TIMER\nPRINT TIMER(0)\n").unwrap();
+    let after = seconds_since_midnight_utc();
+
+    for (i, line) in output.trim().lines().enumerate() {
+        // TIMER counts fractional seconds, as GW-BASIC's does.
+        let t: f64 = line
+            .parse()
+            .unwrap_or_else(|e| panic!("TIMER printed {line:?}: {e}"));
+        assert!(
+            (0.0..86_400.0).contains(&t),
+            "TIMER must be a second-of-day, got {t}"
+        );
+        // Compiling and running takes a moment, and the day may roll over in
+        // between, so compare modulo a day with a generous window.
+        let skew = (t - before)
+            .rem_euclid(86_400.0)
+            .min((after - t).rem_euclid(86_400.0));
+        assert!(
+            skew < 120.0,
+            "form {i}: TIMER said {t}, but the clock read {before}..{after}"
+        );
+    }
+}
+
+/// TIMER never goes backwards within a run.
+#[test]
+fn test_timer_does_not_go_backwards() {
+    let output = compile_and_run(
+        "A = TIMER\nFOR I = 1 TO 2000000\nX = X + 1\nNEXT I\nB = TIMER\nPRINT (B >= A)\nPRINT (B - A < 60)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["-1", "-1"]);
+}
+
+/// Seconds since midnight UTC, the same quantity TIMER reports.
+fn seconds_since_midnight_utc() -> f64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    (now.as_secs() % 86_400) as f64 + f64::from(now.subsec_millis()) / 1000.0
 }

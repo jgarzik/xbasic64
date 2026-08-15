@@ -30,22 +30,29 @@ cargo run -- -S program.bas        # Emit assembly only (no linking)
 xbasic64 is a BASIC-to-x86_64 native code compiler with a direct AST-to-assembly pipeline (no IR):
 
 ```
-Source → Lexer → Parser → CodeGen → Assembly → Executable
-              (tokens)   (AST)    (x86-64)
+Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
+              (tokens)   (AST)  (symbols) (x86-64)
 ```
 
 ### Source Files (`src/`)
 
 - **lexer.rs** - Tokenizer handling case-insensitive keywords, line numbers, type suffixes (`%`, `&`, `!`, `#`, `$`), and BASIC literals
 - **parser.rs** - Recursive descent parser producing an AST; handles expression precedence via Pratt parsing
+- **sema.rs** - Semantic analysis: builds the symbol table (procedures, arrays,
+  records, constants, labels) and reports errors with a source line, so codegen
+  never has to guess what a name means
 - **codegen.rs** - Direct AST-to-x86-64 assembly translation using System V AMD64 ABI
+- **using.rs** - `PRINT USING` format strings, parsed at compile time
 - **runtime.rs** - Hand-written x86-64 assembly runtime library (I/O, strings, math) using libc
 - **main.rs** - CLI driver: reads source, runs pipeline, shells out to `as` and `cc` for linking
 
 ### Test Structure (`tests/`)
 
 Integration tests organized by feature area:
-- `common/mod.rs` - Test harness with `compile_and_run()` helper that compiles BASIC source and captures output
+- `common/mod.rs` - Test harness. `compile_and_run()` for the usual case;
+  `compile_only()` for "this must be rejected, with this message"; and
+  `compile_and_run_raw()` for "printed this, then aborted with this exit code"
+- `docs/mod.rs` - Compiles every ```basic example in LANGREF.md and README.md
 - Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
 
 ### Key Design Decisions
@@ -55,6 +62,13 @@ Integration tests organized by feature area:
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility
+- **Module-level storage is static**: globals live in `.bss`, so they are zeroed
+  and reachable from procedures; procedure locals are stack slots zeroed on entry
+- **Uniform word addressing**: every variable, string (pointer + length), array
+  descriptor and record field is a sequence of 8-byte words reached through `Loc`
+- **Runtime checks on by default**: `--unsafe` removes them
+- **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
+  the same `.globl` names; a new helper must be added to both
 
 ## Language Reference
 

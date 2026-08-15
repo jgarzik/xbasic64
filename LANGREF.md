@@ -62,24 +62,26 @@ Variable and procedure names:
 
 **Integers:**
 ```basic
-42          ' Decimal
--17         ' Negative
-&HFF        ' Hexadecimal (255)
-&O377       ' Octal (255)
+A = 42          ' Decimal
+B = -17         ' Negative
+C = &HFF        ' Hexadecimal (255)
+D = &O377       ' Octal (255)
+E = &377        ' Octal too: a bare & introduces octal
+F = &B1010      ' Binary (10)
 ```
 
 **Floating-point:**
 ```basic
-3.14
-.5
-1E+10
-2.5D-3      ' Double precision
+A = 3.14
+B = .5
+C = 1E+10
+D = 2.5D-3      ' Double precision
 ```
 
 **Strings:**
 ```basic
-"Hello, World!"
-"She said ""Hi"""   ' Embedded quote
+A$ = "Hello, World!"
+B$ = "She said ""Hi"""   ' Embedded quote
 ```
 
 ---
@@ -169,9 +171,18 @@ DIM Values%(50)          ' Integer array
 
 ### Scope
 
-- **Global by default**: Variables declared at module level are accessible everywhere
-- **Local in procedures**: Variables declared inside `SUB` or `FUNCTION` are local to that procedure
-- Parameters are local to their procedure
+- **Global by default**: a name used anywhere at module level is global, and
+  refers to the same storage inside every procedure
+- **Local in procedures**: a name used only inside a `SUB` or `FUNCTION` is
+  local to it, and starts fresh (0 or `""`) on every call, so recursion works
+- **Parameters shadow**: a parameter, and a `FUNCTION`'s return
+  pseudo-variable, are always local even when a global shares the name
+
+The first two rules together mean that assigning to `X` inside a procedure
+writes the global `X` if and only if `X` also appears at module level.
+
+Unassigned variables read as `0` or `""`; they are never left holding whatever
+was previously in memory.
 
 ---
 
@@ -202,6 +213,9 @@ DIM Values%(50)          ' Integer array
 | `>=`     | Greater than or equal |
 
 Comparisons return `-1` (true) or `0` (false).
+
+Strings compare too, lexicographically by character value, so comparison is
+case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 
 ### Logical Operators
 
@@ -237,6 +251,8 @@ From highest to lowest:
 7. `AND`
 8. `OR`, `XOR`
 
+Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
+
 Use parentheses to override precedence:
 ```basic
 Result = (A + B) * C
@@ -252,7 +268,22 @@ Result = (A + B) * C
 LET X = 10      ' LET is optional
 X = 10          ' Same as above
 A$ = "Hello"
-Array(5) = 42
+DIM Arr(10)
+Arr(5) = 42
+```
+
+`LET` is accepted before any assignment, including record fields and
+`MID$`:
+
+```basic
+TYPE Person
+    Name AS STRING * 20
+END TYPE
+DIM P AS Person
+
+LET P.Name = "Ada"
+S$ = "xxllo"
+LET MID$(S$, 1, 2) = "HE"       ' S$ is now "HEllo"
 ```
 
 ### PRINT
@@ -271,6 +302,45 @@ Semicolon at end suppresses newline:
 ```basic
 PRINT "Enter value: ";
 ```
+
+### PRINT USING
+
+Formatted output. The format is a string literal:
+
+```basic
+PRINT USING "###.##"; 3.14159       '   3.14
+PRINT USING "Total: ###"; 42        ' Total:  42
+PRINT USING "## and ##"; 1; 2       '   1 and  2
+```
+
+Numeric fields:
+
+| Format  | Meaning                                          |
+|---------|--------------------------------------------------|
+| `###`   | Digit positions; the value is right-justified    |
+| `##.##` | Digits either side of a decimal point            |
+| `+`     | Leading or trailing sign, always shown           |
+| `-`     | Trailing sign, shown only for negatives          |
+| `,`     | Group the integer part in thousands              |
+| `$$`    | Leading currency sign, floated against the digits|
+| `**`    | Pad with asterisks instead of spaces             |
+| `**$`   | Both of the above                                |
+| `^^^^`  | Exponential form                                 |
+
+String fields:
+
+| Format  | Meaning                                          |
+|---------|--------------------------------------------------|
+| `!`     | First character only                             |
+| `\   \` | Fixed width: 2 plus the spaces between           |
+| `&`     | The whole string                                 |
+
+`_` emits the next character literally. A value too wide for its field is
+printed in full, preceded by `%`. If values remain after the format is
+exhausted, the format restarts.
+
+A field is at most 255 characters wide with at most 40 fractional digits;
+a format asking for more is clamped to those.
 
 ### INPUT
 
@@ -422,6 +492,11 @@ Computed jump:
 ```basic
 ON Choice GOTO 100, 200, 300
 ' If Choice=1, goto 100; if Choice=2, goto 200; etc.
+100 PRINT "one"
+110 END
+200 PRINT "two"
+210 END
+300 PRINT "three"
 ```
 
 ### DIM
@@ -440,13 +515,13 @@ DIM Names$(50)       ' String array
 Inline data:
 
 ```basic
-DATA 10, 20, 30, "Hello", "World"
+100 DATA 10, 20, 30, "Hello", "World"
 
 READ A, B, C
 READ X$, Y$
 
 RESTORE          ' Reset data pointer to beginning
-RESTORE 100      ' Reset to DATA at line 100
+RESTORE 100      ' Resume at the DATA on line 100
 ```
 
 ### CLS
@@ -455,6 +530,155 @@ Clear screen:
 
 ```basic
 CLS
+```
+
+### SWAP
+
+Exchange two values of the same type, including array elements:
+
+```basic
+DIM Items(10)
+SWAP A, B
+SWAP Items(I), Items(J)
+```
+
+### CONST
+
+A named constant, folded at compile time. It may be used anywhere a literal
+can, including as an array bound:
+
+```basic
+CONST MAX = 100
+CONST HALF = MAX / 2
+CONST TITLE$ = "Report"
+DIM Buffer(MAX)
+```
+
+### WRITE
+
+Like `PRINT`, but values are separated by commas and strings are quoted:
+
+```basic
+WRITE "Alice", 30       ' "Alice",30
+WRITE #1, A$, N         ' the same, to a file
+```
+
+`WRITE` always ends its line, and what it writes is exactly what
+`INPUT #` reads back.
+
+### EXIT
+
+Leave the innermost matching loop, or return early from a procedure:
+
+```basic
+FOR I = 1 TO 100
+    IF Found THEN EXIT FOR
+NEXT I
+
+DO
+    IF Done THEN EXIT DO
+LOOP
+
+SUB Check(N)
+    IF N = 0 THEN EXIT SUB
+    PRINT N
+END SUB
+```
+
+### REDIM
+
+Resize an existing array. `REDIM` alone clears it; `REDIM PRESERVE` keeps the
+existing elements and zeroes the new ones:
+
+```basic
+DIM Items(10)
+REDIM Items(20)             ' cleared
+REDIM PRESERVE Items(30)    ' contents kept
+```
+
+Only the last dimension may change under `PRESERVE`.
+
+### OPTION BASE
+
+Set the lowest legal subscript. It must appear before any `DIM`, and only once:
+
+```basic
+OPTION BASE 1
+DIM Items(10)     ' subscripts 1 to 10
+```
+
+### DEF FN
+
+A single-expression function. The name must begin with `FN`:
+
+```basic
+DEF FNArea(W, H) = W * H
+PRINT FNArea(3, 4)
+```
+
+### TYPE
+
+A user-defined record. Fields may be any built-in type or another record:
+
+```basic
+TYPE Point
+    X AS INTEGER
+    Y AS INTEGER
+END TYPE
+
+TYPE Person
+    Name AS STRING * 30
+    Home AS Point
+END TYPE
+
+DIM P AS Person
+P.Name = "Alice"
+P.Home.X = 10
+
+DIM People(100) AS Person
+People(0).Name = "Bob"
+```
+
+Assigning one record to another copies it. A record may be passed to a
+procedure, where it arrives by value:
+
+```basic
+TYPE Person
+    Name AS STRING * 30
+END TYPE
+
+SUB Show(P AS Person)
+    PRINT P.Name
+END SUB
+```
+
+`AS` also gives an ordinary variable, parameter or `FUNCTION` result a
+declared type:
+
+```basic
+DIM Count AS INTEGER
+
+SUB Log(Level AS INTEGER, Text AS STRING * 80)
+    PRINT Level; Text
+END SUB
+
+FUNCTION Total AS DOUBLE
+    Total = 1.5
+END FUNCTION
+
+FUNCTION Half(X) AS INTEGER
+    Half = X / 2        ' Half(7) is 3, not 3.5
+END FUNCTION
+```
+
+A declared result type must not contradict a type suffix on the name, and
+a `SUB` -- having no result -- cannot be declared `AS` anything.
+
+One `DIM` may mix declarators freely:
+
+```basic
+DIM I AS INTEGER, Grid(9, 9) AS INTEGER, Names$(20)
+
 ```
 
 ### END / STOP
@@ -487,6 +711,10 @@ STOP    ' Terminate (historically for debugging)
 | `LOG(x)`   | Natural logarithm                        |
 | `RND`      | Random number 0 ≤ r < 1                  |
 
+**Numeric output:** `PRINT` writes the shortest decimal that reads back as the
+same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
+`0.3333333333333333`) and a `SINGLE` shows only the ~7 digits it carries.
+
 **RND behavior:**
 ```basic
 X = RND           ' Next random number
@@ -509,8 +737,24 @@ X = RND(-1)       ' Reseed with system time (implementation-defined)
 | `CHR$(n)`             | Character from ASCII code                      |
 | `VAL(s$)`             | Convert string to number                       |
 | `STR$(x)`             | Convert number to string                       |
+| `SPACE$(n)`           | A string of n spaces                           |
+| `STRING$(n, c)`       | n copies of a character (code or first of c$)  |
+| `LTRIM$(s$)`          | Drop leading spaces                            |
+| `RTRIM$(s$)`          | Drop trailing spaces                           |
+| `UCASE$(s$)`          | Convert to upper case                          |
+| `LCASE$(s$)`          | Convert to lower case                          |
+| `HEX$(n)`             | Hexadecimal text for an integer                |
+| `OCT$(n)`             | Octal text for an integer                      |
 
 **String indexing is 1-based** for `MID$` and `INSTR`.
+
+`MID$` may also be assigned to, overwriting characters in place. The target's
+length never changes:
+
+```basic
+A$ = "hello"
+MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
+```
 
 ### Type Conversion Functions
 
@@ -523,9 +767,23 @@ X = RND(-1)       ' Reseed with system time (implementation-defined)
 
 ### Other Functions
 
-| Function   | Description                              |
-|------------|------------------------------------------|
-| `TIMER`    | Seconds since midnight (Double)          |
+| Function      | Description                                    |
+|---------------|------------------------------------------------|
+| `TIMER`       | Seconds since midnight, UTC, fractional (Double) |
+| `LBOUND(a[,d])` | Lowest subscript of an array, of dimension d |
+| `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
+| `EOF(n)`      | True once file n has been read to the end      |
+| `LOF(n)`      | Length of file n in bytes                      |
+| `TAB(n)`      | In PRINT: advance to column n                  |
+| `SPC(n)`      | In PRINT: emit n spaces                        |
+
+`TIMER` counts fractional seconds since midnight UTC on every platform, so
+subtracting two readings times a section of code.
+
+`LBOUND` and `UBOUND` take an array *name*, of any element type. The
+dimension may be any numeric expression; asking for one the array does
+not have is an error, reported at compile time when it is a constant and
+at run time otherwise.
 
 ---
 
@@ -548,6 +806,13 @@ CLOSE #1          ' Close specific file
 CLOSE             ' Close all files
 ```
 
+A file number may be any numeric expression, not only a literal:
+
+```basic
+F% = 1
+OPEN "data.txt" FOR INPUT AS #F%
+```
+
 ### Writing to Files
 
 ```basic
@@ -556,12 +821,33 @@ PRINT #1, X; Y; Z
 PRINT #1, A$
 ```
 
+Lines end with the host's terminator -- CRLF on Windows, LF elsewhere --
+so `LOF` counts two bytes per line ending on Windows and one elsewhere.
+Reading accepts either, so a file written on one platform reads correctly
+on the other.
+
 ### Reading from Files
 
 ```basic
 INPUT #1, X           ' Read value
 INPUT #1, A$, B$      ' Read multiple values
 LINE INPUT #1, Text$  ' Read entire line
+```
+
+`INPUT #` reads one comma-delimited field per variable, skipping leading
+blanks and line breaks, so several fields may come from one line and one
+field may span several. A field wrapped in quotes may contain commas.
+`LINE INPUT #` takes a whole line, commas and all.
+
+`EOF()` gives the usual read-until-the-end loop:
+
+```basic
+OPEN "data.txt" FOR INPUT AS #1
+WHILE NOT EOF(1)
+    LINE INPUT #1, Line$
+    PRINT Line$
+WEND
+CLOSE #1
 ```
 
 ### Example
@@ -657,6 +943,30 @@ END FUNCTION
 
 ---
 
+## Runtime Errors
+
+Compiled programs check for the mistakes that would otherwise corrupt memory
+or crash. On failure the program writes a message naming the fault and the
+line it happened on to standard error, and exits with status 1:
+
+```
+?Subscript out of range in 42
+```
+
+Checked: array subscripts (against every dimension, and against the lower
+bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
+run, division by zero for `/`, `\` and `MOD`, `SQR` of a negative number,
+`LOG` of a non-positive number, and allocation failure.
+
+Checks are on by default. Compiling with `--unsafe` removes them, which is
+worth doing only for code already known to be correct:
+
+```bash
+xbasic64 --unsafe program.bas
+```
+
+---
+
 ## Limitations
 
 The following features are **not supported**:
@@ -677,13 +987,11 @@ The following features are **not supported**:
 - `ERR`, `ERL`
 
 ### Other
-- `DEF FN` (use `FUNCTION` instead)
 - `DEFINT`, `DEFSNG`, etc. (use type suffixes)
 - `COMMON`, `SHARED` (single-module only)
-- `REDIM` (dynamic array resizing)
 - Random-access file I/O (`OPEN FOR RANDOM`, `GET`, `PUT`)
-- `LOCATE`, `PRINT USING`
-- `WIDTH`, `LPRINT`
+- `LOCATE`, `WIDTH`, `LPRINT`
+- A `FUNCTION` cannot return a `TYPE` record; pass one to a `SUB` instead
 
 ---
 
@@ -696,4 +1004,6 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 3. **Boolean true is -1** - Comparisons return -1 (true) or 0 (false)
 4. **Array indices start at 0** - `DIM A(10)` creates 11 elements (0-10)
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
-6. **Parameters are by-value only** - No `BYREF` support
+6. **Parameters are by-value only** - No `BYREF` support, records included:
+   a record argument is passed as the address of the caller's copy, which the
+   callee copies into a local, so changes to it do not escape

@@ -25,7 +25,21 @@
 //! - Left operand is restored to `eax`/`xmm0`
 //! - Right operand is placed in `ecx`/`xmm1`
 //!
-//! # Stack Frame Layout
+//! # Storage Model
+//!
+//! Storage is addressed uniformly as 8-byte words through [`Loc`], which is
+//! either a `.bss` symbol or an `rbp`-relative frame offset. Callers ask for
+//! "word N of this variable" and never compute offsets themselves.
+//!
+//! **Module-level variables and arrays live in `.bss`** (`_var_<NAME>`,
+//! `_arr_<NAME>`, RIP-relative). This gives three things at once: the loader
+//! zero-fills them, so an unassigned variable reads as `0` / `""` as BASIC
+//! requires; a symbol is frame-independent, so a `SUB` and the main program
+//! refer to the same storage; and access costs exactly what a frame reference
+//! did.
+//!
+//! **Procedure locals live on the stack** and are zeroed by the prologue (see
+//! `emit_zero_frame`), so each invocation starts clean and recursion works.
 //!
 //! ```text
 //! High addresses
@@ -44,8 +58,48 @@
 //! Low addresses
 //! ```
 //!
-//! All local variables are allocated 8 bytes regardless of type (for alignment).
-//! Variable offsets are always negative relative to `rbp`.
+//! Word layout within a variable's storage:
+//!
+//! | kind           | word 0          | word 1      | word 1+i      |
+//! |----------------|-----------------|-------------|---------------|
+//! | numeric scalar | value           | --          | --            |
+//! | string scalar  | pointer         | length      | --            |
+//! | array          | element pointer | dim 0 bound | dim *i* bound |
+//!
+//! Numeric scalars occupy one 8-byte word regardless of declared type; the
+//! narrower types are stored and loaded with narrower operands within it.
+//!
+//! Scoping rules follow LANGREF: a name used anywhere at module level is
+//! global and shared with every procedure; parameters and a FUNCTION's return
+//! pseudo-variable are always local and shadow a global of the same name; a
+//! name used only inside a procedure is local to it.
+//!
+//! A record declared with `TYPE` is laid out as consecutive words too, so a
+//! field is reached exactly the way a variable is -- a base [`Loc`] plus a word
+//! offset. Only an array element, whose address is not known until run time,
+//! needs a separate indirect path.
+//!
+//! # Private `_proc_*` calling convention
+//!
+//! Calls to user procedures do not follow the platform ABI, since the symbols
+//! are private to the compiled program. `classify_params` is the single
+//! definition, called by both the call site and the prologue:
+//!
+//! - Numeric arguments travel as f64 bit patterns in *integer* registers, and
+//!   the callee narrows them to the declared type.
+//! - A string occupies two slots, pointer then length.
+//! - A record is passed as a pointer to the caller's copy, which the prologue
+//!   copies into a local slot, giving by-value semantics.
+//! - A parameter is never split between registers and the stack, and spilling
+//!   is monotone: once one parameter goes to the stack, so do all later ones.
+//! - Stack arguments sit at `[rbp + 16 + 8i]`, with no Win64 shadow space.
+//!
+//! # Semantic analysis
+//!
+//! Code generation assumes `sema` has already run and accepted the program: it
+//! consults [`Symbols`] rather than guessing what a name means, and the
+//! remaining `expect`/`unreachable!` sites are invariants sema establishes, not
+//! reachable failure modes.
 //!
 //! # Stack Alignment (Critical for ABI Compliance)
 //!
@@ -85,9 +139,11 @@
 //! This allows efficient substring operations without copying.
 //!
 //! - String values: `rax` = pointer to characters, `rdx` = length
-//! - String variables: Two consecutive 8-byte slots at `[rbp + offset]` (ptr) and
-//!   `[rbp + offset - 8]` (len), where offset is negative (e.g., -8, -16).
-//!   The ptr is at higher address, len at lower address (stack grows downward).
+//! - String variables: two words of the variable's own storage -- word 0 is the
+//!   pointer, word 1 the length. Both are reserved when the variable is first
+//!   seen, so the length can never land in a neighbouring variable's slot.
+//! - An unassigned string is `(NULL, 0)`, which the runtime's print helpers
+//!   treat as empty rather than dereferencing.
 //!
 //! String literals are emitted in the `.data` section with labels `_str_N`.
 //!
@@ -148,8 +204,11 @@
 // SPDX-License-Identifier: MIT
 
 use crate::abi::{Abi, PlatformAbi};
+use crate::parser::TypeRef;
 use crate::parser::*;
-use std::collections::HashMap;
+use crate::sema::{Scope as SemaScope, Symbols};
+use crate::using;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 /// Simple math functions: BASIC name -> libc function name
@@ -199,22 +258,180 @@ const GOSUB_STACK_SIZE: i32 = 524288;
 
 /// ASCII character codes
 const ASCII_TAB: i64 = 9;
+const ASCII_COMMA: i64 = 44;
+const ASCII_QUOTE: i64 = 34;
 
 fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
 
+/// Map a BASIC identifier to an assembler-safe symbol.
+///
+/// BASIC names keep their type suffixes (`A$`, `N%`), which are not valid
+/// symbol characters. The mapping is injective because `_` escapes itself, so
+/// distinct BASIC names cannot collide: `A_S` becomes `A__S` while `A$`
+/// becomes `A_S`.
+fn mangle(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for c in name.chars() {
+        match c {
+            '_' => out.push_str("__"),
+            '%' => out.push_str("_I"),
+            '&' => out.push_str("_L"),
+            '!' => out.push_str("_F"),
+            '#' => out.push_str("_D"),
+            '$' => out.push_str("_S"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Where a variable or array descriptor lives.
+///
+/// Storage is addressed uniformly as a sequence of 8-byte words, so callers ask
+/// for "word N of this variable" and never do offset arithmetic themselves.
+/// Word layout by kind:
+///
+/// | kind            | word 0            | word 1        | word 1+i          |
+/// |-----------------|-------------------|---------------|-------------------|
+/// | numeric scalar  | value             | --            | --                |
+/// | string scalar   | pointer           | length        | --                |
+/// | array           | element pointer   | dim 0 bound   | dim *i* bound     |
+///
+/// Today every `Loc` is a `Frame`; the `Global` variant exists so that moving
+/// module-level storage to `.bss` is a change of location, not of every access
+/// site.
+#[derive(Clone, Debug, PartialEq)]
+enum Loc {
+    /// RIP-relative, at assembler symbol `sym`.
+    Global(String),
+    /// rbp-relative address of word 0 (negative, since the frame grows down).
+    Frame(i32),
+}
+
+impl Loc {
+    /// Operand for word `n`, with an explicit operand size.
+    fn at(&self, size: &str, n: i32) -> String {
+        match self {
+            Loc::Global(sym) => format!("{} [rip + {} + {}]", size, sym, n * 8),
+            Loc::Frame(off) => format!("{} [rbp + {}]", size, off + n * 8),
+        }
+    }
+
+    /// Operand for word `n` as a QWORD, the common case.
+    fn q(&self, n: i32) -> String {
+        self.at("QWORD PTR", n)
+    }
+
+    /// A location `n` words further along, used to reach a record field.
+    fn offset_words(&self, n: i32) -> Loc {
+        match self {
+            Loc::Global(sym) => Loc::Global(format!("{} + {}", sym, n * 8)),
+            Loc::Frame(off) => Loc::Frame(off + n * 8),
+        }
+    }
+}
+
+/// A runtime error the generated code can raise.
+///
+/// Each variant names a message constant in the runtime. The BASIC line number
+/// is passed separately at the call site, so the set of messages stays small no
+/// matter how many check sites exist.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum RtError {
+    Subscript,
+    DivideByZero,
+    Domain,
+    Overflow,
+    Undim,
+    OutOfMemory,
+    GosubOverflow,
+}
+
+impl RtError {
+    /// Assembler symbol holding the message text.
+    fn symbol(self) -> &'static str {
+        match self {
+            RtError::Subscript => "_err_subscript",
+            RtError::DivideByZero => "_err_div0",
+            RtError::Domain => "_err_domain",
+            RtError::Overflow => "_err_overflow",
+            RtError::Undim => "_err_undim",
+            RtError::OutOfMemory => "_err_memory",
+            RtError::GosubOverflow => "_err_gosub",
+        }
+    }
+
+    /// Short tag used to build a unique trampoline label.
+    fn tag(self) -> &'static str {
+        match self {
+            RtError::Subscript => "sub",
+            RtError::DivideByZero => "div0",
+            RtError::Domain => "dom",
+            RtError::Overflow => "ovf",
+            RtError::Undim => "undim",
+            RtError::OutOfMemory => "mem",
+            RtError::GosubOverflow => "gosub",
+        }
+    }
+}
+
+/// Code generation options.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Emit runtime safety checks (array bounds, division by zero, ...).
+    pub checks: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        // Checks are on unless the user explicitly opts out.
+        Options { checks: true }
+    }
+}
+
+/// A file number, ready to be placed in an argument register.
+enum FileNum {
+    /// A literal, placed directly as an immediate.
+    Imm(i64),
+    /// An evaluated expression, parked in a frame slot.
+    Slot(Loc),
+}
+
+/// One 8-byte physical argument slot in the private `_proc_*` convention.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot {
+    /// `INT_ARG_REGS[i]`.
+    Reg(usize),
+    /// Caller: `[rsp + 8*i]` at the moment of the `call`.
+    /// Callee: `[rbp + 16 + 8*i]` after `push rbp; mov rbp, rsp`.
+    Stk(usize),
+}
+
+/// Where one parameter's words are passed.
+#[derive(Clone, Debug)]
+struct ParamPlace {
+    ty: DataType,
+    ptr: Slot,
+    /// Second slot, for a string's length.
+    len: Option<Slot>,
+}
+
 /// Variable storage information
 #[derive(Clone)]
 struct VarInfo {
-    offset: i32,
+    loc: Loc,
     data_type: DataType,
 }
 
 /// Metadata for array storage
+#[derive(Clone)]
 struct ArrayInfo {
-    ptr_offset: i32,       // stack offset where array pointer is stored
-    dim_offsets: Vec<i32>, // stack offsets where dimension bounds are stored
+    /// Word 0 holds the malloc'd element pointer; word 1+i holds dimension i's
+    /// element count (already the declared bound + 1).
+    loc: Loc,
+    ndims: usize,
 }
 
 #[derive(Default)]
@@ -228,8 +445,44 @@ pub struct CodeGen {
     data_items: Vec<Literal>,       // DATA values
     current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
-    gosub_used: bool,               // whether GOSUB is used (need return stack)
-    expr_depth: u32,                // current expression nesting depth
+    proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
+    /// Names resolved by semantic analysis; codegen consults this instead of
+    /// guessing from an identifier's spelling.
+    symbols: Symbols,
+    /// Code generation options (currently just whether checks are emitted).
+    opts: Options,
+    /// BASIC line of the statement being compiled, for runtime diagnostics.
+    current_line: u32,
+    /// Error trampolines needed so far, keyed by (error, line) so that sites
+    /// sharing both share one trampoline. Ordered for reproducible output.
+    error_sites: BTreeMap<(RtError, u32), String>,
+    /// Enclosing loops, innermost last, so EXIT FOR / EXIT DO know where to
+    /// jump. Each entry is (is_for, end label).
+    loop_stack: Vec<(bool, String)>,
+    /// Label of the current procedure's epilogue, for EXIT SUB / EXIT FUNCTION.
+    proc_exit_label: Option<String>,
+    /// Storage for module-level variables declared with `DIM ... AS`.
+    record_vars: HashMap<String, Loc>,
+    /// The same, for the current procedure's typed locals and parameters.
+    /// Kept separate from `record_vars` and cleared per procedure: a shared
+    /// map let one procedure's frame slot be reused by the next, which then
+    /// read and wrote below its own `rsp`.
+    proc_record_vars: HashMap<String, Loc>,
+    /// Declared types of the current procedure's typed parameters.
+    proc_types: HashMap<String, TypeRef>,
+    /// Module-level typed variables and their size in words, for .bss.
+    record_globals: BTreeMap<String, i32>,
+    /// Element size in words for module-level arrays of records, by
+    /// upper-case name.
+    record_elem_words: HashMap<String, i32>,
+    /// The same, for arrays declared inside the current procedure.
+    proc_record_elem_words: HashMap<String, i32>,
+    /// DATA item index reached at each numeric line label, for RESTORE.
+    data_line_index: HashMap<u32, usize>,
+    /// The same for named labels.
+    data_label_index: HashMap<String, usize>,
+    gosub_used: bool, // whether GOSUB is used (need return stack)
+    expr_depth: u32,  // current expression nesting depth
 }
 
 impl CodeGen {
@@ -357,25 +610,160 @@ impl CodeGen {
             return info.clone();
         }
 
-        // Allocate new variable - determine type from suffix
+        // Allocate new variable - determine type from suffix.
+        // A string needs two words (pointer, length); everything else one.
+        // Reserving both here, once, is what keeps the length word inside the
+        // variable's own storage: it used to be scavenged at `offset - 8`,
+        // which is the *next* variable's slot unless something else happened to
+        // reserve it first.
         let data_type = DataType::from_suffix(name);
-        self.stack_offset -= 8; // All types use 8 bytes for alignment
-        let offset = self.stack_offset;
-
-        let info = VarInfo { offset, data_type };
+        let words = Self::words_for(data_type);
 
         if self.current_proc.is_some() {
+            // Not a module-level name, so it is local to this procedure: a
+            // fresh, zeroed slot per invocation, which is what makes recursion
+            // work.
+            self.stack_offset -= 8 * words;
+            let info = VarInfo {
+                loc: Loc::Frame(self.stack_offset),
+                data_type,
+            };
             self.proc_vars.insert(name.to_string(), info.clone());
+            info
         } else {
+            // Module-level: static storage, shared with every procedure and
+            // zero-initialized by the loader.
+            let info = VarInfo {
+                loc: Loc::Global(format!("_var_{}", mangle(name))),
+                data_type,
+            };
             self.vars.insert(name.to_string(), info.clone());
+            info
         }
-
-        info
     }
 
-    /// Get just the stack offset for a variable (convenience method)
-    fn get_var_offset(&mut self, name: &str) -> i32 {
-        self.get_var_info(name).offset
+    /// Find an array, preferring one DIM'd in the current procedure over a
+    /// module-level array of the same name.
+    fn lookup_array(&self, name: &str) -> Option<&ArrayInfo> {
+        if self.current_proc.is_some() {
+            if let Some(info) = self.proc_arrays.get(name) {
+                return Some(info);
+            }
+        }
+        self.arrays.get(name)
+    }
+
+    /// Value representation of a parameter: its `AS` clause when it has one,
+    /// otherwise the type its name's suffix implies.
+    ///
+    /// A record parameter is passed as a pointer to the caller's copy, which
+    /// the prologue then copies into a local slot, so it arrives by value like
+    /// every other parameter without needing a new addressing mode.
+    fn param_data_type(p: &Param) -> DataType {
+        match &p.ty {
+            Some(TypeRef::Record(_)) => DataType::Long, // a pointer
+            Some(t) => DataType::from_type_ref(t),
+            None => DataType::from_suffix(&p.name),
+        }
+    }
+
+    /// Assign physical slots to a procedure's parameters.
+    ///
+    /// This is the single definition of the private `_proc_*` calling
+    /// convention. Both the call site and the procedure prologue call it with
+    /// the same input -- the declared parameter types, in order -- so the two
+    /// sides cannot drift apart. They previously open-coded their own slot
+    /// arithmetic and disagreed about strings: a string argument occupies two
+    /// slots (pointer and length) but the callee bound only one register per
+    /// parameter, so the string arrived empty and every parameter after it was
+    /// read from the wrong register.
+    ///
+    /// Two rules keep the assignment simple enough to be obviously the same on
+    /// both sides:
+    ///
+    /// * A parameter is never split between registers and the stack. Splitting
+    ///   would buy at most one register, and `_proc_*` is a private symbol with
+    ///   no external ABI obligation.
+    /// * Spilling is monotone: once one parameter goes to the stack, so do all
+    ///   later ones, which keeps stack slot indices contiguous in declaration
+    ///   order.
+    ///
+    /// Returns the placements and the number of stack slots needed.
+    fn classify_params(types: &[DataType]) -> (Vec<ParamPlace>, usize) {
+        let n_regs = PlatformAbi::INT_ARG_REGS.len();
+        let mut next_reg = 0usize;
+        let mut next_stk = 0usize;
+        let mut places = Vec::with_capacity(types.len());
+
+        for &ty in types {
+            let words = Self::words_for(ty) as usize;
+            // If it does not fit entirely in the remaining registers, this
+            // parameter and every later one go on the stack.
+            if next_reg + words > n_regs {
+                next_reg = n_regs;
+            }
+            let in_regs = next_reg < n_regs;
+
+            let take = |counter: &mut usize| -> Slot {
+                let slot = if in_regs {
+                    Slot::Reg(*counter)
+                } else {
+                    Slot::Stk(*counter)
+                };
+                *counter += 1;
+                slot
+            };
+            let counter = if in_regs {
+                &mut next_reg
+            } else {
+                &mut next_stk
+            };
+
+            let ptr = take(counter);
+            let len = if words == 2 {
+                Some(take(counter))
+            } else {
+                None
+            };
+            places.push(ParamPlace { ty, ptr, len });
+        }
+
+        (places, next_stk)
+    }
+
+    /// Size in bytes of one element of an array, from the name's type suffix.
+    ///
+    /// Elements are stored at their declared width, the same way scalars are.
+    /// Storing every numeric element as f64 regardless -- as this used to --
+    /// meant `A%(0)` wrote 8 bytes of double but was *read* as an integer,
+    /// because expr_type types an array access by its suffix. Typed numeric
+    /// arrays returned garbage as a result.
+    fn elem_size_for(&self, name: &str) -> i32 {
+        // An array declared with `DIM ... AS T` has records for elements, so
+        // its element size comes from the type rather than a name suffix.
+        if let Some(words) = self.record_elem_words_of(name) {
+            return words * 8;
+        }
+        Self::elem_size(name)
+    }
+
+    fn elem_size(name: &str) -> i32 {
+        match DataType::from_suffix(name) {
+            DataType::String => 16, // pointer + length
+            DataType::Integer => 2,
+            DataType::Long | DataType::Single => 4,
+            DataType::Double => 8,
+        }
+    }
+
+    /// Number of 8-byte words a scalar of this type occupies.
+    fn words_for(data_type: DataType) -> i32 {
+        if data_type == DataType::String { 2 } else { 1 }
+    }
+
+    /// Get just the storage location for a variable (convenience method)
+    fn get_var_loc(&mut self, name: &str) -> Loc {
+        self.get_var_info(name).loc
     }
 
     /// Determine the result type of an expression
@@ -386,9 +774,29 @@ impl CodeGen {
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::String,
             },
-            Expr::Variable(name) => DataType::from_suffix(name),
+            Expr::Variable(name) if crate::sema::is_zero_arg_builtin(name) => {
+                self.fn_return_type(name)
+            }
+            Expr::Variable(name) => match self.symbols.consts.get(&name.to_uppercase()) {
+                Some(Literal::Integer(_)) => DataType::Long,
+                Some(Literal::Float(_)) => DataType::Double,
+                Some(Literal::String(_)) => DataType::String,
+                // A variable declared with `AS` carries that type rather than
+                // the one its name's suffix would imply.
+                // An already-allocated slot knows its own type -- which for a
+                // parameter declared `N AS INTEGER` is the declared one, not
+                // what the name's suffix would imply.
+                None => match self.lookup_var(name) {
+                    Some(info) => info.data_type,
+                    None => match self.typed_var(name) {
+                        Some(t) => DataType::from_type_ref(&t),
+                        None => DataType::from_suffix(name),
+                    },
+                },
+            },
             Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
-            Expr::FnCall { name, .. } => self.fn_return_type(name),
+            Expr::FnCall { name, args } => self.call_return_type(name, args),
+            Expr::Field { .. } => self.field_expr_type(expr),
             Expr::Unary { operand, .. } => self.expr_type(operand),
             Expr::Binary { left, right, op } => {
                 let lt = self.expr_type(left);
@@ -399,15 +807,63 @@ impl CodeGen {
     }
 
     /// Get the return type of a function (built-in or user-defined)
+    /// Result type of ABS, which preserves its argument's type.
+    fn abs_result_type(arg: DataType) -> DataType {
+        match arg {
+            DataType::Integer | DataType::Long => DataType::Long,
+            DataType::Single => DataType::Single,
+            _ => DataType::Double,
+        }
+    }
+
+    /// Return type of a call, including builtins whose result type depends on
+    /// their argument.
+    fn call_return_type(&self, name: &str, args: &[Expr]) -> DataType {
+        if name.to_uppercase() == "ABS" && !args.is_empty() {
+            return Self::abs_result_type(self.expr_type(&args[0]));
+        }
+        self.fn_return_type(name)
+    }
+
+    /// Result type of a user-defined FUNCTION.
+    ///
+    /// `FUNCTION F(X) AS INTEGER` used to be parsed and then thrown away, so
+    /// the result fell back to the name's suffix -- Double for an unsuffixed
+    /// name, which printed 3.5 where the program asked for 3.
+    fn proc_return_type(&self, name: &str) -> DataType {
+        match self
+            .symbols
+            .procs
+            .get(&name.to_uppercase())
+            .and_then(|p| p.ret_ty.as_ref())
+        {
+            Some(ty) => DataType::from_type_ref(ty),
+            None => DataType::from_suffix(name),
+        }
+    }
+
     fn fn_return_type(&self, name: &str) -> DataType {
         // Built-in functions that return strings
         let upper = name.to_uppercase();
+
+        // A user-defined FUNCTION's declared type wins over any name-based
+        // guess, including the built-in table below.
+        if let Some(proc) = self.symbols.procs.get(&upper) {
+            if let Some(ty) = &proc.ret_ty {
+                return DataType::from_type_ref(ty);
+            }
+        }
+
         if upper.ends_with('$') {
             return DataType::String;
         }
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" => DataType::Long,
+            // CSNG converts to SINGLE; saying Double here made its result print
+            // with a Double's digits.
+            "CSNG" => DataType::Single,
             // Most built-ins and user functions: check suffix, default to Double
             _ => DataType::from_suffix(name),
         }
@@ -506,11 +962,29 @@ impl CodeGen {
         }
     }
 
-    pub fn generate(&mut self, program: &Program) -> String {
+    pub fn generate(&mut self, program: &Program, symbols: Symbols, opts: Options) -> String {
+        self.symbols = symbols;
+        self.opts = opts;
         // First pass: collect DATA statements and check for GOSUB
         for stmt in &program.statements {
             self.preprocess(stmt);
         }
+
+        // Render main into a scratch buffer *before* the procedures.
+        //
+        // Procedures used to be emitted first, which meant `vars` and `arrays`
+        // were still empty while a procedure body was compiled: a reference to a
+        // module-level variable allocated a fresh procedure local (so globals
+        // read as 0 inside a SUB) and a reference to a module-level array hit
+        // "Array not declared". Compiling main first means that by the time any
+        // procedure is compiled, every module-level name is known and classified
+        // as a global. The alternative -- a separate collect_globals walker --
+        // would have to mirror every name-introducing statement forever.
+        let main_asm = {
+            let saved = std::mem::take(&mut self.output);
+            self.gen_main(program);
+            std::mem::replace(&mut self.output, saved)
+        };
 
         // Emit assembly header
         self.emit(".intel_syntax noprefix");
@@ -519,16 +993,69 @@ impl CodeGen {
         self.emit(&format!(".globl {}main", p));
         self.emit("");
 
-        // Generate procedures first
+        // Procedures
         for stmt in &program.statements {
-            if let Stmt::Sub { name, params, body } = stmt {
+            if let StmtKind::Sub { name, params, body } = &stmt.kind {
                 self.gen_procedure(name, params, body, false);
-            } else if let Stmt::Function { name, params, body } = stmt {
+            } else if let StmtKind::Function {
+                name, params, body, ..
+            } = &stmt.kind
+            {
                 self.gen_procedure(name, params, body, true);
             }
         }
 
-        // Generate main
+        self.output.push_str(&main_asm);
+
+        // Error trampolines, past every function body so the checked fast path
+        // is only a compare and a never-taken branch.
+        self.emit_error_trampolines();
+
+        // Emit data section
+        self.emit_data_section();
+
+        self.output.clone()
+    }
+
+    /// Reserve descriptors for every array declared in `scope`.
+    ///
+    /// Done before any code is emitted, so that an array used earlier in
+    /// program order than its `DIM` still has somewhere to read from. Its
+    /// element pointer is null until the DIM runs, which the bounds check
+    /// reports as "Array used before DIM" rather than crashing.
+    fn reserve_array_descriptors(&mut self, scope: &SemaScope) {
+        let mut decls: Vec<(String, usize)> = self
+            .symbols
+            .arrays
+            .iter()
+            .filter(|((s, _), _)| s == scope)
+            .map(|((_, name), info)| (name.clone(), info.rank))
+            .collect();
+        decls.sort();
+
+        for (name, rank) in decls {
+            if self.lookup_array(&name).is_some() {
+                continue;
+            }
+            let loc = if self.current_proc.is_some() {
+                self.stack_offset -= 8 * (1 + rank as i32);
+                Loc::Frame(self.stack_offset)
+            } else {
+                Loc::Global(format!("_arr_{}", mangle(&name)))
+            };
+            let info = ArrayInfo { loc, ndims: rank };
+            if self.current_proc.is_some() {
+                self.proc_arrays.insert(name, info);
+            } else {
+                self.arrays.insert(name, info);
+            }
+        }
+    }
+
+    /// Emit `main`: prologue, module-level statements, epilogue.
+    fn gen_main(&mut self, program: &Program) {
+        self.reserve_array_descriptors(&SemaScope::Module);
+        let p = PREFIX;
         self.emit_label(&format!("{}main", p));
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
@@ -556,8 +1083,8 @@ impl CodeGen {
 
         // Generate main body
         for stmt in &program.statements {
-            match stmt {
-                Stmt::Sub { .. } | Stmt::Function { .. } => {}
+            match stmt.kind {
+                StmtKind::Sub { .. } | StmtKind::Function { .. } => {}
                 _ => self.gen_stmt(stmt),
             }
         }
@@ -576,60 +1103,198 @@ impl CodeGen {
         //
         // Since we use 16-byte sub/add for all temporaries in expression evaluation,
         // we just need sub rsp, N where N is a multiple of 16 to maintain alignment.
+        // Only main's own buffer is in `self.output` here, so this cannot reach
+        // a procedure's placeholder -- note "# STACK_RESERVE" is a prefix of
+        // "# STACK_RESERVE_PROC_<name>".
         let stack_needed = -self.stack_offset;
         let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
         let old = "    sub rsp, 0         # STACK_RESERVE";
         let new = format!("    sub rsp, {}        # STACK_RESERVE", stack_size);
         self.output = self.output.replace(old, &new);
-
-        // Emit data section
-        self.emit_data_section();
-
-        self.output.clone()
     }
 
     /// Preprocess statement: collect DATA items and check for GOSUB usage
     fn preprocess(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Data(values) => self.data_items.extend(values.clone()),
-            Stmt::Gosub(_) => self.gosub_used = true,
+        match &stmt.kind {
+            StmtKind::Data(values) => self.data_items.extend(values.clone()),
+            StmtKind::Gosub(_) => self.gosub_used = true,
+            // Record where each label sits in the DATA stream, so RESTORE can
+            // resume from it.
+            StmtKind::Label(n) => {
+                self.data_line_index.insert(*n, self.data_items.len());
+            }
+            StmtKind::LabelName(name) => {
+                self.data_label_index
+                    .insert(name.to_uppercase(), self.data_items.len());
+            }
             _ => {}
         }
         // Recurse into nested statements
-        let bodies: Vec<&[Stmt]> = match stmt {
-            Stmt::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                let mut v = vec![then_branch.as_slice()];
-                if let Some(eb) = else_branch {
-                    v.push(eb.as_slice());
-                }
-                v
-            }
-            Stmt::For { body, .. }
-            | Stmt::While { body, .. }
-            | Stmt::DoLoop { body, .. }
-            | Stmt::Sub { body, .. }
-            | Stmt::Function { body, .. } => vec![body.as_slice()],
-            _ => vec![],
-        };
-        for body in bodies {
+        for body in child_bodies(stmt) {
             for s in body {
                 self.preprocess(s);
             }
         }
     }
 
-    fn gen_procedure(&mut self, name: &str, params: &[String], body: &[Stmt], is_function: bool) {
+    /// Guard a math function whose argument must be in range: compare the
+    /// value in `xmm0` against zero and raise "Illegal function call" when
+    /// `cond` holds (`jb` for "negative", `jbe` for "not positive").
+    fn emit_domain_check(&mut self, cond: &str) {
+        if !self.opts.checks {
+            return;
+        }
+        self.emit("    xorpd xmm1, xmm1");
+        self.emit("    ucomisd xmm0, xmm1");
+        self.emit_check(cond, RtError::Domain);
+    }
+
+    /// Guard an integer divide: `idiv` raises #DE (a SIGFPE crash) both when
+    /// the divisor is zero and for INT_MIN / -1, which overflows the quotient.
+    /// The divisor is expected in `ecx`.
+    fn emit_integer_divide_checks(&mut self) {
+        if !self.opts.checks {
+            return;
+        }
+        self.emit("    test ecx, ecx");
+        self.emit_check("je", RtError::DivideByZero);
+        // INT_MIN / -1 overflows; both operands must match for it to trap.
+        self.emit("    cmp ecx, -1");
+        let skip = self.new_label("nodivovf");
+        self.emit(&format!("    jne {}", skip));
+        self.emit("    cmp eax, -2147483648");
+        self.emit_check("je", RtError::Overflow);
+        self.emit_label(&skip);
+    }
+
+    /// Label of the trampoline that raises `kind` at the current line,
+    /// creating it if this is the first site to need it.
+    fn error_label(&mut self, kind: RtError) -> String {
+        let line = self.current_line;
+        self.error_sites
+            .entry((kind, line))
+            .or_insert_with(|| format!(".Lerr_{}_{}", kind.tag(), line))
+            .clone()
+    }
+
+    /// With `OPTION BASE 1`, subscript 0 is out of range too.
+    ///
+    /// Element storage is still allocated for it -- the descriptor keeps
+    /// holding N+1 elements and slot 0 simply goes unused -- which leaves the
+    /// linear index arithmetic completely unchanged.
+    fn emit_lower_bound_check(&mut self, reg: &str) {
+        if self.symbols.option_base == 0 {
+            return;
+        }
+        self.emit(&format!("    cmp {}, {}", reg, self.symbols.option_base));
+        self.emit_check("jb", RtError::Subscript);
+    }
+
+    /// A LBOUND/UBOUND dimension known at compile time.
+    ///
+    /// The descriptor's word 0 holds the element pointer and word i the i'th
+    /// dimension's count, so a constant dimension is a fixed offset.
+    fn const_dim(&self, e: &Expr) -> Option<i32> {
+        let lit = match e {
+            Expr::Literal(l) => l.clone(),
+            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase())?.clone(),
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => i32::try_from(n).ok(),
+            _ => None,
+        }
+    }
+
+    /// Evaluate a computed dimension into `rax`, checked against `rank`.
+    ///
+    /// Dimensions are 1-based, so an unsigned compare of `dim - 1` against the
+    /// rank catches zero and negative values in the same branch.
+    fn gen_dim_index(&mut self, dim: &Expr, rank: i64) {
+        let ty = self.gen_expr(dim);
+        self.gen_coercion(ty, DataType::Long);
+        self.emit("    movsxd rax, eax");
+        self.emit("    dec rax");
+        self.emit(&format!("    cmp rax, {}", rank));
+        self.emit_check("jae", RtError::Subscript);
+        self.emit("    inc rax");
+    }
+
+    /// The scope semantic analysis would name for the code being generated.
+    fn sema_scope(&self) -> SemaScope {
+        match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        }
+    }
+
+    /// Emit a check: branch to the error trampoline when `cond` holds.
+    ///
+    /// The fast path costs only the caller's compare plus this never-taken
+    /// branch; everything else lives in the cold trampoline.
+    fn emit_check(&mut self, cond: &str, kind: RtError) {
+        if !self.opts.checks {
+            return;
+        }
+        let label = self.error_label(kind);
+        self.emit(&format!("    {} {}", cond, label));
+    }
+
+    /// Emit every error trampoline collected during code generation.
+    fn emit_error_trampolines(&mut self) {
+        let sites = std::mem::take(&mut self.error_sites);
+        if sites.is_empty() {
+            return;
+        }
+        self.emit("");
+        self.emit("# Runtime error trampolines (cold; never fall through)");
+        for ((kind, line), label) in sites {
+            self.emit_label(&label);
+            let sym = kind.symbol();
+            self.emit(&format!("    lea {}, [rip + {}]", Self::arg_reg(0), sym));
+            self.emit(&format!("    mov {}, {}", Self::arg_reg(1), line));
+            self.emit("    call _rt_error");
+        }
+    }
+
+    /// Zero the current frame, from `rsp` up to `rbp`.
+    ///
+    /// Emitted in a procedure prologue right after the stack reserve and before
+    /// parameters are spilled. Uses `r10`/`r11`, which are caller-saved and are
+    /// argument registers on neither System V nor Win64, so the incoming
+    /// arguments stay live. (`rep stosq` would clobber `rdi`/`rcx`/`rax`, all of
+    /// which carry arguments.)
+    ///
+    /// The loop is bottom-tested, so a zero-sized frame runs no iterations, and
+    /// it derives its bounds from the registers rather than the reserve size, so
+    /// it cannot drift out of step with the backpatched `sub rsp, N`.
+    fn emit_zero_frame(&mut self) {
+        let body = self.new_label("zero");
+        let check = self.new_label("zchk");
+        self.emit("    # zero locals: [rsp, rbp)");
+        self.emit("    mov r11, rsp");
+        self.emit("    mov r10, rbp");
+        self.emit(&format!("    jmp {}", check));
+        self.emit_label(&body);
+        self.emit("    mov QWORD PTR [r11], 0");
+        self.emit("    add r11, 8");
+        self.emit_label(&check);
+        self.emit("    cmp r11, r10");
+        self.emit(&format!("    jb {}", body));
+    }
+
+    fn gen_procedure(&mut self, name: &str, params: &[Param], body: &[Stmt], is_function: bool) {
         self.current_proc = Some(name.to_string());
         self.proc_vars.clear();
+        self.proc_arrays.clear();
+        self.proc_types.clear();
+        self.proc_record_vars.clear();
+        self.proc_record_elem_words.clear();
         let old_stack_offset = self.stack_offset;
         self.stack_offset = 0;
 
         // Procedure label
-        self.emit_label(&format!("_proc_{}", name));
+        self.emit_label(&format!("_proc_{}", mangle(name)));
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
@@ -637,82 +1302,157 @@ impl CodeGen {
         let placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
         self.emit(&placeholder);
 
-        // Parameters are passed in registers (per platform ABI)
-        // First N params in registers, rest on stack at [rbp+16], [rbp+24], etc.
-        // Store them all in our local stack space
+        // Zero the frame before anything is spilled into it, so that procedure
+        // locals start at 0 / "" on every call the way module-level variables
+        // do. Must come before the parameter spill below, which would otherwise
+        // be wiped.
+        self.emit_zero_frame();
+
+        self.reserve_array_descriptors(&SemaScope::Proc(name.to_string()));
+
+        // Spill parameters into the frame, using the same placement the call
+        // site computed from the same declared types.
         let int_regs = PlatformAbi::INT_ARG_REGS;
-        let max_reg_args = int_regs.len();
-        for (i, param) in params.iter().enumerate() {
-            self.stack_offset -= 8;
-            let data_type = DataType::from_suffix(param);
+        let param_types: Vec<DataType> = params.iter().map(Self::param_data_type).collect();
+        let (places, _) = Self::classify_params(&param_types);
+
+        for (param_decl, place) in params.iter().zip(&places) {
+            let param = &param_decl.name;
+
+            // A record parameter arrives as a pointer to the caller's copy.
+            // Copying it into a local slot here gives by-value semantics and
+            // lets field access use ordinary frame addressing.
+            if let Some(TypeRef::Record(_)) = &param_decl.ty {
+                let ty = param_decl.ty.clone().expect("matched above");
+                let words = self.symbols.type_words(&ty);
+                self.stack_offset -= 8 * words;
+                let loc = Loc::Frame(self.stack_offset);
+                let src = match place.ptr {
+                    Slot::Reg(i) => int_regs[i].to_string(),
+                    Slot::Stk(i) => {
+                        self.emit(&format!(
+                            "    mov r11, QWORD PTR [rbp + {}]",
+                            16 + 8 * i as i32
+                        ));
+                        "r11".to_string()
+                    }
+                };
+                self.emit(&format!("    mov r10, {}", src));
+                for w in 0..words {
+                    self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
+                    self.emit(&format!("    mov {}, rax", loc.q(w)));
+                }
+                self.proc_record_vars.insert(param.clone(), loc);
+                self.proc_types.insert(param.clone(), ty);
+                continue;
+            }
+
+            self.stack_offset -= 8 * Self::words_for(place.ty);
+            let loc = Loc::Frame(self.stack_offset);
             self.proc_vars.insert(
                 param.clone(),
                 VarInfo {
-                    offset: self.stack_offset,
-                    data_type,
+                    loc: loc.clone(),
+                    data_type: place.ty,
                 },
             );
-            if i < max_reg_args {
-                // Parameter in register - store to our local stack
-                self.emit(&format!(
-                    "    mov QWORD PTR [rbp + {}], {}",
-                    self.stack_offset, int_regs[i]
-                ));
-            } else {
-                // Parameter on call stack - copy to our local stack
-                // Overflow args are at [rbp+16], [rbp+24], etc. (after saved rbp and ret addr)
-                let stack_arg_offset = 16 + (i - max_reg_args) * 8;
-                self.emit(&format!(
-                    "    mov rax, QWORD PTR [rbp + {}]",
-                    stack_arg_offset
-                ));
-                self.emit(&format!(
-                    "    mov QWORD PTR [rbp + {}], rax",
-                    self.stack_offset
-                ));
+
+            // Bring a slot's value into a register we can store from. r11 is
+            // caller-saved and an argument register on neither ABI, so using it
+            // as scratch cannot clobber a parameter still to be spilled.
+            let fetch = |s: &mut Self, slot: Slot| -> String {
+                match slot {
+                    Slot::Reg(i) => int_regs[i].to_string(),
+                    Slot::Stk(i) => {
+                        s.emit(&format!(
+                            "    mov r11, QWORD PTR [rbp + {}]",
+                            16 + 8 * i as i32
+                        ));
+                        "r11".to_string()
+                    }
+                }
+            };
+
+            match place.ty {
+                DataType::String => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                    let l = fetch(self, place.len.expect("string parameter has a length slot"));
+                    self.emit(&format!("    mov {}, {}", loc.q(1), l));
+                }
+                DataType::Double => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                }
+                // Numeric arguments arrive as f64 bit patterns; narrow to the
+                // declared type. rax/xmm0 are safe scratch: neither is an
+                // argument register on either ABI.
+                DataType::Single => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    movq xmm0, {}", p));
+                    self.emit("    cvtsd2ss xmm0, xmm0");
+                    self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+                }
+                DataType::Integer | DataType::Long => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    movq xmm0, {}", p));
+                    self.emit("    cvttsd2si eax, xmm0");
+                    let (size, reg) = if place.ty == DataType::Integer {
+                        ("WORD PTR", "ax")
+                    } else {
+                        ("DWORD PTR", "eax")
+                    };
+                    self.emit(&format!("    mov {}, {}", loc.at(size, 0), reg));
+                }
             }
         }
 
         // If function, allocate return value slot
         if is_function {
-            self.stack_offset -= 8;
-            let data_type = DataType::from_suffix(name);
+            let data_type = self.proc_return_type(name);
+            self.stack_offset -= 8 * Self::words_for(data_type);
             self.proc_vars.insert(
                 name.to_string(),
                 VarInfo {
-                    offset: self.stack_offset,
+                    loc: Loc::Frame(self.stack_offset),
                     data_type,
                 },
             );
         }
 
         // Generate body
+        let exit_label = format!(".Lproc_exit_{}", mangle(name));
+        let saved_exit = self.proc_exit_label.replace(exit_label.clone());
+        let saved_loops = std::mem::take(&mut self.loop_stack);
         for stmt in body {
             self.gen_stmt(stmt);
         }
+        self.loop_stack = saved_loops;
+        self.proc_exit_label = saved_exit;
+        self.emit_label(&exit_label);
 
         // Return - load return value into appropriate register based on type
         if is_function {
             let ret_info = &self.proc_vars[name];
-            let offset = ret_info.offset;
+            let loc = ret_info.loc.clone();
             let data_type = ret_info.data_type;
             match data_type {
                 DataType::Integer => {
-                    self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
                 }
                 DataType::Long => {
-                    self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
                 }
                 DataType::Single => {
-                    self.emit(&format!("    movss xmm0, DWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
                 }
                 DataType::Double => {
-                    self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
                 }
                 DataType::String => {
                     // Load string (ptr, len) into rax, rdx
-                    self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", offset));
-                    self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
+                    self.emit(&format!("    mov rax, {}", loc.q(0)));
+                    self.emit(&format!("    mov rdx, {}", loc.q(1)));
                 }
             }
         }
@@ -736,12 +1476,63 @@ impl CodeGen {
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Label(n) => {
+        if stmt.line != 0 {
+            self.current_line = stmt.line;
+        }
+        match &stmt.kind {
+            StmtKind::Label(n) => {
                 self.emit_label(&format!("_line_{}", n));
             }
 
-            Stmt::Let {
+            StmtKind::LabelName(name) => {
+                self.emit_label(&format!("_label_{}", mangle(name)));
+            }
+
+            // Assignment to a record field.
+            StmtKind::Let {
+                name,
+                indices: None,
+                value,
+            } if self.typed_var(name).is_some() && !self.has_plain_slot(name) => {
+                let Some((loc, ty)) = self.typed_storage(name) else {
+                    unreachable!("guarded above")
+                };
+                // Assigning one whole record to another copies its words.
+                if let TypeRef::Record(_) = &ty {
+                    let words = self.symbols.type_words(&ty);
+                    match value {
+                        Expr::Variable(src) => {
+                            let src_ty = self.typed_var(src).expect("sema checked the source");
+                            let src_loc = self.get_record_loc(src, &src_ty);
+                            for w in 0..words {
+                                self.emit(&format!("    mov rax, {}", src_loc.q(w)));
+                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                            }
+                            return;
+                        }
+                        // An array element's address is only known at run time.
+                        Expr::ArrayAccess { name, indices }
+                        | Expr::FnCall {
+                            name,
+                            args: indices,
+                        } => {
+                            let indices = indices.clone();
+                            self.gen_array_addr(name, &indices);
+                            self.emit("    mov r10, rax");
+                            for w in 0..words {
+                                self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
+                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                let vt = self.gen_expr(value);
+                self.gen_store_typed(&loc, &ty, vt);
+            }
+
+            StmtKind::Let {
                 name,
                 indices,
                 value,
@@ -760,27 +1551,19 @@ impl CodeGen {
                     self.gen_coercion(expr_type, var_info.data_type);
 
                     // Store based on target type
+                    let loc = &var_info.loc;
                     match var_info.data_type {
                         DataType::Integer => {
-                            self.emit(&format!("    mov WORD PTR [rbp + {}], ax", var_info.offset));
+                            self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
                         }
                         DataType::Long => {
-                            self.emit(&format!(
-                                "    mov DWORD PTR [rbp + {}], eax",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
                         }
                         DataType::Single => {
-                            self.emit(&format!(
-                                "    movss DWORD PTR [rbp + {}], xmm0",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
                         }
                         DataType::Double => {
-                            self.emit(&format!(
-                                "    movsd QWORD PTR [rbp + {}], xmm0",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                         }
                         DataType::String => {
                             // Should be handled by gen_string_assign above
@@ -790,15 +1573,46 @@ impl CodeGen {
                 }
             }
 
-            Stmt::Print { items, newline } => {
+            StmtKind::Print {
+                items,
+                newline,
+                using: Some(fmt),
+                ..
+            } => {
+                self.gen_print_using(fmt, items);
+                if *newline {
+                    self.emit("    call _rt_print_newline");
+                }
+            }
+
+            StmtKind::Print {
+                items,
+                newline,
+                write,
+                ..
+            } => {
+                let mut first = true;
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
-                            self.gen_print_expr(expr);
+                            // WRITE separates values with commas and quotes
+                            // strings; PRINT emits them bare.
+                            if *write {
+                                if !first {
+                                    self.emit_arg_imm(0, ASCII_COMMA);
+                                    self.emit("    call _rt_print_char");
+                                }
+                                self.gen_write_expr(expr);
+                            } else {
+                                self.gen_print_expr(expr);
+                            }
+                            first = false;
                         }
                         PrintItem::Tab => {
-                            self.emit_arg_imm(0, ASCII_TAB);
-                            self.emit("    call _rt_print_char");
+                            if !*write {
+                                self.emit_arg_imm(0, ASCII_TAB);
+                                self.emit("    call _rt_print_char");
+                            }
                         }
                         PrintItem::Empty => {}
                     }
@@ -808,7 +1622,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::Input { prompt, vars } => {
+            StmtKind::Input { prompt, vars } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
                     self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
@@ -816,33 +1630,40 @@ impl CodeGen {
                     self.emit("    call _rt_print_string");
                 }
                 for var in vars {
-                    if is_string_var(var) {
+                    if is_string_var(&var.name) {
                         self.emit("    call _rt_input_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
                     } else {
                         self.emit("    call _rt_input_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
 
-            Stmt::LineInput { prompt, var } => {
+            StmtKind::LineInput {
+                prompt,
+                var,
+                file_num,
+            } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
                     self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
                     self.emit_arg_imm(1, pstr.len() as i64);
                     self.emit("    call _rt_print_string");
                 }
-                self.emit("    call _rt_input_string");
-                let offset = self.get_var_offset(var);
-                self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+                match file_num {
+                    Some(e) => {
+                        // LINE INPUT # takes the whole line; INPUT # takes one
+                        // comma-delimited field, which is a different reader.
+                        let fnum = self.gen_file_num(e);
+                        self.emit_arg_file_num(0, &fnum);
+                        self.emit("    call _rt_file_line_input");
+                    }
+                    None => self.emit("    call _rt_input_string"),
+                }
+                self.gen_store_lvalue(var);
             }
 
-            Stmt::If {
+            StmtKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -876,7 +1697,7 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::For {
+            StmtKind::For {
                 var,
                 start,
                 end,
@@ -885,12 +1706,12 @@ impl CodeGen {
             } => {
                 let start_label = self.new_label("for");
                 let end_label = self.new_label("endfor");
-                let var_offset = self.get_var_offset(var);
+                let var_loc = self.get_var_loc(var);
 
                 // Initialize loop variable - coerce to double
                 let start_type = self.gen_expr(start);
                 self.gen_coercion(start_type, DataType::Double);
-                self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_offset));
+                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
 
                 // Store end value - coerce to double
                 self.stack_offset -= 8;
@@ -917,7 +1738,7 @@ impl CodeGen {
                 self.emit_label(&start_label);
 
                 // Check condition (var > end for positive step, var < end for negative)
-                self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", var_offset));
+                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
                 self.emit(&format!("    movsd xmm1, QWORD PTR [rbp + {}]", end_offset));
                 self.emit(&format!(
                     "    movsd xmm2, QWORD PTR [rbp + {}]",
@@ -941,23 +1762,25 @@ impl CodeGen {
                 self.label_counter += 1;
 
                 // Body
+                self.loop_stack.push((true, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
 
                 // Increment
-                self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", var_offset));
+                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
                 self.emit(&format!(
                     "    addsd xmm0, QWORD PTR [rbp + {}]",
                     step_offset
                 ));
-                self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_offset));
+                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
             }
 
-            Stmt::While { condition, body } => {
+            StmtKind::While { condition, body } => {
                 let start_label = self.new_label("while");
                 let end_label = self.new_label("endwhile");
 
@@ -972,15 +1795,18 @@ impl CodeGen {
                     self.emit(&format!("    je {}", end_label));
                 }
 
+                // WHILE is a DO-family loop for EXIT DO purposes.
+                self.loop_stack.push((false, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
             }
 
-            Stmt::DoLoop {
+            StmtKind::DoLoop {
                 condition,
                 cond_at_start,
                 is_until,
@@ -1013,9 +1839,11 @@ impl CodeGen {
                     }
                 }
 
+                self.loop_stack.push((false, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
 
                 if !*cond_at_start {
                     if let Some(cond) = condition {
@@ -1046,18 +1874,18 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::Goto(target) => {
+            StmtKind::Goto(target) => {
                 let label = match target {
                     GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", s),
+                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                 };
                 self.emit(&format!("    jmp {}", label));
             }
 
-            Stmt::Gosub(target) => {
+            StmtKind::Gosub(target) => {
                 let label = match target {
                     GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", s),
+                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                 };
                 let ret_label = self.new_label("gosub_ret");
                 // Check for stack overflow before push
@@ -1065,7 +1893,7 @@ impl CodeGen {
                 self.emit("    sub rcx, 8");
                 self.emit("    lea rax, [rip + _gosub_stack]");
                 self.emit("    cmp rcx, rax");
-                self.emit("    jb _rt_gosub_overflow");
+                self.emit_check("jb", RtError::GosubOverflow);
                 // Push return address to GOSUB stack
                 self.emit(&format!("    lea rax, [rip + {}]", ret_label));
                 self.emit("    mov QWORD PTR [rcx], rax");
@@ -1074,7 +1902,7 @@ impl CodeGen {
                 self.emit_label(&ret_label);
             }
 
-            Stmt::Return => {
+            StmtKind::Return => {
                 // Pop return address from GOSUB stack and jump (use rcx - caller-saved on both ABIs)
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
                 self.emit("    mov rax, QWORD PTR [rcx]");
@@ -1083,7 +1911,7 @@ impl CodeGen {
                 self.emit("    jmp rax");
             }
 
-            Stmt::OnGoto { expr, targets } => {
+            StmtKind::OnGoto { expr, targets } => {
                 let expr_type = self.gen_expr(expr);
                 // Convert to integer in rax
                 if expr_type.is_integer() {
@@ -1095,72 +1923,145 @@ impl CodeGen {
                 for (i, target) in targets.iter().enumerate() {
                     let label = match target {
                         GotoTarget::Line(n) => format!("_line_{}", n),
-                        GotoTarget::Label(s) => format!("_label_{}", s),
+                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                     };
                     self.emit(&format!("    cmp rax, {}", i + 1));
                     self.emit(&format!("    je {}", label));
                 }
             }
 
-            Stmt::Dim { arrays } => {
-                for arr in arrays {
-                    self.gen_dim_array(arr);
+            StmtKind::Dim { decls } => {
+                for decl in decls {
+                    self.gen_declarator(decl, false);
                 }
             }
 
-            Stmt::Sub { .. } | Stmt::Function { .. } => {
+            StmtKind::Sub { .. } | StmtKind::Function { .. } => {
                 // Already handled in first pass
             }
 
-            Stmt::Call { name, args } => {
+            StmtKind::Call { name, args } => {
                 self.gen_call(name, args);
             }
 
-            Stmt::Data(_) => {
+            StmtKind::Data(_) => {
                 // Data already collected in first pass
             }
 
-            Stmt::Read(vars) => {
+            StmtKind::Read(vars) => {
                 for var in vars {
-                    if is_string_var(var) {
+                    if is_string_var(&var.name) {
+                        // _rt_read_string returns (ptr, len); the length used to
+                        // be discarded, leaving whatever was in the length word.
                         self.emit("    call _rt_read_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
                     } else {
                         self.emit("    call _rt_read_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
 
-            Stmt::Restore(target) => {
-                let idx = if let Some(_t) = target {
-                    // TODO: find DATA line index
-                    0
-                } else {
-                    0
+            StmtKind::Restore(target) => {
+                // RESTORE <line> resumes reading at the first DATA item at or
+                // after that line. preprocess recorded how many items had been
+                // seen when each label was reached; without that this always
+                // restarted from the beginning, silently.
+                let idx = match target {
+                    Some(GotoTarget::Line(n)) => self.data_line_index.get(n).copied().unwrap_or(0),
+                    Some(GotoTarget::Label(name)) => self
+                        .data_label_index
+                        .get(&name.to_uppercase())
+                        .copied()
+                        .unwrap_or(0),
+                    None => 0,
                 };
-                self.emit_arg_imm(0, idx);
+                self.emit_arg_imm(0, idx as i64);
                 self.emit("    call _rt_restore");
             }
 
-            Stmt::Cls => {
+            // A TYPE definition emits nothing; its layout lives in Symbols.
+            StmtKind::TypeDef { .. } => {}
+
+            StmtKind::FieldAssign { target, value } => {
+                if target.indices.is_some() {
+                    self.gen_array_field(target, Some(value));
+                } else {
+                    let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields)
+                    else {
+                        unreachable!("sema resolved this field path")
+                    };
+                    let vt = self.gen_expr(value);
+                    self.gen_store_typed(&loc, &ty, vt);
+                }
+            }
+
+            StmtKind::Redim { decls, preserve } => {
+                for decl in decls {
+                    self.gen_declarator(decl, *preserve);
+                }
+            }
+
+            StmtKind::MidAssign {
+                target,
+                start,
+                len,
+                value,
+            } => self.gen_mid_assign(target, start, len.as_ref(), value),
+
+            StmtKind::Swap(a, b) => self.gen_swap(a, b),
+
+            // CONST and OPTION BASE are resolved at compile time.
+            StmtKind::Const { .. } | StmtKind::OptionBase(_) => {}
+
+            StmtKind::ExitLoop { is_for } => {
+                // Leave the innermost matching loop. Sema has already checked
+                // that one exists.
+                let target = self
+                    .loop_stack
+                    .iter()
+                    .rev()
+                    .find(|(f, _)| f == is_for)
+                    .map(|(_, label)| label.clone());
+                if let Some(label) = target {
+                    self.emit(&format!("    jmp {}", label));
+                }
+            }
+
+            StmtKind::ExitProc => {
+                if let Some(label) = self.proc_exit_label.clone() {
+                    self.emit(&format!("    jmp {}", label));
+                }
+            }
+
+            StmtKind::Cls => {
                 self.emit("    call _rt_cls");
             }
 
-            Stmt::SelectCase { expr, cases } => {
+            StmtKind::SelectCase { expr, cases } => {
                 let end_label = self.new_label("endselect");
 
-                // Evaluate SELECT expression and save to temp
+                // Evaluate the selector once, into a frame slot. A string
+                // needs two words, for its pointer and length.
+                let is_string = self.expr_type(expr) == DataType::String;
                 let expr_type = self.gen_expr(expr);
-                self.gen_coercion(expr_type, DataType::Double);
-                self.stack_offset -= 8;
-                let temp_offset = self.stack_offset;
-                self.emit(&format!(
-                    "    movsd QWORD PTR [rbp + {}], xmm0",
-                    temp_offset
-                ));
+                let temp_offset;
+                if is_string {
+                    self.stack_offset -= 16;
+                    temp_offset = self.stack_offset;
+                    self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", temp_offset));
+                    self.emit(&format!(
+                        "    mov QWORD PTR [rbp + {}], rdx",
+                        temp_offset + 8
+                    ));
+                } else {
+                    self.gen_coercion(expr_type, DataType::Double);
+                    self.stack_offset -= 8;
+                    temp_offset = self.stack_offset;
+                    self.emit(&format!(
+                        "    movsd QWORD PTR [rbp + {}], xmm0",
+                        temp_offset
+                    ));
+                }
 
                 // Generate code for each case
                 for (i, (case_value, body)) in cases.iter().enumerate() {
@@ -1170,16 +2071,15 @@ impl CodeGen {
                         end_label.clone()
                     };
 
-                    if let Some(value) = case_value {
-                        // Evaluate case value and compare
-                        let val_type = self.gen_expr(value);
-                        self.gen_coercion(val_type, DataType::Double);
-                        self.emit(&format!(
-                            "    movsd xmm1, QWORD PTR [rbp + {}]",
-                            temp_offset
-                        ));
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit(&format!("    jne {}", next_case_label));
+                    if let Some(clauses) = case_value {
+                        // Any alternative matching enters the body; all of them
+                        // failing moves on to the next CASE.
+                        let body_label = self.new_label("casebody");
+                        for clause in clauses {
+                            self.gen_case_clause(clause, temp_offset, is_string, &body_label);
+                        }
+                        self.emit(&format!("    jmp {}", next_case_label));
+                        self.emit_label(&body_label);
                     }
                     // CASE ELSE (None) falls through without comparison
 
@@ -1198,18 +2098,20 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::End | Stmt::Stop => {
-                self.emit("    xor eax, eax");
-                self.emit("    leave");
-                self.emit("    ret");
+            StmtKind::End | StmtKind::Stop => {
+                // Terminate the program, not just the current frame. A plain
+                // `leave; ret` only ends the program when END appears in main;
+                // inside a SUB or FUNCTION it just returns to the caller.
+                self.emit("    call _rt_end");
             }
 
-            Stmt::Open {
+            StmtKind::Open {
                 filename,
                 mode,
                 file_num,
             } => {
                 // _rt_file_open(filename_ptr, filename_len, mode, file_num)
+                let fnum = self.gen_file_num(file_num);
                 self.gen_expr(filename);
                 self.emit_arg_reg(0, "rax"); // filename ptr
                 self.emit_arg_reg(1, "rdx"); // filename len
@@ -1219,53 +2121,86 @@ impl CodeGen {
                     FileMode::Append => 2,
                 };
                 self.emit_arg_imm(2, mode_num);
-                self.emit_arg_imm(3, *file_num as i64);
+                self.emit_arg_file_num(3, &fnum);
                 self.emit("    call _rt_file_open");
             }
 
-            Stmt::Close { file_num } => {
-                self.emit_arg_imm(0, *file_num as i64);
-                self.emit("    call _rt_file_close");
-            }
+            StmtKind::Close { file_num } => match file_num {
+                Some(e) => {
+                    let fnum = self.gen_file_num(e);
+                    self.emit_arg_file_num(0, &fnum);
+                    self.emit("    call _rt_file_close");
+                }
+                // Bare CLOSE closes every open file.
+                None => self.emit("    call _rt_file_close_all"),
+            },
 
-            Stmt::PrintFile {
+            StmtKind::PrintFile {
                 file_num,
                 items,
                 newline,
+                using: Some(_),
+                ..
             } => {
+                // Sema rejects USING on file output for now, so this is only
+                // reachable if that check is removed without adding support.
+                let _ = (file_num, items, newline);
+                unreachable!("PRINT # USING is rejected by semantic analysis")
+            }
+
+            StmtKind::PrintFile {
+                file_num,
+                items,
+                newline,
+                write,
+                ..
+            } => {
+                let fnum = self.gen_file_num(file_num);
+                let mut first = true;
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
-                            self.gen_print_expr_to_file(expr, *file_num);
+                            if *write && !first {
+                                self.emit_arg_file_num(0, &fnum);
+                                self.emit_arg_imm(1, ASCII_COMMA);
+                                self.emit("    call _rt_file_print_char");
+                            }
+                            if *write {
+                                self.gen_write_expr_to_file(expr, &fnum);
+                            } else {
+                                self.gen_print_expr_to_file(expr, &fnum);
+                            }
+                            first = false;
                         }
                         PrintItem::Tab => {
-                            self.emit_arg_imm(0, *file_num as i64);
-                            self.emit_arg_imm(1, ASCII_TAB);
-                            self.emit("    call _rt_file_print_char");
+                            // For WRITE the comma is only a separator, and one
+                            // is already emitted before each value; emitting a
+                            // tab as well wrote "10\t,20".
+                            if !*write {
+                                self.emit_arg_file_num(0, &fnum);
+                                self.emit_arg_imm(1, ASCII_TAB);
+                                self.emit("    call _rt_file_print_char");
+                            }
                         }
                         PrintItem::Empty => {}
                     }
                 }
                 if *newline {
-                    self.emit_arg_imm(0, *file_num as i64);
+                    self.emit_arg_file_num(0, &fnum);
                     self.emit("    call _rt_file_print_newline");
                 }
             }
 
-            Stmt::InputFile { file_num, vars } => {
+            StmtKind::InputFile { file_num, vars } => {
+                let fnum = self.gen_file_num(file_num);
                 for var in vars {
-                    if is_string_var(var) {
-                        self.emit_arg_imm(0, *file_num as i64);
+                    self.emit_arg_file_num(0, &fnum);
+                    if is_string_var(&var.name) {
                         self.emit("    call _rt_file_input_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
                     } else {
-                        self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
         }
@@ -1277,11 +2212,23 @@ impl CodeGen {
     fn gen_expr(&mut self, expr: &Expr) -> DataType {
         match expr {
             Expr::Literal(lit) => match lit {
-                Literal::Integer(n) => {
-                    // Load as integer into eax
-                    self.emit(&format!("    mov eax, {}", *n as i32));
-                    DataType::Long
-                }
+                Literal::Integer(n) => match i32::try_from(*n) {
+                    Ok(v) => {
+                        // Load as integer into eax
+                        self.emit(&format!("    mov eax, {}", v));
+                        DataType::Long
+                    }
+                    // Wider than LONG: emit as a Double rather than truncating
+                    // to 32 bits, which silently turned 1000000000000001 into
+                    // -1530494975. The lexer widens such literals already; this
+                    // also covers values arriving from DATA.
+                    Err(_) => {
+                        let bits = (*n as f64).to_bits();
+                        self.emit(&format!("    mov rax, 0x{:X}", bits));
+                        self.emit("    movq xmm0, rax");
+                        DataType::Double
+                    }
+                },
                 Literal::Float(f) => {
                     // Load as double into xmm0
                     let bits = f.to_bits();
@@ -1298,32 +2245,59 @@ impl CodeGen {
             },
 
             Expr::Variable(name) => {
+                // A CONST is substituted with its folded value.
+                if let Some(lit) = self.symbols.consts.get(&name.to_uppercase()).cloned() {
+                    return self.gen_expr(&Expr::Literal(lit));
+                }
+
+                // A variable declared with `AS` lives in typed storage, which
+                // is where its assignments went.
+                if let Some((loc, ty)) = self.typed_storage(name) {
+                    return self.gen_load_typed(&loc, &ty);
+                }
+
+                // A bare reference to a parameterless FUNCTION calls it, as in
+                // QuickBASIC. Inside the function's own body the same name is
+                // its return variable, so that case must not become infinite
+                // recursion.
+                let upper = name.to_uppercase();
+
+                // The same applies to the builtins that take no argument.
+                if crate::sema::is_zero_arg_builtin(&upper) {
+                    self.gen_fn_call(&upper, &[]);
+                    return self.fn_return_type(&upper);
+                }
+
+                let is_own_name = self.current_proc.as_deref() == Some(upper.as_str());
+                if !is_own_name
+                    && self
+                        .symbols
+                        .procs
+                        .get(&upper)
+                        .is_some_and(|p| p.is_function && p.params.is_empty())
+                {
+                    self.gen_call(&upper, &[]);
+                    return self.fn_return_type(&upper);
+                }
+
                 let info = self.get_var_info(name);
+                let loc = &info.loc;
                 match info.data_type {
                     DataType::Integer => {
-                        self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", info.offset));
+                        self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
                     }
                     DataType::Long => {
-                        self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", info.offset));
+                        self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
                     }
                     DataType::Single => {
-                        self.emit(&format!(
-                            "    movss xmm0, DWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
                     }
                     DataType::Double => {
-                        self.emit(&format!(
-                            "    movsd xmm0, QWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
                     }
                     DataType::String => {
-                        self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", info.offset));
-                        self.emit(&format!(
-                            "    mov rdx, QWORD PTR [rbp + {}]",
-                            info.offset - 8
-                        ));
+                        self.emit(&format!("    mov rax, {}", loc.q(0)));
+                        self.emit(&format!("    mov rdx, {}", loc.q(1)));
                     }
                 }
                 info.data_type
@@ -1378,12 +2352,38 @@ impl CodeGen {
 
             Expr::FnCall { name, args } => {
                 self.gen_fn_call(name, args);
-                self.fn_return_type(name)
+                self.call_return_type(name, args)
+            }
+
+            Expr::Field { .. } => {
+                if let Some((name, indices, fields)) = Self::flatten_indexed_field_path(expr) {
+                    let target = LValue {
+                        name,
+                        indices: Some(indices),
+                        fields,
+                    };
+                    return self.gen_array_field(&target, None);
+                }
+                let Some((name, fields)) = Self::flatten_field_path(expr) else {
+                    unreachable!("sema rejects a field access on a non-record")
+                };
+                let Some((loc, ty)) = self.resolve_field_path(&name, &fields) else {
+                    unreachable!("sema resolved this field path")
+                };
+                self.gen_load_typed(&loc, &ty)
             }
         }
     }
 
     /// Generate code for a binary expression
+    /// True for the six relational operators.
+    fn is_comparison(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+        )
+    }
+
     fn gen_binary_expr(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> DataType {
         // Track expression nesting depth and warn if too deep
         self.expr_depth += 1;
@@ -1425,6 +2425,58 @@ impl CodeGen {
             // Result: ptr in rax, len in rdx
             self.expr_depth -= 1;
             return DataType::String;
+        }
+
+        // Handle string comparison specially.
+        //
+        // Without this, comparing two strings fell through to the numeric path:
+        // gen_coercion(String, String) is a no-op so nothing complained, and
+        // emit_typed dropped through to the float branch, emitting
+        // `ucomisd xmm0, xmm1` on registers that never held the operands. Every
+        // relational operator on strings silently returned a constant.
+        // (Guarded on the operand types, not `result_type`: a comparison always
+        // promotes to Long, which is the type of its -1/0 result.)
+        if Self::is_comparison(op)
+            && self.expr_type(left) == DataType::String
+            && self.expr_type(right) == DataType::String
+        {
+            // Evaluate left string (ptr in rax, len in rdx)
+            self.gen_expr(left);
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
+            self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
+
+            // Evaluate right string (ptr in rax, len in rdx)
+            self.gen_expr(right);
+            self.emit("    mov r8, rax"); // right ptr
+            self.emit("    mov r9, rdx"); // right len
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit_arg_reg(0, "rax");
+            self.emit_arg_reg(1, "rdx");
+            self.emit_arg_reg(2, "r8");
+            self.emit_arg_reg(3, "r9");
+            self.emit("    call _rt_strcmp");
+
+            // _rt_strcmp returns <0, 0 or >0 in eax, like memcmp. Turn that
+            // into BASIC's -1 / 0 by testing it against zero with the signed
+            // condition for this operator.
+            let setcc = match op {
+                BinaryOp::Eq => "sete",
+                BinaryOp::Ne => "setne",
+                BinaryOp::Lt => "setl",
+                BinaryOp::Gt => "setg",
+                BinaryOp::Le => "setle",
+                BinaryOp::Ge => "setge",
+                _ => unreachable!("guarded by is_comparison"),
+            };
+            self.emit("    test eax, eax");
+            self.emit(&format!("    {} al", setcc));
+            self.emit("    movzx eax, al");
+            self.emit("    neg eax"); // BASIC true is -1
+            self.expr_depth -= 1;
+            return DataType::Long;
         }
 
         // For comparison/logical ops, we'll work in the promoted type but return Long
@@ -1499,15 +2551,26 @@ impl CodeGen {
             ),
             BinaryOp::Div => {
                 self.emit_cvt_to_double(work_type);
+                if self.opts.checks {
+                    // Test the bit pattern rather than comparing with ucomisd:
+                    // doubling drops the sign bit, so the result is zero for
+                    // both +0.0 and -0.0, and there is no unordered case to
+                    // worry about.
+                    self.emit("    movq r11, xmm1");
+                    self.emit("    add r11, r11");
+                    self.emit_check("jz", RtError::DivideByZero);
+                }
                 self.emit("    divsd xmm0, xmm1");
             }
             BinaryOp::IntDiv => {
                 self.emit_cvt_float_to_int(work_type);
+                self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
             }
             BinaryOp::Mod => {
                 self.emit_cvt_float_to_int(work_type);
+                self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
                 self.emit("    mov eax, edx");
@@ -1563,7 +2626,963 @@ impl CodeGen {
         result_type
     }
 
+    /// Evaluate a file-number expression ahead of a runtime call.
+    ///
+    /// Returns either an immediate (the common `#1` case) or a frame slot
+    /// holding the value. Evaluating it *first*, into a slot, keeps a complex
+    /// expression from clobbering argument registers that have already been
+    /// loaded for the same call.
+    fn gen_file_num(&mut self, e: &Expr) -> FileNum {
+        if let Expr::Literal(Literal::Integer(n)) = e {
+            return FileNum::Imm(*n);
+        }
+        let ty = self.gen_expr(e);
+        self.gen_coercion(ty, DataType::Long);
+        self.stack_offset -= 8;
+        let loc = Loc::Frame(self.stack_offset);
+        self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+        FileNum::Slot(loc)
+    }
+
+    /// Place a previously evaluated file number in an argument register.
+    fn emit_arg_file_num(&mut self, idx: usize, fnum: &FileNum) {
+        match fnum {
+            FileNum::Imm(n) => self.emit_arg_imm(idx, *n),
+            FileNum::Slot(loc) => {
+                let reg = Self::arg_reg(idx);
+                self.emit(&format!("    movsxd {}, {}", reg, loc.at("DWORD PTR", 0)));
+            }
+        }
+    }
+
+    /// `MID$(s, start [, len]) = value` -- overwrite characters in place.
+    ///
+    /// The six arguments exceed Win64's four argument registers, so the last
+    /// two go on the stack; `emit_arg_reg` handles only the register slots.
+    fn gen_mid_assign(&mut self, target: &LValue, start: &Expr, len: Option<&Expr>, value: &Expr) {
+        // Everything is evaluated into a temp block first, because each
+        // evaluation clobbers the value registers.
+        const SLOTS: i32 = 96; // 6 values, 16-byte aligned with room to spare
+        self.emit(&format!("    sub rsp, {}", SLOTS));
+
+        self.gen_read_lvalue(target);
+        self.emit("    mov QWORD PTR [rsp], rax"); // target pointer
+        self.emit("    mov QWORD PTR [rsp + 8], rdx"); // target length
+
+        let t = self.gen_expr(start);
+        self.gen_coercion(t, DataType::Long);
+        self.emit("    movsxd rax, eax");
+        self.emit("    mov QWORD PTR [rsp + 16], rax");
+
+        match len {
+            Some(e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+            }
+            // No length given: replace as much as the value provides.
+            None => self.emit("    mov rax, 0x7FFFFFFF"),
+        }
+        self.emit("    mov QWORD PTR [rsp + 24], rax");
+
+        self.gen_expr(value);
+        self.emit("    mov QWORD PTR [rsp + 32], rax"); // source pointer
+        self.emit("    mov QWORD PTR [rsp + 40], rdx"); // source length
+
+        // Load the register arguments, then the stack ones on Win64.
+        let regs = PlatformAbi::INT_ARG_REGS;
+        for (i, off) in [0, 8, 16, 24].iter().enumerate() {
+            if i < regs.len() {
+                self.emit(&format!("    mov {}, QWORD PTR [rsp + {}]", regs[i], off));
+            }
+        }
+        if regs.len() >= 6 {
+            self.emit(&format!("    mov {}, QWORD PTR [rsp + 32]", regs[4]));
+            self.emit(&format!("    mov {}, QWORD PTR [rsp + 40]", regs[5]));
+            self.emit("    call _rt_mid_assign");
+        } else {
+            // Win64: the 5th and 6th arguments sit just above the 32-byte
+            // shadow space, at [rsp+32] and [rsp+40] as seen by the caller.
+            // The callee reads them at [rsp+40] and [rsp+48], since `call`
+            // pushes a return address in between.
+            self.emit("    mov r10, QWORD PTR [rsp + 32]");
+            self.emit("    mov r11, QWORD PTR [rsp + 40]");
+            self.emit("    sub rsp, 64");
+            self.emit("    mov QWORD PTR [rsp + 32], r10");
+            self.emit("    mov QWORD PTR [rsp + 40], r11");
+            self.emit("    call _rt_mid_assign");
+            self.emit("    add rsp, 64");
+        }
+
+        self.emit(&format!("    add rsp, {}", SLOTS));
+    }
+
+    /// Exchange two values, which sema has checked are the same type class.
+    ///
+    /// Both are read before either is written, so `SWAP A(I), A(J)` is correct
+    /// even when the subscripts alias.
+    fn gen_swap(&mut self, a: &LValue, b: &LValue) {
+        // A field's type comes from its declaration, not from the base
+        // variable's name, which carries no suffix for a record.
+        let is_string = self.expr_type(&Self::lvalue_expr(a)) == DataType::String;
+
+        // Read A into a temp.
+        self.gen_read_lvalue(a);
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if is_string {
+            self.emit("    mov QWORD PTR [rsp], rax");
+            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        // Read B and store it into A.
+        self.gen_read_lvalue(b);
+        self.gen_store_lvalue(a);
+
+        // Restore the saved A into B.
+        if is_string {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+        } else {
+            self.emit("    movsd xmm0, QWORD PTR [rsp]");
+        }
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_store_lvalue(b);
+    }
+
+    /// Load an assignment target's current value, in the same registers
+    /// `gen_expr` would leave it in.
+    fn gen_read_lvalue(&mut self, target: &LValue) {
+        let expr = Self::lvalue_expr(target);
+        let ty = self.gen_expr(&expr);
+        if ty != DataType::String {
+            // gen_store_lvalue expects a Double, as the runtime readers produce.
+            self.gen_coercion(ty, DataType::Double);
+        }
+    }
+
+    /// The expression form of an assignment target.
+    ///
+    /// Reading a target is exactly evaluating this, so SWAP and the compound
+    /// readers do not need a second implementation of field and subscript
+    /// resolution -- and, before this, simply dropped the field path.
+    fn lvalue_expr(target: &LValue) -> Expr {
+        let mut expr = match &target.indices {
+            Some(indices) => Expr::ArrayAccess {
+                name: target.name.clone(),
+                indices: indices.clone(),
+            },
+            None => Expr::Variable(target.name.clone()),
+        };
+        for field in &target.fields {
+            expr = Expr::Field {
+                base: Box::new(expr),
+                field: field.clone(),
+            };
+        }
+        expr
+    }
+
+    /// Copy the string in `rax`/`rdx` onto the heap.
+    ///
+    /// String assignment copies, so that mutating one variable is not visible
+    /// through another, and so that a string constant's shared `.data` literal
+    /// can never be written through.
+    fn emit_string_copy(&mut self) {
+        self.emit("    mov r10, rax");
+        self.emit("    mov r11, rdx");
+        self.emit_arg_reg(0, "r10");
+        self.emit_arg_reg(1, "r11");
+        self.emit("    call _rt_strdup");
+    }
+
+    /// Split `arr(i).f...` into its array name, subscripts and field path.
+    fn flatten_indexed_field_path(expr: &Expr) -> Option<(String, Vec<Expr>, Vec<String>)> {
+        let mut fields = Vec::new();
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expr::Field { base, field } => {
+                    fields.push(field.clone());
+                    cur = base;
+                }
+                Expr::ArrayAccess { name, indices }
+                | Expr::FnCall {
+                    name,
+                    args: indices,
+                } => {
+                    fields.reverse();
+                    return Some((name.clone(), indices.clone(), fields));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Split a field-access expression into its base variable and field path.
+    fn flatten_field_path(expr: &Expr) -> Option<(String, Vec<String>)> {
+        let mut fields = Vec::new();
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expr::Field { base, field } => {
+                    fields.push(field.clone());
+                    cur = base;
+                }
+                Expr::Variable(name) => {
+                    fields.reverse();
+                    return Some((name.clone(), fields));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Result type of a field access.
+    fn field_expr_type(&self, expr: &Expr) -> DataType {
+        let (name, fields) = match Self::flatten_indexed_field_path(expr) {
+            Some((n, _, f)) => (n, f),
+            None => match Self::flatten_field_path(expr) {
+                Some(v) => v,
+                None => return DataType::Double,
+            },
+        };
+        let scope = match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        };
+        let Some(mut ty) = self.symbols.typed_var(&scope, &name).cloned() else {
+            return DataType::Double;
+        };
+        for field in &fields {
+            let TypeRef::Record(rec) = &ty else {
+                return DataType::Double;
+            };
+            let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                return DataType::Double;
+            };
+            let Some(f) = info.field(field) else {
+                return DataType::Double;
+            };
+            ty = f.ty.clone();
+        }
+        DataType::from_type_ref(&ty)
+    }
+
+    /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
+    fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
+        let ty = self.typed_var(name)?;
+        self.record_elem_words_of(name).is_some().then_some(ty)
+    }
+
+    /// Load or store a field of an array element.
+    ///
+    /// The element address is computed into `rax` and kept in `rcx`, and the
+    /// field is reached at a fixed byte offset from it. Unlike a scalar record,
+    /// this address is not known until run time, so it cannot go through `Loc`.
+    /// Emit the address of a record lvalue into `rax`.
+    ///
+    /// Returns false when the expression does not denote one, leaving no code
+    /// emitted, so the caller can fall back to its ordinary value path.
+    fn gen_record_addr(&mut self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Variable(name) => {
+                let Some(ty) = self.typed_var(name) else {
+                    return false;
+                };
+                if !matches!(ty, TypeRef::Record(_)) {
+                    return false;
+                }
+                let loc = self.get_record_loc(name, &ty);
+                match &loc {
+                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
+                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                }
+                true
+            }
+
+            // An element of an array of records: the address is only known at
+            // run time, so it is computed rather than taken from a `Loc`.
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } => {
+                match self.array_elem_type(name) {
+                    Some(TypeRef::Record(_)) => {}
+                    _ => return false,
+                }
+                let indices = indices.clone();
+                self.gen_array_addr(name, &indices);
+                true
+            }
+
+            // A nested record reached through a field path, on either base.
+            Expr::Field { .. } => {
+                if let Some((name, indices, fields)) = Self::flatten_indexed_field_path(expr) {
+                    let Some(base) = self.array_elem_type(&name) else {
+                        return false;
+                    };
+                    let Some((offset, ty)) = self.field_byte_offset(&base, &fields) else {
+                        return false;
+                    };
+                    if !matches!(ty, TypeRef::Record(_)) {
+                        return false;
+                    }
+                    self.gen_array_addr(&name, &indices);
+                    if offset != 0 {
+                        self.emit(&format!("    add rax, {}", offset));
+                    }
+                    return true;
+                }
+
+                let Some((name, fields)) = Self::flatten_field_path(expr) else {
+                    return false;
+                };
+                let Some((loc, ty)) = self.resolve_field_path(&name, &fields) else {
+                    return false;
+                };
+                if !matches!(ty, TypeRef::Record(_)) {
+                    return false;
+                }
+                match &loc {
+                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
+                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                }
+                true
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Byte offset of a field path within `base`, and the type it arrives at.
+    fn field_byte_offset(&self, base: &TypeRef, fields: &[String]) -> Option<(i32, TypeRef)> {
+        let mut ty = base.clone();
+        let mut offset = 0i32;
+        for field in fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            let f = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())?
+                .field(field)?;
+            offset += f.word * 8;
+            ty = f.ty.clone();
+        }
+        Some((offset, ty))
+    }
+
+    fn gen_array_field(&mut self, target: &LValue, value: Option<&Expr>) -> DataType {
+        let indices = target.indices.clone().unwrap_or_default();
+        let Some(ty) = self.array_elem_type(&target.name) else {
+            unreachable!("sema checked this is an array of records")
+        };
+
+        let Some((byte_offset, ty)) = self.field_byte_offset(&ty, &target.fields) else {
+            unreachable!("sema checked the field path")
+        };
+
+        match value {
+            None => {
+                self.gen_array_addr(&target.name, &indices);
+                let loc = Loc::Frame(0); // placeholder, replaced below
+                let _ = loc;
+                self.emit(&format!("    add rax, {}", byte_offset));
+                self.gen_load_indirect("rax", &ty)
+            }
+            Some(v) => {
+                // Evaluate the value first, then the address, since computing
+                // the address clobbers the value registers.
+                let vt = self.gen_expr(v);
+                if DataType::from_type_ref(&ty) == DataType::String {
+                    self.emit_string_copy();
+                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    self.emit("    mov QWORD PTR [rsp], rax");
+                    self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                } else {
+                    self.gen_coercion(vt, DataType::Double);
+                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    self.emit("    movsd QWORD PTR [rsp], xmm0");
+                }
+
+                self.gen_array_addr(&target.name, &indices);
+                self.emit(&format!("    add rax, {}", byte_offset));
+                self.emit("    mov rcx, rax");
+                self.emit_store_parked(&ty);
+                DataType::Double
+            }
+        }
+    }
+
+    /// Store a value parked on the stack through the address in `rcx`.
+    ///
+    /// The pairing with the `sub rsp` that parked it is the caller's, so that
+    /// the value can be produced before the address that would clobber it.
+    fn emit_store_parked(&mut self, ty: &TypeRef) {
+        if DataType::from_type_ref(ty) == DataType::String {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rcx], rax");
+            self.emit("    mov QWORD PTR [rcx + 8], rdx");
+            return;
+        }
+        self.emit("    movsd xmm0, QWORD PTR [rsp]");
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_coercion(DataType::Double, DataType::from_type_ref(ty));
+        match ty {
+            TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+            TypeRef::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+            TypeRef::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+            _ => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+        }
+    }
+
+    /// Load a scalar of the given declared type from the address in `reg`.
+    fn gen_load_indirect(&mut self, reg: &str, ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => {
+                self.emit(&format!("    movsx eax, WORD PTR [{}]", reg));
+                DataType::Integer
+            }
+            TypeRef::Long => {
+                self.emit(&format!("    mov eax, DWORD PTR [{}]", reg));
+                DataType::Long
+            }
+            TypeRef::Single => {
+                self.emit(&format!("    movss xmm0, DWORD PTR [{}]", reg));
+                DataType::Single
+            }
+            TypeRef::Double => {
+                self.emit(&format!("    movsd xmm0, QWORD PTR [{}]", reg));
+                DataType::Double
+            }
+            TypeRef::FixedString(_) => {
+                self.emit(&format!("    mov rcx, {}", reg));
+                self.emit("    mov rax, QWORD PTR [rcx]");
+                self.emit("    mov rdx, QWORD PTR [rcx + 8]");
+                DataType::String
+            }
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
+    /// Find an already-allocated variable slot, without creating one.
+    fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
+        if self.current_proc.is_some() {
+            if let Some(info) = self.proc_vars.get(name) {
+                return Some(info);
+            }
+        }
+        self.vars.get(name)
+    }
+
+    /// Whether `name` already has ordinary variable storage.
+    ///
+    /// A parameter declared `N AS INTEGER` is spilled into a normal frame slot
+    /// by the prologue, so it must not also be treated as typed storage; a
+    /// record parameter is the opposite, and is registered in `record_vars`.
+    fn has_plain_slot(&self, name: &str) -> bool {
+        (self.current_proc.is_some() && self.proc_vars.contains_key(name))
+            || self.vars.contains_key(name)
+    }
+
+    /// Typed storage for a variable declared with `AS`, if that is where it
+    /// actually lives.
+    fn typed_storage(&mut self, name: &str) -> Option<(Loc, TypeRef)> {
+        if self.has_plain_slot(name) && self.record_loc_of(name).is_none() {
+            return None;
+        }
+        let ty = self.typed_var(name)?;
+        let loc = self.get_record_loc(name, &ty);
+        Some((loc, ty))
+    }
+
+    /// Declared type of a variable, when it was given one with `DIM ... AS`.
+    fn typed_var(&self, name: &str) -> Option<TypeRef> {
+        if let Some(t) = self.proc_types.get(name) {
+            return Some(t.clone());
+        }
+        let scope = match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        };
+        self.symbols.typed_var(&scope, name).cloned()
+    }
+
+    /// Resolve `base.field...` to a storage location and the field's type.
+    ///
+    /// Records are laid out as consecutive 8-byte words, so a field is reached
+    /// the same way a variable is: a base location plus a word offset. That
+    /// keeps every existing load and store site working unchanged.
+    fn resolve_field_path(&mut self, name: &str, fields: &[String]) -> Option<(Loc, TypeRef)> {
+        let mut ty = self.typed_var(name)?;
+        let mut loc = self.get_record_loc(name, &ty);
+
+        for field in fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            let info = self.symbols.records.get(&rec.to_uppercase())?;
+            let f = info.field(field)?;
+            loc = loc.offset_words(f.word);
+            ty = f.ty.clone();
+        }
+        Some((loc, ty))
+    }
+
+    /// Storage for a variable declared with `DIM ... AS`, allocating it the
+    /// first time it is seen.
+    fn get_record_loc(&mut self, name: &str, ty: &TypeRef) -> Loc {
+        if let Some(loc) = self.record_loc_of(name) {
+            return loc;
+        }
+        let words = self.symbols.type_words(ty);
+
+        // A record is local only when the current procedure actually declares
+        // it. Deciding on `current_proc.is_some()` alone gave a frame slot to a
+        // module-level record merely *referred to* from inside a procedure.
+        if self.declared_in_current_proc(name) {
+            self.stack_offset -= 8 * words;
+            let loc = Loc::Frame(self.stack_offset);
+            self.proc_record_vars.insert(name.to_string(), loc.clone());
+            return loc;
+        }
+
+        let loc = Loc::Global(format!("_rec_{}", mangle(name)));
+        self.record_vars.insert(name.to_string(), loc.clone());
+        self.record_globals.insert(name.to_string(), words);
+        loc
+    }
+
+    /// Where a typed variable already lives, preferring the current
+    /// procedure's own declarations over module-level ones.
+    fn record_loc_of(&self, name: &str) -> Option<Loc> {
+        if self.current_proc.is_some() {
+            if let Some(loc) = self.proc_record_vars.get(name) {
+                return Some(loc.clone());
+            }
+        }
+        self.record_vars.get(name).cloned()
+    }
+
+    /// Element size in words of an array of records, with the same preference.
+    fn record_elem_words_of(&self, name: &str) -> Option<i32> {
+        let upper = name.to_uppercase();
+        if self.current_proc.is_some() {
+            if let Some(w) = self.proc_record_elem_words.get(&upper) {
+                return Some(*w);
+            }
+        }
+        self.record_elem_words.get(&upper).copied()
+    }
+
+    /// Whether the current procedure declares `name` itself, as a typed
+    /// parameter or a local `DIM ... AS`.
+    fn declared_in_current_proc(&self, name: &str) -> bool {
+        let Some(proc) = &self.current_proc else {
+            return false;
+        };
+        self.proc_types.contains_key(name)
+            || self
+                .symbols
+                .typed_var_in(&SemaScope::Proc(proc.clone()), name)
+                .is_some()
+    }
+
+    /// Load a scalar of the given declared type from `loc`.
+    fn gen_load_typed(&mut self, loc: &Loc, ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => {
+                self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
+                DataType::Integer
+            }
+            TypeRef::Long => {
+                self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
+                DataType::Long
+            }
+            TypeRef::Single => {
+                self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
+                DataType::Single
+            }
+            TypeRef::Double => {
+                self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
+                DataType::Double
+            }
+            TypeRef::FixedString(_) => {
+                self.emit(&format!("    mov rax, {}", loc.q(0)));
+                self.emit(&format!("    mov rdx, {}", loc.q(1)));
+                DataType::String
+            }
+            // A whole record has no scalar value; sema rejects using one here.
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
+    /// Store a scalar of the given declared type into `loc`.
+    fn gen_store_typed(&mut self, loc: &Loc, ty: &TypeRef, value_type: DataType) {
+        match ty {
+            TypeRef::Integer => {
+                self.gen_coercion(value_type, DataType::Integer);
+                self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
+            }
+            TypeRef::Long => {
+                self.gen_coercion(value_type, DataType::Long);
+                self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+            }
+            TypeRef::Single => {
+                self.gen_coercion(value_type, DataType::Single);
+                self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+            }
+            TypeRef::Double => {
+                self.gen_coercion(value_type, DataType::Double);
+                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+            }
+            TypeRef::FixedString(_) => {
+                self.emit_string_copy();
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
+                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+            }
+            TypeRef::Record(_) => {}
+        }
+    }
+
+    /// Store a freshly produced value into an assignment target.
+    ///
+    /// The value is expected where `gen_expr` leaves it: `rax`/`rdx` for a
+    /// string, `xmm0` for a number. For an array element the address has to be
+    /// computed *after* the value exists, since computing it clobbers `rax`, so
+    /// the value is parked on the stack across the address calculation.
+    fn gen_store_lvalue(&mut self, target: &LValue) {
+        // A record field is addressed by a base location plus a word offset,
+        // so it stores exactly like a scalar.
+        if !target.fields.is_empty() {
+            // `arr(i).f`: the address is only known at run time, so the value
+            // is parked across the address calculation that clobbers it.
+            if let Some(indices) = target.indices.clone() {
+                if let Some(base) = self.array_elem_type(&target.name) {
+                    if let Some((offset, ty)) = self.field_byte_offset(&base, &target.fields) {
+                        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                        if DataType::from_type_ref(&ty) == DataType::String {
+                            self.emit("    mov QWORD PTR [rsp], rax");
+                            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                        } else {
+                            self.emit("    movsd QWORD PTR [rsp], xmm0");
+                        }
+                        self.gen_array_addr(&target.name, &indices);
+                        self.emit(&format!("    add rax, {}", offset));
+                        self.emit("    mov rcx, rax");
+                        self.emit_store_parked(&ty);
+                        return;
+                    }
+                }
+            }
+            if let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields) {
+                self.gen_store_typed(&loc, &ty, DataType::Double);
+                return;
+            }
+        }
+
+        let is_string = is_string_var(&target.name);
+        if is_string {
+            self.emit_string_copy();
+        }
+
+        let Some(indices) = &target.indices else {
+            let loc = self.get_var_loc(&target.name);
+            if is_string {
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
+                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+            } else {
+                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+            }
+            return;
+        };
+
+        // Park the value, compute the element address, then store.
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if is_string {
+            self.emit("    mov QWORD PTR [rsp], rax");
+            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        let indices = indices.clone();
+        self.gen_array_addr(&target.name, &indices);
+        self.emit("    mov rcx, rax");
+
+        if is_string {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rcx], rax");
+            self.emit("    mov QWORD PTR [rcx + 8], rdx");
+        } else {
+            self.emit("    movsd xmm0, QWORD PTR [rsp]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            // Narrow to the element's declared type, as a normal store does.
+            let elem_type = DataType::from_suffix(&target.name);
+            self.gen_coercion(DataType::Double, elem_type);
+            match elem_type {
+                DataType::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+                DataType::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+                DataType::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+                DataType::Double => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+                DataType::String => unreachable!("handled above"),
+            }
+        }
+    }
+
+    /// Emit `PRINT USING`.
+    ///
+    /// The format is parsed at compile time (see the `using` module), so this
+    /// emits a straight-line sequence: literal runs go to the ordinary string
+    /// printer, and each field calls one of two small runtime helpers. Values
+    /// are consumed in order by the fields that take one; if the values run out
+    /// the format stops there, and if values remain the format restarts, which
+    /// is what GW-BASIC does.
+    fn gen_print_using(&mut self, fmt: &Expr, items: &[PrintItem]) {
+        let Expr::Literal(Literal::String(format)) = fmt else {
+            unreachable!("sema requires a literal PRINT USING format")
+        };
+        let parts = using::parse(format);
+
+        let values: Vec<&Expr> = items
+            .iter()
+            .filter_map(|i| match i {
+                PrintItem::Expr(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+
+        let fields = parts.iter().filter(|p| p.consumes_value()).count();
+        if fields == 0 || values.is_empty() {
+            // No fields to fill: the format is just text.
+            for part in &parts {
+                if let using::UsingPart::Literal(text) = part {
+                    self.emit_literal_string(text);
+                }
+            }
+            return;
+        }
+
+        let mut next = 0usize;
+        while next < values.len() {
+            let before = next;
+            for part in &parts {
+                match part {
+                    using::UsingPart::Literal(text) => self.emit_literal_string(text),
+                    using::UsingPart::Num {
+                        width,
+                        decimals,
+                        flags,
+                    } => {
+                        if next >= values.len() {
+                            return;
+                        }
+                        let value = values[next];
+                        next += 1;
+                        let ty = self.gen_expr(value);
+                        self.gen_coercion(ty, DataType::Double);
+                        self.emit_arg_imm(0, *width as i64);
+                        self.emit_arg_imm(1, *decimals as i64);
+                        self.emit_arg_imm(2, *flags);
+                        self.emit("    call _rt_print_using_num");
+                    }
+                    using::UsingPart::Str { kind, width } => {
+                        if next >= values.len() {
+                            return;
+                        }
+                        let value = values[next];
+                        next += 1;
+                        self.gen_expr(value);
+                        // rax = ptr, rdx = len from gen_expr
+                        self.emit("    mov r10, rax");
+                        self.emit("    mov r11, rdx");
+                        self.emit_arg_reg(0, "r10");
+                        self.emit_arg_reg(1, "r11");
+                        let w = match kind {
+                            using::StrFieldKind::Whole => 0,
+                            using::StrFieldKind::First => 1,
+                            using::StrFieldKind::Fixed => *width as i64,
+                        };
+                        self.emit_arg_imm(2, w);
+                        self.emit("    call _rt_print_using_str");
+                    }
+                }
+            }
+            // A format with fields must consume at least one value per pass,
+            // otherwise restarting would loop forever.
+            if next == before {
+                return;
+            }
+        }
+    }
+
+    /// Print a literal string constant.
+    fn emit_literal_string(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let idx = self.add_string_literal(text);
+        self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
+        self.emit_arg_imm(1, text.len() as i64);
+        self.emit("    call _rt_print_string");
+    }
+
+    /// Emit one CASE alternative: jump to `body_label` when it matches.
+    ///
+    /// The selector was evaluated once, into the frame slot at `temp_offset`.
+    fn gen_case_clause(
+        &mut self,
+        clause: &CaseClause,
+        temp_offset: i32,
+        is_string: bool,
+        body_label: &str,
+    ) {
+        if is_string {
+            return self.gen_case_clause_string(clause, temp_offset, body_label);
+        }
+        let sel = format!("QWORD PTR [rbp + {}]", temp_offset);
+        match clause {
+            CaseClause::Value(e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    je {}", body_label));
+            }
+            CaseClause::Range(lo, hi) => {
+                // Inclusive at both ends. The low bound is tested first, and a
+                // failure skips the high test.
+                let skip = self.new_label("caseskip");
+                let t = self.gen_expr(lo);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    jb {}", skip));
+                let t = self.gen_expr(hi);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    jbe {}", body_label));
+                self.emit_label(&skip);
+            }
+            CaseClause::Compare(op, e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                // Unsigned conditions, since ucomisd sets the carry flag.
+                let cc = match op {
+                    BinaryOp::Eq => "je",
+                    BinaryOp::Ne => "jne",
+                    BinaryOp::Lt => "jb",
+                    BinaryOp::Gt => "ja",
+                    BinaryOp::Le => "jbe",
+                    BinaryOp::Ge => "jae",
+                    _ => unreachable!("the parser only builds comparisons here"),
+                };
+                self.emit(&format!("    {} {}", cc, body_label));
+            }
+        }
+    }
+
+    /// A CASE alternative on a string selector.
+    ///
+    /// Comparison goes through `_rt_strcmp`, the same helper the relational
+    /// operators use, so ordering is consistent between `CASE "a" TO "m"` and
+    /// `IF S$ >= "a" AND S$ <= "m"`.
+    fn gen_case_clause_string(&mut self, clause: &CaseClause, temp: i32, body_label: &str) {
+        // Compare the selector against the expression, leaving memcmp-style
+        // ordering in eax.
+        let compare = |s: &mut Self, e: &Expr| {
+            s.gen_expr(e);
+            s.emit("    mov r10, rax");
+            s.emit("    mov r11, rdx");
+            s.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", temp));
+            s.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", temp + 8));
+            s.emit_arg_reg(0, "rax");
+            s.emit_arg_reg(1, "rdx");
+            s.emit_arg_reg(2, "r10");
+            s.emit_arg_reg(3, "r11");
+            s.emit("    call _rt_strcmp");
+            s.emit("    test eax, eax");
+        };
+
+        match clause {
+            CaseClause::Value(e) => {
+                compare(self, e);
+                self.emit(&format!("    je {}", body_label));
+            }
+            CaseClause::Range(lo, hi) => {
+                let skip = self.new_label("caseskip");
+                compare(self, lo);
+                self.emit(&format!("    jl {}", skip));
+                compare(self, hi);
+                self.emit(&format!("    jle {}", body_label));
+                self.emit_label(&skip);
+            }
+            CaseClause::Compare(op, e) => {
+                compare(self, e);
+                let cc = match op {
+                    BinaryOp::Eq => "je",
+                    BinaryOp::Ne => "jne",
+                    BinaryOp::Lt => "jl",
+                    BinaryOp::Gt => "jg",
+                    BinaryOp::Le => "jle",
+                    BinaryOp::Ge => "jge",
+                    _ => unreachable!("the parser only builds comparisons here"),
+                };
+                self.emit(&format!("    {} {}", cc, body_label));
+            }
+        }
+    }
+
+    /// Emit one WRITE value: strings are quoted, numbers printed as usual.
+    fn gen_write_expr(&mut self, expr: &Expr) {
+        if self.expr_type(expr) == DataType::String {
+            self.emit_arg_imm(0, ASCII_QUOTE);
+            self.emit("    call _rt_print_char");
+            self.gen_print_expr(expr);
+            self.emit_arg_imm(0, ASCII_QUOTE);
+            self.emit("    call _rt_print_char");
+        } else {
+            self.gen_print_expr(expr);
+        }
+    }
+
+    /// WRITE # equivalent of [`Self::gen_write_expr`].
+    fn gen_write_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
+        if self.expr_type(expr) == DataType::String {
+            self.emit_arg_file_num(0, file_num);
+            self.emit_arg_imm(1, ASCII_QUOTE);
+            self.emit("    call _rt_file_print_char");
+            self.gen_print_expr_to_file(expr, file_num);
+            self.emit_arg_file_num(0, file_num);
+            self.emit_arg_imm(1, ASCII_QUOTE);
+            self.emit("    call _rt_file_print_char");
+        } else {
+            self.gen_print_expr_to_file(expr, file_num);
+        }
+    }
+
     fn gen_print_expr(&mut self, expr: &Expr) {
+        // TAB() and SPC() position the cursor rather than producing a value,
+        // so they are emitted for their effect and nothing is printed after.
+        if let Expr::FnCall { name, args } = expr {
+            let upper = name.to_uppercase();
+            if upper == "TAB" || upper == "SPC" {
+                self.gen_fn_call(&upper, args);
+                return;
+            }
+        }
+
         // Check the expression type first
         let expected_type = self.expr_type(expr);
 
@@ -1575,14 +3594,21 @@ impl CodeGen {
             self.emit_arg_reg(1, "rdx"); // len
             self.emit("    call _rt_print_string");
         } else {
-            // Numeric expression - evaluate and convert to double for printing
+            // Numeric expression - evaluate and convert to double for printing.
+            // A Single is printed via its own helper, which round-trips against
+            // 32-bit precision: widening 3.14159! to a double and printing all
+            // the digits that survive would show 3.141590118408203.
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
-            self.emit("    call _rt_print_float");
+            if expr_type == DataType::Single {
+                self.emit("    call _rt_print_single");
+            } else {
+                self.emit("    call _rt_print_float");
+            }
         }
     }
 
-    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: i32) {
+    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
         // Check the expression type first
         let expected_type = self.expr_type(expr);
 
@@ -1594,13 +3620,13 @@ impl CodeGen {
             // clobbering rdx with ptr. Order matters to avoid register conflicts.
             self.emit_arg_reg(2, "rdx"); // len → r8 (on Win64) or rdx (on SysV, no-op)
             self.emit_arg_reg(1, "rax"); // ptr → rdx (on Win64) or rsi (on SysV)
-            self.emit_arg_imm(0, file_num as i64); // file_num → rcx or rdi
+            self.emit_arg_file_num(0, file_num); // file_num → rcx or rdi
             self.emit("    call _rt_file_print_string");
         } else {
             // Numeric expression - evaluate and convert to double for printing
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
-            self.emit_arg_imm(0, file_num as i64);
+            self.emit_arg_file_num(0, file_num);
             self.emit("    call _rt_file_print_float");
         }
     }
@@ -1612,6 +3638,11 @@ impl CodeGen {
         if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
             let arg_type = self.gen_expr(&args[0]);
             self.gen_coercion(arg_type, DataType::Double);
+            // LOG is undefined at and below zero; libc would quietly return
+            // -inf or NaN.
+            if upper_name == "LOG" {
+                self.emit_domain_check("jbe");
+            }
             self.emit_call_libc(libc_fn);
             return;
         }
@@ -1620,6 +3651,11 @@ impl CodeGen {
         if let Some(instr) = INLINE_MATH_FNS.get(upper_name.as_str()) {
             let arg_type = self.gen_expr(&args[0]);
             self.gen_coercion(arg_type, DataType::Double);
+            // sqrtsd of a negative operand yields NaN, which then printed as a
+            // huge meaningless integer.
+            if upper_name == "SQR" {
+                self.emit_domain_check("jb");
+            }
             self.emit(&format!("    {}", instr));
             return;
         }
@@ -1632,6 +3668,9 @@ impl CodeGen {
                 self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
                 self.emit("    movq xmm1, rax");
                 self.emit("    andpd xmm0, xmm1");
+                // ABS preserves its argument's type: narrow back so the value
+                // matches what call_return_type promises.
+                self.gen_coercion(DataType::Double, Self::abs_result_type(arg_type));
             }
             "SGN" => {
                 let arg_type = self.gen_expr(&args[0]);
@@ -1840,212 +3879,372 @@ impl CodeGen {
                 }
                 // Result is integer (Long) in eax
             }
-            "CSNG" | "CDBL" => {
+            "CSNG" => {
                 let arg_type = self.gen_expr(&args[0]);
-                // Convert to double
+                self.gen_coercion(arg_type, DataType::Single);
+            }
+            "CDBL" => {
+                let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
             }
             "TIMER" => {
                 self.emit("    call _rt_timer");
             }
+            // String builders. These allocate, so the result outlives the call.
+            "SPACE$" => {
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_reg(0, "rax");
+                self.emit("    call _rt_space");
+            }
+            "STRING$" => {
+                // STRING$(n, ch) takes either a character code or a string
+                // whose first character is used.
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit("    push rax");
+                self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+                let ct = self.gen_expr(&args[1]);
+                if ct == DataType::String {
+                    self.emit("    movzx eax, BYTE PTR [rax]");
+                } else {
+                    self.gen_coercion(ct, DataType::Long);
+                }
+                self.emit("    mov r10d, eax");
+                self.emit("    add rsp, 8");
+                self.emit("    pop rax");
+                self.emit_arg_reg(0, "rax");
+                self.emit_arg_reg(1, "r10");
+                self.emit("    call _rt_string_n");
+            }
+            // Trimming and case conversion.
+            "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => {
+                self.gen_expr(&args[0]);
+                self.emit("    mov r10, rax");
+                self.emit("    mov r11, rdx");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                let rt = match upper_name.as_str() {
+                    "LTRIM$" => "_rt_ltrim",
+                    "RTRIM$" => "_rt_rtrim",
+                    "UCASE$" => "_rt_ucase",
+                    _ => "_rt_lcase",
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // Radix conversions.
+            "HEX$" | "OCT$" => {
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "HEX$" {
+                    "_rt_hex"
+                } else {
+                    "_rt_oct"
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // Array bounds. The descriptor stores each dimension's element
+            // count, so UBOUND is that minus one and LBOUND is always 0.
+            "LBOUND" | "UBOUND" => {
+                let Expr::Variable(arr) = &args[0] else {
+                    unreachable!("sema requires an array name here")
+                };
+                let arr = arr.to_uppercase();
+                let rank = self
+                    .symbols
+                    .lookup_array(&self.sema_scope(), &arr)
+                    .expect("sema checked the array exists")
+                    .rank as i64;
+
+                // The lower bound does not depend on which dimension is asked
+                // for, but an out-of-range dimension is still an error.
+                if upper_name == "LBOUND" {
+                    if let Some(dim) = args.get(1) {
+                        if self.const_dim(dim).is_none() {
+                            self.gen_dim_index(dim, rank);
+                        }
+                    }
+                    self.emit(&format!("    mov eax, {}", self.symbols.option_base));
+                    return;
+                }
+
+                let loc = self
+                    .lookup_array(&arr)
+                    .expect("sema checked the array exists")
+                    .loc
+                    .clone();
+
+                match args.get(1).map(|d| (d, self.const_dim(d))) {
+                    // The usual case: a literal or CONST dimension, resolved
+                    // to a fixed descriptor slot.
+                    None | Some((_, Some(_))) => {
+                        let dim = args.get(1).and_then(|d| self.const_dim(d)).unwrap_or(1);
+                        self.emit(&format!("    mov rax, {}", loc.q(dim)));
+                    }
+                    // A computed dimension indexes the descriptor at run time.
+                    Some((dim, None)) => {
+                        self.gen_dim_index(dim, rank);
+                        match &loc {
+                            Loc::Global(sym) => self.emit(&format!("    lea rcx, [rip + {}]", sym)),
+                            Loc::Frame(off) => self.emit(&format!("    lea rcx, [rbp + {}]", off)),
+                        }
+                        self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
+                    }
+                }
+                self.emit("    dec rax");
+            }
+            // File status. Both take a file number and return a number.
+            "EOF" | "LOF" => {
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Long);
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "EOF" {
+                    "_rt_file_eof"
+                } else {
+                    "_rt_file_lof"
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // Print positioning. These emit output rather than yielding a
+            // value, so they are only meaningful inside PRINT.
+            "TAB" | "SPC" => {
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Long);
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "TAB" {
+                    "_rt_print_tab"
+                } else {
+                    "_rt_print_spc"
+                };
+                self.emit(&format!("    call {}", rt));
+                // Leave a zero so PRINT has a well-defined value to render...
+                // but PRINT special-cases these, so it is never printed.
+                self.emit("    xorpd xmm0, xmm0");
+            }
             _ => {
                 // User-defined function or array access
-                if self.arrays.contains_key(&upper_name) || upper_name.ends_with('$') {
-                    // Array access
-                    self.gen_array_load(&upper_name, args);
+                // Sema has already established that this name is a procedure
+                // or an array, so no spelling heuristic is needed. Procedures
+                // win: an array and a procedure cannot share a name.
+                if self.symbols.procs.contains_key(&upper_name) {
+                    self.gen_call(&upper_name, args);
                 } else {
-                    // User function call
-                    self.gen_call(name, args);
+                    self.gen_array_load(&upper_name, args);
                 }
             }
         }
     }
 
+    /// Emit a call to a user SUB or FUNCTION.
+    ///
+    /// Argument placement comes from `classify_params`, driven by the callee's
+    /// *declared* parameter types. Classifying by the argument expressions'
+    /// types instead -- as this used to -- lets caller and callee disagree, and
+    /// silently corrupts the callee's frame.
     fn gen_call(&mut self, name: &str, args: &[Expr]) {
-        let int_regs = PlatformAbi::INT_ARG_REGS;
-        let max_reg_args = int_regs.len();
+        let upper = name.to_uppercase();
+        let param_types: Vec<DataType> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.iter().map(Self::param_data_type).collect())
+            .unwrap_or_default();
 
+        let mangled = mangle(&upper);
         if args.is_empty() {
-            self.emit(&format!("    call _proc_{}", name));
+            self.emit(&format!("    call _proc_{}", mangled));
             return;
         }
 
-        // Phase 1: Evaluate ALL arguments to stack temporaries
-        // This prevents clobbering of registers when args contain nested function calls
-        // Each arg needs 8 bytes (numeric as double bits, string ptr only - len follows)
-        let mut arg_info: Vec<(DataType, i32)> = Vec::new(); // (type, stack_offset)
+        let (places, stack_slots) = Self::classify_params(&param_types);
 
-        // Calculate total slots needed (strings need 2 slots: ptr + len)
-        let mut total_slots = 0;
-        for arg in args.iter() {
-            let arg_type = self.expr_type(arg);
-            if arg_type == DataType::String {
-                total_slots += 2; // ptr + len
-            } else {
-                total_slots += 1;
+        // Phase 1: evaluate every argument into a temp block, so that a nested
+        // call inside a later argument cannot clobber an earlier one.
+        let words: usize = param_types
+            .iter()
+            .map(|t| Self::words_for(*t) as usize)
+            .sum();
+        let temp_bytes = ((words * 8 + 15) & !15) as i32;
+        self.emit(&format!("    sub rsp, {}", temp_bytes));
+
+        let param_decls: Vec<Param> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.clone())
+            .unwrap_or_default();
+
+        let mut temp_of: Vec<i32> = Vec::with_capacity(args.len());
+        let mut w = 0i32;
+        for (i, (arg, ty)) in args.iter().zip(&param_types).enumerate() {
+            // A record argument is passed as the address of the caller's copy.
+            // Any record lvalue qualifies, not just a plain variable: passing
+            // `A(1)` used to fall through to the numeric path below and hand
+            // the callee a float where it expected a pointer.
+            if let Some(Param {
+                ty: Some(TypeRef::Record(_)),
+                ..
+            }) = param_decls.get(i)
+            {
+                if self.gen_record_addr(arg) {
+                    self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                    temp_of.push(w * 8);
+                    w += 1;
+                    continue;
+                }
             }
-        }
-
-        // Allocate stack space (16-byte aligned)
-        let stack_space = (total_slots * 8 + 15) & !15;
-        self.emit(&format!("    sub rsp, {}", stack_space));
-
-        // Evaluate each argument and save to stack
-        let mut slot_offset = 0i32;
-        for arg in args.iter() {
             let arg_type = self.gen_expr(arg);
-            if arg_type == DataType::String {
-                // String: save ptr and len to consecutive slots
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", slot_offset));
-                self.emit(&format!(
-                    "    mov QWORD PTR [rsp + {}], rdx",
-                    slot_offset + 8
-                ));
-                arg_info.push((arg_type, slot_offset));
-                slot_offset += 16;
+            if *ty == DataType::String {
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8));
+                temp_of.push(w * 8);
+                w += 2;
             } else {
-                // Numeric: coerce to double and save
+                // Numeric arguments travel as f64 bit patterns in integer
+                // slots; the callee narrows to the declared type.
                 self.gen_coercion(arg_type, DataType::Double);
+                self.emit(&format!("    movsd QWORD PTR [rsp + {}], xmm0", w * 8));
+                temp_of.push(w * 8);
+                w += 1;
+            }
+        }
+
+        // Phase 2: copy the stack-passed slots into place.
+        let stack_bytes = ((stack_slots * 8 + 15) & !15) as i32;
+        if stack_slots > 0 {
+            self.emit(&format!("    sub rsp, {}", stack_bytes));
+        }
+        for (place, off) in places.iter().zip(&temp_of) {
+            // r11 is caller-saved and an argument register on neither ABI.
+            if let Slot::Stk(i) = place.ptr {
                 self.emit(&format!(
-                    "    movsd QWORD PTR [rsp + {}], xmm0",
-                    slot_offset
+                    "    mov r11, QWORD PTR [rsp + {}]",
+                    stack_bytes + off
                 ));
-                arg_info.push((arg_type, slot_offset));
-                slot_offset += 8;
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
+            }
+            if let Some(Slot::Stk(i)) = place.len {
+                self.emit(&format!(
+                    "    mov r11, QWORD PTR [rsp + {}]",
+                    stack_bytes + off + 8
+                ));
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
             }
         }
 
-        // Phase 2: Count register slots used
-        let mut reg_slots_used: usize = 0;
-        for (arg_type, _) in arg_info.iter() {
-            if *arg_type == DataType::String {
-                reg_slots_used += 2; // ptr + len
-            } else {
-                reg_slots_used += 1;
+        // Phase 3: load the register slots last, so nothing can clobber them.
+        let regs = PlatformAbi::INT_ARG_REGS;
+        for (place, off) in places.iter().zip(&temp_of) {
+            if let Slot::Reg(i) = place.ptr {
+                self.emit(&format!(
+                    "    mov {}, QWORD PTR [rsp + {}]",
+                    regs[i],
+                    stack_bytes + off
+                ));
+            }
+            if let Some(Slot::Reg(i)) = place.len {
+                self.emit(&format!(
+                    "    mov {}, QWORD PTR [rsp + {}]",
+                    regs[i],
+                    stack_bytes + off + 8
+                ));
             }
         }
 
-        // Calculate overflow args (those that don't fit in registers)
-        let overflow_slots = reg_slots_used.saturating_sub(max_reg_args);
+        self.emit(&format!("    call _proc_{}", mangled));
+        self.emit(&format!("    add rsp, {}", stack_bytes + temp_bytes));
+    }
 
-        // Phase 3: Handle overflow args (push to call stack for >6 params)
-        let overflow_space = if overflow_slots > 0 {
-            let space = ((overflow_slots * 8 + 15) & !15) as i32;
-            self.emit(&format!("    sub rsp, {}", space));
-
-            // Copy overflow args from temp stack to call stack
-            let mut reg_count = 0;
-            let mut overflow_idx = 0;
-            for (arg_type, temp_offset) in arg_info.iter() {
-                if *arg_type == DataType::String {
-                    // String takes 2 register slots
-                    if reg_count >= max_reg_args {
-                        // Both ptr and len are overflow
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space, temp_offset
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space,
-                            temp_offset + 8
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    } else if reg_count + 1 >= max_reg_args {
-                        // Only len is overflow (ptr fits in last register)
-                        reg_count += 1; // ptr in register
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space,
-                            temp_offset + 8
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    }
-                    reg_count += 2;
+    /// Emit storage for one DIM/REDIM declarator.
+    ///
+    /// A declarator is an array, a typed scalar, or a typed array, and one
+    /// statement may mix them.
+    fn gen_declarator(&mut self, decl: &Declarator, preserve: bool) {
+        match (&decl.dimensions, &decl.ty) {
+            // An array of records: element size comes from the type.
+            (Some(dims), Some(ty)) => {
+                let arr = ArrayDecl {
+                    name: decl.name.clone(),
+                    dimensions: dims.clone(),
+                };
+                let words = self.symbols.type_words(ty);
+                let key = decl.name.to_uppercase();
+                if self.current_proc.is_some() {
+                    self.proc_record_elem_words.insert(key, words);
                 } else {
-                    if reg_count >= max_reg_args {
-                        // This arg is overflow
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space, temp_offset
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    }
-                    reg_count += 1;
+                    self.record_elem_words.insert(key, words);
+                }
+                self.gen_array_alloc(&arr, preserve);
+            }
+            (Some(dims), None) => {
+                let arr = ArrayDecl {
+                    name: decl.name.clone(),
+                    dimensions: dims.clone(),
+                };
+                if preserve {
+                    self.gen_array_alloc(&arr, true);
+                } else {
+                    self.gen_dim_array(&arr);
                 }
             }
-            space
-        } else {
-            0
-        };
-
-        // Phase 4: Load arguments into registers (immediately before call)
-        let mut reg_idx = 0;
-        let base_offset = overflow_space; // Offset to temp stack from current rsp
-        for (arg_type, temp_offset) in arg_info.iter() {
-            if reg_idx >= max_reg_args {
-                break;
+            // A typed scalar: allocating its storage is all that is needed,
+            // since .bss and the frame prologue already zero it.
+            (None, Some(ty)) => {
+                let ty = ty.clone();
+                self.get_record_loc(&decl.name, &ty);
             }
-            if *arg_type == DataType::String {
-                // String: load ptr and len into consecutive registers
-                if reg_idx < max_reg_args {
-                    self.emit(&format!(
-                        "    mov {}, QWORD PTR [rsp + {} + {}]",
-                        int_regs[reg_idx], base_offset, temp_offset
-                    ));
-                    reg_idx += 1;
-                }
-                if reg_idx < max_reg_args {
-                    self.emit(&format!(
-                        "    mov {}, QWORD PTR [rsp + {} + {}]",
-                        int_regs[reg_idx],
-                        base_offset,
-                        temp_offset + 8
-                    ));
-                    reg_idx += 1;
-                }
-            } else {
-                // Numeric: load as 64-bit value
-                self.emit(&format!(
-                    "    mov {}, QWORD PTR [rsp + {} + {}]",
-                    int_regs[reg_idx], base_offset, temp_offset
-                ));
-                reg_idx += 1;
-            }
+            (None, None) => unreachable!("the parser rejects a bare declarator"),
         }
-
-        // Make the call
-        self.emit(&format!("    call _proc_{}", name));
-
-        // Clean up: overflow space + temp stack space
-        let total_cleanup = overflow_space + stack_space;
-        self.emit(&format!("    add rsp, {}", total_cleanup));
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
-        let elem_size = if is_string_var(&arr.name) { 16 } else { 8 };
+        self.gen_array_alloc(arr, false);
+    }
 
-        // First, evaluate and store all dimension bounds
+    /// Allocate or reallocate an array's storage.
+    ///
+    /// The descriptor -- word 0 the element pointer, word 1+i dimension i's
+    /// element count -- is reused when the array already exists, so REDIM
+    /// resizes in place rather than orphaning it, and a repeated DIM does not
+    /// leak a second descriptor.
+    ///
+    /// With `preserve`, the block is grown with realloc and the new tail
+    /// zeroed; otherwise fresh zeroed storage is allocated.
+    fn gen_array_alloc(&mut self, arr: &ArrayDecl, preserve: bool) {
+        let elem_size = self.elem_size_for(&arr.name);
+        let ndims = arr.dimensions.len();
+
+        // Reuse the existing descriptor, or reserve one. A module-level array
+        // gets static storage so procedures can reach it; one declared inside a
+        // procedure is local to it.
+        let loc = match self.lookup_array(&arr.name).map(|i| i.loc.clone()) {
+            Some(existing) => existing,
+            None if self.current_proc.is_some() => {
+                self.stack_offset -= 8 * (1 + ndims as i32);
+                Loc::Frame(self.stack_offset)
+            }
+            None => Loc::Global(format!("_arr_{}", mangle(&arr.name))),
+        };
+
+        // With PRESERVE, the old element count is needed to know where the
+        // newly added tail begins.
+        if preserve {
+            self.emit(&format!("    mov rax, {}", loc.q(1)));
+            for i in 1..ndims {
+                self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+            }
+            self.emit(&format!("    imul rax, {}", elem_size));
+            self.emit("    push rax"); // old size in bytes
+            self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+        }
+
+        // Evaluate and store all dimension bounds.
         // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
-        let mut dim_offsets = Vec::new();
-        for dim in arr.dimensions.iter() {
+        for (i, dim) in arr.dimensions.iter().enumerate() {
             let dim_type = self.gen_expr(dim);
             if dim_type.is_integer() {
                 // Value already in eax, sign-extend to rax
@@ -2054,48 +4253,91 @@ impl CodeGen {
                 self.emit("    cvttsd2si rax, xmm0");
             }
             self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
-            self.stack_offset -= 8;
-            dim_offsets.push(self.stack_offset);
-            self.emit(&format!(
-                "    mov QWORD PTR [rbp + {}], rax",
-                self.stack_offset
-            ));
+            self.emit(&format!("    mov {}, rax", loc.q(1 + i as i32)));
         }
 
         // Calculate total elements: dim0 * dim1 * dim2 * ...
-        self.emit(&format!(
-            "    mov rax, QWORD PTR [rbp + {}]",
-            dim_offsets[0]
-        ));
-        for offset in dim_offsets.iter().skip(1) {
-            self.emit(&format!("    imul rax, QWORD PTR [rbp + {}]", offset));
+        self.emit(&format!("    mov rax, {}", loc.q(1)));
+        for i in 1..ndims {
+            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+        }
+        self.emit(&format!("    imul rax, {}", elem_size));
+
+        if preserve {
+            // realloc(old_ptr, new_size)
+            self.emit("    mov r10, rax"); // new size in bytes
+            self.emit("    push r10");
+            self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned across the call
+            self.emit(&format!("    mov {}, {}", Self::arg_reg(0), loc.q(0)));
+            self.emit_arg_reg(1, "r10");
+            self.emit_call_libc("realloc");
+            self.emit("    add rsp, 8");
+            self.emit("    pop r10"); // new size
+        } else {
+            // calloc(1, size): BASIC guarantees a fresh array reads as 0 / "",
+            // which malloc alone does not.
+            self.emit(&format!("    mov {}, 1", Self::arg_reg(0)));
+            self.emit_arg_reg(1, "rax");
+            self.emit_call_libc("calloc");
         }
 
-        // Allocate: total_elements * elem_size
-        let arg0 = Self::arg_reg(0);
-        self.emit(&format!("    imul {}, rax, {}", arg0, elem_size));
-        self.emit_call_libc("malloc");
+        if self.opts.checks {
+            // A null result would otherwise be written into the descriptor and
+            // dereferenced on first use.
+            self.emit("    test rax, rax");
+            self.emit_check("jz", RtError::OutOfMemory);
+        }
 
         // Store array pointer
-        self.stack_offset -= 8;
-        let ptr_offset = self.stack_offset;
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", ptr_offset));
+        self.emit(&format!("    mov {}, rax", loc.q(0)));
+
+        if preserve {
+            // Zero the newly added tail, from the old size up to the new one.
+            self.emit("    add rsp, 8");
+            self.emit("    pop r11"); // old size in bytes
+            self.emit("    mov rcx, r11");
+            let loop_label = self.new_label("preserve_zero");
+            let done_label = self.new_label("preserve_done");
+            self.emit_label(&loop_label);
+            self.emit("    cmp rcx, r10");
+            self.emit(&format!("    jae {}", done_label));
+            self.emit("    mov BYTE PTR [rax + rcx], 0");
+            self.emit("    inc rcx");
+            self.emit(&format!("    jmp {}", loop_label));
+            self.emit_label(&done_label);
+        }
 
         // Record array info
-        self.arrays.insert(
-            arr.name.clone(),
-            ArrayInfo {
-                ptr_offset,
-                dim_offsets,
-            },
-        );
+        let info = ArrayInfo { loc, ndims };
+        if self.current_proc.is_some() {
+            self.proc_arrays.insert(arr.name.clone(), info);
+        } else {
+            self.arrays.insert(arr.name.clone(), info);
+        }
     }
 
-    fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
-        let arr_info = self.arrays.get(name).expect("Array not declared");
-        let ptr_offset = arr_info.ptr_offset;
-        let dim_offsets = arr_info.dim_offsets.clone();
-        let elem_size = if is_string_var(name) { 16 } else { 8 };
+    /// Compute the address of an array element, leaving it in `rax`.
+    ///
+    /// Shared by loads and stores so the index arithmetic -- and the bounds
+    /// checks guarding it -- exist in exactly one place.
+    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
+        // Descriptors for every declared array are reserved before any code is
+        // emitted, and sema has already rejected undeclared ones, so this
+        // cannot fail for a program that reached code generation.
+        let arr_info = self
+            .lookup_array(name)
+            .expect("sema checked the array is declared");
+        let loc = arr_info.loc.clone();
+        let elem_size = self.elem_size_for(name);
+
+        // A module-level array's descriptor lives in .bss, so its element
+        // pointer is null until the DIM executes. Catching that is what turns
+        // "used before DIM at run time" into a diagnosable abort rather than a
+        // null dereference.
+        if self.opts.checks {
+            self.emit(&format!("    cmp {}, 0", loc.q(0)));
+            self.emit_check("je", RtError::Undim);
+        }
 
         // Calculate linear index using row-major order:
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
@@ -2106,6 +4348,14 @@ impl CodeGen {
             self.emit("    movsxd rax, eax");
         } else {
             self.emit("    cvttsd2si rax, xmm0");
+        }
+        // One unsigned compare catches both a negative index and one past the
+        // end, since a negative value wraps to a huge unsigned one. The stored
+        // bound is already the element count (declared bound + 1).
+        if self.opts.checks {
+            self.emit(&format!("    cmp rax, {}", loc.q(1)));
+            self.emit_check("jae", RtError::Subscript);
+            self.emit_lower_bound_check("rax");
         }
 
         // For each subsequent index, multiply by dimension bound and add
@@ -2120,130 +4370,134 @@ impl CodeGen {
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
+            if self.opts.checks {
+                self.emit(&format!("    cmp rcx, {}", loc.q(1 + i as i32)));
+                self.emit_check("jae", RtError::Subscript);
+                self.emit_lower_bound_check("rcx");
+            }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
-            self.emit(&format!(
-                "    imul rax, QWORD PTR [rbp + {}]",
-                dim_offsets[i]
-            ));
+            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
             self.emit("    add rax, rcx");
         }
 
         // Multiply by element size and add to base pointer
         self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+        self.emit(&format!("    add rax, {}", loc.q(0)));
+    }
+
+    fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
+        self.gen_array_addr(name, indices);
 
         // Load value from computed address
-        if is_string_var(name) {
-            self.emit("    mov rcx, rax");
-            self.emit("    mov rax, QWORD PTR [rcx]");
-            self.emit("    mov rdx, QWORD PTR [rcx + 8]");
-        } else {
-            self.emit("    movsd xmm0, QWORD PTR [rax]");
+        match DataType::from_suffix(name) {
+            DataType::String => {
+                self.emit("    mov rcx, rax");
+                self.emit("    mov rax, QWORD PTR [rcx]");
+                self.emit("    mov rdx, QWORD PTR [rcx + 8]");
+            }
+            DataType::Integer => self.emit("    movsx eax, WORD PTR [rax]"),
+            DataType::Long => self.emit("    mov eax, DWORD PTR [rax]"),
+            DataType::Single => self.emit("    movss xmm0, DWORD PTR [rax]"),
+            DataType::Double => self.emit("    movsd xmm0, QWORD PTR [rax]"),
         }
     }
 
     fn gen_array_store(&mut self, name: &str, indices: &[Expr], value: &Expr) {
-        let arr_info = self.arrays.get(name).expect("Array not declared");
-        let ptr_offset = arr_info.ptr_offset;
-        let dim_offsets = arr_info.dim_offsets.clone();
-        let elem_size = if is_string_var(name) { 16 } else { 8 };
+        self.gen_array_addr(name, indices);
 
-        // Calculate linear index using row-major order (same as gen_array_load)
-        let idx_type = self.gen_expr(&indices[0]);
-        if idx_type.is_integer() {
-            self.emit("    movsxd rax, eax");
-        } else {
-            self.emit("    cvttsd2si rax, xmm0");
-        }
-
-        for (i, idx_expr) in indices.iter().enumerate().skip(1) {
-            // Save current accumulated index - use 16 bytes for alignment
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-            self.emit("    mov QWORD PTR [rsp], rax");
-            let idx_type = self.gen_expr(idx_expr);
-            if idx_type.is_integer() {
-                self.emit("    movsxd rcx, eax");
-            } else {
-                self.emit("    cvttsd2si rcx, xmm0");
-            }
-            self.emit("    mov rax, QWORD PTR [rsp]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-            self.emit(&format!(
-                "    imul rax, QWORD PTR [rbp + {}]",
-                dim_offsets[i]
-            ));
-            self.emit("    add rax, rcx");
-        }
-
-        // Compute final address and save it - use 16 bytes for alignment
-        self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+        // Save the address while the value is evaluated - 16 bytes for alignment
         self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-        self.emit("    mov QWORD PTR [rsp], rax"); // save address
+        self.emit("    mov QWORD PTR [rsp], rax");
 
-        // Evaluate value
         let val_type = self.gen_expr(value);
+        if val_type == DataType::String {
+            self.emit_string_copy();
+        }
 
-        // Store value at computed address
         self.emit("    mov rcx, QWORD PTR [rsp]");
         self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-        if is_string_var(name) {
+
+        let elem_type = DataType::from_suffix(name);
+        if elem_type == DataType::String {
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
         } else {
-            // Coerce to double for array storage
-            self.gen_coercion(val_type, DataType::Double);
-            self.emit("    movsd QWORD PTR [rcx], xmm0");
+            // Coerce to the element's declared type, then store at its width,
+            // exactly as a scalar assignment does.
+            self.gen_coercion(val_type, elem_type);
+            match elem_type {
+                DataType::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+                DataType::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+                DataType::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+                DataType::Double => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+                DataType::String => unreachable!("handled above"),
+            }
         }
     }
 
     fn gen_string_assign(&mut self, name: &str, value: &Expr) {
         self.gen_expr(value);
-        let offset = self.get_var_offset(name);
-        // For strings, also allocate space for length
-        self.stack_offset -= 8; // extra space for length
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+        self.emit_string_copy();
+        // Both words were reserved when the variable was first seen, so this no
+        // longer has to scavenge a slot per assignment.
+        let loc = self.get_var_loc(name);
+        self.emit(&format!("    mov {}, rax", loc.q(0)));
+        self.emit(&format!("    mov {}, rdx", loc.q(1)));
     }
 
     fn emit_data_section(&mut self) {
+        // Pass 1: intern every DATA string and build the table rows as text.
+        //
+        // Nothing is emitted yet, so `string_literals` may still grow. Emitting
+        // the `_str_N` labels first and interning DATA strings afterwards -- as
+        // this used to -- left the trailing labels referenced by the table but
+        // never defined, so any program with a string in a DATA statement
+        // failed to link.
+        let data_items = std::mem::take(&mut self.data_items);
+        let mut rows: Vec<(u8, String)> = Vec::with_capacity(data_items.len());
+        for item in &data_items {
+            rows.push(match item {
+                Literal::Integer(n) => (0, n.to_string()),
+                Literal::Float(f) => (1, format!("0x{:X}", f.to_bits())),
+                Literal::String(s) => {
+                    let idx = self.add_string_literal(s);
+                    (2, format!("_str_{}", idx))
+                }
+            });
+        }
+
+        // Pass 2: emit. `string_literals` is final from here on.
         self.output.push_str("\n.data\n");
 
-        // String literals - clone to avoid borrow issues
         let strings = self.string_literals.clone();
         for (i, s) in strings.iter().enumerate() {
             self.output.push_str(&format!("_str_{}:\n", i));
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            // .asciz, not .ascii: _rt_read_string measures DATA strings with
+            // strlen/lstrlenA, so without a terminator a string READ runs past
+            // its own literal into the next one. The trailing NUL is invisible
+            // to everything that uses the (ptr, len) representation.
             self.output
-                .push_str(&format!("    .ascii \"{}\"\n", escaped));
+                .push_str(&format!("    .asciz \"{}\"\n", escaped));
         }
 
         // DATA table - always define it (even if empty) to avoid linker errors
+        self.output.push_str(".p2align 3\n");
         self.output.push_str("_data_table:\n");
-        let data_items = self.data_items.clone();
-        for item in &data_items {
-            match item {
-                Literal::Integer(n) => {
-                    self.output.push_str("    .quad 0  # type int\n");
-                    self.output.push_str(&format!("    .quad {}\n", n));
-                }
-                Literal::Float(f) => {
-                    self.output.push_str("    .quad 1  # type float\n");
-                    self.output
-                        .push_str(&format!("    .quad 0x{:X}\n", f.to_bits()));
-                }
-                Literal::String(s) => {
-                    let idx = self.string_literals.len();
-                    self.string_literals.push(s.clone());
-                    self.output.push_str("    .quad 2  # type string\n");
-                    self.output.push_str(&format!("    .quad _str_{}\n", idx));
-                }
-            }
+        for (tag, value) in &rows {
+            let kind = match tag {
+                0 => "int",
+                1 => "float",
+                _ => "string",
+            };
+            self.output
+                .push_str(&format!("    .quad {}  # type {}\n", tag, kind));
+            self.output.push_str(&format!("    .quad {}\n", value));
         }
         self.output
-            .push_str(&format!("_data_count: .quad {}\n", data_items.len()));
+            .push_str(&format!("_data_count: .quad {}\n", rows.len()));
 
         // DATA pointer
         self.emit("_data_ptr: .quad 0");
@@ -2255,6 +4509,45 @@ impl CodeGen {
 
         self.emit("");
         self.emit(".bss");
+        self.emit(".p2align 3");
+
+        // Module-level variables and arrays. .bss is zero-filled by the loader,
+        // which is what gives BASIC's "unassigned is 0 / empty string" for free.
+        // Emitted in sorted order so the generated assembly is reproducible.
+        let mut vars: Vec<(&String, &VarInfo)> = self.vars.iter().collect();
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in vars {
+            if let Loc::Global(sym) = &info.loc {
+                let bytes = 8 * Self::words_for(info.data_type);
+                self.output
+                    .push_str(&format!("{}: .zero {}  # {}\n", sym, bytes, name));
+            }
+        }
+
+        let record_globals = std::mem::take(&mut self.record_globals);
+        for (name, words) in &record_globals {
+            self.output.push_str(&format!(
+                "_rec_{}: .zero {}  # {} (record)\n",
+                mangle(name),
+                words * 8,
+                name
+            ));
+        }
+
+        let mut arrays: Vec<(&String, &ArrayInfo)> = self.arrays.iter().collect();
+        arrays.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in arrays {
+            if let Loc::Global(sym) = &info.loc {
+                // Word 0 is the element pointer (null until DIM runs), then one
+                // word per dimension bound.
+                let bytes = 8 * (1 + info.ndims);
+                self.output.push_str(&format!(
+                    "{}: .zero {}  # {} ptr + {} dim(s)\n",
+                    sym, bytes, name, info.ndims
+                ));
+            }
+        }
+
         // GOSUB stack (if needed)
         if self.gosub_used {
             self.emit(&format!(
