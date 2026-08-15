@@ -177,8 +177,9 @@
 // SPDX-License-Identifier: MIT
 
 use crate::abi::{Abi, PlatformAbi};
+use crate::parser::TypeRef;
 use crate::parser::*;
-use crate::sema::Symbols;
+use crate::sema::{Scope as SemaScope, Symbols};
 use crate::using;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -294,6 +295,14 @@ impl Loc {
     /// Operand for word `n` as a QWORD, the common case.
     fn q(&self, n: i32) -> String {
         self.at("QWORD PTR", n)
+    }
+
+    /// A location `n` words further along, used to reach a record field.
+    fn offset_words(&self, n: i32) -> Loc {
+        match self {
+            Loc::Global(sym) => Loc::Global(format!("{} + {}", sym, n * 8)),
+            Loc::Frame(off) => Loc::Frame(off + n * 8),
+        }
     }
 }
 
@@ -422,6 +431,14 @@ pub struct CodeGen {
     loop_stack: Vec<(bool, String)>,
     /// Label of the current procedure's epilogue, for EXIT SUB / EXIT FUNCTION.
     proc_exit_label: Option<String>,
+    /// Storage for variables declared with `DIM ... AS`.
+    record_vars: HashMap<String, Loc>,
+    /// Declared types of the current procedure's typed parameters.
+    proc_types: HashMap<String, TypeRef>,
+    /// Module-level typed variables and their size in words, for .bss.
+    record_globals: BTreeMap<String, i32>,
+    /// Element size in words for arrays of records, by upper-case name.
+    record_elem_words: HashMap<String, i32>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -594,6 +611,20 @@ impl CodeGen {
         self.arrays.get(name)
     }
 
+    /// Value representation of a parameter: its `AS` clause when it has one,
+    /// otherwise the type its name's suffix implies.
+    ///
+    /// A record parameter is passed as a pointer to the caller's copy, which
+    /// the prologue then copies into a local slot, so it arrives by value like
+    /// every other parameter without needing a new addressing mode.
+    fn param_data_type(p: &Param) -> DataType {
+        match &p.ty {
+            Some(TypeRef::Record(_)) => DataType::Long, // a pointer
+            Some(t) => Self::data_type_of(t),
+            None => DataType::from_suffix(&p.name),
+        }
+    }
+
     /// Assign physical slots to a procedure's parameters.
     ///
     /// This is the single definition of the private `_proc_*` calling
@@ -665,6 +696,15 @@ impl CodeGen {
     /// meant `A%(0)` wrote 8 bytes of double but was *read* as an integer,
     /// because expr_type types an array access by its suffix. Typed numeric
     /// arrays returned garbage as a result.
+    fn elem_size_for(&self, name: &str) -> i32 {
+        // An array declared with `DIM ... AS T` has records for elements, so
+        // its element size comes from the type rather than a name suffix.
+        if let Some(words) = self.record_elem_words.get(&name.to_uppercase()) {
+            return words * 8;
+        }
+        Self::elem_size(name)
+    }
+
     fn elem_size(name: &str) -> i32 {
         match DataType::from_suffix(name) {
             DataType::String => 16, // pointer + length
@@ -696,10 +736,22 @@ impl CodeGen {
                 Some(Literal::Integer(_)) => DataType::Long,
                 Some(Literal::Float(_)) => DataType::Double,
                 Some(Literal::String(_)) => DataType::String,
-                None => DataType::from_suffix(name),
+                // A variable declared with `AS` carries that type rather than
+                // the one its name's suffix would imply.
+                // An already-allocated slot knows its own type -- which for a
+                // parameter declared `N AS INTEGER` is the declared one, not
+                // what the name's suffix would imply.
+                None => match self.lookup_var(name) {
+                    Some(info) => info.data_type,
+                    None => match self.typed_var(name) {
+                        Some(t) => Self::data_type_of(&t),
+                        None => DataType::from_suffix(name),
+                    },
+                },
             },
             Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
             Expr::FnCall { name, args } => self.call_return_type(name, args),
+            Expr::Field { .. } => self.field_expr_type(expr),
             Expr::Unary { operand, .. } => self.expr_type(operand),
             Expr::Binary { left, right, op } => {
                 let lt = self.expr_type(left);
@@ -1074,10 +1126,11 @@ impl CodeGen {
         self.emit(&format!("    jb {}", body));
     }
 
-    fn gen_procedure(&mut self, name: &str, params: &[String], body: &[Stmt], is_function: bool) {
+    fn gen_procedure(&mut self, name: &str, params: &[Param], body: &[Stmt], is_function: bool) {
         self.current_proc = Some(name.to_string());
         self.proc_vars.clear();
         self.proc_arrays.clear();
+        self.proc_types.clear();
         let old_stack_offset = self.stack_offset;
         self.stack_offset = 0;
 
@@ -1099,10 +1152,40 @@ impl CodeGen {
         // Spill parameters into the frame, using the same placement the call
         // site computed from the same declared types.
         let int_regs = PlatformAbi::INT_ARG_REGS;
-        let param_types: Vec<DataType> = params.iter().map(|p| DataType::from_suffix(p)).collect();
+        let param_types: Vec<DataType> = params.iter().map(Self::param_data_type).collect();
         let (places, _) = Self::classify_params(&param_types);
 
-        for (param, place) in params.iter().zip(&places) {
+        for (param_decl, place) in params.iter().zip(&places) {
+            let param = &param_decl.name;
+
+            // A record parameter arrives as a pointer to the caller's copy.
+            // Copying it into a local slot here gives by-value semantics and
+            // lets field access use ordinary frame addressing.
+            if let Some(TypeRef::Record(_)) = &param_decl.ty {
+                let ty = param_decl.ty.clone().expect("matched above");
+                let words = self.symbols.type_words(&ty);
+                self.stack_offset -= 8 * words;
+                let loc = Loc::Frame(self.stack_offset);
+                let src = match place.ptr {
+                    Slot::Reg(i) => int_regs[i].to_string(),
+                    Slot::Stk(i) => {
+                        self.emit(&format!(
+                            "    mov r11, QWORD PTR [rbp + {}]",
+                            16 + 8 * i as i32
+                        ));
+                        "r11".to_string()
+                    }
+                };
+                self.emit(&format!("    mov r10, {}", src));
+                for w in 0..words {
+                    self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
+                    self.emit(&format!("    mov {}, rax", loc.q(w)));
+                }
+                self.record_vars.insert(param.clone(), loc);
+                self.proc_types.insert(param.clone(), ty);
+                continue;
+            }
+
             self.stack_offset -= 8 * Self::words_for(place.ty);
             let loc = Loc::Frame(self.stack_offset);
             self.proc_vars.insert(
@@ -1242,6 +1325,32 @@ impl CodeGen {
 
             StmtKind::LabelName(name) => {
                 self.emit_label(&format!("_label_{}", mangle(name)));
+            }
+
+            // Assignment to a record field.
+            StmtKind::Let {
+                name,
+                indices: None,
+                value,
+            } if self.typed_var(name).is_some() && !self.has_plain_slot(name) => {
+                let Some((loc, ty)) = self.typed_storage(name) else {
+                    unreachable!("guarded above")
+                };
+                // Assigning one whole record to another copies its words.
+                if let TypeRef::Record(_) = &ty {
+                    if let Expr::Variable(src) = value {
+                        let words = self.symbols.type_words(&ty);
+                        let src_ty = self.typed_var(src).expect("sema checked the source");
+                        let src_loc = self.get_record_loc(src, &src_ty);
+                        for w in 0..words {
+                            self.emit(&format!("    mov rax, {}", src_loc.q(w)));
+                            self.emit(&format!("    mov {}, rax", loc.q(w)));
+                        }
+                        return;
+                    }
+                }
+                let vt = self.gen_expr(value);
+                self.gen_store_typed(&loc, &ty, vt);
             }
 
             StmtKind::Let {
@@ -1682,6 +1791,47 @@ impl CodeGen {
                 self.emit("    call _rt_restore");
             }
 
+            // A TYPE definition emits nothing; its layout lives in Symbols.
+            StmtKind::TypeDef { .. } => {}
+
+            StmtKind::FieldAssign { target, value } => {
+                if target.indices.is_some() {
+                    self.gen_array_field(target, Some(value));
+                } else {
+                    let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields)
+                    else {
+                        unreachable!("sema resolved this field path")
+                    };
+                    let vt = self.gen_expr(value);
+                    self.gen_store_typed(&loc, &ty, vt);
+                }
+            }
+
+            StmtKind::DimTyped {
+                name,
+                ty,
+                dimensions,
+            } => {
+                match dimensions {
+                    // An array of records: element size comes from the type.
+                    Some(dims) => {
+                        let decl = ArrayDecl {
+                            name: name.clone(),
+                            dimensions: dims.clone(),
+                        };
+                        let words = self.symbols.type_words(ty);
+                        self.record_elem_words.insert(name.to_uppercase(), words);
+                        self.gen_array_alloc(&decl, false);
+                    }
+                    // A scalar: allocating its storage is all that is needed,
+                    // since .bss and the frame prologue already zero it.
+                    None => {
+                        let ty = ty.clone();
+                        self.get_record_loc(name, &ty);
+                    }
+                }
+            }
+
             StmtKind::Redim { arrays, preserve } => {
                 for arr in arrays {
                     self.gen_array_alloc(arr, *preserve);
@@ -1920,6 +2070,12 @@ impl CodeGen {
                     return self.gen_expr(&Expr::Literal(lit));
                 }
 
+                // A variable declared with `AS` lives in typed storage, which
+                // is where its assignments went.
+                if let Some((loc, ty)) = self.typed_storage(name) {
+                    return self.gen_load_typed(&loc, &ty);
+                }
+
                 // A bare reference to a parameterless FUNCTION calls it, as in
                 // QuickBASIC. Inside the function's own body the same name is
                 // its return variable, so that case must not become infinite
@@ -2010,6 +2166,24 @@ impl CodeGen {
             Expr::FnCall { name, args } => {
                 self.gen_fn_call(name, args);
                 self.call_return_type(name, args)
+            }
+
+            Expr::Field { .. } => {
+                if let Some((name, indices, fields)) = Self::flatten_indexed_field_path(expr) {
+                    let target = LValue {
+                        name,
+                        indices: Some(indices),
+                        fields,
+                    };
+                    return self.gen_array_field(&target, None);
+                }
+                let Some((name, fields)) = Self::flatten_field_path(expr) else {
+                    unreachable!("sema rejects a field access on a non-record")
+                };
+                let Some((loc, ty)) = self.resolve_field_path(&name, &fields) else {
+                    unreachable!("sema resolved this field path")
+                };
+                self.gen_load_typed(&loc, &ty)
             }
         }
     }
@@ -2415,6 +2589,345 @@ impl CodeGen {
         self.emit("    call _rt_strdup");
     }
 
+    /// Split `arr(i).f...` into its array name, subscripts and field path.
+    fn flatten_indexed_field_path(expr: &Expr) -> Option<(String, Vec<Expr>, Vec<String>)> {
+        let mut fields = Vec::new();
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expr::Field { base, field } => {
+                    fields.push(field.clone());
+                    cur = base;
+                }
+                Expr::ArrayAccess { name, indices }
+                | Expr::FnCall {
+                    name,
+                    args: indices,
+                } => {
+                    fields.reverse();
+                    return Some((name.clone(), indices.clone(), fields));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Split a field-access expression into its base variable and field path.
+    fn flatten_field_path(expr: &Expr) -> Option<(String, Vec<String>)> {
+        let mut fields = Vec::new();
+        let mut cur = expr;
+        loop {
+            match cur {
+                Expr::Field { base, field } => {
+                    fields.push(field.clone());
+                    cur = base;
+                }
+                Expr::Variable(name) => {
+                    fields.reverse();
+                    return Some((name.clone(), fields));
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// Result type of a field access.
+    fn field_expr_type(&self, expr: &Expr) -> DataType {
+        let (name, fields) = match Self::flatten_indexed_field_path(expr) {
+            Some((n, _, f)) => (n, f),
+            None => match Self::flatten_field_path(expr) {
+                Some(v) => v,
+                None => return DataType::Double,
+            },
+        };
+        let scope = match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        };
+        let Some(mut ty) = self.symbols.typed_var(&scope, &name).cloned() else {
+            return DataType::Double;
+        };
+        for field in &fields {
+            let TypeRef::Record(rec) = &ty else {
+                return DataType::Double;
+            };
+            let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                return DataType::Double;
+            };
+            let Some(f) = info.field(field) else {
+                return DataType::Double;
+            };
+            ty = f.ty.clone();
+        }
+        Self::data_type_of(&ty)
+    }
+
+    /// The value representation of a declared type.
+    fn data_type_of(ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => DataType::Integer,
+            TypeRef::Long => DataType::Long,
+            TypeRef::Single => DataType::Single,
+            TypeRef::Double => DataType::Double,
+            TypeRef::FixedString(_) => DataType::String,
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
+    /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
+    fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
+        let ty = self.typed_var(name)?;
+        self.record_elem_words
+            .contains_key(&name.to_uppercase())
+            .then_some(ty)
+    }
+
+    /// Load or store a field of an array element.
+    ///
+    /// The element address is computed into `rax` and kept in `rcx`, and the
+    /// field is reached at a fixed byte offset from it. Unlike a scalar record,
+    /// this address is not known until run time, so it cannot go through `Loc`.
+    fn gen_array_field(&mut self, target: &LValue, value: Option<&Expr>) -> DataType {
+        let indices = target.indices.clone().unwrap_or_default();
+        let Some(mut ty) = self.array_elem_type(&target.name) else {
+            unreachable!("sema checked this is an array of records")
+        };
+
+        // Walk the field path for its byte offset and final type.
+        let mut byte_offset = 0i32;
+        for field in &target.fields {
+            let TypeRef::Record(rec) = &ty else {
+                unreachable!("sema checked the field path")
+            };
+            let info = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())
+                .expect("sema checked the type exists");
+            let f = info.field(field).expect("sema checked the field exists");
+            byte_offset += f.word * 8;
+            ty = f.ty.clone();
+        }
+
+        match value {
+            None => {
+                self.gen_array_addr(&target.name, &indices);
+                let loc = Loc::Frame(0); // placeholder, replaced below
+                let _ = loc;
+                self.emit(&format!("    add rax, {}", byte_offset));
+                self.gen_load_indirect("rax", &ty)
+            }
+            Some(v) => {
+                // Evaluate the value first, then the address, since computing
+                // the address clobbers the value registers.
+                let vt = self.gen_expr(v);
+                if Self::data_type_of(&ty) == DataType::String {
+                    self.emit_string_copy();
+                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    self.emit("    mov QWORD PTR [rsp], rax");
+                    self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                } else {
+                    self.gen_coercion(vt, DataType::Double);
+                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    self.emit("    movsd QWORD PTR [rsp], xmm0");
+                }
+
+                self.gen_array_addr(&target.name, &indices);
+                self.emit(&format!("    add rax, {}", byte_offset));
+                self.emit("    mov rcx, rax");
+
+                if Self::data_type_of(&ty) == DataType::String {
+                    self.emit("    mov rax, QWORD PTR [rsp]");
+                    self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+                    self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+                    self.emit("    mov QWORD PTR [rcx], rax");
+                    self.emit("    mov QWORD PTR [rcx + 8], rdx");
+                } else {
+                    self.emit("    movsd xmm0, QWORD PTR [rsp]");
+                    self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+                    self.gen_coercion(DataType::Double, Self::data_type_of(&ty));
+                    match ty {
+                        TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+                        TypeRef::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+                        TypeRef::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+                        _ => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+                    }
+                }
+                DataType::Double
+            }
+        }
+    }
+
+    /// Load a scalar of the given declared type from the address in `reg`.
+    fn gen_load_indirect(&mut self, reg: &str, ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => {
+                self.emit(&format!("    movsx eax, WORD PTR [{}]", reg));
+                DataType::Integer
+            }
+            TypeRef::Long => {
+                self.emit(&format!("    mov eax, DWORD PTR [{}]", reg));
+                DataType::Long
+            }
+            TypeRef::Single => {
+                self.emit(&format!("    movss xmm0, DWORD PTR [{}]", reg));
+                DataType::Single
+            }
+            TypeRef::Double => {
+                self.emit(&format!("    movsd xmm0, QWORD PTR [{}]", reg));
+                DataType::Double
+            }
+            TypeRef::FixedString(_) => {
+                self.emit(&format!("    mov rcx, {}", reg));
+                self.emit("    mov rax, QWORD PTR [rcx]");
+                self.emit("    mov rdx, QWORD PTR [rcx + 8]");
+                DataType::String
+            }
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
+    /// Find an already-allocated variable slot, without creating one.
+    fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
+        if self.current_proc.is_some() {
+            if let Some(info) = self.proc_vars.get(name) {
+                return Some(info);
+            }
+        }
+        self.vars.get(name)
+    }
+
+    /// Whether `name` already has ordinary variable storage.
+    ///
+    /// A parameter declared `N AS INTEGER` is spilled into a normal frame slot
+    /// by the prologue, so it must not also be treated as typed storage; a
+    /// record parameter is the opposite, and is registered in `record_vars`.
+    fn has_plain_slot(&self, name: &str) -> bool {
+        (self.current_proc.is_some() && self.proc_vars.contains_key(name))
+            || self.vars.contains_key(name)
+    }
+
+    /// Typed storage for a variable declared with `AS`, if that is where it
+    /// actually lives.
+    fn typed_storage(&mut self, name: &str) -> Option<(Loc, TypeRef)> {
+        if self.has_plain_slot(name) && !self.record_vars.contains_key(name) {
+            return None;
+        }
+        let ty = self.typed_var(name)?;
+        let loc = self.get_record_loc(name, &ty);
+        Some((loc, ty))
+    }
+
+    /// Declared type of a variable, when it was given one with `DIM ... AS`.
+    fn typed_var(&self, name: &str) -> Option<TypeRef> {
+        if let Some(t) = self.proc_types.get(name) {
+            return Some(t.clone());
+        }
+        let scope = match &self.current_proc {
+            Some(p) => SemaScope::Proc(p.clone()),
+            None => SemaScope::Module,
+        };
+        self.symbols.typed_var(&scope, name).cloned()
+    }
+
+    /// Resolve `base.field...` to a storage location and the field's type.
+    ///
+    /// Records are laid out as consecutive 8-byte words, so a field is reached
+    /// the same way a variable is: a base location plus a word offset. That
+    /// keeps every existing load and store site working unchanged.
+    fn resolve_field_path(&mut self, name: &str, fields: &[String]) -> Option<(Loc, TypeRef)> {
+        let mut ty = self.typed_var(name)?;
+        let mut loc = self.get_record_loc(name, &ty);
+
+        for field in fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            let info = self.symbols.records.get(&rec.to_uppercase())?;
+            let f = info.field(field)?;
+            loc = loc.offset_words(f.word);
+            ty = f.ty.clone();
+        }
+        Some((loc, ty))
+    }
+
+    /// Storage for a variable declared with `DIM ... AS`, allocating it the
+    /// first time it is seen.
+    fn get_record_loc(&mut self, name: &str, ty: &TypeRef) -> Loc {
+        if let Some(info) = self.record_vars.get(name) {
+            return info.clone();
+        }
+        let words = self.symbols.type_words(ty);
+        let loc = if self.current_proc.is_some() {
+            self.stack_offset -= 8 * words;
+            Loc::Frame(self.stack_offset)
+        } else {
+            Loc::Global(format!("_rec_{}", mangle(name)))
+        };
+        self.record_vars.insert(name.to_string(), loc.clone());
+        if let Loc::Global(_) = loc {
+            self.record_globals.insert(name.to_string(), words);
+        }
+        loc
+    }
+
+    /// Load a scalar of the given declared type from `loc`.
+    fn gen_load_typed(&mut self, loc: &Loc, ty: &TypeRef) -> DataType {
+        match ty {
+            TypeRef::Integer => {
+                self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
+                DataType::Integer
+            }
+            TypeRef::Long => {
+                self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
+                DataType::Long
+            }
+            TypeRef::Single => {
+                self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
+                DataType::Single
+            }
+            TypeRef::Double => {
+                self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
+                DataType::Double
+            }
+            TypeRef::FixedString(_) => {
+                self.emit(&format!("    mov rax, {}", loc.q(0)));
+                self.emit(&format!("    mov rdx, {}", loc.q(1)));
+                DataType::String
+            }
+            // A whole record has no scalar value; sema rejects using one here.
+            TypeRef::Record(_) => DataType::Double,
+        }
+    }
+
+    /// Store a scalar of the given declared type into `loc`.
+    fn gen_store_typed(&mut self, loc: &Loc, ty: &TypeRef, value_type: DataType) {
+        match ty {
+            TypeRef::Integer => {
+                self.gen_coercion(value_type, DataType::Integer);
+                self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
+            }
+            TypeRef::Long => {
+                self.gen_coercion(value_type, DataType::Long);
+                self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+            }
+            TypeRef::Single => {
+                self.gen_coercion(value_type, DataType::Single);
+                self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+            }
+            TypeRef::Double => {
+                self.gen_coercion(value_type, DataType::Double);
+                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+            }
+            TypeRef::FixedString(_) => {
+                self.emit_string_copy();
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
+                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+            }
+            TypeRef::Record(_) => {}
+        }
+    }
+
     /// Store a freshly produced value into an assignment target.
     ///
     /// The value is expected where `gen_expr` leaves it: `rax`/`rdx` for a
@@ -2422,6 +2935,15 @@ impl CodeGen {
     /// computed *after* the value exists, since computing it clobbers `rax`, so
     /// the value is parked on the stack across the address calculation.
     fn gen_store_lvalue(&mut self, target: &LValue) {
+        // A record field is addressed by a base location plus a word offset,
+        // so it stores exactly like a scalar.
+        if !target.fields.is_empty() {
+            if let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields) {
+                self.gen_store_typed(&loc, &ty, DataType::Double);
+                return;
+            }
+        }
+
         let is_string = is_string_var(&target.name);
         if is_string {
             self.emit_string_copy();
@@ -3053,7 +3575,7 @@ impl CodeGen {
             .symbols
             .procs
             .get(&upper)
-            .map(|p| p.params.iter().map(|s| DataType::from_suffix(s)).collect())
+            .map(|p| p.params.iter().map(Self::param_data_type).collect())
             .unwrap_or_default();
 
         let mangled = mangle(&upper);
@@ -3073,9 +3595,36 @@ impl CodeGen {
         let temp_bytes = ((words * 8 + 15) & !15) as i32;
         self.emit(&format!("    sub rsp, {}", temp_bytes));
 
+        let param_decls: Vec<Param> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.clone())
+            .unwrap_or_default();
+
         let mut temp_of: Vec<i32> = Vec::with_capacity(args.len());
         let mut w = 0i32;
-        for (arg, ty) in args.iter().zip(&param_types) {
+        for (i, (arg, ty)) in args.iter().zip(&param_types).enumerate() {
+            // A record argument is passed as the address of the caller's copy.
+            if let Some(Param {
+                ty: Some(TypeRef::Record(_)),
+                ..
+            }) = param_decls.get(i)
+            {
+                if let Expr::Variable(src) = arg {
+                    if let Some(src_ty) = self.typed_var(src) {
+                        let src_loc = self.get_record_loc(src, &src_ty);
+                        match &src_loc {
+                            Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
+                            Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                        }
+                        self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                        temp_of.push(w * 8);
+                        w += 1;
+                        continue;
+                    }
+                }
+            }
             let arg_type = self.gen_expr(arg);
             if *ty == DataType::String {
                 self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
@@ -3152,7 +3701,7 @@ impl CodeGen {
     /// With `preserve`, the block is grown with realloc and the new tail
     /// zeroed; otherwise fresh zeroed storage is allocated.
     fn gen_array_alloc(&mut self, arr: &ArrayDecl, preserve: bool) {
-        let elem_size = Self::elem_size(&arr.name);
+        let elem_size = self.elem_size_for(&arr.name);
         let ndims = arr.dimensions.len();
 
         // Reuse the existing descriptor, or reserve one. A module-level array
@@ -3260,7 +3809,7 @@ impl CodeGen {
     fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
         let arr_info = self.lookup_array(name).expect("Array not declared");
         let loc = arr_info.loc.clone();
-        let elem_size = Self::elem_size(name);
+        let elem_size = self.elem_size_for(name);
 
         // A module-level array's descriptor lives in .bss, so its element
         // pointer is null until the DIM executes. Catching that is what turns
@@ -3454,6 +4003,16 @@ impl CodeGen {
                 self.output
                     .push_str(&format!("{}: .zero {}  # {}\n", sym, bytes, name));
             }
+        }
+
+        let record_globals = std::mem::take(&mut self.record_globals);
+        for (name, words) in &record_globals {
+            self.output.push_str(&format!(
+                "_rec_{}: .zero {}  # {} (record)\n",
+                mangle(name),
+                words * 8,
+                name
+            ));
         }
 
         let mut arrays: Vec<(&String, &ArrayInfo)> = self.arrays.iter().collect();

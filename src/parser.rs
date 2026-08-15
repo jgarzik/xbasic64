@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::Token;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Binary operator precedence levels (higher = tighter binding)
 /// Returns (precedence, BinaryOp) or None if not a binary operator
@@ -128,12 +128,12 @@ pub enum StmtKind {
     },
     Sub {
         name: String,
-        params: Vec<String>,
+        params: Vec<Param>,
         body: Vec<Stmt>,
     },
     Function {
         name: String,
-        params: Vec<String>,
+        params: Vec<Param>,
         body: Vec<Stmt>,
     },
     Call {
@@ -162,6 +162,23 @@ pub enum StmtKind {
     ExitProc,
     /// `OPTION BASE 0|1` -- lowest subscript for arrays declared after it.
     OptionBase(i64),
+    /// `TYPE name ... END TYPE` -- a user-defined record type.
+    TypeDef {
+        name: String,
+        fields: Vec<FieldDecl>,
+    },
+    /// `v.field = value` -- assign to a record field.
+    FieldAssign {
+        target: LValue,
+        value: Expr,
+    },
+    /// `DIM v AS T` -- declare a variable of a user-defined or built-in type.
+    DimTyped {
+        name: String,
+        ty: TypeRef,
+        /// Array bounds, when declaring an array of this type.
+        dimensions: Option<Vec<Expr>>,
+    },
     Data(Vec<Literal>),
     Read(Vec<LValue>),
     Restore(Option<GotoTarget>),
@@ -211,6 +228,35 @@ pub enum PrintItem {
     Empty, // semicolon = no separator
 }
 
+/// A declared type: one of the built-ins, or a user-defined record.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeRef {
+    Integer,
+    Long,
+    Single,
+    Double,
+    /// `STRING * n` -- a fixed-length string field.
+    FixedString(usize),
+    /// A user-defined TYPE, by name.
+    Record(String),
+}
+
+/// One procedure parameter.
+#[derive(Debug, Clone)]
+pub struct Param {
+    pub name: String,
+    /// Declared type from an `AS` clause; `None` means the type comes from the
+    /// name's suffix, as it always has.
+    pub ty: Option<TypeRef>,
+}
+
+/// One field of a user-defined TYPE.
+#[derive(Debug, Clone)]
+pub struct FieldDecl {
+    pub name: String,
+    pub ty: TypeRef,
+}
+
 /// A target that can be assigned to: a variable, or one array element.
 ///
 /// Introduced so that statements which read into a variable -- INPUT, LINE
@@ -222,6 +268,8 @@ pub struct LValue {
     pub name: String,
     /// Subscripts, when the target is an array element.
     pub indices: Option<Vec<Expr>>,
+    /// Record field path, e.g. `p.origin.x` gives ["ORIGIN", "X"].
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +304,11 @@ pub enum Expr {
     FnCall {
         name: String,
         args: Vec<Expr>,
+    },
+    /// Record field access: `v.field`
+    Field {
+        base: Box<Expr>,
+        field: String,
     },
 }
 
@@ -482,6 +535,8 @@ pub struct Parser {
     /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
     /// start of a line is not mistaken for a label definition.
     declared_procs: HashSet<String>,
+    /// Declared result types from `FUNCTION f AS T`.
+    function_types: HashMap<String, TypeRef>,
 }
 
 impl Parser {
@@ -663,6 +718,7 @@ impl Parser {
             Token::On => self.parse_on_goto(),
             Token::Dim => self.parse_dim(),
             Token::Redim => self.parse_redim(),
+            Token::Type => self.parse_type_def(),
             Token::Sub => self.parse_sub(),
             Token::Function => self.parse_function(),
             Token::Data => self.parse_data(),
@@ -1032,7 +1088,25 @@ impl Parser {
         } else {
             None
         };
-        Ok(LValue { name, indices })
+        // A record field path may follow: v.field.sub
+        let mut fields = Vec::new();
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Token::Ident(f) => fields.push(f),
+                tok => {
+                    return err(format!(
+                        "Expected a field name after '.', got {}",
+                        describe_token(&tok)
+                    ));
+                }
+            }
+        }
+        Ok(LValue {
+            name,
+            indices,
+            fields,
+        })
     }
 
     fn parse_let(&mut self) -> PResult<StmtKind> {
@@ -1074,6 +1148,33 @@ impl Parser {
             return err("Expected identifier");
         };
 
+        // A record field assignment: v.field... = value
+        if matches!(self.peek(), Token::Dot) {
+            let mut fields = Vec::new();
+            while matches!(self.peek(), Token::Dot) {
+                self.advance();
+                match self.advance() {
+                    Token::Ident(f) => fields.push(f),
+                    tok => {
+                        return err(format!(
+                            "Expected a field name after '.', got {}",
+                            describe_token(&tok)
+                        ));
+                    }
+                }
+            }
+            self.expect(Token::Eq)?;
+            let value = self.parse_expression()?;
+            return Ok(StmtKind::FieldAssign {
+                target: LValue {
+                    name,
+                    indices: None,
+                    fields,
+                },
+                value,
+            });
+        }
+
         // Check for array subscript or function call
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -1082,6 +1183,33 @@ impl Parser {
             // Look ahead to see if there's an = after )
             let args = self.parse_expr_list()?;
             self.expect(Token::RParen)?;
+
+            // arr(i).field... = value
+            if matches!(self.peek(), Token::Dot) {
+                let mut fields = Vec::new();
+                while matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                    match self.advance() {
+                        Token::Ident(f) => fields.push(f),
+                        tok => {
+                            return err(format!(
+                                "Expected a field name after '.', got {}",
+                                describe_token(&tok)
+                            ));
+                        }
+                    }
+                }
+                self.expect(Token::Eq)?;
+                let value = self.parse_expression()?;
+                return Ok(StmtKind::FieldAssign {
+                    target: LValue {
+                        name,
+                        indices: Some(args),
+                        fields,
+                    },
+                    value,
+                });
+            }
 
             if matches!(self.peek(), Token::Eq) {
                 self.advance();
@@ -1140,10 +1268,12 @@ impl Parser {
             Expr::Variable(name) => LValue {
                 name,
                 indices: None,
+                fields: Vec::new(),
             },
             Expr::ArrayAccess { name, indices } => LValue {
                 name,
                 indices: Some(indices),
+                fields: Vec::new(),
             },
             _ => return err("MID$ assignment requires a string variable"),
         };
@@ -1466,9 +1596,34 @@ impl Parser {
                 return err("Expected an array name");
             };
 
+            // `DIM v AS T` and `DIM v(bounds) AS T` declare a typed variable
+            // rather than an untyped array.
+            if matches!(self.peek(), Token::As) {
+                self.advance();
+                let ty = self.parse_type_ref()?;
+                return Ok(StmtKind::DimTyped {
+                    name,
+                    ty,
+                    dimensions: None,
+                });
+            }
+
             self.expect(Token::LParen)?;
             let dimensions = self.parse_expr_list()?;
             self.expect(Token::RParen)?;
+
+            if matches!(self.peek(), Token::As) {
+                self.advance();
+                let ty = self.parse_type_ref()?;
+                // Register it so that `name(i)` parses as an array access
+                // rather than a function call.
+                self.declared_arrays.insert(name.to_uppercase());
+                return Ok(StmtKind::DimTyped {
+                    name,
+                    ty,
+                    dimensions: Some(dimensions),
+                });
+            }
 
             // Track this array name for later use in parse_primary
             self.declared_arrays.insert(name.to_uppercase());
@@ -1500,6 +1655,79 @@ impl Parser {
         Ok(StmtKind::Redim { arrays, preserve })
     }
 
+    /// Parse a type name in an `AS` clause.
+    ///
+    /// The built-in type names are matched here rather than made keywords: as
+    /// keywords they would collide with ordinary uses of the same words, and
+    /// both `FUNCTION Double(X)` and `STRING$(...)` are real programs.
+    fn parse_type_ref(&mut self) -> PResult<TypeRef> {
+        let Token::Ident(name) = self.advance() else {
+            return err("Expected a type name");
+        };
+        match name.to_uppercase().as_str() {
+            "INTEGER" => Ok(TypeRef::Integer),
+            "LONG" => Ok(TypeRef::Long),
+            "SINGLE" => Ok(TypeRef::Single),
+            "DOUBLE" => Ok(TypeRef::Double),
+            "STRING" => {
+                // STRING * n declares a fixed-length field.
+                if matches!(self.peek(), Token::Star) {
+                    self.advance();
+                    match self.advance() {
+                        Token::Integer(n) if n > 0 => Ok(TypeRef::FixedString(n as usize)),
+                        tok => err(format!(
+                            "Expected a positive length after STRING *, got {}",
+                            describe_token(&tok)
+                        )),
+                    }
+                } else {
+                    err("A STRING field needs a fixed length, as in STRING * 20")
+                }
+            }
+            _ => Ok(TypeRef::Record(name)),
+        }
+    }
+
+    /// `TYPE name` ... `END TYPE`
+    fn parse_type_def(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume TYPE
+        let name = if let Token::Ident(n) = self.advance() {
+            n
+        } else {
+            return err("Expected a type name after TYPE");
+        };
+        self.skip_newlines();
+
+        let mut fields = Vec::new();
+        loop {
+            // END TYPE, in either spelling, closes the definition.
+            if matches!(self.peek(), Token::EndType) {
+                self.advance();
+                break;
+            }
+            if matches!(self.peek(), Token::End) && matches!(self.peek_at(1), Token::Type) {
+                self.advance();
+                self.advance();
+                break;
+            }
+            if matches!(self.peek(), Token::Eof) {
+                return err(format!("TYPE '{}' is missing its END TYPE", name));
+            }
+
+            let field = if let Token::Ident(f) = self.advance() {
+                f
+            } else {
+                return err("Expected a field name");
+            };
+            self.expect(Token::As)?;
+            let ty = self.parse_type_ref()?;
+            fields.push(FieldDecl { name: field, ty });
+            self.skip_newlines();
+        }
+
+        Ok(StmtKind::TypeDef { name, fields })
+    }
+
     fn parse_sub(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume SUB
         let name = if let Token::Ident(n) = self.advance() {
@@ -1517,6 +1745,19 @@ impl Parser {
             Vec::new()
         };
 
+        // `FUNCTION f AS T` gives the result a declared type.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+            let ty = self.parse_type_ref()?;
+            if let TypeRef::Record(r) = &ty {
+                return err(format!(
+                    "a FUNCTION cannot return the record type '{}'; use a SUB with a record parameter",
+                    r
+                ));
+            }
+            self.function_types.insert(name.to_uppercase(), ty);
+        }
+
         self.skip_newlines();
 
         let mut body = Vec::new();
@@ -1532,6 +1773,7 @@ impl Parser {
         Ok(StmtKind::Sub { name, params, body })
     }
 
+    /// `FUNCTION name(params)` ... `END FUNCTION`
     fn parse_function(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume FUNCTION
         let name = if let Token::Ident(n) = self.advance() {
@@ -1549,6 +1791,19 @@ impl Parser {
             Vec::new()
         };
 
+        // `FUNCTION f AS T` gives the result a declared type.
+        if matches!(self.peek(), Token::As) {
+            self.advance();
+            let ty = self.parse_type_ref()?;
+            if let TypeRef::Record(r) = &ty {
+                return err(format!(
+                    "a FUNCTION cannot return the record type '{}'; use a SUB with a record parameter",
+                    r
+                ));
+            }
+            self.function_types.insert(name.to_uppercase(), ty);
+        }
+
         self.skip_newlines();
 
         let mut body = Vec::new();
@@ -1564,11 +1819,18 @@ impl Parser {
         Ok(StmtKind::Function { name, params, body })
     }
 
-    fn parse_param_list(&mut self) -> PResult<Vec<String>> {
+    fn parse_param_list(&mut self) -> PResult<Vec<Param>> {
         let mut params = Vec::new();
         while let Token::Ident(name) = self.peek().clone() {
             self.advance();
-            params.push(name);
+            // `name AS Type` declares a typed parameter, including a record.
+            let ty = if matches!(self.peek(), Token::As) {
+                self.advance();
+                Some(self.parse_type_ref()?)
+            } else {
+                None
+            };
+            params.push(Param { name, ty });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
@@ -1709,6 +1971,28 @@ impl Parser {
 
     /// Precedence-climbing parser for binary expressions
     /// min_prec: minimum precedence level to parse at this level
+    /// Consume any `.field` chain following an expression.
+    fn parse_field_chain(&mut self, mut base: Expr) -> PResult<Expr> {
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Token::Ident(field) => {
+                    base = Expr::Field {
+                        base: Box::new(base),
+                        field,
+                    }
+                }
+                tok => {
+                    return err(format!(
+                        "Expected a field name after '.', got {}",
+                        describe_token(&tok)
+                    ));
+                }
+            }
+        }
+        Ok(base)
+    }
+
     fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
         // Handle NOT prefix operator (binds tighter than binary ops)
         let mut left = if matches!(self.peek(), Token::Not) {
@@ -1784,16 +2068,17 @@ impl Parser {
                     self.expect(Token::RParen)?;
 
                     // Distinguish array access from function call based on DIM declarations
-                    if self.declared_arrays.contains(&name.to_uppercase()) {
-                        Ok(Expr::ArrayAccess {
+                    let base = if self.declared_arrays.contains(&name.to_uppercase()) {
+                        Expr::ArrayAccess {
                             name,
                             indices: args,
-                        })
+                        }
                     } else {
-                        Ok(Expr::FnCall { name, args })
-                    }
+                        Expr::FnCall { name, args }
+                    };
+                    self.parse_field_chain(base)
                 } else {
-                    Ok(Expr::Variable(name))
+                    self.parse_field_chain(Expr::Variable(name))
                 }
             }
             Token::LParen => {

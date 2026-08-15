@@ -198,3 +198,123 @@ A% = 10: B& = 20: C! = 0.5: D# = 100.0: PRINT A% + B& * C! + D#
     assert_eq!(lines[5], "1024", "single^double");
     assert_eq!(lines[6], "120", "mixed expression");
 }
+
+/// User-defined TYPE records: declaration, field access, and mixed field types.
+#[test]
+fn test_type_records() {
+    let output = compile_and_run(
+        "TYPE Rec\nI AS INTEGER\nL AS LONG\nS AS SINGLE\nD AS DOUBLE\nN AS STRING * 20\nEND TYPE\nDIM R AS Rec\nPRINT R.I\nR.I = 7\nR.L = 100000\nR.S = 2.5\nR.D = 1.25\nR.N = \"hello\"\nPRINT R.I; R.L; R.S; R.D\nPRINT R.N; LEN(R.N)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "0", "a record starts zeroed");
+    assert_eq!(lines[1], "71000002.51.25", "each field keeps its own type");
+    assert_eq!(lines[2], "hello5");
+}
+
+/// A TYPE may contain another TYPE, to any depth.
+#[test]
+fn test_nested_records() {
+    let output = compile_and_run(
+        "TYPE Point\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nTYPE Rect\nTL AS Point\nBR AS Point\nEND TYPE\nDIM B AS Rect\nB.TL.X = 1\nB.TL.Y = 2\nB.BR.X = 9\nB.BR.Y = 8\nPRINT B.TL.X; B.TL.Y; B.BR.X; B.BR.Y\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1298");
+}
+
+/// Assigning one record to another copies it, rather than aliasing.
+#[test]
+fn test_whole_record_assignment() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A AS P\nDIM B AS P\nB.X = 3\nB.Y = 4\nA = B\nPRINT A.X; A.Y\nB.X = 99\nPRINT A.X\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["34", "3"], "A kept its own copy");
+}
+
+/// Arrays of records, including a nested field and a string field.
+#[test]
+fn test_arrays_of_records() {
+    let output = compile_and_run(
+        "TYPE Person\nNM AS STRING * 20\nAGE AS INTEGER\nEND TYPE\nDIM P(2) AS Person\nP(0).NM = \"Alice\"\nP(0).AGE = 30\nP(1).NM = \"Bob\"\nP(1).AGE = 25\nPRINT P(0).NM; P(0).AGE\nPRINT P(1).NM; P(1).AGE\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["Alice30", "Bob25"]);
+}
+
+/// A record array indexed by a loop variable.
+#[test]
+fn test_record_array_in_loop() {
+    let output = compile_and_run(
+        "TYPE P\nN AS INTEGER\nEND TYPE\nDIM A(4) AS P\nFOR I = 0 TO 4\nA(I).N = I * I\nNEXT I\nFOR I = 0 TO 4\nPRINT A(I).N;\nNEXT I\nPRINT \"\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "014916");
+}
+
+/// A module-level record is shared with procedures, like any other global.
+#[test]
+fn test_record_visible_in_procedure() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB Bump\nG.X = G.X + 1\nEND SUB\nG.X = 5\nBump\nBump\nPRINT G.X\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "7");
+}
+
+/// A record declared inside a procedure is local to it and zeroed each call.
+#[test]
+fn test_local_record_is_fresh_each_call() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nSUB T\nDIM L AS P\nPRINT L.X\nL.X = 9\nEND SUB\nT\nT\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["0", "0"]);
+}
+
+/// A record is passed to a procedure by value: the callee gets the address of
+/// the caller's copy and copies it into a local slot, so changes do not escape.
+#[test]
+fn test_record_parameters() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["78", "7"], "the caller's record is unchanged");
+}
+
+/// A record parameter mixed with ordinary ones, and a nested record.
+#[test]
+fn test_record_parameter_mixed_and_nested() {
+    let output = compile_and_run(
+        "TYPE Pt\nX AS INTEGER\nEND TYPE\nTYPE Bx\nTL AS Pt\nEND TYPE\nSUB T(A, V AS Bx, B)\nPRINT A; V.TL.X; B\nEND SUB\nDIM Q AS Bx\nQ.TL.X = 5\nT(1, Q, 2)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "152");
+}
+
+/// `AS` also gives a plain variable or parameter a declared type.
+#[test]
+fn test_as_typed_variables() {
+    let output = compile_and_run(
+        "DIM N AS INTEGER\nDIM S AS STRING * 10\nN = 42\nS = \"hi\"\nPRINT N; S\nPRINT N * 2\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["42hi", "84"]);
+}
+
+/// A typed parameter, and a FUNCTION with a declared result type.
+#[test]
+fn test_as_typed_parameters_and_result() {
+    let output = compile_and_run(
+        "SUB T(N AS INTEGER, S AS STRING * 10)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["7hi", "42"]);
+}

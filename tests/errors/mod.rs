@@ -500,3 +500,29 @@ fn test_redim_rules() {
         "may only change its last dimension",
     );
 }
+
+/// TYPE declarations and uses are checked.
+#[test]
+fn test_type_rules() {
+    expect_rejected(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\nPRINT Q.Z\n",
+        "TYPE 'P' has no field 'Z'",
+    );
+    expect_rejected("DIM Q AS NoSuch\n", "undefined TYPE 'NOSUCH'");
+    expect_rejected("A = 1\nPRINT A.X\n", "is not a record variable");
+    expect_rejected(
+        "TYPE P\nX AS INTEGER\nX AS LONG\nEND TYPE\n",
+        "is declared twice",
+    );
+    expect_rejected("TYPE P\nQ AS P\nEND TYPE\n", "cannot contain itself");
+    expect_rejected(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nTYPE Q\nY AS INTEGER\nEND TYPE\nDIM A AS P\nDIM B AS Q\nA = B\n",
+        "can only be assigned another P record",
+    );
+    // A record-returning FUNCTION would need the caller to provide storage;
+    // rejected rather than miscompiled.
+    expect_rejected(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nFUNCTION Make AS P\nEND FUNCTION\n",
+        "cannot return the record type",
+    );
+}

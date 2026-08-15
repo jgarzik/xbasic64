@@ -68,6 +68,8 @@ static KEYWORDS: LazyLock<HashMap<&'static str, Token>> = LazyLock::new(|| {
         ("BASE", Token::Base),
         ("REDIM", Token::Redim),
         ("PRESERVE", Token::Preserve),
+        ("TYPE", Token::Type),
+        ("ENDTYPE", Token::EndType),
     ])
 });
 
@@ -139,6 +141,8 @@ pub enum Token {
     Base,
     Redim,
     Preserve,
+    Type,
+    EndType,
 
     // Operators
     Plus,
@@ -161,6 +165,7 @@ pub enum Token {
     Semicolon,
     Colon,
     Hash,
+    Dot,
 
     // Special
     Newline,
@@ -414,6 +419,10 @@ impl<'a> Lexer<'a> {
             '(' => Ok(Token::LParen),
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
+            // A '.' outside a number separates a record variable from a field.
+            // Numbers consume their own '.' in read_number, so this only fires
+            // for field access.
+            '.' => Ok(Token::Dot),
             ';' => Ok(Token::Semicolon),
             ':' => Ok(Token::Colon),
             '#' => Ok(Token::Hash),

@@ -83,8 +83,40 @@ fn builtin(name: &str) -> Option<&'static (&'static str, usize, usize)> {
 #[derive(Debug, Clone)]
 pub struct ProcInfo {
     pub is_function: bool,
-    pub params: Vec<String>,
+    pub params: Vec<Param>,
     pub line: u32,
+}
+
+/// Layout of one field within a record.
+#[derive(Debug, Clone)]
+pub struct FieldInfo {
+    /// Offset from the start of the record, in 8-byte words.
+    pub word: i32,
+    pub ty: TypeRef,
+}
+
+/// A user-defined TYPE, laid out.
+///
+/// Every field occupies a whole number of 8-byte words, matching how scalars
+/// are stored everywhere else, so a field is addressed the same way a variable
+/// is: a base location plus a word offset.
+#[derive(Debug, Clone, Default)]
+pub struct RecordInfo {
+    /// Fields in declaration order, by upper-case name.
+    pub fields: Vec<(String, FieldInfo)>,
+    /// Total size in 8-byte words.
+    pub words: i32,
+    pub line: u32,
+}
+
+impl RecordInfo {
+    pub fn field(&self, name: &str) -> Option<&FieldInfo> {
+        let upper = name.to_uppercase();
+        self.fields
+            .iter()
+            .find(|(n, _)| *n == upper)
+            .map(|(_, f)| f)
+    }
 }
 
 /// An array declaration.
@@ -114,9 +146,41 @@ pub struct Symbols {
     pub consts: HashMap<String, Literal>,
     /// Lowest legal subscript, set by OPTION BASE. Defaults to 0.
     pub option_base: i64,
+    /// User-defined TYPEs, by upper-case name.
+    pub records: HashMap<String, RecordInfo>,
+    /// Variables declared with `DIM ... AS`, by (scope, upper-case name).
+    pub typed_vars: HashMap<(Scope, String), TypeRef>,
 }
 
 impl Symbols {
+    /// Size of a declared type, in 8-byte words.
+    ///
+    /// A string field is a (pointer, length) pair, so two words; a fixed-length
+    /// string is stored the same way, with its declared length used only to
+    /// pad or truncate on assignment.
+    pub fn type_words(&self, ty: &TypeRef) -> i32 {
+        match ty {
+            TypeRef::Integer | TypeRef::Long | TypeRef::Single | TypeRef::Double => 1,
+            TypeRef::FixedString(_) => 2,
+            TypeRef::Record(name) => self
+                .records
+                .get(&name.to_uppercase())
+                .map(|r| r.words)
+                .unwrap_or(1),
+        }
+    }
+
+    /// Look up a variable's declared type, preferring the current scope.
+    pub fn typed_var(&self, scope: &Scope, name: &str) -> Option<&TypeRef> {
+        let upper = name.to_uppercase();
+        if let Scope::Proc(_) = scope {
+            if let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone())) {
+                return Some(t);
+            }
+        }
+        self.typed_vars.get(&(Scope::Module, upper))
+    }
+
     /// Look up an array visible from `scope`: a procedure-local declaration
     /// shadows a module-level one of the same name.
     pub fn lookup_array(&self, scope: &Scope, name: &str) -> Option<&ArrayInfo> {
@@ -194,6 +258,92 @@ impl Analyzer {
                 StmtKind::LabelName(name) => {
                     if !self.symbols.labels.insert(name.clone()) {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
+                    }
+                }
+                StmtKind::TypeDef { name, fields } => {
+                    let upper = name.to_uppercase();
+                    if let Some(prev) = self.symbols.records.get(&upper) {
+                        let prev_line = prev.line;
+                        self.error_with_note(
+                            stmt.line,
+                            format!("TYPE '{}' is already defined", name),
+                            format!("previous definition is on line {}", prev_line),
+                        );
+                    }
+                    if scope != &Scope::Module {
+                        self.error(
+                            stmt.line,
+                            format!("TYPE '{}' must be defined at module level", name),
+                        );
+                    }
+                    // Lay the record out now. A field whose type is another
+                    // record needs that one already defined, which is also what
+                    // makes a cycle impossible.
+                    let mut info = RecordInfo {
+                        line: stmt.line,
+                        ..Default::default()
+                    };
+                    for f in fields {
+                        let fu = f.name.to_uppercase();
+                        if info.field(&fu).is_some() {
+                            self.error(
+                                stmt.line,
+                                format!("field '{}' is declared twice in TYPE '{}'", f.name, name),
+                            );
+                            continue;
+                        }
+                        if let TypeRef::Record(inner) = &f.ty {
+                            let iu = inner.to_uppercase();
+                            if iu == upper {
+                                self.error(
+                                    stmt.line,
+                                    format!("TYPE '{}' cannot contain itself", name),
+                                );
+                                continue;
+                            }
+                            if !self.symbols.records.contains_key(&iu) {
+                                self.error(
+                                    stmt.line,
+                                    format!("field '{}' uses undefined TYPE '{}'", f.name, inner),
+                                );
+                                continue;
+                            }
+                        }
+                        let words = self.symbols.type_words(&f.ty);
+                        info.fields.push((
+                            fu,
+                            FieldInfo {
+                                word: info.words,
+                                ty: f.ty.clone(),
+                            },
+                        ));
+                        info.words += words;
+                    }
+                    self.symbols.records.insert(upper, info);
+                }
+                StmtKind::DimTyped {
+                    name,
+                    ty,
+                    dimensions,
+                } => {
+                    if let TypeRef::Record(r) = ty {
+                        if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                            self.error(stmt.line, format!("undefined TYPE '{}'", r));
+                        }
+                    }
+                    let key = (scope.clone(), name.to_uppercase());
+                    if self.symbols.typed_vars.contains_key(&key) {
+                        self.error(stmt.line, format!("'{}' is already declared", name));
+                    }
+                    self.symbols.typed_vars.insert(key.clone(), ty.clone());
+                    if let Some(dims) = dimensions {
+                        self.symbols.arrays.insert(
+                            key,
+                            ArrayInfo {
+                                rank: dims.len(),
+                                line: stmt.line,
+                            },
+                        );
                     }
                 }
                 StmtKind::OptionBase(n) => {
@@ -279,6 +429,27 @@ impl Analyzer {
                             line: stmt.line,
                         },
                     );
+                    // A parameter with an AS clause is a typed variable inside
+                    // the body, so field access on it resolves.
+                    for p in params {
+                        if let Some(ty) = &p.ty {
+                            if let TypeRef::Record(r) = ty {
+                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                    self.error(
+                                        stmt.line,
+                                        format!(
+                                            "parameter '{}' uses undefined TYPE '{}'",
+                                            p.name, r
+                                        ),
+                                    );
+                                }
+                            }
+                            self.symbols.typed_vars.insert(
+                                (Scope::Proc(name.clone()), p.name.to_uppercase()),
+                                ty.clone(),
+                            );
+                        }
+                    }
                     self.collect(body, &Scope::Proc(name.clone()));
                 }
                 _ => {
@@ -314,8 +485,44 @@ impl Analyzer {
                     for e in idx {
                         self.check_expr(e, scope, line);
                     }
+                } else if let Some(target_ty) = self.symbols.typed_var(scope, name).cloned() {
+                    if let TypeRef::Record(rname) = &target_ty {
+                        match value {
+                            Expr::Variable(src) => match self.symbols.typed_var(scope, src) {
+                                Some(TypeRef::Record(sname))
+                                    if sname.to_uppercase() == rname.to_uppercase() => {}
+                                _ => self.error(
+                                    line,
+                                    format!(
+                                        "'{}' can only be assigned another {} record",
+                                        name, rname
+                                    ),
+                                ),
+                            },
+                            _ => self.error(
+                                line,
+                                format!("'{}' can only be assigned another {} record", name, rname),
+                            ),
+                        }
+                    }
                 } else {
                     self.check_assign_types(name, value, scope, line);
+                }
+            }
+            StmtKind::FieldAssign { target, value } => {
+                self.check_expr(value, scope, line);
+                // Rebuild the access as an expression to reuse one checker.
+                let mut e = Expr::Variable(target.name.clone());
+                for f in &target.fields {
+                    e = Expr::Field {
+                        base: Box::new(e),
+                        field: f.clone(),
+                    };
+                }
+                if let Some(ty) = self.check_field_path(&e, scope, line) {
+                    if matches!(ty, TypeRef::Record(_)) {
+                        self.error(line, "cannot assign to a whole record; assign its fields");
+                    }
                 }
             }
             StmtKind::Call { name, args } => {
@@ -718,7 +925,55 @@ impl Analyzer {
             Expr::FnCall { name, args } => {
                 self.check_call(name, args, scope, line, false);
             }
+            Expr::Field { .. } => {
+                self.check_field_path(expr, scope, line);
+            }
         }
+    }
+
+    /// Check that a field path names real fields of a real record type.
+    ///
+    /// Returns the field's type when the path resolves.
+    fn check_field_path(&mut self, expr: &Expr, scope: &Scope, line: u32) -> Option<TypeRef> {
+        let (name, fields) = flatten_field_path(expr)?;
+        let Some(mut ty) = self.symbols.typed_var(scope, &name).cloned() else {
+            self.error_with_note(
+                line,
+                format!("'{}' is not a record variable", name),
+                format!("declare it with DIM {} AS <type>", name),
+            );
+            return None;
+        };
+        for field in &fields {
+            let TypeRef::Record(rec) = &ty else {
+                self.error(
+                    line,
+                    format!("'{}' has no fields; it is not a record", name),
+                );
+                return None;
+            };
+            let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                return None;
+            };
+            match info.field(field) {
+                Some(f) => ty = f.ty.clone(),
+                None => {
+                    let known: Vec<&str> = info.fields.iter().map(|(n, _)| n.as_str()).collect();
+                    match closest(&field.to_uppercase(), &known) {
+                        Some(sug) => self.error_with_note(
+                            line,
+                            format!("TYPE '{}' has no field '{}'", rec, field),
+                            format!("did you mean '{}'?", sug),
+                        ),
+                        None => {
+                            self.error(line, format!("TYPE '{}' has no field '{}'", rec, field))
+                        }
+                    }
+                    return None;
+                }
+            }
+        }
+        Some(ty)
     }
 
     /// Reject mixing strings and numbers in an operator that cannot take them.
@@ -782,6 +1037,18 @@ impl Analyzer {
                     self.expr_is_string(left, scope)
                 }
             }
+            Expr::Field { .. } => {
+                let (name, fields) = flatten_field_path(expr)?;
+                let mut ty = self.symbols.typed_var(scope, &name).cloned()?;
+                for field in &fields {
+                    let TypeRef::Record(rec) = &ty else {
+                        return None;
+                    };
+                    let info = self.symbols.records.get(&rec.to_uppercase())?;
+                    ty = info.field(field)?.ty.clone();
+                }
+                Some(matches!(ty, TypeRef::FixedString(_)))
+            }
             Expr::FnCall { name, .. } => {
                 let upper = name.to_uppercase();
                 if self.symbols.lookup_array(scope, &upper).is_some()
@@ -815,6 +1082,27 @@ fn op_name(op: BinaryOp) -> &'static str {
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
         BinaryOp::Xor => "XOR",
+    }
+}
+
+/// Split a field-access expression into its base variable and field path.
+fn flatten_field_path(expr: &Expr) -> Option<(String, Vec<String>)> {
+    let mut fields = Vec::new();
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::Field { base, field } => {
+                fields.push(field.clone());
+                cur = base;
+            }
+            // `arr(i).f` resolves against the array's element type, so the
+            // subscripts do not affect which field is named.
+            Expr::Variable(name) | Expr::ArrayAccess { name, .. } | Expr::FnCall { name, .. } => {
+                fields.reverse();
+                return Some((name.clone(), fields));
+            }
+            _ => return None,
+        }
     }
 }
 
