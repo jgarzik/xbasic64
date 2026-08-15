@@ -92,3 +92,20 @@ fn test_print_using_format_repeats() {
     let output = compile_and_run("PRINT USING \"##;\"; 1; 2; 3\n").unwrap();
     assert_eq!(output.trim(), "1; 2; 3;");
 }
+
+/// TAB() moves to a column and SPC() emits spaces. Both were unimplemented and
+/// failed at link time.
+#[test]
+fn test_tab_and_spc() {
+    let output = compile_and_run(
+        "PRINT TAB(5); \"x\"\nPRINT \"a\"; SPC(3); \"b\"\nPRINT \"ab\"; TAB(10); \"c\"\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "    x", "TAB(5) puts x in column 5");
+    assert_eq!(lines[1], "a   b");
+    assert_eq!(
+        lines[2], "ab       c",
+        "TAB accounts for text already printed"
+    );
+}

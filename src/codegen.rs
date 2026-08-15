@@ -350,6 +350,14 @@ impl Default for Options {
     }
 }
 
+/// A file number, ready to be placed in an argument register.
+enum FileNum {
+    /// A literal, placed directly as an immediate.
+    Imm(i64),
+    /// An evaluated expression, parked in a frame slot.
+    Slot(Loc),
+}
+
 /// One 8-byte physical argument slot in the private `_proc_*` convention.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Slot {
@@ -717,6 +725,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
+            "EOF" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -1282,30 +1291,35 @@ impl CodeGen {
                     self.emit("    call _rt_print_string");
                 }
                 for var in vars {
-                    if is_string_var(var) {
+                    if is_string_var(&var.name) {
                         self.emit("    call _rt_input_string");
-                        let loc = self.get_var_loc(var);
-                        self.emit(&format!("    mov {}, rax", loc.q(0)));
-                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
                     } else {
                         self.emit("    call _rt_input_number");
-                        let loc = self.get_var_loc(var);
-                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
 
-            StmtKind::LineInput { prompt, var } => {
+            StmtKind::LineInput {
+                prompt,
+                var,
+                file_num,
+            } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
                     self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
                     self.emit_arg_imm(1, pstr.len() as i64);
                     self.emit("    call _rt_print_string");
                 }
-                self.emit("    call _rt_input_string");
-                let loc = self.get_var_loc(var);
-                self.emit(&format!("    mov {}, rax", loc.q(0)));
-                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+                match file_num {
+                    Some(e) => {
+                        let fnum = self.gen_file_num(e);
+                        self.emit_arg_file_num(0, &fnum);
+                        self.emit("    call _rt_file_input_string");
+                    }
+                    None => self.emit("    call _rt_input_string"),
+                }
+                self.gen_store_lvalue(var);
             }
 
             StmtKind::If {
@@ -1588,18 +1602,14 @@ impl CodeGen {
 
             StmtKind::Read(vars) => {
                 for var in vars {
-                    if is_string_var(var) {
-                        self.emit("    call _rt_read_string");
-                        let loc = self.get_var_loc(var);
+                    if is_string_var(&var.name) {
                         // _rt_read_string returns (ptr, len); the length used to
                         // be discarded, leaving whatever was in the length word.
-                        self.emit(&format!("    mov {}, rax", loc.q(0)));
-                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
+                        self.emit("    call _rt_read_string");
                     } else {
                         self.emit("    call _rt_read_number");
-                        let loc = self.get_var_loc(var);
-                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
 
@@ -1680,6 +1690,7 @@ impl CodeGen {
                 file_num,
             } => {
                 // _rt_file_open(filename_ptr, filename_len, mode, file_num)
+                let fnum = self.gen_file_num(file_num);
                 self.gen_expr(filename);
                 self.emit_arg_reg(0, "rax"); // filename ptr
                 self.emit_arg_reg(1, "rdx"); // filename len
@@ -1689,14 +1700,19 @@ impl CodeGen {
                     FileMode::Append => 2,
                 };
                 self.emit_arg_imm(2, mode_num);
-                self.emit_arg_imm(3, *file_num as i64);
+                self.emit_arg_file_num(3, &fnum);
                 self.emit("    call _rt_file_open");
             }
 
-            StmtKind::Close { file_num } => {
-                self.emit_arg_imm(0, *file_num as i64);
-                self.emit("    call _rt_file_close");
-            }
+            StmtKind::Close { file_num } => match file_num {
+                Some(e) => {
+                    let fnum = self.gen_file_num(e);
+                    self.emit_arg_file_num(0, &fnum);
+                    self.emit("    call _rt_file_close");
+                }
+                // Bare CLOSE closes every open file.
+                None => self.emit("    call _rt_file_close_all"),
+            },
 
             StmtKind::PrintFile {
                 file_num,
@@ -1716,13 +1732,14 @@ impl CodeGen {
                 newline,
                 ..
             } => {
+                let fnum = self.gen_file_num(file_num);
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
-                            self.gen_print_expr_to_file(expr, *file_num);
+                            self.gen_print_expr_to_file(expr, &fnum);
                         }
                         PrintItem::Tab => {
-                            self.emit_arg_imm(0, *file_num as i64);
+                            self.emit_arg_file_num(0, &fnum);
                             self.emit_arg_imm(1, ASCII_TAB);
                             self.emit("    call _rt_file_print_char");
                         }
@@ -1730,25 +1747,21 @@ impl CodeGen {
                     }
                 }
                 if *newline {
-                    self.emit_arg_imm(0, *file_num as i64);
+                    self.emit_arg_file_num(0, &fnum);
                     self.emit("    call _rt_file_print_newline");
                 }
             }
 
             StmtKind::InputFile { file_num, vars } => {
+                let fnum = self.gen_file_num(file_num);
                 for var in vars {
-                    if is_string_var(var) {
-                        self.emit_arg_imm(0, *file_num as i64);
+                    self.emit_arg_file_num(0, &fnum);
+                    if is_string_var(&var.name) {
                         self.emit("    call _rt_file_input_string");
-                        let loc = self.get_var_loc(var);
-                        self.emit(&format!("    mov {}, rax", loc.q(0)));
-                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
                     } else {
-                        self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_number");
-                        let loc = self.get_var_loc(var);
-                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
+                    self.gen_store_lvalue(var);
                 }
             }
         }
@@ -2138,6 +2151,90 @@ impl CodeGen {
         result_type
     }
 
+    /// Evaluate a file-number expression ahead of a runtime call.
+    ///
+    /// Returns either an immediate (the common `#1` case) or a frame slot
+    /// holding the value. Evaluating it *first*, into a slot, keeps a complex
+    /// expression from clobbering argument registers that have already been
+    /// loaded for the same call.
+    fn gen_file_num(&mut self, e: &Expr) -> FileNum {
+        if let Expr::Literal(Literal::Integer(n)) = e {
+            return FileNum::Imm(*n);
+        }
+        let ty = self.gen_expr(e);
+        self.gen_coercion(ty, DataType::Long);
+        self.stack_offset -= 8;
+        let loc = Loc::Frame(self.stack_offset);
+        self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+        FileNum::Slot(loc)
+    }
+
+    /// Place a previously evaluated file number in an argument register.
+    fn emit_arg_file_num(&mut self, idx: usize, fnum: &FileNum) {
+        match fnum {
+            FileNum::Imm(n) => self.emit_arg_imm(idx, *n),
+            FileNum::Slot(loc) => {
+                let reg = Self::arg_reg(idx);
+                self.emit(&format!("    movsxd {}, {}", reg, loc.at("DWORD PTR", 0)));
+            }
+        }
+    }
+
+    /// Store a freshly produced value into an assignment target.
+    ///
+    /// The value is expected where `gen_expr` leaves it: `rax`/`rdx` for a
+    /// string, `xmm0` for a number. For an array element the address has to be
+    /// computed *after* the value exists, since computing it clobbers `rax`, so
+    /// the value is parked on the stack across the address calculation.
+    fn gen_store_lvalue(&mut self, target: &LValue) {
+        let is_string = is_string_var(&target.name);
+
+        let Some(indices) = &target.indices else {
+            let loc = self.get_var_loc(&target.name);
+            if is_string {
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
+                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+            } else {
+                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+            }
+            return;
+        };
+
+        // Park the value, compute the element address, then store.
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if is_string {
+            self.emit("    mov QWORD PTR [rsp], rax");
+            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        let indices = indices.clone();
+        self.gen_array_addr(&target.name, &indices);
+        self.emit("    mov rcx, rax");
+
+        if is_string {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rcx], rax");
+            self.emit("    mov QWORD PTR [rcx + 8], rdx");
+        } else {
+            self.emit("    movsd xmm0, QWORD PTR [rsp]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            // Narrow to the element's declared type, as a normal store does.
+            let elem_type = DataType::from_suffix(&target.name);
+            self.gen_coercion(DataType::Double, elem_type);
+            match elem_type {
+                DataType::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+                DataType::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+                DataType::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+                DataType::Double => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+                DataType::String => unreachable!("handled above"),
+            }
+        }
+    }
+
     /// Emit `PRINT USING`.
     ///
     /// The format is parsed at compile time (see the `using` module), so this
@@ -2236,6 +2333,16 @@ impl CodeGen {
     }
 
     fn gen_print_expr(&mut self, expr: &Expr) {
+        // TAB() and SPC() position the cursor rather than producing a value,
+        // so they are emitted for their effect and nothing is printed after.
+        if let Expr::FnCall { name, args } = expr {
+            let upper = name.to_uppercase();
+            if upper == "TAB" || upper == "SPC" {
+                self.gen_fn_call(&upper, args);
+                return;
+            }
+        }
+
         // Check the expression type first
         let expected_type = self.expr_type(expr);
 
@@ -2261,7 +2368,7 @@ impl CodeGen {
         }
     }
 
-    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: i32) {
+    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
         // Check the expression type first
         let expected_type = self.expr_type(expr);
 
@@ -2273,13 +2380,13 @@ impl CodeGen {
             // clobbering rdx with ptr. Order matters to avoid register conflicts.
             self.emit_arg_reg(2, "rdx"); // len → r8 (on Win64) or rdx (on SysV, no-op)
             self.emit_arg_reg(1, "rax"); // ptr → rdx (on Win64) or rsi (on SysV)
-            self.emit_arg_imm(0, file_num as i64); // file_num → rcx or rdi
+            self.emit_arg_file_num(0, file_num); // file_num → rcx or rdi
             self.emit("    call _rt_file_print_string");
         } else {
             // Numeric expression - evaluate and convert to double for printing
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
-            self.emit_arg_imm(0, file_num as i64);
+            self.emit_arg_file_num(0, file_num);
             self.emit("    call _rt_file_print_float");
         }
     }
@@ -2542,6 +2649,34 @@ impl CodeGen {
             }
             "TIMER" => {
                 self.emit("    call _rt_timer");
+            }
+            // File status. Both take a file number and return a number.
+            "EOF" | "LOF" => {
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Long);
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "EOF" {
+                    "_rt_file_eof"
+                } else {
+                    "_rt_file_lof"
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // Print positioning. These emit output rather than yielding a
+            // value, so they are only meaningful inside PRINT.
+            "TAB" | "SPC" => {
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Long);
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "TAB" {
+                    "_rt_print_tab"
+                } else {
+                    "_rt_print_spc"
+                };
+                self.emit(&format!("    call {}", rt));
+                // Leave a zero so PRINT has a well-defined value to render...
+                // but PRINT special-cases these, so it is never printed.
+                self.emit("    xorpd xmm0, xmm0");
             }
             _ => {
                 // User-defined function or array access

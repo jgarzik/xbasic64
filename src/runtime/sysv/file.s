@@ -421,3 +421,141 @@ _rt_file_input_string:
     pop rbx
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_close_all - Close every open file (bare CLOSE)
+# ------------------------------------------------------------------------------
+# Arguments: none
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_file_close_all
+_rt_file_close_all:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, 1              # BASIC file numbers start at 1
+.Lclose_all_loop:
+    cmp ebx, 15
+    jg .Lclose_all_done
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    test rdi, rdi
+    jz .Lclose_all_next
+    call {libc}fflush
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    call {libc}fclose
+    lea rax, [rip + _file_handles]
+    mov QWORD PTR [rax + rbx*8], 0
+.Lclose_all_next:
+    inc ebx
+    jmp .Lclose_all_loop
+.Lclose_all_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_eof - EOF(n): has the file been read to the end?
+# ------------------------------------------------------------------------------
+# Peeks one character and pushes it back, since feof() only reports end-of-file
+# after a read has already failed, which would make EOF() lag by one line.
+#
+# Arguments:
+#   rdi = file number
+#
+# Returns:
+#   eax = -1 at end of file, 0 otherwise (BASIC's true/false, as a LONG)
+# ------------------------------------------------------------------------------
+.globl _rt_file_eof
+_rt_file_eof:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, edi
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    test rdi, rdi
+    jz .Leof_true           # never opened: treat as at end
+
+    call {libc}fgetc
+    cmp eax, -1
+    je .Leof_true
+
+    # Push the character back so the next read still sees it.
+    mov edi, eax
+    lea rax, [rip + _file_handles]
+    mov rsi, [rax + rbx*8]
+    call {libc}ungetc
+    xor eax, eax            # 0 = false
+    jmp .Leof_done
+
+.Leof_true:
+    mov eax, -1             # BASIC true
+
+.Leof_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_lof - LOF(n): length of the file in bytes
+# ------------------------------------------------------------------------------
+# Arguments:
+#   rdi = file number
+#
+# Returns:
+#   xmm0 = length in bytes, or 0.0 when the file is not open
+# ------------------------------------------------------------------------------
+.globl _rt_file_lof
+_rt_file_lof:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov ebx, edi
+
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    test rdi, rdi
+    jz .Llof_zero
+
+    # Remember the position, seek to the end, read it, then restore.
+    call {libc}ftell
+    mov r12, rax                    # saved position
+
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    xor esi, esi
+    mov edx, 2                      # SEEK_END
+    call {libc}fseek
+
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    call {libc}ftell
+    push rax                        # length
+
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rbx*8]
+    mov rsi, r12
+    xor edx, edx                    # SEEK_SET
+    call {libc}fseek
+
+    pop rax
+    cvtsi2sd xmm0, rax
+    jmp .Llof_done
+
+.Llof_zero:
+    xorpd xmm0, xmm0
+
+.Llof_done:
+    pop r12
+    pop rbx
+    leave
+    ret

@@ -78,11 +78,13 @@ pub enum StmtKind {
     },
     Input {
         prompt: Option<String>,
-        vars: Vec<String>,
+        vars: Vec<LValue>,
     },
     LineInput {
         prompt: Option<String>,
-        var: String,
+        var: LValue,
+        /// `LINE INPUT #n, Var$` reads a whole line from a file.
+        file_num: Option<Expr>,
     },
     If {
         condition: Expr,
@@ -131,7 +133,7 @@ pub enum StmtKind {
         args: Vec<Expr>,
     },
     Data(Vec<Literal>),
-    Read(Vec<String>),
+    Read(Vec<LValue>),
     Restore(Option<GotoTarget>),
     Cls,
     SelectCase {
@@ -144,21 +146,22 @@ pub enum StmtKind {
     Open {
         filename: Expr,
         mode: FileMode,
-        file_num: i32,
+        file_num: Expr,
     },
+    /// `CLOSE #n`, or bare `CLOSE` to close every open file.
     Close {
-        file_num: i32,
+        file_num: Option<Expr>,
     },
     PrintFile {
-        file_num: i32,
+        file_num: Expr,
         items: Vec<PrintItem>,
         newline: bool,
         /// PRINT USING format string, when one was given.
         using: Option<Expr>,
     },
     InputFile {
-        file_num: i32,
-        vars: Vec<String>,
+        file_num: Expr,
+        vars: Vec<LValue>,
     },
 }
 
@@ -174,6 +177,19 @@ pub enum PrintItem {
     Expr(Expr),
     Tab,   // comma = tab to next zone
     Empty, // semicolon = no separator
+}
+
+/// A target that can be assigned to: a variable, or one array element.
+///
+/// Introduced so that statements which read into a variable -- INPUT, LINE
+/// INPUT, INPUT #, READ, and now SWAP -- can also target an array element.
+/// They previously held a bare `String`, so `INPUT A(3)` and `READ A(I)` were
+/// impossible to express.
+#[derive(Debug, Clone)]
+pub struct LValue {
+    pub name: String,
+    /// Subscripts, when the target is an array element.
+    pub indices: Option<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -707,11 +723,7 @@ impl Parser {
 
         // Check for PRINT #n (file output)
         let file_num = if matches!(self.peek(), Token::Hash) {
-            self.advance(); // consume #
-            let num = match self.advance() {
-                Token::Integer(n) => n as i32,
-                tok => return err(format!("Expected file number after #, got {:?}", tok)),
-            };
+            let num = self.parse_file_number()?;
             if matches!(self.peek(), Token::Comma) {
                 self.advance(); // consume comma after file number
             }
@@ -776,19 +788,14 @@ impl Parser {
 
         // Check for INPUT #n (file input)
         if matches!(self.peek(), Token::Hash) {
-            self.advance(); // consume #
-            let file_num = match self.advance() {
-                Token::Integer(n) => n as i32,
-                tok => return err(format!("Expected file number after #, got {:?}", tok)),
-            };
+            let file_num = self.parse_file_number()?;
             if matches!(self.peek(), Token::Comma) {
                 self.advance(); // consume comma after file number
             }
 
             let mut vars = Vec::new();
-            while let Token::Ident(name) = self.peek().clone() {
-                self.advance();
-                vars.push(name);
+            while matches!(self.peek(), Token::Ident(_)) {
+                vars.push(self.parse_lvalue()?);
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -813,9 +820,8 @@ impl Parser {
         }
 
         // Read variable names
-        while let Token::Ident(name) = self.peek().clone() {
-            self.advance();
-            vars.push(name);
+        while matches!(self.peek(), Token::Ident(_)) {
+            vars.push(self.parse_lvalue()?);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
@@ -830,6 +836,17 @@ impl Parser {
         self.advance(); // consume LINE
         self.expect(Token::Input)?;
 
+        // LINE INPUT #n, Var$ -- documented in LANGREF but never parsed.
+        let file_num = if matches!(self.peek(), Token::Hash) {
+            let num = self.parse_file_number()?;
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            }
+            Some(num)
+        } else {
+            None
+        };
+
         let mut prompt = None;
 
         // Check for prompt string
@@ -841,13 +858,34 @@ impl Parser {
             }
         }
 
-        let var = if let Token::Ident(name) = self.advance() {
-            name
-        } else {
+        if !matches!(self.peek(), Token::Ident(_)) {
             return err("Expected variable name after LINE INPUT");
-        };
+        }
+        let var = self.parse_lvalue()?;
 
-        Ok(StmtKind::LineInput { prompt, var })
+        Ok(StmtKind::LineInput {
+            prompt,
+            var,
+            file_num,
+        })
+    }
+
+    /// Parse an assignment target: a name, optionally subscripted.
+    fn parse_lvalue(&mut self) -> PResult<LValue> {
+        let name = if let Token::Ident(n) = self.advance() {
+            n
+        } else {
+            return err("Expected variable name");
+        };
+        let indices = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let args = self.parse_expr_list()?;
+            self.expect(Token::RParen)?;
+            Some(args)
+        } else {
+            None
+        };
+        Ok(LValue { name, indices })
     }
 
     fn parse_let(&mut self) -> PResult<StmtKind> {
@@ -1383,9 +1421,8 @@ impl Parser {
         self.advance(); // consume READ
         let mut vars = Vec::new();
 
-        while let Token::Ident(name) = self.peek().clone() {
-            self.advance();
-            vars.push(name);
+        while matches!(self.peek(), Token::Ident(_)) {
+            vars.push(self.parse_lvalue()?);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
@@ -1404,6 +1441,15 @@ impl Parser {
             None
         };
         Ok(StmtKind::Restore(target))
+    }
+
+    /// Parse a file number: `#` followed by any numeric expression.
+    ///
+    /// GW-BASIC allows an expression here; only a literal used to be accepted,
+    /// so `OPEN ... AS #F%` was a parse error.
+    fn parse_file_number(&mut self) -> PResult<Expr> {
+        self.expect(Token::Hash)?;
+        self.parse_expression()
     }
 
     fn parse_open(&mut self) -> PResult<StmtKind> {
@@ -1435,12 +1481,7 @@ impl Parser {
         // Expect AS
         self.expect(Token::As)?;
 
-        // Expect #n
-        self.expect(Token::Hash)?;
-        let file_num = match self.advance() {
-            Token::Integer(n) => n as i32,
-            tok => return err(format!("Expected file number after #, got {:?}", tok)),
-        };
+        let file_num = self.parse_file_number()?;
 
         Ok(StmtKind::Open {
             filename,
@@ -1452,11 +1493,11 @@ impl Parser {
     fn parse_close(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume CLOSE
 
-        // Expect #n
-        self.expect(Token::Hash)?;
-        let file_num = match self.advance() {
-            Token::Integer(n) => n as i32,
-            tok => return err(format!("Expected file number after #, got {:?}", tok)),
+        // Bare CLOSE closes every open file.
+        let file_num = if matches!(self.peek(), Token::Hash) {
+            Some(self.parse_file_number()?)
+        } else {
+            None
         };
 
         Ok(StmtKind::Close { file_num })
@@ -1740,10 +1781,10 @@ mod tests {
     fn test_input_simple() {
         let prog = parse("INPUT X").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Input { prompt, vars } = &prog.statements[0].kind {
+        if let StmtKind::Input { prompt, vars, .. } = &prog.statements[0].kind {
             assert!(prompt.is_none());
             assert_eq!(vars.len(), 1);
-            assert_eq!(vars[0], "X");
+            assert_eq!(vars[0].name, "X");
         } else {
             panic!("Expected Input");
         }
@@ -1752,9 +1793,9 @@ mod tests {
     #[test]
     fn test_input_with_prompt() {
         let prog = parse(r#"INPUT "Enter value: ", X"#).unwrap();
-        if let StmtKind::Input { prompt, vars } = &prog.statements[0].kind {
+        if let StmtKind::Input { prompt, vars, .. } = &prog.statements[0].kind {
             assert_eq!(prompt.as_ref().unwrap(), "Enter value: ");
-            assert_eq!(vars[0], "X");
+            assert_eq!(vars[0].name, "X");
         } else {
             panic!("Expected Input");
         }
@@ -1778,9 +1819,9 @@ mod tests {
     fn test_line_input_simple() {
         let prog = parse("LINE INPUT X$").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::LineInput { prompt, var } = &prog.statements[0].kind {
+        if let StmtKind::LineInput { prompt, var, .. } = &prog.statements[0].kind {
             assert!(prompt.is_none());
-            assert_eq!(var, "X$");
+            assert_eq!(var.name, "X$");
         } else {
             panic!("Expected LineInput");
         }
@@ -1789,9 +1830,9 @@ mod tests {
     #[test]
     fn test_line_input_with_prompt() {
         let prog = parse(r#"LINE INPUT "Name: ", NAME$"#).unwrap();
-        if let StmtKind::LineInput { prompt, var } = &prog.statements[0].kind {
+        if let StmtKind::LineInput { prompt, var, .. } = &prog.statements[0].kind {
             assert_eq!(prompt.as_ref().unwrap(), "Name: ");
-            assert_eq!(var, "NAME$");
+            assert_eq!(var.name, "NAME$");
         } else {
             panic!("Expected LineInput");
         }
@@ -2364,7 +2405,7 @@ mod tests {
         assert_eq!(prog.statements.len(), 1);
         if let StmtKind::Read(vars) = &prog.statements[0].kind {
             assert_eq!(vars.len(), 1);
-            assert_eq!(vars[0], "X");
+            assert_eq!(vars[0].name, "X");
         } else {
             panic!("Expected Read");
         }

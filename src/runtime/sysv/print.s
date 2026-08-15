@@ -41,6 +41,8 @@
 _rt_print_string:
     push rbp
     mov rbp, rsp
+    sub rsp, 16
+    mov QWORD PTR [rbp - 8], rsi    # remember the length for the column tracker
     # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
     # prologue both leave it that way. Printing nothing is the correct result,
     # and returning early avoids passing NULL to printf, which is undefined.
@@ -52,6 +54,9 @@ _rt_print_string:
     lea rdi, [rip + _fmt_str]   # format string → rdi (1st arg)
     xor eax, eax        # no vector registers used (required for varargs)
     call {libc}printf
+    # Advance the column tracker by the number of characters written.
+    mov rax, QWORD PTR [rbp - 8]
+    add QWORD PTR [rip + _print_col], rax
 .Lprint_str_done:
     leave
     ret
@@ -74,6 +79,7 @@ _rt_print_char:
     lea rdi, [rip + _fmt_char]  # format → rdi (1st arg)
     xor eax, eax        # no vector registers
     call {libc}printf
+    inc QWORD PTR [rip + _print_col]
     leave
     ret
 
@@ -92,6 +98,7 @@ _rt_print_newline:
     lea rdi, [rip + _fmt_newline]
     xor eax, eax
     call {libc}printf
+    mov QWORD PTR [rip + _print_col], 0
     leave
     ret
 
@@ -265,3 +272,65 @@ _rt_end:
     mov rbp, rsp
     xor edi, edi            # exit code 0
     call {libc}exit
+
+# ------------------------------------------------------------------------------
+# _rt_print_spc - SPC(n): print n spaces
+# ------------------------------------------------------------------------------
+# Arguments: rdi = count      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_spc
+_rt_print_spc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+    mov rbx, rdi
+.Lspc_loop:
+    cmp rbx, 0
+    jle .Lspc_done
+    mov edi, ' '
+    call _rt_print_char
+    dec rbx
+    jmp .Lspc_loop
+.Lspc_done:
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_tab - TAB(n): advance to column n
+# ------------------------------------------------------------------------------
+# Columns are 1-based, as in GW-BASIC. If output is already at or past the
+# requested column, a newline is emitted first and the tab applies to the new
+# line.
+#
+# Arguments: rdi = target column      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_tab
+_rt_print_tab:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov rbx, rdi
+    cmp rbx, 1
+    jge .Ltab_have_target
+    mov rbx, 1
+.Ltab_have_target:
+    dec rbx                 # 1-based column -> count of characters before it
+
+    cmp rbx, QWORD PTR [rip + _print_col]
+    jge .Ltab_pad
+    call _rt_print_newline
+
+.Ltab_pad:
+    mov rdi, rbx
+    sub rdi, QWORD PTR [rip + _print_col]
+    call _rt_print_spc
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret

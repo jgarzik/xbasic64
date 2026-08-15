@@ -514,3 +514,124 @@ _rt_file_input_string:
     leave
     ret
 
+
+# ------------------------------------------------------------------------------
+# _rt_file_close_all - Close every open file (bare CLOSE)
+# ------------------------------------------------------------------------------
+# Arguments: none
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_file_close_all
+_rt_file_close_all:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40
+
+    mov ebx, 1              # BASIC file numbers start at 1
+.Lclose_all_loop:
+    cmp ebx, 15
+    jg .Lclose_all_done
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Lclose_all_next
+    call CloseHandle
+    lea rax, [rip + _file_handles]
+    mov QWORD PTR [rax + rbx*8], 0
+.Lclose_all_next:
+    inc ebx
+    jmp .Lclose_all_loop
+.Lclose_all_done:
+    add rsp, 40
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_eof - EOF(n): has the file been read to the end?
+# ------------------------------------------------------------------------------
+# Compares the current position against the file size, which needs no
+# pushback and so keeps the next read unaffected.
+#
+# Arguments:
+#   rcx = file number
+#
+# Returns:
+#   eax = -1 at end of file, 0 otherwise (BASIC's true/false, as a LONG)
+# ------------------------------------------------------------------------------
+.globl _rt_file_eof
+_rt_file_eof:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push rsi
+    sub rsp, 40
+
+    mov ebx, ecx
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Leof_true           # never opened: treat as at end
+
+    # Current position: SetFilePointer(h, 0, NULL, FILE_CURRENT)
+    xor edx, edx
+    xor r8, r8
+    mov r9d, 1              # FILE_CURRENT
+    call SetFilePointer
+    mov rsi, rax            # position
+
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    xor edx, edx
+    call GetFileSize
+
+    cmp rsi, rax
+    jb .Leof_false
+.Leof_true:
+    mov eax, -1
+    jmp .Leof_done
+.Leof_false:
+    xor eax, eax
+.Leof_done:
+    add rsp, 40
+    pop rsi
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_lof - LOF(n): length of the file in bytes
+# ------------------------------------------------------------------------------
+# Arguments:
+#   rcx = file number
+#
+# Returns:
+#   xmm0 = length in bytes, or 0.0 when the file is not open
+# ------------------------------------------------------------------------------
+.globl _rt_file_lof
+_rt_file_lof:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40
+
+    mov ebx, ecx
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Llof_zero
+
+    xor edx, edx
+    call GetFileSize
+    cvtsi2sd xmm0, rax
+    jmp .Llof_done
+
+.Llof_zero:
+    xorpd xmm0, xmm0
+
+.Llof_done:
+    add rsp, 40
+    pop rbx
+    leave
+    ret

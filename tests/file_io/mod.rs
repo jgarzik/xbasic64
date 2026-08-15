@@ -67,3 +67,87 @@ PRINT "appended"
         assert_eq!(lines, vec!["Line 1", "Line 2", "Line 3"]);
     }
 }
+
+/// LANGREF documents `LINE INPUT #1, Text$`, but it never parsed: the file
+/// number form was missing entirely from LINE INPUT.
+#[test]
+fn test_line_input_from_file() {
+    let source = r#"
+OPEN "l.txt" FOR OUTPUT AS #1
+PRINT #1, "a whole line, with commas"
+CLOSE #1
+OPEN "l.txt" FOR INPUT AS #1
+LINE INPUT #1, T$
+CLOSE #1
+PRINT "["; T$; "]"
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "[a whole line, with commas]");
+}
+
+/// A file number may be any numeric expression; only a literal used to parse.
+#[test]
+fn test_file_number_expression() {
+    let source = r#"
+F% = 1
+OPEN "e.txt" FOR OUTPUT AS #F%
+PRINT #F%, "written"
+CLOSE #F%
+OPEN "e.txt" FOR INPUT AS #(F% + 0)
+LINE INPUT #1, A$
+CLOSE #1
+PRINT A$
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "written");
+}
+
+/// LANGREF documents bare CLOSE as "close all files"; it was a parse error.
+#[test]
+fn test_bare_close() {
+    let source = r#"
+OPEN "a.txt" FOR OUTPUT AS #1
+OPEN "b.txt" FOR OUTPUT AS #2
+PRINT #1, "one"
+PRINT #2, "two"
+CLOSE
+OPEN "a.txt" FOR INPUT AS #1
+LINE INPUT #1, X$
+CLOSE
+PRINT X$
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "one");
+}
+
+/// EOF() makes read-until-end loops possible; without it the documented file
+/// I/O support could not actually be used to read a file of unknown length.
+#[test]
+fn test_eof_and_lof() {
+    let source = r#"
+OPEN "d.txt" FOR OUTPUT AS #1
+PRINT #1, "one"
+PRINT #1, "two"
+PRINT #1, "three"
+CLOSE #1
+OPEN "d.txt" FOR INPUT AS #1
+N = 0
+WHILE NOT EOF(1)
+LINE INPUT #1, L$
+PRINT L$
+N = N + 1
+WEND
+CLOSE #1
+PRINT "lines:"; N
+OPEN "d.txt" FOR INPUT AS #1
+PRINT "bytes:"; LOF(1)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "one");
+    assert_eq!(lines[1], "two");
+    assert_eq!(lines[2], "three");
+    assert_eq!(lines[3], "lines:3");
+    assert_eq!(lines[4], "bytes:14", "3 lines plus their newlines");
+}

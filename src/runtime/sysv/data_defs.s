@@ -22,6 +22,9 @@ _fmt_g9: .asciz "%.9g"
 .p2align 3
 _fmt_g_single_table: .quad _fmt_g6, _fmt_g7, _fmt_g8, _fmt_g9, 0
 _num_buf: .skip 64
+# Current output column, so TAB(n) knows how far to advance. Updated by the
+# console print helpers and reset by a newline.
+_print_col: .quad 0
 _fmt_char: .asciz "%c"
 _fmt_newline: .asciz "\n"
 _fmt_input: .asciz "%lf"

@@ -23,6 +23,8 @@
 _stdout_handle: .quad 0
 _print_buffer: .skip 64          # Buffer for number formatting
 _bytes_written: .quad 0          # For WriteFile output parameter
+# Current output column, so TAB(n) knows how far to advance.
+_print_col: .quad 0
 _newline_str: .ascii "\r\n"      # Windows uses CRLF
 
 .text
@@ -57,6 +59,7 @@ _rt_print_string:
     push rbp
     mov rbp, rsp
     sub rsp, 48             # Shadow space + stack args
+    mov QWORD PTR [rbp - 8], rdx    # remember the length for the column tracker
 
     # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
     # prologue both leave it that way. Printing nothing is the correct result,
@@ -76,6 +79,8 @@ _rt_print_string:
     lea r9, [rip + _bytes_written]  # &bytesWritten → r9 (4th arg)
     mov QWORD PTR [rsp + 32], 0     # NULL → 5th arg (stack)
     call WriteFile
+    mov rax, QWORD PTR [rbp - 8]
+    add QWORD PTR [rip + _print_col], rax
 
 .Lprint_str_done:
     leave
@@ -107,6 +112,7 @@ _rt_print_char:
     lea r9, [rip + _bytes_written]
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
+    inc QWORD PTR [rip + _print_col]
 
     leave
     ret
@@ -130,6 +136,7 @@ _rt_print_newline:
     lea r9, [rip + _bytes_written]
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
+    mov QWORD PTR [rip + _print_col], 0
 
     leave
     ret
@@ -283,3 +290,64 @@ _rt_end:
     sub rsp, 32             # Shadow space
     xor ecx, ecx            # exit code 0
     call ExitProcess
+
+# ------------------------------------------------------------------------------
+# _rt_print_spc - SPC(n): print n spaces
+# ------------------------------------------------------------------------------
+# Arguments: rcx = count      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_spc
+_rt_print_spc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40
+    mov rbx, rcx
+.Lspc_loop:
+    cmp rbx, 0
+    jle .Lspc_done
+    mov ecx, ' '
+    call _rt_print_char
+    dec rbx
+    jmp .Lspc_loop
+.Lspc_done:
+    add rsp, 40
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_tab - TAB(n): advance to column n
+# ------------------------------------------------------------------------------
+# Columns are 1-based, as in GW-BASIC. If output is already at or past the
+# requested column, a newline is emitted first.
+#
+# Arguments: rcx = target column      Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_tab
+_rt_print_tab:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40
+
+    mov rbx, rcx
+    cmp rbx, 1
+    jge .Ltab_have_target
+    mov rbx, 1
+.Ltab_have_target:
+    dec rbx
+
+    cmp rbx, QWORD PTR [rip + _print_col]
+    jge .Ltab_pad
+    call _rt_print_newline
+
+.Ltab_pad:
+    mov rcx, rbx
+    sub rcx, QWORD PTR [rip + _print_col]
+    call _rt_print_spc
+
+    add rsp, 40
+    pop rbx
+    leave
+    ret
