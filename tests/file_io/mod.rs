@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run, compile_and_run_with_files};
+use crate::common::compile_and_run_with_files;
 use std::fs;
 
 #[test]
@@ -167,10 +167,12 @@ CLOSE #1
 /// file held `10\t,20\t,"ab"` -- which no INPUT # could read back.
 #[test]
 fn test_write_file_separators() {
-    let output = compile_and_run(
+    let output = compile_and_run_with_files(
         "OPEN \"wsep.txt\" FOR OUTPUT AS #1\nWRITE #1, 10, 20, \"ab\"\nCLOSE #1\nOPEN \"wsep.txt\" FOR INPUT AS #1\nLINE INPUT #1, L$\nCLOSE #1\nPRINT \"[\"; L$; \"]\"\n",
+        |_| Ok(()),
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(output.trim(), "[10,20,\"ab\"]");
 }
 
@@ -207,10 +209,12 @@ fn test_input_file_quoted_fields() {
 /// What WRITE # writes, INPUT # reads back.
 #[test]
 fn test_write_file_round_trip() {
-    let output = compile_and_run(
+    let output = compile_and_run_with_files(
         "OPEN \"wrt.txt\" FOR OUTPUT AS #1\nWRITE #1, 10, 20, \"ab\"\nCLOSE #1\nOPEN \"wrt.txt\" FOR INPUT AS #1\nINPUT #1, A, B, C$\nCLOSE #1\nPRINT A; B; \"[\"; C$; \"]\"\n",
+        |_| Ok(()),
     )
-    .unwrap();
+    .unwrap()
+    .0;
     assert_eq!(output.trim(), "1020[ab]");
 }
 
