@@ -6,9 +6,12 @@
 # BASIC line number is a register argument, so only a handful of message
 # constants are ever needed no matter how many check sites exist.
 #
-# Messages are NUL-terminated and their length is computed here rather than
-# passed in: emitting a length from a `.equ` at the call site assembles to a
-# memory load in GAS's Intel syntax, not an immediate.
+# Messages are NUL-terminated and measured here rather than having their length
+# passed in. A check site lives in the program's own .text, which the assembler
+# sees before this file, so `mov reg, _msg_len` there is a *forward* reference:
+# GAS cannot yet know the symbol is absolute and assembles a memory load from
+# that address instead of an immediate. Measuring here sidesteps the ordering
+# entirely.
 #
 # Diagnostics go to stderr, so a program's real output on stdout stays clean
 # and a test can still check partial output followed by an abort.

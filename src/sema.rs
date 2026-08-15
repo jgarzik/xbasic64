@@ -47,6 +47,7 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("FIX", 1, 1),
     ("INSTR", 2, 3),
     ("INT", 1, 1),
+    ("LBOUND", 1, 2),
     ("LEFT$", 2, 2),
     ("LEN", 1, 1),
     ("LOF", 1, 1),
@@ -60,6 +61,7 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("SQR", 1, 1),
     ("STR$", 1, 1),
     ("TAB", 1, 1),
+    ("UBOUND", 1, 2),
     ("TAN", 1, 1),
     ("TIMER", 0, 1),
     ("VAL", 1, 1),
@@ -100,6 +102,8 @@ pub struct Symbols {
     pub labels: HashSet<String>,
     /// Numeric line-number labels available as branch targets.
     pub lines: HashSet<u32>,
+    /// CONST names and their folded values.
+    pub consts: HashMap<String, Literal>,
 }
 
 impl Symbols {
@@ -137,6 +141,10 @@ pub fn analyze(program: &Program) -> (Symbols, Vec<Diagnostic>) {
 struct Analyzer {
     symbols: Symbols,
     diagnostics: Vec<Diagnostic>,
+    /// Enclosing loops, innermost last: true for FOR, false for WHILE/DO.
+    loops: Vec<bool>,
+    /// Whether the walk is currently inside a procedure body.
+    in_proc: bool,
 }
 
 impl Analyzer {
@@ -174,6 +182,21 @@ impl Analyzer {
                 StmtKind::LabelName(name) => {
                     if !self.symbols.labels.insert(name.clone()) {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
+                    }
+                }
+                StmtKind::Const { name, value } => {
+                    let upper = name.to_uppercase();
+                    if self.symbols.consts.contains_key(&upper) {
+                        self.error(stmt.line, format!("'{}' is already defined", name));
+                    }
+                    match self.const_eval(value) {
+                        Some(lit) => {
+                            self.symbols.consts.insert(upper, lit);
+                        }
+                        None => self.error(
+                            stmt.line,
+                            format!("CONST '{}' must have a constant value", name),
+                        ),
                     }
                 }
                 StmtKind::Dim { arrays } => {
@@ -306,11 +329,15 @@ impl Analyzer {
                 if let Some(s) = step {
                     self.check_expr(s, scope, line);
                 }
+                self.loops.push(true);
                 self.check(body, scope);
+                self.loops.pop();
             }
             StmtKind::While { condition, body } => {
                 self.check_expr(condition, scope, line);
+                self.loops.push(false);
                 self.check(body, scope);
+                self.loops.pop();
             }
             StmtKind::DoLoop {
                 condition, body, ..
@@ -318,7 +345,9 @@ impl Analyzer {
                 if let Some(c) = condition {
                     self.check_expr(c, scope, line);
                 }
+                self.loops.push(false);
                 self.check(body, scope);
+                self.loops.pop();
             }
             StmtKind::SelectCase { expr, cases } => {
                 self.check_expr(expr, scope, line);
@@ -346,10 +375,86 @@ impl Analyzer {
                 }
             }
             StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. } => {
+                let saved_loops = std::mem::take(&mut self.loops);
+                let was_in_proc = std::mem::replace(&mut self.in_proc, true);
                 self.check(body, &Scope::Proc(name.clone()));
+                self.in_proc = was_in_proc;
+                self.loops = saved_loops;
+            }
+            StmtKind::ExitLoop { is_for } => {
+                if !self.loops.iter().any(|f| f == is_for) {
+                    let what = if *is_for { "FOR" } else { "DO or WHILE" };
+                    self.error(line, format!("EXIT outside of a {} loop", what));
+                }
+            }
+            StmtKind::ExitProc => {
+                if !self.in_proc {
+                    self.error(line, "EXIT SUB/FUNCTION outside of a procedure");
+                }
+            }
+            StmtKind::Swap(a, b) => {
+                for t in [a, b] {
+                    if let Some(indices) = &t.indices {
+                        self.check_array_use(&t.name, indices.len(), scope, line);
+                        for e in indices {
+                            self.check_expr(e, scope, line);
+                        }
+                    }
+                }
+                if a.name.ends_with('$') != b.name.ends_with('$') {
+                    self.error(line, "SWAP requires both values to be the same type");
+                }
             }
             StmtKind::Open { filename, .. } => self.check_expr(filename, scope, line),
             _ => {}
+        }
+    }
+
+    /// Fold a constant expression, or return None when it is not constant.
+    ///
+    /// Small on purpose: literals, references to earlier CONSTs, and the
+    /// arithmetic that appears in real constant declarations.
+    fn const_eval(&self, e: &Expr) -> Option<Literal> {
+        match e {
+            Expr::Literal(l) => Some(l.clone()),
+            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase()).cloned(),
+            Expr::Unary { op, operand } => {
+                let v = self.const_eval(operand)?;
+                match (op, v) {
+                    (UnaryOp::Neg, Literal::Integer(n)) => Some(Literal::Integer(-n)),
+                    (UnaryOp::Neg, Literal::Float(f)) => Some(Literal::Float(-f)),
+                    _ => None,
+                }
+            }
+            Expr::Binary { op, left, right } => {
+                let (l, r) = (self.const_eval(left)?, self.const_eval(right)?);
+                let (a, b) = match (&l, &r) {
+                    (Literal::Integer(a), Literal::Integer(b)) => {
+                        // Integer arithmetic stays integer where it can.
+                        return match op {
+                            BinaryOp::Add => Some(Literal::Integer(a.checked_add(*b)?)),
+                            BinaryOp::Sub => Some(Literal::Integer(a.checked_sub(*b)?)),
+                            BinaryOp::Mul => Some(Literal::Integer(a.checked_mul(*b)?)),
+                            BinaryOp::IntDiv if *b != 0 => Some(Literal::Integer(a / b)),
+                            BinaryOp::Mod if *b != 0 => Some(Literal::Integer(a % b)),
+                            BinaryOp::Div if *b != 0 => Some(Literal::Float(*a as f64 / *b as f64)),
+                            _ => None,
+                        };
+                    }
+                    (Literal::Integer(a), Literal::Float(b)) => (*a as f64, *b),
+                    (Literal::Float(a), Literal::Integer(b)) => (*a, *b as f64),
+                    (Literal::Float(a), Literal::Float(b)) => (*a, *b),
+                    _ => return None,
+                };
+                match op {
+                    BinaryOp::Add => Some(Literal::Float(a + b)),
+                    BinaryOp::Sub => Some(Literal::Float(a - b)),
+                    BinaryOp::Mul => Some(Literal::Float(a * b)),
+                    BinaryOp::Div if b != 0.0 => Some(Literal::Float(a / b)),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 

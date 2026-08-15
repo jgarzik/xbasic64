@@ -75,6 +75,8 @@ pub enum StmtKind {
         newline: bool,
         /// PRINT USING format string, when one was given.
         using: Option<Expr>,
+        /// True for WRITE: values are comma-separated and strings quoted.
+        write: bool,
     },
     Input {
         prompt: Option<String>,
@@ -132,6 +134,19 @@ pub enum StmtKind {
         name: String,
         args: Vec<Expr>,
     },
+    /// `SWAP a, b` -- exchange two values of the same type class.
+    Swap(LValue, LValue),
+    /// `CONST N = expr` -- a compile-time constant.
+    Const {
+        name: String,
+        value: Expr,
+    },
+    /// `EXIT FOR` / `EXIT DO` -- leave the innermost matching loop.
+    ExitLoop {
+        is_for: bool,
+    },
+    /// `EXIT SUB` / `EXIT FUNCTION` -- return from the current procedure.
+    ExitProc,
     Data(Vec<Literal>),
     Read(Vec<LValue>),
     Restore(Option<GotoTarget>),
@@ -158,6 +173,8 @@ pub enum StmtKind {
         newline: bool,
         /// PRINT USING format string, when one was given.
         using: Option<Expr>,
+        /// True for WRITE #: values are comma-separated and strings quoted.
+        write: bool,
     },
     InputFile {
         file_num: Expr,
@@ -414,6 +431,19 @@ impl std::fmt::Display for LocatedParseError {
     }
 }
 
+/// Human-readable name for a token, for diagnostics.
+fn describe_token(tok: &Token) -> String {
+    match tok {
+        Token::Ident(n) => format!("identifier '{}'", n),
+        Token::Integer(n) => format!("{}", n),
+        Token::Float(f) => format!("{}", f),
+        Token::String(s) => format!("string \"{}\"", s),
+        Token::Newline => "end of line".to_string(),
+        Token::Eof => "end of file".to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
 /// Shorthand for the parser's result type.
 type PResult<T> = Result<T, ParseError>;
 
@@ -595,7 +625,11 @@ impl Parser {
         }
 
         match self.peek().clone() {
-            Token::Print => self.parse_print(),
+            Token::Print => self.parse_print(false),
+            Token::Write => self.parse_print(true),
+            Token::Swap => self.parse_swap(),
+            Token::Const => self.parse_const(),
+            Token::Exit => self.parse_exit(),
             Token::Input => self.parse_input(),
             Token::Line => self.parse_line_input(),
             Token::Let => self.parse_let(),
@@ -718,8 +752,8 @@ impl Parser {
         }
     }
 
-    fn parse_print(&mut self) -> PResult<StmtKind> {
-        self.advance(); // consume PRINT
+    fn parse_print(&mut self, write: bool) -> PResult<StmtKind> {
+        self.advance(); // consume PRINT or WRITE
 
         // Check for PRINT #n (file output)
         let file_num = if matches!(self.peek(), Token::Hash) {
@@ -773,13 +807,51 @@ impl Parser {
                 items,
                 newline,
                 using,
+                write,
             })
         } else {
             Ok(StmtKind::Print {
                 items,
                 newline,
                 using,
+                write,
             })
+        }
+    }
+
+    /// `SWAP a, b`
+    fn parse_swap(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume SWAP
+        let a = self.parse_lvalue()?;
+        self.expect(Token::Comma)?;
+        let b = self.parse_lvalue()?;
+        Ok(StmtKind::Swap(a, b))
+    }
+
+    /// `CONST NAME = expr`
+    fn parse_const(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume CONST
+        let name = if let Token::Ident(n) = self.advance() {
+            n
+        } else {
+            return err("Expected a name after CONST");
+        };
+        self.expect(Token::Eq)?;
+        let value = self.parse_expression()?;
+        Ok(StmtKind::Const { name, value })
+    }
+
+    /// `EXIT FOR` / `EXIT DO` / `EXIT SUB` / `EXIT FUNCTION`
+    fn parse_exit(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume EXIT
+        match self.advance() {
+            Token::For => Ok(StmtKind::ExitLoop { is_for: true }),
+            Token::Do => Ok(StmtKind::ExitLoop { is_for: false }),
+            Token::Sub | Token::Function => Ok(StmtKind::ExitProc),
+            tok => err(format!(
+                "Expected FOR, DO, SUB or FUNCTION after EXIT, got {}",
+                describe_token(&tok)
+            )),
         }
     }
 

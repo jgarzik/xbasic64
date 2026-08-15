@@ -457,3 +457,20 @@ PRINT LOG(1)
     assert_eq!(run.lines(), vec!["90", "2.5", "2", "2", "4", "0"]);
     assert_eq!(run.exit_code, Some(0));
 }
+
+/// The new statements are checked for misuse.
+#[test]
+fn test_new_statement_misuse_is_diagnosed() {
+    expect_rejected("EXIT FOR\n", "EXIT outside of a FOR loop");
+    expect_rejected("EXIT DO\n", "EXIT outside of a DO or WHILE loop");
+    expect_rejected("EXIT SUB\n", "EXIT SUB/FUNCTION outside of a procedure");
+    expect_rejected(
+        "A = 1\nB$ = \"x\"\nSWAP A, B$\n",
+        "SWAP requires both values to be the same type",
+    );
+    expect_rejected("X = 1\nCONST C = X\n", "must have a constant value");
+    expect_rejected(
+        "F$ = \"##\"\nPRINT USING F$; 1\n",
+        "PRINT USING requires a literal format string",
+    );
+}

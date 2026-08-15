@@ -330,3 +330,94 @@ Greet : PRINT "after"
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["called", "after"]);
 }
+
+/// SWAP exchanges two values. Both are read before either is written, so
+/// swapping two elements of the same array is correct even when the subscripts
+/// alias.
+#[test]
+fn test_swap() {
+    let output = compile_and_run(
+        "A = 1\nB = 2\nSWAP A, B\nPRINT A; B\nX$ = \"x\"\nY$ = \"yy\"\nSWAP X$, Y$\nPRINT X$; Y$\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["21", "yyx"]);
+}
+
+/// SWAP in anger: a sort that exchanges array elements.
+#[test]
+fn test_swap_array_elements() {
+    let output = compile_and_run(
+        "DIM A(4)\nA(0)=5\nA(1)=3\nA(2)=4\nA(3)=1\nA(4)=2\nFOR I = 0 TO 3\nFOR J = 0 TO 3 - I\nIF A(J) > A(J+1) THEN SWAP A(J), A(J+1)\nNEXT J\nNEXT I\nFOR I = 0 TO 4\nPRINT A(I);\nNEXT I\nPRINT \"\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "12345");
+}
+
+/// CONST is folded at compile time and substituted wherever the name is used,
+/// including as an array bound.
+#[test]
+fn test_const() {
+    let output = compile_and_run(
+        "CONST MAX = 10\nCONST HALF = MAX / 2\nCONST NAME$ = \"hi\"\nPRINT MAX\nPRINT HALF\nPRINT NAME$\nDIM A(MAX)\nA(MAX) = 7\nPRINT A(10)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["10", "5", "hi", "7"]);
+}
+
+/// WRITE separates values with commas and quotes strings.
+#[test]
+fn test_write() {
+    let output = compile_and_run("WRITE \"a\", 1, \"b\"\nWRITE 1, 2.5\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["\"a\",1,\"b\"", "1,2.5"]);
+}
+
+/// LBOUND and UBOUND report an array's declared bounds.
+#[test]
+fn test_lbound_ubound() {
+    let output = compile_and_run(
+        "DIM A(5)\nDIM M(3,7)\nPRINT LBOUND(A); UBOUND(A)\nPRINT UBOUND(M, 1); UBOUND(M, 2)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["05", "37"]);
+}
+
+/// EXIT leaves the innermost matching loop, or returns from a procedure.
+#[test]
+fn test_exit_statements() {
+    let output = compile_and_run(
+        "FOR I = 1 TO 10\nIF I = 3 THEN EXIT FOR\nNEXT I\nPRINT I\nJ = 0\nDO\nJ = J + 1\nIF J = 4 THEN EXIT DO\nLOOP\nPRINT J\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["3", "4"]);
+}
+
+/// EXIT SUB returns early without running the rest of the procedure.
+#[test]
+fn test_exit_sub() {
+    let output = compile_and_run(
+        "SUB T(N)\nIF N = 0 THEN EXIT SUB\nPRINT N\nEND SUB\nT(0)\nT(5)\nPRINT \"done\"\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["5", "done"], "the N=0 call printed nothing");
+}
+
+/// EXIT FOR only leaves a FOR loop, and the nesting is respected.
+#[test]
+fn test_exit_leaves_innermost_matching_loop() {
+    let output = compile_and_run(
+        "FOR I = 1 TO 2\nFOR J = 1 TO 10\nIF J = 2 THEN EXIT FOR\nNEXT J\nPRINT I; J\nNEXT I\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["12", "22"],
+        "inner loop exited, outer continued"
+    );
+}

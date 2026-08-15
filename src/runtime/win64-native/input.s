@@ -131,8 +131,11 @@ _rt_input_string:
 _rt_input_number:
     push rbp
     mov rbp, rsp
+    push rbx
+    push rsi
     sub rsp, 48             # Shadow space + stack args
 
+.Linput_num_try:
     # Clear buffer
     lea rax, [rip + _input_buf]
     mov BYTE PTR [rax], 0
@@ -151,15 +154,40 @@ _rt_input_number:
     # Null-terminate the input
     lea rax, [rip + _bytes_read]
     mov rcx, [rax]          # bytes read
+    test rcx, rcx
+    jz .Linput_num_eof      # no input left: yield 0
     lea rax, [rip + _input_buf]
     mov BYTE PTR [rax + rcx], 0
 
-    # Parse number using strtod(buffer, NULL)
+    # Parse number using strtod(buffer, &end)
     lea rcx, [rip + _input_buf]
-    xor rdx, rdx            # NULL endptr
+    lea rdx, [rbp - 32]     # endptr
     call strtod
 
-    # Result is in xmm0
+    # strtod leaves endptr at the start when nothing parsed. Reject that and
+    # ask again, as GW-BASIC does; without this, text silently yielded 0.
+    mov rax, QWORD PTR [rbp - 32]
+    lea rcx, [rip + _input_buf]
+    cmp rax, rcx
+    je .Linput_num_redo
+
+    add rsp, 48
+    pop rsi
+    pop rbx
+    leave
+    ret
+
+.Linput_num_redo:
+    lea rcx, [rip + _redo_msg]
+    mov rdx, _redo_msg_len
+    call _rt_print_string
+    jmp .Linput_num_try
+
+.Linput_num_eof:
+    xorpd xmm0, xmm0
+    add rsp, 48
+    pop rsi
+    pop rbx
     leave
     ret
 

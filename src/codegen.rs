@@ -230,6 +230,8 @@ const GOSUB_STACK_SIZE: i32 = 524288;
 
 /// ASCII character codes
 const ASCII_TAB: i64 = 9;
+const ASCII_COMMA: i64 = 44;
+const ASCII_QUOTE: i64 = 34;
 
 fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
@@ -415,6 +417,11 @@ pub struct CodeGen {
     /// Error trampolines needed so far, keyed by (error, line) so that sites
     /// sharing both share one trampoline. Ordered for reproducible output.
     error_sites: BTreeMap<(RtError, u32), String>,
+    /// Enclosing loops, innermost last, so EXIT FOR / EXIT DO know where to
+    /// jump. Each entry is (is_for, end label).
+    loop_stack: Vec<(bool, String)>,
+    /// Label of the current procedure's epilogue, for EXIT SUB / EXIT FUNCTION.
+    proc_exit_label: Option<String>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -685,7 +692,12 @@ impl CodeGen {
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::String,
             },
-            Expr::Variable(name) => DataType::from_suffix(name),
+            Expr::Variable(name) => match self.symbols.consts.get(&name.to_uppercase()) {
+                Some(Literal::Integer(_)) => DataType::Long,
+                Some(Literal::Float(_)) => DataType::Double,
+                Some(Literal::String(_)) => DataType::String,
+                None => DataType::from_suffix(name),
+            },
             Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
             Expr::FnCall { name, args } => self.call_return_type(name, args),
             Expr::Unary { operand, .. } => self.expr_type(operand),
@@ -725,7 +737,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
-            "EOF" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -1152,9 +1164,15 @@ impl CodeGen {
         }
 
         // Generate body
+        let exit_label = format!(".Lproc_exit_{}", mangle(name));
+        let saved_exit = self.proc_exit_label.replace(exit_label.clone());
+        let saved_loops = std::mem::take(&mut self.loop_stack);
         for stmt in body {
             self.gen_stmt(stmt);
         }
+        self.loop_stack = saved_loops;
+        self.proc_exit_label = saved_exit;
+        self.emit_label(&exit_label);
 
         // Return - load return value into appropriate register based on type
         if is_function {
@@ -1258,6 +1276,7 @@ impl CodeGen {
                 items,
                 newline,
                 using: Some(fmt),
+                ..
             } => {
                 self.gen_print_using(fmt, items);
                 if *newline {
@@ -1265,15 +1284,34 @@ impl CodeGen {
                 }
             }
 
-            StmtKind::Print { items, newline, .. } => {
+            StmtKind::Print {
+                items,
+                newline,
+                write,
+                ..
+            } => {
+                let mut first = true;
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
-                            self.gen_print_expr(expr);
+                            // WRITE separates values with commas and quotes
+                            // strings; PRINT emits them bare.
+                            if *write {
+                                if !first {
+                                    self.emit_arg_imm(0, ASCII_COMMA);
+                                    self.emit("    call _rt_print_char");
+                                }
+                                self.gen_write_expr(expr);
+                            } else {
+                                self.gen_print_expr(expr);
+                            }
+                            first = false;
                         }
                         PrintItem::Tab => {
-                            self.emit_arg_imm(0, ASCII_TAB);
-                            self.emit("    call _rt_print_char");
+                            if !*write {
+                                self.emit_arg_imm(0, ASCII_TAB);
+                                self.emit("    call _rt_print_char");
+                            }
                         }
                         PrintItem::Empty => {}
                     }
@@ -1421,9 +1459,11 @@ impl CodeGen {
                 self.label_counter += 1;
 
                 // Body
+                self.loop_stack.push((true, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
 
                 // Increment
                 self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
@@ -1452,9 +1492,12 @@ impl CodeGen {
                     self.emit(&format!("    je {}", end_label));
                 }
 
+                // WHILE is a DO-family loop for EXIT DO purposes.
+                self.loop_stack.push((false, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
@@ -1493,9 +1536,11 @@ impl CodeGen {
                     }
                 }
 
+                self.loop_stack.push((false, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
+                self.loop_stack.pop();
 
                 if !*cond_at_start {
                     if let Some(cond) = condition {
@@ -1624,6 +1669,31 @@ impl CodeGen {
                 self.emit("    call _rt_restore");
             }
 
+            StmtKind::Swap(a, b) => self.gen_swap(a, b),
+
+            // CONST is resolved at compile time; nothing is emitted.
+            StmtKind::Const { .. } => {}
+
+            StmtKind::ExitLoop { is_for } => {
+                // Leave the innermost matching loop. Sema has already checked
+                // that one exists.
+                let target = self
+                    .loop_stack
+                    .iter()
+                    .rev()
+                    .find(|(f, _)| f == is_for)
+                    .map(|(_, label)| label.clone());
+                if let Some(label) = target {
+                    self.emit(&format!("    jmp {}", label));
+                }
+            }
+
+            StmtKind::ExitProc => {
+                if let Some(label) = self.proc_exit_label.clone() {
+                    self.emit(&format!("    jmp {}", label));
+                }
+            }
+
             StmtKind::Cls => {
                 self.emit("    call _rt_cls");
             }
@@ -1719,6 +1789,7 @@ impl CodeGen {
                 items,
                 newline,
                 using: Some(_),
+                ..
             } => {
                 // Sema rejects USING on file output for now, so this is only
                 // reachable if that check is removed without adding support.
@@ -1730,13 +1801,25 @@ impl CodeGen {
                 file_num,
                 items,
                 newline,
+                write,
                 ..
             } => {
                 let fnum = self.gen_file_num(file_num);
+                let mut first = true;
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
-                            self.gen_print_expr_to_file(expr, &fnum);
+                            if *write && !first {
+                                self.emit_arg_file_num(0, &fnum);
+                                self.emit_arg_imm(1, ASCII_COMMA);
+                                self.emit("    call _rt_file_print_char");
+                            }
+                            if *write {
+                                self.gen_write_expr_to_file(expr, &fnum);
+                            } else {
+                                self.gen_print_expr_to_file(expr, &fnum);
+                            }
+                            first = false;
                         }
                         PrintItem::Tab => {
                             self.emit_arg_file_num(0, &fnum);
@@ -1806,6 +1889,11 @@ impl CodeGen {
             },
 
             Expr::Variable(name) => {
+                // A CONST is substituted with its folded value.
+                if let Some(lit) = self.symbols.consts.get(&name.to_uppercase()).cloned() {
+                    return self.gen_expr(&Expr::Literal(lit));
+                }
+
                 // A bare reference to a parameterless FUNCTION calls it, as in
                 // QuickBASIC. Inside the function's own body the same name is
                 // its return variable, so that case must not become infinite
@@ -2180,6 +2268,55 @@ impl CodeGen {
         }
     }
 
+    /// Exchange two values, which sema has checked are the same type class.
+    ///
+    /// Both are read before either is written, so `SWAP A(I), A(J)` is correct
+    /// even when the subscripts alias.
+    fn gen_swap(&mut self, a: &LValue, b: &LValue) {
+        let is_string = is_string_var(&a.name);
+
+        // Read A into a temp.
+        self.gen_read_lvalue(a);
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if is_string {
+            self.emit("    mov QWORD PTR [rsp], rax");
+            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        // Read B and store it into A.
+        self.gen_read_lvalue(b);
+        self.gen_store_lvalue(a);
+
+        // Restore the saved A into B.
+        if is_string {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+        } else {
+            self.emit("    movsd xmm0, QWORD PTR [rsp]");
+        }
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_store_lvalue(b);
+    }
+
+    /// Load an assignment target's current value, in the same registers
+    /// `gen_expr` would leave it in.
+    fn gen_read_lvalue(&mut self, target: &LValue) {
+        let expr = match &target.indices {
+            Some(indices) => Expr::ArrayAccess {
+                name: target.name.clone(),
+                indices: indices.clone(),
+            },
+            None => Expr::Variable(target.name.clone()),
+        };
+        let ty = self.gen_expr(&expr);
+        if ty != DataType::String {
+            // gen_store_lvalue expects a Double, as the runtime readers produce.
+            self.gen_coercion(ty, DataType::Double);
+        }
+    }
+
     /// Store a freshly produced value into an assignment target.
     ///
     /// The value is expected where `gen_expr` leaves it: `rax`/`rdx` for a
@@ -2330,6 +2467,34 @@ impl CodeGen {
         self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
         self.emit_arg_imm(1, text.len() as i64);
         self.emit("    call _rt_print_string");
+    }
+
+    /// Emit one WRITE value: strings are quoted, numbers printed as usual.
+    fn gen_write_expr(&mut self, expr: &Expr) {
+        if self.expr_type(expr) == DataType::String {
+            self.emit_arg_imm(0, ASCII_QUOTE);
+            self.emit("    call _rt_print_char");
+            self.gen_print_expr(expr);
+            self.emit_arg_imm(0, ASCII_QUOTE);
+            self.emit("    call _rt_print_char");
+        } else {
+            self.gen_print_expr(expr);
+        }
+    }
+
+    /// WRITE # equivalent of [`Self::gen_write_expr`].
+    fn gen_write_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
+        if self.expr_type(expr) == DataType::String {
+            self.emit_arg_file_num(0, file_num);
+            self.emit_arg_imm(1, ASCII_QUOTE);
+            self.emit("    call _rt_file_print_char");
+            self.gen_print_expr_to_file(expr, file_num);
+            self.emit_arg_file_num(0, file_num);
+            self.emit_arg_imm(1, ASCII_QUOTE);
+            self.emit("    call _rt_file_print_char");
+        } else {
+            self.gen_print_expr_to_file(expr, file_num);
+        }
     }
 
     fn gen_print_expr(&mut self, expr: &Expr) {
@@ -2649,6 +2814,31 @@ impl CodeGen {
             }
             "TIMER" => {
                 self.emit("    call _rt_timer");
+            }
+            // Array bounds. The descriptor stores each dimension's element
+            // count, so UBOUND is that minus one and LBOUND is always 0.
+            "LBOUND" | "UBOUND" => {
+                let arr = match &args[0] {
+                    Expr::Variable(n) => n.to_uppercase(),
+                    Expr::FnCall { name, .. } => name.to_uppercase(),
+                    Expr::ArrayAccess { name, .. } => name.to_uppercase(),
+                    _ => unreachable!("sema requires an array name here"),
+                };
+                let dim = match args.get(1) {
+                    Some(Expr::Literal(Literal::Integer(n))) => *n as i32,
+                    _ => 1,
+                };
+                if upper_name == "LBOUND" {
+                    self.emit("    mov eax, 0");
+                } else {
+                    let loc = self
+                        .lookup_array(&arr)
+                        .expect("sema checked the array exists")
+                        .loc
+                        .clone();
+                    self.emit(&format!("    mov rax, {}", loc.q(dim)));
+                    self.emit("    dec rax");
+                }
             }
             // File status. Both take a file number and return a number.
             "EOF" | "LOF" => {
