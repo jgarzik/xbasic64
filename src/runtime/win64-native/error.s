@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Error Reporting (Win64 Native)
-# ==============================================================================
 #
 # One abort path for every runtime check. The message text is passed in and the
 # BASIC line number is a register argument, so only a handful of message
@@ -15,7 +13,6 @@
 #
 # Diagnostics go to the standard error handle, so a program's real output stays
 # clean and a test can still check partial output followed by an abort.
-# ==============================================================================
 
 .equ STD_ERROR_HANDLE, -12
 
@@ -36,15 +33,12 @@ _err_badfile:   .asciz "Bad file number"
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_error - Report a runtime error and terminate
-# ------------------------------------------------------------------------------
 # Arguments (Win64):
 #   rcx = message pointer (NUL-terminated)
 #   rdx = BASIC line number, or 0 when unknown
 #
 # Returns: never (ExitProcess(1))
-# ------------------------------------------------------------------------------
 .globl _rt_error
 _rt_error:
     push rbp

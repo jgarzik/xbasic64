@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Input Functions (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # Keyboard input functions using Win32 API (ReadFile) instead of libc scanf.
 # Uses UCRT strtod for number parsing.
@@ -10,7 +8,6 @@
 #   - 32-byte shadow space required before every call
 #   - Callee-saved: rbx, rbp, rdi, rsi, r12-r15
 #
-# ==============================================================================
 
 # Win32 API Constants
 .equ STD_INPUT_HANDLE, -10
@@ -30,9 +27,7 @@ _bytes_read: .quad 0             # For ReadFile output parameter
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_init_input - Initialize stdin handle (call once at startup)
-# ------------------------------------------------------------------------------
 # Internal: _rt_platform_init calls this; it is not a codegen entry point.
 _rt_init_input:
     push rbp
@@ -48,9 +43,7 @@ _rt_init_input:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_input_string - Read a line of text from stdin
-# ------------------------------------------------------------------------------
 # Reads characters until newline (which is not included in result).
 # Uses a static buffer, so the returned pointer is only valid until the next
 # call to _rt_input_string.
@@ -60,7 +53,6 @@ _rt_init_input:
 # Returns:
 #   rax = pointer to string data (in _input_buf)
 #   rdx = length of string
-# ------------------------------------------------------------------------------
 .globl _rt_input_string
 _rt_input_string:
     push rbp
@@ -117,16 +109,13 @@ _rt_input_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_input_number - Read a numeric value from stdin
-# ------------------------------------------------------------------------------
 # Reads a double-precision floating point number. Uses strtod from UCRT.
 #
 # Arguments: none
 #
 # Returns:
 #   xmm0 = the number read (double)
-# ------------------------------------------------------------------------------
 .globl _rt_input_number
 _rt_input_number:
     push rbp

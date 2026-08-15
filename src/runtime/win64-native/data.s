@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: DATA/READ/RESTORE Support (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # Functions implementing BASIC's DATA/READ/RESTORE statements.
 # Uses UCRT strtod for string-to-number conversion.
@@ -20,23 +18,19 @@
 # Win64 ABI:
 #   - Args: rcx, rdx, r8, r9
 #   - 32-byte shadow space required before calls
-# ==============================================================================
 
 # DATA type tags
 .equ TYPE_INTEGER, 0
 .equ TYPE_FLOAT,   1
 .equ TYPE_STRING,  2
 
-# ------------------------------------------------------------------------------
 # _rt_read_number - Read next DATA value as a number
-# ------------------------------------------------------------------------------
 # Reads the next value from the DATA table and returns it as a double.
 #
 # Arguments: none
 #
 # Returns:
 #   xmm0 = value as double
-# ------------------------------------------------------------------------------
 .globl _rt_read_number
 _rt_read_number:
     push rbp
@@ -77,9 +71,7 @@ _rt_read_number:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_read_string - Read next DATA value as a string
-# ------------------------------------------------------------------------------
 # Reads the next value from the DATA table and returns it as a string.
 #
 # Arguments: none
@@ -87,7 +79,6 @@ _rt_read_number:
 # Returns:
 #   rax = pointer to string data
 #   rdx = string length
-# ------------------------------------------------------------------------------
 .globl _rt_read_string
 _rt_read_string:
     push rbp
@@ -119,16 +110,13 @@ _rt_read_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_restore - Reset DATA pointer (RESTORE statement)
-# ------------------------------------------------------------------------------
 # Resets the DATA read position.
 #
 # Arguments:
 #   rcx = new position (0-based index into data table)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_restore
 _rt_restore:
     mov QWORD PTR [rip + _data_ptr], rcx

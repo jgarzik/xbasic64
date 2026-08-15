@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Math and Utility Functions
-# ==============================================================================
 #
 # Miscellaneous functions that don't fit in other categories.
 #
@@ -11,11 +9,8 @@
 # Global state (from data_defs.s):
 #   _rng_state = 8 bytes for random number generator state
 #   _cls_seq   = ANSI escape sequence for clear screen
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_rnd - Generate random number (RND function)
-# ------------------------------------------------------------------------------
 # Returns a pseudo-random number in the range [0, 1).
 #
 # Arguments:
@@ -40,7 +35,6 @@
 #
 #   Bit layout: [sign=0][exp=1023][mantissa=random52bits] = 1.xxxxx
 #   Subtract 1.0 to get 0.xxxxx
-# ------------------------------------------------------------------------------
 .globl _rt_rnd
 _rt_rnd:
     push rbp
@@ -71,9 +65,7 @@ _rt_rnd:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_timer - TIMER: seconds since midnight, UTC
-# ------------------------------------------------------------------------------
 # GW-BASIC's TIMER counts fractional seconds since midnight, so this uses
 # gettimeofday rather than time(): whole seconds alone made a program that
 # times a short loop always read zero.
@@ -84,7 +76,6 @@ _rt_rnd:
 #
 # Returns:
 #   xmm0 = seconds since midnight (double, 0 <= t < 86400)
-# ------------------------------------------------------------------------------
 .globl _rt_timer
 _rt_timer:
     push rbp
@@ -112,9 +103,7 @@ _rt_timer:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_cls - Clear screen (CLS statement)
-# ------------------------------------------------------------------------------
 # Clears the terminal screen and moves cursor to home position.
 # Uses ANSI escape sequences, which work on most modern terminals.
 #
@@ -124,7 +113,6 @@ _rt_timer:
 # Escape sequence: ESC[2J ESC[H
 #   ESC[2J = clear entire screen
 #   ESC[H  = move cursor to home (top-left)
-# ------------------------------------------------------------------------------
 .globl _rt_cls
 _rt_cls:
     push rbp

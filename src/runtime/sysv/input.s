@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Input Functions
-# ==============================================================================
 #
 # Keyboard input functions for the BASIC INPUT statement. These read from stdin
 # using libc scanf.
@@ -18,11 +16,8 @@
 #   Strings are returned as (pointer, length) pairs:
 #   - rax = pointer to string data
 #   - rdx = length in bytes
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_input_string - Read a line of text from stdin
-# ------------------------------------------------------------------------------
 # Reads characters until newline (which is not included in result).
 # Uses a static buffer, so the returned pointer is only valid until the next
 # call to _rt_input_string.
@@ -38,7 +33,6 @@
 #   2. scanf("%1023[^\n]", buffer) - read up to 1023 chars
 #   3. getchar() - consume the trailing newline
 #   4. Calculate string length by scanning for null terminator
-# ------------------------------------------------------------------------------
 .globl _rt_input_string
 _rt_input_string:
     push rbp
@@ -67,9 +61,7 @@ _rt_input_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_input_number - Read a numeric value from stdin
-# ------------------------------------------------------------------------------
 # Reads a double-precision floating point number. BASIC's INPUT statement
 # converts this to the appropriate type (Integer, Long, Single, Double).
 #
@@ -82,7 +74,6 @@ _rt_input_string:
 #   1. scanf("%lf", &local_var) - read double into stack
 #   2. getchar() - consume trailing newline
 #   3. Load result into xmm0
-# ------------------------------------------------------------------------------
 .globl _rt_input_number
 _rt_input_number:
     push rbp

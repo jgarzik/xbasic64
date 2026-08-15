@@ -540,9 +540,7 @@ impl<'a> Lexer<'a> {
 mod tests {
     use super::*;
 
-    // ===================
     // Literal Tests
-    // ===================
 
     #[test]
     fn test_integer_literal() {
@@ -616,9 +614,7 @@ mod tests {
         assert!(result.unwrap_err().contains("Unterminated"));
     }
 
-    // ===================
     // Identifier Tests
-    // ===================
 
     #[test]
     fn test_identifier() {
@@ -640,9 +636,7 @@ mod tests {
         assert_eq!(tokens[4], Token::Ident("E$".to_string())); // string
     }
 
-    // ===================
     // Keyword Tests
-    // ===================
 
     #[test]
     fn test_keywords_print_input() {
@@ -767,9 +761,7 @@ mod tests {
         assert_eq!(tokens[3], Token::Print);
     }
 
-    // ===================
     // Operator Tests
-    // ===================
 
     #[test]
     fn test_arithmetic_operators() {
@@ -795,9 +787,7 @@ mod tests {
         assert_eq!(tokens[5], Token::Ge);
     }
 
-    // ===================
     // Punctuation Tests
-    // ===================
 
     #[test]
     fn test_punctuation() {
@@ -810,9 +800,7 @@ mod tests {
         assert_eq!(tokens[4], Token::Colon);
     }
 
-    // ===================
     // Special Token Tests
-    // ===================
 
     #[test]
     fn test_line_numbers() {
@@ -845,9 +833,7 @@ mod tests {
         assert_eq!(tokens[0], Token::Eof);
     }
 
-    // ===================
     // Comment Tests
-    // ===================
 
     #[test]
     fn test_rem_comment() {
@@ -873,9 +859,7 @@ mod tests {
         assert_eq!(tokens[5], Token::Ident("Y".to_string()));
     }
 
-    // ===================
     // Integration Tests
-    // ===================
 
     #[test]
     fn test_for_loop_statement() {

@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: File I/O Functions
-# ==============================================================================
 #
 # File input/output functions implementing BASIC's OPEN, CLOSE, PRINT#, INPUT#
 # statements. Uses libc file operations (fopen, fclose, fprintf, fscanf, fgets).
@@ -32,11 +30,8 @@
 # Error Handling:
 #   Currently minimal - fopen failure results in NULL handle, which will
 #   cause subsequent operations to fail silently or crash.
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # Data Section: File handle table and buffers
-# ------------------------------------------------------------------------------
 .data
 # File handle table: FILE* pointers indexed by BASIC file number (1-15)
 # Index 0 unused, indices 1-15 for BASIC files #1-#15
@@ -66,9 +61,7 @@ _file_input_buf: .skip 1024
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_file_open - Open a file (OPEN statement)
-# ------------------------------------------------------------------------------
 # Associates a filename with a file number for subsequent I/O.
 #
 # Arguments:
@@ -84,7 +77,6 @@ _file_input_buf: .skip 1024
 #   2. Select mode string based on mode argument
 #   3. Call fopen(filename, mode)
 #   4. Store resulting FILE* in handle table
-# ------------------------------------------------------------------------------
 .globl _rt_file_open
 _rt_file_open:
     push rbp
@@ -140,16 +132,13 @@ _rt_file_open:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_close - Close a file (CLOSE statement)
-# ------------------------------------------------------------------------------
 # Closes the file associated with a file number and clears its handle.
 #
 # Arguments:
 #   rdi = file number (1-15)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_close
 _rt_file_close:
     push rbp
@@ -183,16 +172,13 @@ _rt_file_close:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_string - Write string to file (PRINT# with string)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = file number
 #   rsi = string pointer
 #   rdx = string length
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_string
 _rt_file_print_string:
     push rbp
@@ -230,9 +216,7 @@ _rt_file_print_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_float - Write number to file (PRINT# with number)
-# ------------------------------------------------------------------------------
 # Prints whole numbers as integers for clean output.
 #
 # Arguments:
@@ -240,7 +224,6 @@ _rt_file_print_string:
 #   xmm0 = value to write (double)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_float
 _rt_file_print_float:
     push rbp
@@ -257,9 +240,7 @@ _rt_file_print_float:
     call _rt_fmt_double
     jmp .Lfile_num_emit
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_single - Write a SINGLE
-# ------------------------------------------------------------------------------
 # A SINGLE carries only ~7 significant digits, so it uses a table starting at a
 # shorter format and compares at 32-bit precision. Otherwise 3.14159! would
 # print as 3.1415901184082: at 15 digits even a float's value round-trips.
@@ -272,7 +253,6 @@ _rt_file_print_float:
 #   xmm0 = value, already widened to double
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_single
 _rt_file_print_single:
     push rbp
@@ -298,9 +278,7 @@ _rt_file_print_single:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_con_string - Write a string to the console
-# ------------------------------------------------------------------------------
 # The console is file handle 0. This exists for the runtime's own messages and
 # for PRINT USING, which has no file form; generated code passes a handle like
 # any other caller.
@@ -310,7 +288,6 @@ _rt_file_print_single:
 #   rsi = string length
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_con_string
 _rt_con_string:
     mov rdx, rsi            # length  -> 3rd arg
@@ -318,15 +295,12 @@ _rt_con_string:
     xor edi, edi            # console -> 1st arg
     jmp _rt_file_print_string
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_spc - SPC(n): write n spaces
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = file number
 #   rsi = count
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_spc
 _rt_file_print_spc:
     push rbp
@@ -350,9 +324,7 @@ _rt_file_print_spc:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_tab - TAB(n): advance to column n
-# ------------------------------------------------------------------------------
 # Columns are 1-based, as in GW-BASIC. If the sink is already at or past the
 # requested column, a newline is written first and the tab applies to the new
 # line.
@@ -362,7 +334,6 @@ _rt_file_print_spc:
 #   rsi = target column
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_tab
 _rt_file_print_tab:
     push rbp
@@ -396,15 +367,12 @@ _rt_file_print_tab:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_char - Write single character to file
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = file number
 #   rsi = character code
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_char
 _rt_file_print_char:
     push rbp
@@ -430,16 +398,13 @@ _rt_file_print_char:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_newline - Write newline to file
-# ------------------------------------------------------------------------------
 # Called at end of PRINT# statement unless suppressed with ; or ,
 #
 # Arguments:
 #   rdi = file number
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_newline
 _rt_file_print_newline:
     push rbp
@@ -464,9 +429,7 @@ _rt_file_print_newline:
     ret
 
 
-# ------------------------------------------------------------------------------
 # _rt_file_read_field - Read one INPUT # field
-# ------------------------------------------------------------------------------
 # INPUT # reads comma-delimited fields, not whole lines. Reading a line per
 # variable made `INPUT #1, A, B` on "10,20" yield 10 twice, and reading through
 # fscanf("%lf") was worse: it stopped at the comma without consuming it, so
@@ -484,13 +447,9 @@ _rt_file_print_newline:
 #   rax = pointer to the field (in _file_input_buf), rdx = its length
 #
 # Note: uses a static buffer, so the result is valid only until the next read.
-# ------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------
 # _rt_file_getc - Read one byte
-# ------------------------------------------------------------------------------
 # Arguments: rdi = file number
 # Returns:   eax = the byte, or -1 at end of file or on a file that is not open
-# ------------------------------------------------------------------------------
 .globl _rt_file_getc
 _rt_file_getc:
     push rbp
@@ -613,15 +572,12 @@ _rt_file_read_field:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_input_number - INPUT #: read one numeric field
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = file number
 #
 # Returns:
 #   xmm0 = value read, or 0.0 for a field that is not a number
-# ------------------------------------------------------------------------------
 .globl _rt_file_input_number
 _rt_file_input_number:
     push rbp
@@ -637,19 +593,14 @@ _rt_file_input_number:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_input_string - INPUT #: read one string field
-# ------------------------------------------------------------------------------
 # Arguments: rdi = file number
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_file_input_string
 _rt_file_input_string:
     jmp _rt_file_read_field
 
-# ------------------------------------------------------------------------------
 # _rt_file_line_input - LINE INPUT #: read a whole line
-# ------------------------------------------------------------------------------
 # Reads a line from file, stripping the trailing newline.
 #
 # Arguments:
@@ -660,7 +611,6 @@ _rt_file_input_string:
 #   rdx = string length
 #
 # Note: Uses static buffer - result only valid until next file string read.
-# ------------------------------------------------------------------------------
 .globl _rt_file_line_input
 _rt_file_line_input:
     push rbp
@@ -723,12 +673,9 @@ _rt_file_line_input:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_close_all - Close every open file (bare CLOSE)
-# ------------------------------------------------------------------------------
 # Arguments: none
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_close_all
 _rt_file_close_all:
     push rbp
@@ -759,9 +706,7 @@ _rt_file_close_all:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_eof - EOF(n): has the file been read to the end?
-# ------------------------------------------------------------------------------
 # Peeks one character and pushes it back, since feof() only reports end-of-file
 # after a read has already failed, which would make EOF() lag by one line.
 #
@@ -770,7 +715,6 @@ _rt_file_close_all:
 #
 # Returns:
 #   eax = -1 at end of file, 0 otherwise (BASIC's true/false, as a LONG)
-# ------------------------------------------------------------------------------
 .globl _rt_file_eof
 _rt_file_eof:
     push rbp
@@ -805,15 +749,12 @@ _rt_file_eof:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_lof - LOF(n): length of the file in bytes
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = file number
 #
 # Returns:
 #   xmm0 = length in bytes, or 0.0 when the file is not open
-# ------------------------------------------------------------------------------
 .globl _rt_file_lof
 _rt_file_lof:
     push rbp

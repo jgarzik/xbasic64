@@ -40,9 +40,7 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
 /// Precedence of `^`, the tightest-binding binary operator.
 const POWER_PREC: u8 = 7;
 
-// ============================================================================
 // AST Definitions
-// ============================================================================
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -436,9 +434,7 @@ pub fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
     }
 }
 
-// ============================================================================
 // Parse errors and block terminators
-// ============================================================================
 
 /// A block-closing keyword, consumed by `parse_statement` on behalf of the
 /// enclosing block parser.
@@ -550,9 +546,7 @@ fn err<T>(msg: impl Into<String>) -> PResult<T> {
     Err(ParseError::Error(msg.into()))
 }
 
-// ============================================================================
 // Parser
-// ============================================================================
 
 #[derive(Default)]
 pub struct Parser {
@@ -2182,9 +2176,7 @@ mod tests {
         parser.parse().map_err(|e| e.to_string())
     }
 
-    // ===================
     // Label Tests
-    // ===================
 
     #[test]
     fn test_label() {
@@ -2206,9 +2198,7 @@ mod tests {
         assert!(matches!(&prog.statements[4].kind, StmtKind::Label(30)));
     }
 
-    // ===================
     // Let Tests
-    // ===================
 
     #[test]
     fn test_let_simple() {
@@ -2275,9 +2265,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Print Tests
-    // ===================
 
     #[test]
     fn test_print_string() {
@@ -2321,9 +2309,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Input Tests
-    // ===================
 
     #[test]
     fn test_input_simple() {
@@ -2359,9 +2345,7 @@ mod tests {
         }
     }
 
-    // ===================
     // LineInput Tests
-    // ===================
 
     #[test]
     fn test_line_input_simple() {
@@ -2386,9 +2370,7 @@ mod tests {
         }
     }
 
-    // ===================
     // If Tests
-    // ===================
 
     #[test]
     fn test_if_single_line() {
@@ -2463,9 +2445,7 @@ mod tests {
         }
     }
 
-    // ===================
     // For Tests
-    // ===================
 
     #[test]
     fn test_for_simple() {
@@ -2513,9 +2493,7 @@ mod tests {
         }
     }
 
-    // ===================
     // While Tests
-    // ===================
 
     #[test]
     fn test_while_simple() {
@@ -2535,9 +2513,7 @@ mod tests {
         }
     }
 
-    // ===================
     // DoLoop Tests
-    // ===================
 
     #[test]
     fn test_do_loop_simple() {
@@ -2594,9 +2570,7 @@ mod tests {
         }
     }
 
-    // ===================
     // SelectCase Tests
-    // ===================
 
     #[test]
     fn test_select_case_simple() {
@@ -2651,9 +2625,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Goto Tests
-    // ===================
 
     #[test]
     fn test_goto_line_number() {
@@ -2680,9 +2652,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Gosub Tests
-    // ===================
 
     #[test]
     fn test_gosub_line_number() {
@@ -2705,9 +2675,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Return Tests
-    // ===================
 
     #[test]
     fn test_return() {
@@ -2716,9 +2684,7 @@ mod tests {
         assert!(matches!(&prog.statements[0].kind, StmtKind::Return));
     }
 
-    // ===================
     // OnGoto Tests
-    // ===================
 
     #[test]
     fn test_on_goto() {
@@ -2732,9 +2698,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Dim Tests
-    // ===================
 
     #[test]
     fn test_dim_single() {
@@ -2841,9 +2805,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Sub Tests
-    // ===================
 
     #[test]
     fn test_sub_no_params() {
@@ -2868,9 +2830,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Function Tests
-    // ===================
 
     #[test]
     fn test_function_no_params() {
@@ -2899,9 +2859,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Call Tests
-    // ===================
 
     #[test]
     fn test_call_no_args() {
@@ -2936,9 +2894,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Data Tests
-    // ===================
 
     #[test]
     fn test_data_integers() {
@@ -2975,9 +2931,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Read Tests
-    // ===================
 
     #[test]
     fn test_read_single() {
@@ -3001,9 +2955,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Restore Tests
-    // ===================
 
     #[test]
     fn test_restore_simple() {
@@ -3026,9 +2978,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Cls Tests
-    // ===================
 
     #[test]
     fn test_cls() {
@@ -3037,9 +2987,7 @@ mod tests {
         assert!(matches!(&prog.statements[0].kind, StmtKind::Cls));
     }
 
-    // ===================
     // End Tests
-    // ===================
 
     #[test]
     fn test_end() {
@@ -3048,9 +2996,7 @@ mod tests {
         assert!(matches!(&prog.statements[0].kind, StmtKind::End));
     }
 
-    // ===================
     // Stop Tests
-    // ===================
 
     #[test]
     fn test_stop() {
@@ -3059,9 +3005,7 @@ mod tests {
         assert!(matches!(&prog.statements[0].kind, StmtKind::Stop));
     }
 
-    // ===================
     // Expression Tests
-    // ===================
 
     #[test]
     fn test_expr_precedence() {
@@ -3270,9 +3214,7 @@ mod tests {
         }
     }
 
-    // ===================
     // Integration Tests
-    // ===================
 
     #[test]
     fn test_colon_separator() {

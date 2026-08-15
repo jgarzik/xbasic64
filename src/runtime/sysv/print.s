@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Print Functions
-# ==============================================================================
 #
 # Number formatting and program termination. The printing itself lives in
 # file.s: the console is file handle 0, so PRINT and PRINT # are the same
@@ -13,26 +11,20 @@
 #
 # The {libc} placeholder is replaced with "_" on macOS, "" on Linux, and
 # {stdout} with the libc symbol holding the standard output stream.
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_platform_init - Prepare the console for output
-# ------------------------------------------------------------------------------
 # The console is file handle 0, so every print helper reaches it the same way
 # it reaches an OPENed file. Seeding the slot is all that takes here; Windows
 # has to ask the OS for its handles instead.
 #
 # Arguments: none      Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_platform_init
 _rt_platform_init:
     mov rax, QWORD PTR [rip + {stdout}]
     mov QWORD PTR [rip + _file_handles], rax
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_fmt_double - Format a number into _num_buf
-# ------------------------------------------------------------------------------
 # Shared by console and file output so both render numbers identically.
 #
 # GW-BASIC convention: a whole number is written without a decimal point. For
@@ -50,7 +42,6 @@ _rt_platform_init:
 #
 # Returns:
 #   rax = length of the text in _num_buf
-# ------------------------------------------------------------------------------
 .globl _rt_fmt_double
 _rt_fmt_double:
     push rbp
@@ -118,9 +109,7 @@ _rt_fmt_double:
     pop rbp
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_end - Terminate the program normally (END / STOP)
-# ------------------------------------------------------------------------------
 # Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
 # `leave; ret` for END only terminates when it appears in main; inside a
 # procedure it merely returns to the caller and execution continues.
@@ -130,7 +119,6 @@ _rt_fmt_double:
 #
 # Arguments: none
 # Returns: never
-# ------------------------------------------------------------------------------
 .globl _rt_end
 _rt_end:
     push rbp
