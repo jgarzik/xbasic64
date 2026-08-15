@@ -1382,9 +1382,10 @@ impl CodeGen {
             }
 
             Stmt::End | Stmt::Stop => {
-                self.emit("    xor eax, eax");
-                self.emit("    leave");
-                self.emit("    ret");
+                // Terminate the program, not just the current frame. A plain
+                // `leave; ret` only ends the program when END appears in main;
+                // inside a SUB or FUNCTION it just returns to the caller.
+                self.emit("    call _rt_end");
             }
 
             Stmt::Open {

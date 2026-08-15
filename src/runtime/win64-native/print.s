@@ -215,3 +215,24 @@ _rt_gosub_overflow:
     # ExitProcess(1)
     mov ecx, 1
     call ExitProcess
+
+# ------------------------------------------------------------------------------
+# _rt_end - Terminate the program normally (END / STOP)
+# ------------------------------------------------------------------------------
+# Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
+# `leave; ret` for END only terminates when it appears in main; inside a
+# procedure it merely returns to the caller and execution continues.
+#
+# ExitProcess is safe here because this runtime writes console and file output
+# with WriteFile rather than through CRT buffering.
+#
+# Arguments: none
+# Returns: never
+# ------------------------------------------------------------------------------
+.globl _rt_end
+_rt_end:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32             # Shadow space
+    xor ecx, ecx            # exit code 0
+    call ExitProcess

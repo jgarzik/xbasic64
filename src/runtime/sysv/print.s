@@ -155,3 +155,23 @@ _rt_gosub_overflow:
     call {libc}printf
     mov edi, 1              # exit code 1
     call {libc}exit
+
+# ------------------------------------------------------------------------------
+# _rt_end - Terminate the program normally (END / STOP)
+# ------------------------------------------------------------------------------
+# Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
+# `leave; ret` for END only terminates when it appears in main; inside a
+# procedure it merely returns to the caller and execution continues.
+#
+# Uses exit() rather than _exit() so stdio buffers -- printf output and any
+# FILE* opened by file.s -- are flushed.
+#
+# Arguments: none
+# Returns: never
+# ------------------------------------------------------------------------------
+.globl _rt_end
+_rt_end:
+    push rbp
+    mov rbp, rsp
+    xor edi, edi            # exit code 0
+    call {libc}exit

@@ -234,3 +234,44 @@ RETURN
         "nested gosub"
     );
 }
+
+/// END and STOP must terminate the program from any frame. Inside a SUB they
+/// used to emit a bare `leave; ret`, which merely returned to the caller and
+/// let execution continue.
+#[test]
+fn test_end_terminates_from_within_procedure() {
+    let output = compile_and_run(
+        r#"
+SUB Quit
+PRINT "before"
+END
+PRINT "after"
+END SUB
+PRINT "start"
+Quit
+PRINT "unreachable"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["start", "before"], "END ends the program");
+}
+
+/// Same for STOP, and from inside a FUNCTION.
+#[test]
+fn test_stop_terminates_from_within_function() {
+    let output = compile_and_run(
+        r#"
+FUNCTION Half(N)
+PRINT "computing"
+STOP
+Half = N / 2
+END FUNCTION
+PRINT "start"
+PRINT Half(8)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["start", "computing"], "STOP ends the program");
+}
