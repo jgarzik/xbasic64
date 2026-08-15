@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run, normalize_output};
+use crate::common::compile_and_run;
 
 #[test]
 fn test_variable_types() {
@@ -39,8 +39,7 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    let normalized = normalize_output(&output);
-    let lines: Vec<&str> = normalized.lines().collect();
+    let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines[0], "6", "single add");
     assert_eq!(lines[1], "8.75", "single mul");
     assert_eq!(lines[2], "Hello World", "string concat");

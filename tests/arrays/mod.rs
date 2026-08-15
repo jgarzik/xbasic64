@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run, normalize_output};
+use crate::common::compile_and_run;
 
 #[test]
 fn test_arrays_1d_2d() {
@@ -30,8 +30,7 @@ PRINT Grid(0, 0), Grid(0, 1), Grid(0, 2), Grid(1, 0), Grid(1, 1), Grid(1, 2)
 "#,
     )
     .unwrap();
-    let normalized = normalize_output(&output);
-    let lines: Vec<&str> = normalized.lines().collect();
+    let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines[0], "10", "1d a(1)");
     assert_eq!(lines[1], "30", "1d a(3)");
     assert_eq!(lines[2], "15", "2d diagonal sum");

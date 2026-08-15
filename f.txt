@@ -1,0 +1,60 @@
+tests/runtime/mod.rs
+Comment on lines +21 to +23
+        if path.extension().is_none_or(|e| e != "s") {
+            continue;
+        }
+Copilot commented 1 hour ago
+Copilot
+Copilot
+AI
+1h ago
+High
+The extension check compares an OsStr to a &str (e != "s"), which is not reliably comparable and can fail to compile. Convert the extension to &str first (or compare against OsStr::new("s")).
+
+This issue also appears on line 76 of the same file.
+
+Suggested changeset 1 (1)
+tests/runtime/mod.rs
+Original file line number	Diff line number	Diff line change
+     let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {dir}: {e}"));
+     for entry in entries {
+         let path = entry.expect("readable directory entry").path();
+         if path.extension().is_none_or(|e| e != "s") {
+         if path.extension().and_then(|e| e.to_str()) != Some("s") {
+             continue;
+         }
+         let text = std::fs::read_to_string(&path).expect("readable .s file");
+Copilot uses AI. Check for mistakes.
+@jgarzik	Reply...
+tests/print/mod.rs
+Comment on lines +34 to +35
+    let output = compile_and_run("PRINT USING \"##.##\"; 3.14159\nPRINT USING \"###\"; 42\nPRINT USING \"Total: ##.## units\"; 3.5\nPRINT USING \"## and ##\"; 1; 2\n").unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+Copilot commented 1 hour ago
+Copilot
+Copilot
+AI
+1h ago
+Medium
+These assertions use output.lines(), which will leave trailing \r characters on Windows (CRLF), making the test platform-dependent. Normalize CRLF to LF before splitting into lines.
+
+This issue also appears in the following locations of the same file:
+
+line 45
+line 57
+line 68
+line 81
+line 100
+Suggested changeset 1 (1)
+tests/print/mod.rs
+Original file line number	Diff line number	Diff line change
+ #[test]
+ fn test_print_using_numeric() {
+     let output = compile_and_run("PRINT USING \"##.##\"; 3.14159\nPRINT USING \"###\"; 42\nPRINT USING \"Total: ##.## units\"; 3.5\nPRINT USING \"## and ##\"; 1; 2\n").unwrap();
+     let output = crate::common::normalize_output(&output);
+     let lines: Vec<&str> = output.lines().collect();
+     assert_eq!(lines[0], " 3.14", "rounded and right-justified");
+     assert_eq!(lines[1], " 42");
+Copilot uses AI. Check for mistakes.
+
+

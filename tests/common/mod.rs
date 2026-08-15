@@ -1,4 +1,10 @@
 //! Common test utilities for integration tests
+//!
+//! On line endings: the Win64 runtime writes CRLF and the System V one writes
+//! LF, but `str::lines()` splits on `\n` and drops a trailing `\r`, so an
+//! assertion that goes through `lines()` is already platform-independent and
+//! needs no normalizing helper. Comparing a whole multi-line block against a
+//! literal would not be -- write those as per-line assertions.
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
@@ -194,9 +200,4 @@ where
     }
 
     Ok((String::from_utf8_lossy(&run_output.stdout).to_string(), tmp))
-}
-
-/// Normalize line endings for cross-platform test assertions (CRLF -> LF)
-pub fn normalize_output(s: &str) -> String {
-    s.trim().replace("\r\n", "\n")
 }
