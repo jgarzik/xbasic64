@@ -114,22 +114,33 @@ mod tests {
     /// assembles the whole tree rather than each file alone: `.L` labels are
     /// not file-local the way they look.
     ///
+    /// The macOS spelling of the System V tree is covered too. macOS decorates
+    /// C symbols with a leading underscore, and no CI job builds for it, so
+    /// `{libc}` expanding to `_` is otherwise a substitution nothing ever
+    /// performs.
+    ///
     /// This is a Unix-host check, which is where it is worth having: GNU `as`
-    /// assembles both trees, so the Linux job catches a Win64 mistake before
+    /// assembles every variant, so the Linux job catches a Win64 mistake before
     /// Windows CI ever sees it. The reverse is not needed -- a System V
     /// mistake fails the Linux job outright -- and Windows builds its own tree
     /// on every compile a test performs.
     #[test]
-    #[cfg_attr(windows, ignore = "GNU as assembles both trees; Windows uses clang")]
+    #[cfg_attr(windows, ignore = "GNU as assembles every tree; Windows uses clang")]
     fn test_both_runtimes_assemble() {
-        for (name, rt) in [("sysv", &SYSV), ("win64-native", &WIN64)] {
+        // Every (tree, symbol prefix) pair the compiler can emit.
+        let variants = [
+            ("sysv", &SYSV, ""),
+            ("sysv-macos", &SYSV, "_"),
+            ("win64-native", &WIN64, ""),
+        ];
+
+        for (name, rt, libc_prefix) in variants {
             let dir = std::env::temp_dir().join(format!("xbasic64-asm-{name}"));
             std::fs::create_dir_all(&dir).expect("writable temp directory");
             let asm = dir.join("runtime.s");
             let obj = dir.join("runtime.o");
 
-            // The prefix only matters for linking, which this does not do.
-            std::fs::write(&asm, emit(rt, "")).expect("writable assembly file");
+            std::fs::write(&asm, emit(rt, libc_prefix)).expect("writable assembly file");
 
             let output = Command::new("as")
                 .arg("-o")
