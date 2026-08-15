@@ -129,3 +129,80 @@ RETURN
     .expect("nested SELECT CASE contents should be collected");
     assert_eq!(run.lines(), vec!["nested", "7"]);
 }
+
+/// An unmatched block terminator must produce a readable diagnostic naming the
+/// construct it needed, not leak the parser's internal signalling. These used
+/// to surface as `Parse error: CASE:Literal(Integer(1))` and `Parse error: NEXT`.
+#[test]
+fn test_unmatched_block_terminators_diagnose_clearly() {
+    let cases = [
+        ("END SELECT\n", "END SELECT without matching SELECT CASE"),
+        ("CASE 1\n", "CASE without matching SELECT CASE"),
+        ("NEXT I\n", "NEXT without matching FOR"),
+        ("WEND\n", "WEND without matching WHILE"),
+        ("LOOP\n", "LOOP without matching DO"),
+        ("END SUB\n", "END SUB without matching SUB"),
+        ("END FUNCTION\n", "END FUNCTION without matching FUNCTION"),
+        ("ELSE\n", "ELSE without matching IF"),
+        ("END IF\n", "END IF without matching IF"),
+    ];
+    for (source, expected) in cases {
+        let e = compile_only(source)
+            .expect_err(&format!("{source:?} should be rejected, but it compiled"));
+        assert!(
+            e.contains(expected),
+            "for {source:?} expected {expected:?}, got stderr: {}",
+            e.stderr
+        );
+        assert!(
+            e.is_clean_rejection(),
+            "{source:?} should be diagnosed, not panic; exit={:?}",
+            e.exit_code
+        );
+    }
+}
+
+/// A bare `END` inside a SELECT CASE body is the program-termination statement,
+/// not the start of `END SELECT`. Distinguishing them needs two-token lookahead;
+/// without it this failed with "Expected Select, got Newline".
+#[test]
+fn test_end_statement_inside_select_case_body() {
+    let run = compile_and_run_raw(
+        r#"
+X = 1
+SELECT CASE X
+CASE 1
+PRINT "in case"
+END
+END SELECT
+PRINT "unreachable"
+"#,
+        "",
+    )
+    .expect("a bare END inside a CASE body should parse");
+    assert_eq!(run.lines(), vec!["in case"], "END terminated the program");
+    assert_eq!(run.exit_code, Some(0));
+}
+
+/// The ENDSELECT spelling and a nested block inside a case body must both still
+/// work after the lookahead change.
+#[test]
+fn test_select_case_terminator_spellings() {
+    let run = compile_and_run_raw(
+        r#"
+X = 2
+SELECT CASE X
+CASE 1
+PRINT "one"
+CASE 2
+IF X = 2 THEN
+PRINT "two"
+END IF
+END SELECT
+PRINT "after"
+"#,
+        "",
+    )
+    .expect("nested IF inside a case body should parse");
+    assert_eq!(run.lines(), vec!["two", "after"]);
+}

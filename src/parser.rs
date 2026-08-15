@@ -254,6 +254,93 @@ impl DataType {
 }
 
 // ============================================================================
+// Parse errors and block terminators
+// ============================================================================
+
+/// A block-closing keyword, consumed by `parse_statement` on behalf of the
+/// enclosing block parser.
+///
+/// These are not errors. BASIC's block terminators are statements
+/// syntactically, but they belong to the construct that opened the block, so
+/// `parse_statement` reports them through the error channel and the enclosing
+/// parser (`parse_if_body`, `parse_for`, ...) treats the matching one as a
+/// normal end-of-body. Any terminator that reaches the top level without a
+/// matching opener is rendered as a real diagnostic.
+///
+/// Conditions travel as payloads rather than through parser fields, so a
+/// terminator cannot be separated from its expression.
+#[derive(Debug, Clone)]
+pub enum BlockEnd {
+    EndIf,
+    EndSub,
+    EndFunction,
+    EndSelect,
+    Next,
+    Wend,
+    Loop,
+    LoopWhile(Expr),
+    LoopUntil(Expr),
+    Else,
+    ElseIf(Expr),
+}
+
+impl BlockEnd {
+    /// The source keyword, for diagnostics about an unmatched terminator.
+    fn keyword(&self) -> &'static str {
+        match self {
+            BlockEnd::EndIf => "END IF",
+            BlockEnd::EndSub => "END SUB",
+            BlockEnd::EndFunction => "END FUNCTION",
+            BlockEnd::EndSelect => "END SELECT",
+            BlockEnd::Next => "NEXT",
+            BlockEnd::Wend => "WEND",
+            BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "LOOP",
+            BlockEnd::Else => "ELSE",
+            BlockEnd::ElseIf(_) => "ELSEIF",
+        }
+    }
+
+    /// The construct this terminator closes, for the "without matching X" hint.
+    fn opener(&self) -> &'static str {
+        match self {
+            BlockEnd::EndIf | BlockEnd::Else | BlockEnd::ElseIf(_) => "IF",
+            BlockEnd::EndSub => "SUB",
+            BlockEnd::EndFunction => "FUNCTION",
+            BlockEnd::EndSelect => "SELECT CASE",
+            BlockEnd::Next => "FOR",
+            BlockEnd::Wend => "WHILE",
+            BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "DO",
+        }
+    }
+}
+
+/// Why parsing of a statement stopped.
+#[derive(Debug, Clone)]
+pub enum ParseError {
+    /// A block terminator was consumed; the enclosing block parser handles it.
+    Block(BlockEnd),
+    /// A genuine syntax error.
+    Error(String),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::Error(msg) => write!(f, "{}", msg),
+            ParseError::Block(b) => write!(f, "{} without matching {}", b.keyword(), b.opener()),
+        }
+    }
+}
+
+/// Shorthand for the parser's result type.
+type PResult<T> = Result<T, ParseError>;
+
+/// Build a syntax error.
+fn err<T>(msg: impl Into<String>) -> PResult<T> {
+    Err(ParseError::Error(msg.into()))
+}
+
+// ============================================================================
 // Parser
 // ============================================================================
 
@@ -261,11 +348,6 @@ impl DataType {
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    /// Stores condition from LOOP WHILE/UNTIL for DO loops
-    last_loop_condition: Option<Expr>,
-    last_loop_is_until: bool,
-    /// Stores condition from ELSEIF for nested IF construction
-    last_elseif_condition: Option<Expr>,
     /// Tracks declared array names for distinguishing array access from function calls
     declared_arrays: HashSet<String>,
 }
@@ -282,18 +364,32 @@ impl Parser {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
 
+    /// Look `n` tokens past the current one without consuming anything.
+    fn peek_at(&self, n: usize) -> &Token {
+        self.tokens.get(self.pos + n).unwrap_or(&Token::Eof)
+    }
+
+    /// True if the upcoming tokens close a SELECT CASE.
+    ///
+    /// Two-token lookahead matters: a bare `END` inside a case body is the
+    /// program-termination statement, not the start of `END SELECT`.
+    fn at_end_select(&self) -> bool {
+        matches!(self.peek(), Token::EndSelect)
+            || (matches!(self.peek(), Token::End) && matches!(self.peek_at(1), Token::Select))
+    }
+
     fn advance(&mut self) -> Token {
         let tok = self.tokens.get(self.pos).cloned().unwrap_or(Token::Eof);
         self.pos += 1;
         tok
     }
 
-    fn expect(&mut self, expected: Token) -> Result<(), String> {
+    fn expect(&mut self, expected: Token) -> PResult<()> {
         let tok = self.advance();
         if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) {
             Ok(())
         } else {
-            Err(format!("Expected {:?}, got {:?}", expected, tok))
+            err(format!("Expected {:?}, got {:?}", expected, tok))
         }
     }
 
@@ -304,6 +400,10 @@ impl Parser {
     }
 
     pub fn parse(&mut self) -> Result<Program, String> {
+        self.parse_program().map_err(|e| e.to_string())
+    }
+
+    fn parse_program(&mut self) -> PResult<Program> {
         let mut statements = Vec::new();
         self.skip_newlines();
 
@@ -316,7 +416,7 @@ impl Parser {
         Ok(Program { statements })
     }
 
-    fn parse_statement(&mut self) -> Result<Stmt, String> {
+    fn parse_statement(&mut self) -> PResult<Stmt> {
         // Handle line numbers as labels
         if let Token::LineNumber(n) = self.peek().clone() {
             self.advance();
@@ -364,38 +464,38 @@ impl Parser {
                     Token::If => {
                         self.advance();
                         // Return to caller - this is a terminator, not a statement
-                        Err("END IF".to_string())
+                        Err(ParseError::Block(BlockEnd::EndIf))
                     }
                     Token::Sub => {
                         self.advance();
-                        Err("END SUB".to_string())
+                        Err(ParseError::Block(BlockEnd::EndSub))
                     }
                     Token::Function => {
                         self.advance();
-                        Err("END FUNCTION".to_string())
+                        Err(ParseError::Block(BlockEnd::EndFunction))
                     }
                     Token::Select => {
                         self.advance();
-                        Err("END SELECT".to_string())
+                        Err(ParseError::Block(BlockEnd::EndSelect))
                     }
                     _ => Ok(Stmt::End),
                 }
             }
             Token::EndIf => {
                 self.advance();
-                Err("END IF".to_string())
+                Err(ParseError::Block(BlockEnd::EndIf))
             }
             Token::EndSub => {
                 self.advance();
-                Err("END SUB".to_string())
+                Err(ParseError::Block(BlockEnd::EndSub))
             }
             Token::EndFunction => {
                 self.advance();
-                Err("END FUNCTION".to_string())
+                Err(ParseError::Block(BlockEnd::EndFunction))
             }
             Token::EndSelect => {
                 self.advance();
-                Err("END SELECT".to_string())
+                Err(ParseError::Block(BlockEnd::EndSelect))
             }
             Token::Stop => {
                 self.advance();
@@ -407,11 +507,11 @@ impl Parser {
                 if let Token::Ident(_) = self.peek() {
                     self.advance();
                 }
-                Err("NEXT".to_string())
+                Err(ParseError::Block(BlockEnd::Next))
             }
             Token::Wend => {
                 self.advance();
-                Err("WEND".to_string())
+                Err(ParseError::Block(BlockEnd::Wend))
             }
             Token::Loop => {
                 self.advance();
@@ -420,56 +520,40 @@ impl Parser {
                     Token::While => {
                         self.advance();
                         let cond = self.parse_expression()?;
-                        // Store condition for parse_do_loop to retrieve
-                        self.last_loop_condition = Some(cond);
-                        self.last_loop_is_until = false;
-                        Err("LOOP WHILE".to_string())
+                        Err(ParseError::Block(BlockEnd::LoopWhile(cond)))
                     }
                     Token::Until => {
                         self.advance();
                         let cond = self.parse_expression()?;
-                        // Store condition for parse_do_loop to retrieve
-                        self.last_loop_condition = Some(cond);
-                        self.last_loop_is_until = true;
-                        Err("LOOP UNTIL".to_string())
+                        Err(ParseError::Block(BlockEnd::LoopUntil(cond)))
                     }
-                    _ => Err("LOOP".to_string()),
+                    _ => Err(ParseError::Block(BlockEnd::Loop)),
                 }
             }
             Token::Else => {
                 self.advance();
-                Err("ELSE".to_string())
+                Err(ParseError::Block(BlockEnd::Else))
             }
             Token::ElseIf => {
                 self.advance();
                 let cond = self.parse_expression()?;
                 self.expect(Token::Then)?;
-                self.last_elseif_condition = Some(cond);
-                Err("ELSEIF".to_string())
+                Err(ParseError::Block(BlockEnd::ElseIf(cond)))
             }
             Token::Select => self.parse_select_case(),
-            Token::Case => {
-                self.advance();
-                // Check for CASE ELSE
-                if matches!(self.peek(), Token::Else) {
-                    self.advance();
-                    Err("CASE ELSE".to_string())
-                } else {
-                    // Parse the case value
-                    let value = self.parse_expression()?;
-                    Err(format!("CASE:{:?}", value))
-                }
-            }
+            // `parse_select_case` consumes CASE itself, so a CASE reaching here
+            // is always outside any SELECT CASE.
+            Token::Case => err("CASE without matching SELECT CASE"),
             Token::Ident(_) => self.parse_assignment_or_call(),
             Token::Newline => {
                 self.advance();
                 self.parse_statement()
             }
-            _ => Err(format!("Unexpected token: {:?}", self.peek())),
+            _ => err(format!("Unexpected token: {:?}", self.peek())),
         }
     }
 
-    fn parse_print(&mut self) -> Result<Stmt, String> {
+    fn parse_print(&mut self) -> PResult<Stmt> {
         self.advance(); // consume PRINT
 
         // Check for PRINT #n (file output)
@@ -477,7 +561,7 @@ impl Parser {
             self.advance(); // consume #
             let num = match self.advance() {
                 Token::Integer(n) => n as i32,
-                tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+                tok => return err(format!("Expected file number after #, got {:?}", tok)),
             };
             if matches!(self.peek(), Token::Comma) {
                 self.advance(); // consume comma after file number
@@ -520,7 +604,7 @@ impl Parser {
         }
     }
 
-    fn parse_input(&mut self) -> Result<Stmt, String> {
+    fn parse_input(&mut self) -> PResult<Stmt> {
         self.advance(); // consume INPUT
 
         // Check for INPUT #n (file input)
@@ -528,7 +612,7 @@ impl Parser {
             self.advance(); // consume #
             let file_num = match self.advance() {
                 Token::Integer(n) => n as i32,
-                tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+                tok => return err(format!("Expected file number after #, got {:?}", tok)),
             };
             if matches!(self.peek(), Token::Comma) {
                 self.advance(); // consume comma after file number
@@ -575,7 +659,7 @@ impl Parser {
         Ok(Stmt::Input { prompt, vars })
     }
 
-    fn parse_line_input(&mut self) -> Result<Stmt, String> {
+    fn parse_line_input(&mut self) -> PResult<Stmt> {
         self.advance(); // consume LINE
         self.expect(Token::Input)?;
 
@@ -593,22 +677,22 @@ impl Parser {
         let var = if let Token::Ident(name) = self.advance() {
             name
         } else {
-            return Err("Expected variable name after LINE INPUT".to_string());
+            return err("Expected variable name after LINE INPUT");
         };
 
         Ok(Stmt::LineInput { prompt, var })
     }
 
-    fn parse_let(&mut self) -> Result<Stmt, String> {
+    fn parse_let(&mut self) -> PResult<Stmt> {
         self.advance(); // consume LET
         self.parse_assignment()
     }
 
-    fn parse_assignment(&mut self) -> Result<Stmt, String> {
+    fn parse_assignment(&mut self) -> PResult<Stmt> {
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
-            return Err("Expected variable name".to_string());
+            return err("Expected variable name");
         };
 
         // Check for array subscript
@@ -631,11 +715,11 @@ impl Parser {
         })
     }
 
-    fn parse_assignment_or_call(&mut self) -> Result<Stmt, String> {
+    fn parse_assignment_or_call(&mut self) -> PResult<Stmt> {
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
-            return Err("Expected identifier".to_string());
+            return err("Expected identifier");
         };
 
         // Check for array subscript or function call
@@ -687,7 +771,7 @@ impl Parser {
         }
     }
 
-    fn parse_if(&mut self) -> Result<Stmt, String> {
+    fn parse_if(&mut self) -> PResult<Stmt> {
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
         self.expect(Token::Then)?;
@@ -724,7 +808,7 @@ impl Parser {
 
     /// Parse the body of an IF block, returning (then_branch, else_branch)
     /// Handles ELSEIF by constructing nested IF statements in else_branch
-    fn parse_if_body(&mut self) -> Result<(Vec<Stmt>, Option<Vec<Stmt>>), String> {
+    fn parse_if_body(&mut self) -> PResult<(Vec<Stmt>, Option<Vec<Stmt>>)> {
         let mut body = Vec::new();
 
         loop {
@@ -732,30 +816,24 @@ impl Parser {
                 Ok(stmt) => {
                     body.push(stmt);
                 }
-                Err(e) if e == "END IF" => {
+                Err(ParseError::Block(BlockEnd::EndIf)) => {
                     return Ok((body, None));
                 }
-                Err(e) if e == "ELSE" => {
+                Err(ParseError::Block(BlockEnd::Else)) => {
                     // Parse ELSE body until END IF
                     self.skip_newlines();
                     let mut else_body = Vec::new();
                     loop {
                         match self.parse_statement() {
                             Ok(stmt) => else_body.push(stmt),
-                            Err(e) if e == "END IF" => break,
+                            Err(ParseError::Block(BlockEnd::EndIf)) => break,
                             Err(e) => return Err(e),
                         }
                         self.skip_newlines();
                     }
                     return Ok((body, Some(else_body)));
                 }
-                Err(e) if e == "ELSEIF" => {
-                    // Get the stored condition
-                    let elseif_condition = self
-                        .last_elseif_condition
-                        .take()
-                        .ok_or_else(|| "Internal error: ELSEIF condition not stored".to_string())?;
-
+                Err(ParseError::Block(BlockEnd::ElseIf(elseif_condition))) => {
                     // Recursively parse the rest as a nested IF
                     self.skip_newlines();
                     let (nested_then, nested_else) = self.parse_if_body()?;
@@ -774,12 +852,12 @@ impl Parser {
         }
     }
 
-    fn parse_for(&mut self) -> Result<Stmt, String> {
+    fn parse_for(&mut self) -> PResult<Stmt> {
         self.advance(); // consume FOR
         let var = if let Token::Ident(n) = self.advance() {
             n
         } else {
-            return Err("Expected variable name after FOR".to_string());
+            return err("Expected variable name after FOR");
         };
 
         self.expect(Token::Eq)?;
@@ -800,7 +878,7 @@ impl Parser {
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
-                Err(e) if e == "NEXT" => break,
+                Err(ParseError::Block(BlockEnd::Next)) => break,
                 Err(e) => return Err(e),
             }
             self.skip_newlines();
@@ -815,7 +893,7 @@ impl Parser {
         })
     }
 
-    fn parse_while(&mut self) -> Result<Stmt, String> {
+    fn parse_while(&mut self) -> PResult<Stmt> {
         self.advance(); // consume WHILE
         let condition = self.parse_expression()?;
         self.skip_newlines();
@@ -824,7 +902,7 @@ impl Parser {
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
-                Err(e) if e == "WEND" => break,
+                Err(ParseError::Block(BlockEnd::Wend)) => break,
                 Err(e) => return Err(e),
             }
             self.skip_newlines();
@@ -833,7 +911,7 @@ impl Parser {
         Ok(Stmt::While { condition, body })
     }
 
-    fn parse_do_loop(&mut self) -> Result<Stmt, String> {
+    fn parse_do_loop(&mut self) -> PResult<Stmt> {
         self.advance(); // consume DO
 
         // Check for DO WHILE/UNTIL at start
@@ -855,22 +933,17 @@ impl Parser {
         let mut end_condition: Option<Expr> = None;
         let mut end_is_until = false;
 
-        // Clear any previous loop condition
-        self.last_loop_condition = None;
-
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
-                Err(e) if e == "LOOP" => break,
-                Err(e) if e == "LOOP WHILE" => {
-                    // Retrieve condition stored by parse_statement
-                    end_condition = self.last_loop_condition.take();
+                Err(ParseError::Block(BlockEnd::Loop)) => break,
+                Err(ParseError::Block(BlockEnd::LoopWhile(cond))) => {
+                    end_condition = Some(cond);
                     end_is_until = false;
                     break;
                 }
-                Err(e) if e == "LOOP UNTIL" => {
-                    // Retrieve condition stored by parse_statement
-                    end_condition = self.last_loop_condition.take();
+                Err(ParseError::Block(BlockEnd::LoopUntil(cond))) => {
+                    end_condition = Some(cond);
                     end_is_until = true;
                     break;
                 }
@@ -894,7 +967,7 @@ impl Parser {
         })
     }
 
-    fn parse_select_case(&mut self) -> Result<Stmt, String> {
+    fn parse_select_case(&mut self) -> PResult<Stmt> {
         self.advance(); // consume SELECT
         self.expect(Token::Case)?;
         let expr = self.parse_expression()?;
@@ -905,7 +978,7 @@ impl Parser {
         // Parse CASE blocks until END SELECT
         loop {
             // Check for END SELECT
-            if matches!(self.peek(), Token::End | Token::EndSelect) {
+            if self.at_end_select() {
                 // Consume END SELECT
                 if matches!(self.peek(), Token::End) {
                     self.advance();
@@ -932,11 +1005,10 @@ impl Parser {
             // Parse case body until next CASE or END SELECT
             let mut body = Vec::new();
             loop {
-                // Check for terminators before parsing statement
-                match self.peek() {
-                    Token::Case | Token::End | Token::EndSelect => break,
-                    Token::Eof => break,
-                    _ => {}
+                // Check for terminators before parsing statement. A bare END is
+                // a statement, not a terminator: only END SELECT ends the body.
+                if self.at_end_select() || matches!(self.peek(), Token::Case | Token::Eof) {
+                    break;
                 }
 
                 body.push(self.parse_statement()?);
@@ -949,28 +1021,28 @@ impl Parser {
         Ok(Stmt::SelectCase { expr, cases })
     }
 
-    fn parse_goto(&mut self) -> Result<Stmt, String> {
+    fn parse_goto(&mut self) -> PResult<Stmt> {
         self.advance(); // consume GOTO
         let target = self.parse_goto_target()?;
         Ok(Stmt::Goto(target))
     }
 
-    fn parse_gosub(&mut self) -> Result<Stmt, String> {
+    fn parse_gosub(&mut self) -> PResult<Stmt> {
         self.advance(); // consume GOSUB
         let target = self.parse_goto_target()?;
         Ok(Stmt::Gosub(target))
     }
 
-    fn parse_goto_target(&mut self) -> Result<GotoTarget, String> {
+    fn parse_goto_target(&mut self) -> PResult<GotoTarget> {
         match self.advance() {
             Token::Integer(n) => Ok(GotoTarget::Line(n as u32)),
             Token::LineNumber(n) => Ok(GotoTarget::Line(n)),
             Token::Ident(name) => Ok(GotoTarget::Label(name)),
-            tok => Err(format!("Expected line number or label, got {:?}", tok)),
+            tok => err(format!("Expected line number or label, got {:?}", tok)),
         }
     }
 
-    fn parse_on_goto(&mut self) -> Result<Stmt, String> {
+    fn parse_on_goto(&mut self) -> PResult<Stmt> {
         self.advance(); // consume ON
         let expr = self.parse_expression()?;
         self.expect(Token::Goto)?;
@@ -988,7 +1060,7 @@ impl Parser {
         Ok(Stmt::OnGoto { expr, targets })
     }
 
-    fn parse_dim(&mut self) -> Result<Stmt, String> {
+    fn parse_dim(&mut self) -> PResult<Stmt> {
         self.advance(); // consume DIM
         let mut arrays = Vec::new();
 
@@ -996,7 +1068,7 @@ impl Parser {
             let name = if let Token::Ident(n) = self.advance() {
                 n
             } else {
-                return Err("Expected array name after DIM".to_string());
+                return err("Expected array name after DIM");
             };
 
             self.expect(Token::LParen)?;
@@ -1018,12 +1090,12 @@ impl Parser {
         Ok(Stmt::Dim { arrays })
     }
 
-    fn parse_sub(&mut self) -> Result<Stmt, String> {
+    fn parse_sub(&mut self) -> PResult<Stmt> {
         self.advance(); // consume SUB
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
-            return Err("Expected subroutine name".to_string());
+            return err("Expected subroutine name");
         };
 
         let params = if matches!(self.peek(), Token::LParen) {
@@ -1041,7 +1113,7 @@ impl Parser {
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
-                Err(e) if e == "END SUB" => break,
+                Err(ParseError::Block(BlockEnd::EndSub)) => break,
                 Err(e) => return Err(e),
             }
             self.skip_newlines();
@@ -1050,12 +1122,12 @@ impl Parser {
         Ok(Stmt::Sub { name, params, body })
     }
 
-    fn parse_function(&mut self) -> Result<Stmt, String> {
+    fn parse_function(&mut self) -> PResult<Stmt> {
         self.advance(); // consume FUNCTION
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
-            return Err("Expected function name".to_string());
+            return err("Expected function name");
         };
 
         let params = if matches!(self.peek(), Token::LParen) {
@@ -1073,7 +1145,7 @@ impl Parser {
         loop {
             match self.parse_statement() {
                 Ok(stmt) => body.push(stmt),
-                Err(e) if e == "END FUNCTION" => break,
+                Err(ParseError::Block(BlockEnd::EndFunction)) => break,
                 Err(e) => return Err(e),
             }
             self.skip_newlines();
@@ -1082,7 +1154,7 @@ impl Parser {
         Ok(Stmt::Function { name, params, body })
     }
 
-    fn parse_param_list(&mut self) -> Result<Vec<String>, String> {
+    fn parse_param_list(&mut self) -> PResult<Vec<String>> {
         let mut params = Vec::new();
         while let Token::Ident(name) = self.peek().clone() {
             self.advance();
@@ -1096,7 +1168,7 @@ impl Parser {
         Ok(params)
     }
 
-    fn parse_data(&mut self) -> Result<Stmt, String> {
+    fn parse_data(&mut self) -> PResult<Stmt> {
         self.advance(); // consume DATA
         let mut values = Vec::new();
 
@@ -1119,7 +1191,7 @@ impl Parser {
                     match self.advance() {
                         Token::Integer(n) => values.push(Literal::Integer(-n)),
                         Token::Float(f) => values.push(Literal::Float(-f)),
-                        _ => return Err("Expected number after minus in DATA".to_string()),
+                        _ => return err("Expected number after minus in DATA"),
                     }
                 }
                 _ => break,
@@ -1134,7 +1206,7 @@ impl Parser {
         Ok(Stmt::Data(values))
     }
 
-    fn parse_read(&mut self) -> Result<Stmt, String> {
+    fn parse_read(&mut self) -> PResult<Stmt> {
         self.advance(); // consume READ
         let mut vars = Vec::new();
 
@@ -1151,7 +1223,7 @@ impl Parser {
         Ok(Stmt::Read(vars))
     }
 
-    fn parse_restore(&mut self) -> Result<Stmt, String> {
+    fn parse_restore(&mut self) -> PResult<Stmt> {
         self.advance(); // consume RESTORE
         let target = if matches!(self.peek(), Token::Integer(_) | Token::Ident(_)) {
             Some(self.parse_goto_target()?)
@@ -1161,7 +1233,7 @@ impl Parser {
         Ok(Stmt::Restore(target))
     }
 
-    fn parse_open(&mut self) -> Result<Stmt, String> {
+    fn parse_open(&mut self) -> PResult<Stmt> {
         self.advance(); // consume OPEN
 
         // Parse filename expression
@@ -1184,7 +1256,7 @@ impl Parser {
                 self.advance();
                 FileMode::Append
             }
-            tok => return Err(format!("Expected INPUT, OUTPUT, or APPEND, got {:?}", tok)),
+            tok => return err(format!("Expected INPUT, OUTPUT, or APPEND, got {:?}", tok)),
         };
 
         // Expect AS
@@ -1194,7 +1266,7 @@ impl Parser {
         self.expect(Token::Hash)?;
         let file_num = match self.advance() {
             Token::Integer(n) => n as i32,
-            tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+            tok => return err(format!("Expected file number after #, got {:?}", tok)),
         };
 
         Ok(Stmt::Open {
@@ -1204,27 +1276,27 @@ impl Parser {
         })
     }
 
-    fn parse_close(&mut self) -> Result<Stmt, String> {
+    fn parse_close(&mut self) -> PResult<Stmt> {
         self.advance(); // consume CLOSE
 
         // Expect #n
         self.expect(Token::Hash)?;
         let file_num = match self.advance() {
             Token::Integer(n) => n as i32,
-            tok => return Err(format!("Expected file number after #, got {:?}", tok)),
+            tok => return err(format!("Expected file number after #, got {:?}", tok)),
         };
 
         Ok(Stmt::Close { file_num })
     }
 
     // Expression parsing with precedence climbing
-    fn parse_expression(&mut self) -> Result<Expr, String> {
+    fn parse_expression(&mut self) -> PResult<Expr> {
         self.parse_prec(1) // Start at lowest precedence
     }
 
     /// Precedence-climbing parser for binary expressions
     /// min_prec: minimum precedence level to parse at this level
-    fn parse_prec(&mut self, min_prec: u8) -> Result<Expr, String> {
+    fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
         // Handle NOT prefix operator (binds tighter than binary ops)
         let mut left = if matches!(self.peek(), Token::Not) {
             self.advance();
@@ -1255,7 +1327,7 @@ impl Parser {
         Ok(left)
     }
 
-    fn parse_unary(&mut self) -> Result<Expr, String> {
+    fn parse_unary(&mut self) -> PResult<Expr> {
         match self.peek() {
             Token::Minus => {
                 self.advance();
@@ -1273,7 +1345,7 @@ impl Parser {
         }
     }
 
-    fn parse_primary(&mut self) -> Result<Expr, String> {
+    fn parse_primary(&mut self) -> PResult<Expr> {
         match self.peek().clone() {
             Token::Integer(n) => {
                 self.advance();
@@ -1313,11 +1385,11 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
-            tok => Err(format!("Unexpected token in expression: {:?}", tok)),
+            tok => err(format!("Unexpected token in expression: {:?}", tok)),
         }
     }
 
-    fn parse_expr_list(&mut self) -> Result<Vec<Expr>, String> {
+    fn parse_expr_list(&mut self) -> PResult<Vec<Expr>> {
         let mut exprs = Vec::new();
         if matches!(self.peek(), Token::RParen) {
             return Ok(exprs);
