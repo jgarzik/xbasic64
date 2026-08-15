@@ -526,3 +526,49 @@ fn test_type_rules() {
         "cannot return the record type",
     );
 }
+
+/// Inputs that used to abort the compiler with a Rust panic instead of a
+/// diagnostic. Every rejection here must be clean (exit 1, not 101).
+#[test]
+fn test_type_confusion_is_diagnosed_not_panicked() {
+    expect_rejected("DIM A(3)\nA(0) = \"x\"\n", "cannot assign string value");
+    expect_rejected("DIM S$(3)\nS$(0) = 1\n", "cannot assign numeric value");
+    expect_rejected(
+        "SUB T(N)\nPRINT N\nEND SUB\nT(\"x\")\n",
+        "argument 1 of 'T' is numeric, but a string value was given",
+    );
+    expect_rejected(
+        "SUB T(S$)\nPRINT S$\nEND SUB\nT(1)\n",
+        "argument 1 of 'T' is string, but a numeric value was given",
+    );
+    expect_rejected("PRINT SQR(\"x\")\n", "'SQR' takes a numeric argument");
+    expect_rejected(
+        "OPEN \"f\" FOR OUTPUT AS #\"x\"\n",
+        "a file number must be numeric",
+    );
+    expect_rejected("FOR I$ = 1 TO 3\nNEXT I$\n", "must be numeric");
+    expect_rejected("DIM A(3)\nPRINT A(\"x\")\n", "subscript must be numeric");
+    expect_rejected("DIM A()\n", "needs at least one dimension");
+}
+
+/// A whole record is not a value, though it may be assigned or passed.
+#[test]
+fn test_whole_record_is_not_a_value() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\n";
+    expect_rejected(&format!("{ty}PRINT Q\n"), "has no value");
+    expect_rejected(&format!("{ty}PRINT Q + 1\n"), "has no value");
+}
+
+/// Using an array before its DIM has executed is a runtime error, not a
+/// compiler panic: the descriptor exists from the start, with a null element
+/// pointer until the DIM runs.
+#[test]
+fn test_use_before_dim_runs() {
+    let run = compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Array used before DIM"),
+        "expected a runtime diagnostic, got {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}

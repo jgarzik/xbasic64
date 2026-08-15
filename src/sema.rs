@@ -374,6 +374,12 @@ impl Analyzer {
                 StmtKind::Dim { arrays } | StmtKind::Redim { arrays, .. } => {
                     let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
                     for arr in arrays {
+                        if arr.dimensions.is_empty() {
+                            self.error(
+                                stmt.line,
+                                format!("array '{}' needs at least one dimension", arr.name),
+                            );
+                        }
                         let key = (scope.clone(), arr.name.clone());
                         if let Some(prev) = self.symbols.arrays.get(&key) {
                             if !is_redim {
@@ -484,7 +490,10 @@ impl Analyzer {
                     self.check_array_use(name, idx.len(), scope, line);
                     for e in idx {
                         self.check_expr(e, scope, line);
+                        self.require_numeric(e, scope, line, "an array subscript");
                     }
+                    // An array element is typed like a scalar of the same name.
+                    self.check_assign_types(name, value, scope, line);
                 } else if let Some(target_ty) = self.symbols.typed_var(scope, name).cloned() {
                     if let TypeRef::Record(rname) = &target_ty {
                         // The source may be another record variable, or an
@@ -537,6 +546,7 @@ impl Analyzer {
                 for item in items {
                     if let PrintItem::Expr(e) = item {
                         self.check_expr(e, scope, line);
+                        self.reject_record_value(e, scope, line);
                     }
                 }
             }
@@ -562,16 +572,22 @@ impl Analyzer {
                 }
             }
             StmtKind::For {
+                var,
                 start,
                 end,
                 step,
                 body,
-                ..
             } => {
+                if var.ends_with('$') {
+                    self.error(line, "a FOR control variable must be numeric");
+                }
                 self.check_expr(start, scope, line);
+                self.require_numeric(start, scope, line, "a FOR start value");
                 self.check_expr(end, scope, line);
+                self.require_numeric(end, scope, line, "a FOR limit");
                 if let Some(s) = step {
                     self.check_expr(s, scope, line);
+                    self.require_numeric(s, scope, line, "a FOR step");
                 }
                 self.loops.push(true);
                 self.check(body, scope);
@@ -676,7 +692,22 @@ impl Analyzer {
                     self.error(line, "SWAP requires both values to be the same type");
                 }
             }
-            StmtKind::Open { filename, .. } => self.check_expr(filename, scope, line),
+            StmtKind::Open {
+                filename, file_num, ..
+            } => {
+                self.check_expr(filename, scope, line);
+                if self.expr_is_string(filename, scope) == Some(false) {
+                    self.error(line, "OPEN needs a string filename");
+                }
+                self.check_expr(file_num, scope, line);
+                self.require_numeric(file_num, scope, line, "a file number");
+            }
+            StmtKind::Close {
+                file_num: Some(file_num),
+            } => {
+                self.check_expr(file_num, scope, line);
+                self.require_numeric(file_num, scope, line, "a file number");
+            }
             _ => {}
         }
     }
@@ -727,6 +758,113 @@ impl Analyzer {
             }
             _ => None,
         }
+    }
+
+    /// Report a mismatched argument type for a builtin, if there is one.
+    ///
+    /// Codegen coerces builtin arguments without checking, so a string passed
+    /// where a number belongs used to abort the compiler.
+    fn builtin_arg_type_error(&self, name: &str, args: &[Expr], scope: &Scope) -> Option<String> {
+        // Which arguments must be strings; every other one must be numeric.
+        let string_args: &[usize] = match name {
+            "LEN" | "ASC" | "VAL" | "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => &[0],
+            "LEFT$" | "RIGHT$" | "MID$" => &[0],
+            // INSTR is either (haystack, needle) or (start, haystack, needle).
+            "INSTR" if args.len() == 2 => &[0, 1],
+            "INSTR" => &[1, 2],
+            // STRING$ takes a count and either a code or a string.
+            "STRING$" => &[],
+            _ => &[],
+        };
+        // Builtins that take no string argument at all.
+        let all_numeric = !matches!(
+            name,
+            "LEN"
+                | "ASC"
+                | "VAL"
+                | "LEFT$"
+                | "RIGHT$"
+                | "MID$"
+                | "INSTR"
+                | "LTRIM$"
+                | "RTRIM$"
+                | "UCASE$"
+                | "LCASE$"
+                | "STRING$"
+                | "LBOUND"
+                | "UBOUND"
+        );
+
+        for (i, arg) in args.iter().enumerate() {
+            let is_string = self.expr_is_string(arg, scope)?;
+            let want_string = string_args.contains(&i);
+            if all_numeric && is_string {
+                return Some(format!("'{}' takes a numeric argument", name));
+            }
+            if !all_numeric && is_string != want_string && name != "STRING$" {
+                return Some(format!(
+                    "argument {} of '{}' must be {}",
+                    i + 1,
+                    name,
+                    if want_string { "a string" } else { "numeric" }
+                ));
+            }
+        }
+        None
+    }
+
+    /// Reject a whole record where a scalar value is required.
+    ///
+    /// A record is legitimate as an assignment source or a record argument, so
+    /// this is applied only at the sites that consume a value: PRINT items,
+    /// operands, conditions, subscripts and loop bounds.
+    fn reject_record_value(&mut self, e: &Expr, scope: &Scope, line: u32) {
+        let name = match e {
+            Expr::Variable(n) => n.clone(),
+            Expr::Field { .. } => match flatten_field_path(e) {
+                Some((base, fields)) => {
+                    // Resolve the path; only a record-typed result is a problem.
+                    let mut ty = match self.symbols.typed_var(scope, &base) {
+                        Some(t) => t.clone(),
+                        None => return,
+                    };
+                    for f in &fields {
+                        let TypeRef::Record(rec) = &ty else { return };
+                        let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                            return;
+                        };
+                        match info.field(f) {
+                            Some(fi) => ty = fi.ty.clone(),
+                            None => return,
+                        }
+                    }
+                    if let TypeRef::Record(r) = ty {
+                        self.error(
+                            line,
+                            format!("a whole {} record has no value; use one of its fields", r),
+                        );
+                    }
+                    return;
+                }
+                None => return,
+            },
+            _ => return,
+        };
+        if let Some(TypeRef::Record(r)) = self.symbols.typed_var(scope, &name) {
+            let r = r.clone();
+            self.error(
+                line,
+                format!("a whole {} record has no value; use one of its fields", r),
+            );
+        }
+    }
+
+    /// Require an expression to be numeric.
+    fn require_numeric(&mut self, e: &Expr, scope: &Scope, line: u32, what: &str) {
+        if self.expr_is_string(e, scope) == Some(true) {
+            self.error(line, format!("{} must be numeric, not a string", what));
+        }
+        self.reject_record_value(e, scope, line);
     }
 
     /// A PRINT USING format must be a string literal, since it is parsed at
@@ -783,7 +921,43 @@ impl Analyzer {
         }
 
         if let Some(proc) = self.symbols.procs.get(&upper) {
+            // Each argument must match its parameter's type class. Collected
+            // first so that reporting can borrow self mutably.
+            let param_strings: Vec<bool> = proc
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(t) => matches!(t, TypeRef::FixedString(_)),
+                    None => p.name.ends_with('$'),
+                })
+                .collect();
             let (expected, is_function) = (proc.params.len(), proc.is_function);
+
+            for (i, arg) in args.iter().enumerate() {
+                let Some(want_string) = param_strings.get(i).copied() else {
+                    break;
+                };
+                if let Some(is_string) = self.expr_is_string(arg, scope) {
+                    if is_string != want_string {
+                        let (got, wanted) = if is_string {
+                            ("string", "numeric")
+                        } else {
+                            ("numeric", "string")
+                        };
+                        self.error(
+                            line,
+                            format!(
+                                "argument {} of '{}' is {}, but a {} value was given",
+                                i + 1,
+                                name,
+                                wanted,
+                                got
+                            ),
+                        );
+                    }
+                }
+            }
+
             if is_stmt && is_function {
                 self.error(
                     line,
@@ -823,6 +997,8 @@ impl Analyzer {
                     line,
                     format!("'{}' is a function and cannot be used as a statement", name),
                 );
+            } else if let Some(bad) = self.builtin_arg_type_error(&upper, args, scope) {
+                self.error(line, bad);
             } else if args.len() < *min || args.len() > *max {
                 let expected = if min == max {
                     format!("{} argument{}", min, if *min == 1 { "" } else { "s" })
@@ -926,12 +1102,15 @@ impl Analyzer {
                 self.check_array_use(name, indices.len(), scope, line);
                 for i in indices {
                     self.check_expr(i, scope, line);
+                    self.require_numeric(i, scope, line, "an array subscript");
                 }
             }
             Expr::Unary { operand, .. } => self.check_expr(operand, scope, line),
             Expr::Binary { op, left, right } => {
                 self.check_expr(left, scope, line);
                 self.check_expr(right, scope, line);
+                self.reject_record_value(left, scope, line);
+                self.reject_record_value(right, scope, line);
                 self.check_binary_types(*op, left, right, scope, line);
             }
             Expr::FnCall { name, args } => {

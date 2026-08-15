@@ -74,6 +74,33 @@
 //! pseudo-variable are always local and shadow a global of the same name; a
 //! name used only inside a procedure is local to it.
 //!
+//! A record declared with `TYPE` is laid out as consecutive words too, so a
+//! field is reached exactly the way a variable is -- a base [`Loc`] plus a word
+//! offset. Only an array element, whose address is not known until run time,
+//! needs a separate indirect path.
+//!
+//! # Private `_proc_*` calling convention
+//!
+//! Calls to user procedures do not follow the platform ABI, since the symbols
+//! are private to the compiled program. `classify_params` is the single
+//! definition, called by both the call site and the prologue:
+//!
+//! - Numeric arguments travel as f64 bit patterns in *integer* registers, and
+//!   the callee narrows them to the declared type.
+//! - A string occupies two slots, pointer then length.
+//! - A record is passed as a pointer to the caller's copy, which the prologue
+//!   copies into a local slot, giving by-value semantics.
+//! - A parameter is never split between registers and the stack, and spilling
+//!   is monotone: once one parameter goes to the stack, so do all later ones.
+//! - Stack arguments sit at `[rbp + 16 + 8i]`, with no Win64 shadow space.
+//!
+//! # Semantic analysis
+//!
+//! Code generation assumes `sema` has already run and accepted the program: it
+//! consults [`Symbols`] rather than guessing what a name means, and the
+//! remaining `expect`/`unreachable!` sites are invariants sema establishes, not
+//! reachable failure modes.
+//!
 //! # Stack Alignment (Critical for ABI Compliance)
 //!
 //! The System V AMD64 ABI requires 16-byte stack alignment before `call` instructions.
@@ -947,8 +974,44 @@ impl CodeGen {
         self.output.clone()
     }
 
+    /// Reserve descriptors for every array declared in `scope`.
+    ///
+    /// Done before any code is emitted, so that an array used earlier in
+    /// program order than its `DIM` still has somewhere to read from. Its
+    /// element pointer is null until the DIM runs, which the bounds check
+    /// reports as "Array used before DIM" rather than crashing.
+    fn reserve_array_descriptors(&mut self, scope: &SemaScope) {
+        let mut decls: Vec<(String, usize)> = self
+            .symbols
+            .arrays
+            .iter()
+            .filter(|((s, _), _)| s == scope)
+            .map(|((_, name), info)| (name.clone(), info.rank))
+            .collect();
+        decls.sort();
+
+        for (name, rank) in decls {
+            if self.lookup_array(&name).is_some() {
+                continue;
+            }
+            let loc = if self.current_proc.is_some() {
+                self.stack_offset -= 8 * (1 + rank as i32);
+                Loc::Frame(self.stack_offset)
+            } else {
+                Loc::Global(format!("_arr_{}", mangle(&name)))
+            };
+            let info = ArrayInfo { loc, ndims: rank };
+            if self.current_proc.is_some() {
+                self.proc_arrays.insert(name, info);
+            } else {
+                self.arrays.insert(name, info);
+            }
+        }
+    }
+
     /// Emit `main`: prologue, module-level statements, epilogue.
     fn gen_main(&mut self, program: &Program) {
+        self.reserve_array_descriptors(&SemaScope::Module);
         let p = PREFIX;
         self.emit_label(&format!("{}main", p));
         self.emit("    push rbp");
@@ -1161,6 +1224,8 @@ impl CodeGen {
         // do. Must come before the parameter spill below, which would otherwise
         // be wiped.
         self.emit_zero_frame();
+
+        self.reserve_array_descriptors(&SemaScope::Proc(name.to_string()));
 
         // Spill parameters into the frame, using the same placement the call
         // site computed from the same declared types.
@@ -3966,7 +4031,12 @@ impl CodeGen {
     /// Shared by loads and stores so the index arithmetic -- and the bounds
     /// checks guarding it -- exist in exactly one place.
     fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
-        let arr_info = self.lookup_array(name).expect("Array not declared");
+        // Descriptors for every declared array are reserved before any code is
+        // emitted, and sema has already rejected undeclared ones, so this
+        // cannot fail for a program that reached code generation.
+        let arr_info = self
+            .lookup_array(name)
+            .expect("sema checked the array is declared");
         let loc = arr_info.loc.clone();
         let elem_size = self.elem_size_for(name);
 
