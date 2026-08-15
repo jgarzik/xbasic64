@@ -346,6 +346,7 @@ enum RtError {
     Overflow,
     Undim,
     OutOfMemory,
+    GosubOverflow,
 }
 
 impl RtError {
@@ -358,6 +359,7 @@ impl RtError {
             RtError::Overflow => "_err_overflow",
             RtError::Undim => "_err_undim",
             RtError::OutOfMemory => "_err_memory",
+            RtError::GosubOverflow => "_err_gosub",
         }
     }
 
@@ -370,6 +372,7 @@ impl RtError {
             RtError::Overflow => "ovf",
             RtError::Undim => "undim",
             RtError::OutOfMemory => "mem",
+            RtError::GosubOverflow => "gosub",
         }
     }
 }
@@ -771,6 +774,9 @@ impl CodeGen {
                 Literal::Float(_) => DataType::Double,
                 Literal::String(_) => DataType::String,
             },
+            Expr::Variable(name) if crate::sema::is_zero_arg_builtin(name) => {
+                self.fn_return_type(name)
+            }
             Expr::Variable(name) => match self.symbols.consts.get(&name.to_uppercase()) {
                 Some(Literal::Integer(_)) => DataType::Long,
                 Some(Literal::Float(_)) => DataType::Double,
@@ -1887,7 +1893,7 @@ impl CodeGen {
                 self.emit("    sub rcx, 8");
                 self.emit("    lea rax, [rip + _gosub_stack]");
                 self.emit("    cmp rcx, rax");
-                self.emit("    jb _rt_gosub_overflow");
+                self.emit_check("jb", RtError::GosubOverflow);
                 // Push return address to GOSUB stack
                 self.emit(&format!("    lea rax, [rip + {}]", ret_label));
                 self.emit("    mov QWORD PTR [rcx], rax");
@@ -2255,6 +2261,13 @@ impl CodeGen {
                 // its return variable, so that case must not become infinite
                 // recursion.
                 let upper = name.to_uppercase();
+
+                // The same applies to the builtins that take no argument.
+                if crate::sema::is_zero_arg_builtin(&upper) {
+                    self.gen_fn_call(&upper, &[]);
+                    return self.fn_return_type(&upper);
+                }
+
                 let is_own_name = self.current_proc.as_deref() == Some(upper.as_str());
                 if !is_own_name
                     && self

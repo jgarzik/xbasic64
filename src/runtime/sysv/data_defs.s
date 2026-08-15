@@ -37,4 +37,3 @@ _fmt_oct: .asciz "%llo"
 _rng_state: .quad 0x12345678DEADBEEF
 _cls_seq: .asciz "\033[2J\033[H"
 _redo_msg: .asciz "?Redo from start\n"
-_gosub_overflow_msg: .asciz "Error: GOSUB stack overflow\n"

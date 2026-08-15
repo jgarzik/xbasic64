@@ -7,7 +7,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run_raw, compile_only};
+use crate::common::{compile_and_run_flags, compile_and_run_raw, compile_only};
 
 /// The harness itself must be able to tell a rejected program from an accepted one.
 #[test]
@@ -674,4 +674,83 @@ fn test_let_requires_an_assignment() {
         "{}",
         err.stderr
     );
+}
+
+/// Exhausting the GOSUB return stack must abort cleanly.
+///
+/// This is the one runtime helper no test reached: the GOSUB stack holds 64K
+/// entries, so nothing short of unbounded recursion touches it. It is also the
+/// path whose message length was once hand-counted wrong, and the last
+/// diagnostic that went to stdout instead of stderr.
+#[test]
+fn test_gosub_stack_overflow() {
+    let run = compile_and_run_raw("PRINT \"before\"\n100 GOSUB 100\nRETURN\n", "").unwrap();
+    assert_eq!(run.exit_code, Some(1));
+    // Output produced before the abort survives, and the diagnostic does not
+    // pollute it.
+    assert_eq!(run.stdout.trim(), "before");
+    assert!(
+        run.stderr.contains("GOSUB stack overflow"),
+        "stderr was {:?}",
+        run.stderr
+    );
+}
+
+/// `--unsafe` removes the runtime checks, and the program still works.
+///
+/// The flag's entire effect is on emitted code, so without a test that runs
+/// something built with it, it could stop working -- or stop removing anything
+/// -- and nothing would notice.
+#[test]
+fn test_unsafe_flag_still_produces_correct_programs() {
+    let source = "DIM A(5)\nFOR I = 0 TO 5\nA(I) = I * I\nNEXT I\nPRINT A(3); A(5)\nPRINT 7 \\ 2\n";
+
+    let checked = compile_and_run_raw(source, "").unwrap();
+    let unchecked = compile_and_run_flags(source, "", &["--unsafe"]).unwrap();
+
+    let expected: Vec<&str> = vec!["925", "3"];
+    assert_eq!(checked.stdout.trim().lines().collect::<Vec<_>>(), expected);
+    assert_eq!(
+        unchecked.stdout.trim(),
+        checked.stdout.trim(),
+        "--unsafe must not change a correct program's output"
+    );
+    assert_eq!(unchecked.exit_code, Some(0));
+}
+
+/// A bounds violation is caught with checks on, and is not with `--unsafe`.
+#[test]
+fn test_unsafe_flag_removes_the_bounds_check() {
+    let source = "DIM A(2)\nPRINT \"start\"\nA(99) = 1\nPRINT \"end\"\n";
+
+    let checked = compile_and_run_raw(source, "").unwrap();
+    assert_eq!(checked.exit_code, Some(1));
+    assert!(checked.stderr.contains("Subscript out of range"));
+
+    // Without the check the write goes through; the program is in undefined
+    // behaviour, so only the absence of the diagnostic is assertable.
+    let unchecked = compile_and_run_flags(source, "", &["--unsafe"]).unwrap();
+    assert!(
+        !unchecked.stderr.contains("Subscript out of range"),
+        "--unsafe still emitted the check: {:?}",
+        unchecked.stderr
+    );
+}
+
+/// A built-in that takes no argument cannot double as a variable name.
+///
+/// A bare `TIMER` is a call, so allowing `TIMER = 5` would make the write and
+/// the read refer to different things.
+#[test]
+fn test_zero_arg_builtins_are_not_assignable() {
+    for name in ["TIMER", "RND"] {
+        let err =
+            compile_only(&format!("{name} = 5\nPRINT {name}\n")).expect_err("should be rejected");
+        assert!(err.is_clean_rejection(), "{}", err.stderr);
+        assert!(
+            err.stderr.contains("cannot be assigned to"),
+            "{name}: {}",
+            err.stderr
+        );
+    }
 }

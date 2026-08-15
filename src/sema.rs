@@ -75,6 +75,15 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("VAL", 1, 1),
 ];
 
+/// Whether a bare identifier of this name is a call rather than a variable.
+///
+/// `TIMER` and `RND` are the only builtins that take no argument, so a bare
+/// mention of either is a call. Without this they parsed as ordinary variable
+/// reads and quietly returned the zero of a slot nobody ever wrote.
+pub fn is_zero_arg_builtin(name: &str) -> bool {
+    builtin(&name.to_uppercase()).is_some_and(|(_, min, _)| *min == 0)
+}
+
 fn builtin(name: &str) -> Option<&'static (&'static str, usize, usize)> {
     BUILTINS.iter().find(|(n, _, _)| *n == name)
 }
@@ -512,6 +521,18 @@ impl Analyzer {
                 value,
             } => {
                 self.check_expr(value, scope, line);
+                // A bare mention of these is a call, so letting one also name a
+                // variable would make the write and the read mean different
+                // things.
+                if indices.is_none() && is_zero_arg_builtin(name) {
+                    self.error(
+                        line,
+                        format!(
+                            "'{}' is a built-in function and cannot be assigned to",
+                            name.to_uppercase()
+                        ),
+                    );
+                }
                 if let Some(idx) = indices {
                     self.check_array_use(name, idx.len(), scope, line);
                     for e in idx {

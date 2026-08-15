@@ -90,6 +90,18 @@ pub fn compile_only(source: &str) -> Result<(), CompileError> {
 /// `Err` is reserved for compilation failure. This is the primitive the other
 /// run helpers are built on.
 pub fn compile_and_run_raw(source: &str, stdin_input: &str) -> Result<RunOutput, String> {
+    compile_and_run_flags(source, stdin_input, &[])
+}
+
+/// The same, with extra compiler flags.
+///
+/// Used to exercise `--unsafe`, whose whole effect is on the code emitted, so
+/// nothing else in the suite would notice if it stopped working.
+pub fn compile_and_run_flags(
+    source: &str,
+    stdin_input: &str,
+    flags: &[&str],
+) -> Result<RunOutput, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let bas_file = tmp.path().join("test.bas");
     let exe_file = tmp.path().join("test");
@@ -98,6 +110,7 @@ pub fn compile_and_run_raw(source: &str, stdin_input: &str) -> Result<RunOutput,
 
     let compile_output = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
         .arg(&bas_file)
+        .args(flags)
         .arg("-o")
         .arg(&exe_file)
         .output()
