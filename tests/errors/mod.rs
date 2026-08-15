@@ -559,6 +559,41 @@ fn test_whole_record_is_not_a_value() {
     expect_rejected(&format!("{ty}PRINT Q + 1\n"), "has no value");
 }
 
+/// An input target is checked the way a value of the same shape would be.
+///
+/// Nothing checked these at all: `LINE INPUT N` compiled, and since codegen
+/// reads a string and stores it as it stands, N was handed a pointer to
+/// reinterpret as a double -- it printed 4.3e-315. A whole record, or a field
+/// that does not exist, went the same way unnoticed.
+#[test]
+fn test_input_targets_are_checked() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM R AS P\n";
+    expect_rejected("LINE INPUT N\n", "LINE INPUT needs a string variable");
+    expect_rejected(
+        "OPEN \"f\" FOR INPUT AS #1\nLINE INPUT #1, N\n",
+        "LINE INPUT needs a string variable",
+    );
+    expect_rejected(&format!("{ty}INPUT R\n"), "has no value");
+    expect_rejected(&format!("{ty}READ R\n"), "has no value");
+    expect_rejected(&format!("{ty}INPUT R.NOSUCH\n"), "has no field 'NOSUCH'");
+}
+
+/// ...and the forms that were always legal still are.
+#[test]
+fn test_valid_input_targets_still_compile() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM R AS P\n";
+    for source in [
+        "LINE INPUT S$\n",
+        "INPUT N\n",
+        "INPUT A$, B\n",
+        "DIM A(3)\nINPUT A(1)\n",
+        &format!("{ty}INPUT R.X\n"),
+        &format!("{ty}DATA 1\nREAD R.X\n"),
+    ] {
+        compile_only(source).unwrap_or_else(|e| panic!("{source:?} should compile:\n{}", e.stderr));
+    }
+}
+
 /// A file number outside 1-15 is refused rather than indexing off the table.
 ///
 /// The runtime's handle table is 16 slots; nothing checked the index, so

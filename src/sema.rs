@@ -611,17 +611,36 @@ impl Analyzer {
                     }
                 }
             }
-            StmtKind::Input {
-                file_num: Some(file_num),
-                ..
-            } => {
-                self.check_file_num(file_num, scope, line);
+            StmtKind::Input { file_num, vars, .. } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
+                }
+                for var in vars {
+                    self.check_lvalue(var, scope, line);
+                }
             }
-            StmtKind::LineInput {
-                file_num: Some(file_num),
-                ..
-            } => {
-                self.check_file_num(file_num, scope, line);
+            StmtKind::LineInput { file_num, var, .. } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
+                }
+                self.check_lvalue(var, scope, line);
+                // Codegen reads a string and stores it as-is, so a numeric
+                // target used to be handed a pointer to reinterpret as a
+                // double.
+                if self.expr_is_string(&lvalue_as_expr(var), scope) == Some(false) {
+                    self.error(
+                        line,
+                        format!(
+                            "LINE INPUT needs a string variable, but '{}' is numeric",
+                            var.name
+                        ),
+                    );
+                }
+            }
+            StmtKind::Read(vars) => {
+                for var in vars {
+                    self.check_lvalue(var, scope, line);
+                }
             }
             StmtKind::If {
                 condition,
@@ -960,6 +979,17 @@ impl Analyzer {
             self.error(line, format!("{} must be numeric, not a string", what));
         }
         self.reject_record_value(e, scope, line);
+    }
+
+    /// Check an assignment or input target.
+    ///
+    /// Rebuilds the access as an expression so the array, subscript and field
+    /// checks that already exist do the work, then refuses a whole record --
+    /// which has no value to read into any more than it has one to print.
+    fn check_lvalue(&mut self, target: &LValue, scope: &Scope, line: u32) {
+        let e = lvalue_as_expr(target);
+        self.check_expr(&e, scope, line);
+        self.reject_record_value(&e, scope, line);
     }
 
     /// A file number must be numeric, and within the runtime's handle table.
@@ -1464,6 +1494,27 @@ fn op_name(op: BinaryOp) -> &'static str {
 }
 
 /// Split a field-access expression into its base variable and field path.
+/// Rebuild an assignment target as the expression that reads it.
+///
+/// Lets one set of checks serve both sides: `A(I).X` as a target and as a
+/// value are the same access, and only one of them had ever been checked.
+fn lvalue_as_expr(target: &LValue) -> Expr {
+    let mut e = match &target.indices {
+        Some(indices) => Expr::ArrayAccess {
+            name: target.name.clone(),
+            indices: indices.clone(),
+        },
+        None => Expr::Variable(target.name.clone()),
+    };
+    for field in &target.fields {
+        e = Expr::Field {
+            base: Box::new(e),
+            field: field.clone(),
+        };
+    }
+    e
+}
+
 fn flatten_field_path(expr: &Expr) -> Option<(String, Vec<String>)> {
     let mut fields = Vec::new();
     let mut cur = expr;
