@@ -261,7 +261,18 @@ impl Analyzer {
             StmtKind::Call { name, args } => {
                 self.check_call(name, args, scope, line, true);
             }
-            StmtKind::Print { items, .. } | StmtKind::PrintFile { items, .. } => {
+            StmtKind::Print { items, using, .. } => {
+                self.check_using(using.as_ref(), line);
+                for item in items {
+                    if let PrintItem::Expr(e) = item {
+                        self.check_expr(e, scope, line);
+                    }
+                }
+            }
+            StmtKind::PrintFile { items, using, .. } => {
+                if using.is_some() {
+                    self.error(line, "PRINT # USING is not supported");
+                }
                 for item in items {
                     if let PrintItem::Expr(e) = item {
                         self.check_expr(e, scope, line);
@@ -335,6 +346,19 @@ impl Analyzer {
             }
             StmtKind::Open { filename, .. } => self.check_expr(filename, scope, line),
             _ => {}
+        }
+    }
+
+    /// A PRINT USING format must be a string literal, since it is parsed at
+    /// compile time into a sequence of runtime calls.
+    fn check_using(&mut self, using: Option<&Expr>, line: u32) {
+        match using {
+            None => {}
+            Some(Expr::Literal(Literal::String(_))) => {}
+            Some(_) => self.error(
+                line,
+                "PRINT USING requires a literal format string".to_string(),
+            ),
         }
     }
 

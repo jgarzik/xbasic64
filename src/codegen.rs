@@ -179,6 +179,7 @@
 use crate::abi::{Abi, PlatformAbi};
 use crate::parser::*;
 use crate::sema::Symbols;
+use crate::using;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
@@ -1244,7 +1245,18 @@ impl CodeGen {
                 }
             }
 
-            StmtKind::Print { items, newline } => {
+            StmtKind::Print {
+                items,
+                newline,
+                using: Some(fmt),
+            } => {
+                self.gen_print_using(fmt, items);
+                if *newline {
+                    self.emit("    call _rt_print_newline");
+                }
+            }
+
+            StmtKind::Print { items, newline, .. } => {
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
@@ -1690,6 +1702,19 @@ impl CodeGen {
                 file_num,
                 items,
                 newline,
+                using: Some(_),
+            } => {
+                // Sema rejects USING on file output for now, so this is only
+                // reachable if that check is removed without adding support.
+                let _ = (file_num, items, newline);
+                unreachable!("PRINT # USING is rejected by semantic analysis")
+            }
+
+            StmtKind::PrintFile {
+                file_num,
+                items,
+                newline,
+                ..
             } => {
                 for item in items {
                     match item {
@@ -2111,6 +2136,103 @@ impl CodeGen {
 
         self.expr_depth -= 1;
         result_type
+    }
+
+    /// Emit `PRINT USING`.
+    ///
+    /// The format is parsed at compile time (see the `using` module), so this
+    /// emits a straight-line sequence: literal runs go to the ordinary string
+    /// printer, and each field calls one of two small runtime helpers. Values
+    /// are consumed in order by the fields that take one; if the values run out
+    /// the format stops there, and if values remain the format restarts, which
+    /// is what GW-BASIC does.
+    fn gen_print_using(&mut self, fmt: &Expr, items: &[PrintItem]) {
+        let Expr::Literal(Literal::String(format)) = fmt else {
+            unreachable!("sema requires a literal PRINT USING format")
+        };
+        let parts = using::parse(format);
+
+        let values: Vec<&Expr> = items
+            .iter()
+            .filter_map(|i| match i {
+                PrintItem::Expr(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+
+        let fields = parts.iter().filter(|p| p.consumes_value()).count();
+        if fields == 0 || values.is_empty() {
+            // No fields to fill: the format is just text.
+            for part in &parts {
+                if let using::UsingPart::Literal(text) = part {
+                    self.emit_literal_string(text);
+                }
+            }
+            return;
+        }
+
+        let mut next = 0usize;
+        while next < values.len() {
+            let before = next;
+            for part in &parts {
+                match part {
+                    using::UsingPart::Literal(text) => self.emit_literal_string(text),
+                    using::UsingPart::Num {
+                        width,
+                        decimals,
+                        flags,
+                    } => {
+                        if next >= values.len() {
+                            return;
+                        }
+                        let value = values[next];
+                        next += 1;
+                        let ty = self.gen_expr(value);
+                        self.gen_coercion(ty, DataType::Double);
+                        self.emit_arg_imm(0, *width as i64);
+                        self.emit_arg_imm(1, *decimals as i64);
+                        self.emit_arg_imm(2, *flags);
+                        self.emit("    call _rt_print_using_num");
+                    }
+                    using::UsingPart::Str { kind, width } => {
+                        if next >= values.len() {
+                            return;
+                        }
+                        let value = values[next];
+                        next += 1;
+                        self.gen_expr(value);
+                        // rax = ptr, rdx = len from gen_expr
+                        self.emit("    mov r10, rax");
+                        self.emit("    mov r11, rdx");
+                        self.emit_arg_reg(0, "r10");
+                        self.emit_arg_reg(1, "r11");
+                        let w = match kind {
+                            using::StrFieldKind::Whole => 0,
+                            using::StrFieldKind::First => 1,
+                            using::StrFieldKind::Fixed => *width as i64,
+                        };
+                        self.emit_arg_imm(2, w);
+                        self.emit("    call _rt_print_using_str");
+                    }
+                }
+            }
+            // A format with fields must consume at least one value per pass,
+            // otherwise restarting would loop forever.
+            if next == before {
+                return;
+            }
+        }
+    }
+
+    /// Print a literal string constant.
+    fn emit_literal_string(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let idx = self.add_string_literal(text);
+        self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
+        self.emit_arg_imm(1, text.len() as i64);
+        self.emit("    call _rt_print_string");
     }
 
     fn gen_print_expr(&mut self, expr: &Expr) {

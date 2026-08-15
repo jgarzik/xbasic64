@@ -1,0 +1,346 @@
+# ==============================================================================
+# BASIC Runtime: PRINT USING field output
+# ==============================================================================
+#
+# The format string itself is parsed at compile time, so the runtime only has
+# to render one field at a time. That keeps the format-parsing logic in Rust,
+# where it is unit-tested, and leaves just these two helpers to be written per
+# platform.
+#
+# Flag bits (must match src/using.rs):
+#   1  COMMA          group the integer part in thousands
+#   2  DOLLAR         prefix a currency sign, floated against the digits
+#   4  STAR           fill with '*' rather than spaces
+#   8  TRAILING_SIGN  place the sign after the number
+#   16 FORCE_SIGN     always show a sign, '+' for positives
+#   32 EXPONENTIAL    render in exponential form
+# ==============================================================================
+
+.equ USING_COMMA,      1
+.equ USING_DOLLAR,     2
+.equ USING_STAR,       4
+.equ USING_TRAIL_SIGN, 8
+.equ USING_FORCE_SIGN, 16
+.equ USING_EXP,        32
+
+.data
+_using_fmt_f:   .asciz "%.*f"
+_using_fmt_e:   .asciz "%.*E"
+_using_raw:     .skip 160       # sprintf target
+_using_work:    .skip 160       # after comma insertion and sign/currency
+_using_out:     .skip 192       # padded to the field width
+
+.text
+
+# ------------------------------------------------------------------------------
+# _rt_print_using_num - Render one numeric field
+# ------------------------------------------------------------------------------
+# Arguments:
+#   xmm0 = value
+#   rdi  = field width in characters
+#   rsi  = digits after the decimal point
+#   rdx  = flags
+#
+# Returns: nothing
+#
+# A value too wide for its field is printed in full, preceded by '%', which is
+# what GW-BASIC does rather than truncating.
+# ------------------------------------------------------------------------------
+.globl _rt_print_using_num
+_rt_print_using_num:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 24                 # keeps rsp 16-byte aligned
+
+    mov r12, rdi                # width
+    mov r13, rsi                # decimals
+    mov r14, rdx                # flags
+    movsd QWORD PTR [rbp - 56], xmm0    # value
+
+    # A trailing sign, or a forced sign we place ourselves, means the number
+    # itself is formatted without one.
+    xor r15d, r15d              # r15b = sign character, 0 = none
+    mov rax, r14
+    and rax, USING_TRAIL_SIGN | USING_FORCE_SIGN
+    test rax, rax
+    jz .Luse_num_format
+
+    # Decide the sign character and format the magnitude.
+    xorpd xmm1, xmm1
+    movsd xmm0, QWORD PTR [rbp - 56]
+    ucomisd xmm0, xmm1
+    jae .Luse_num_positive
+    mov r15d, '-'
+    # value = -value
+    mov rax, 0x8000000000000000
+    movq xmm1, rax
+    xorpd xmm0, xmm1
+    movsd QWORD PTR [rbp - 56], xmm0
+    jmp .Luse_num_format
+.Luse_num_positive:
+    test r14, USING_FORCE_SIGN
+    jz .Luse_num_format
+    mov r15d, '+'
+
+.Luse_num_format:
+    # sprintf(_using_raw, "%.*f" or "%.*E", decimals, value)
+    lea rdi, [rip + _using_raw]
+    lea rsi, [rip + _using_fmt_f]
+    test r14, USING_EXP
+    jz .Luse_num_have_fmt
+    lea rsi, [rip + _using_fmt_e]
+.Luse_num_have_fmt:
+    mov edx, r13d               # precision
+    movsd xmm0, QWORD PTR [rbp - 56]
+    mov eax, 1
+    call {libc}sprintf
+    mov rbx, rax                # rbx = length of the raw text
+
+    # Copy into the work buffer, inserting commas in the integer part when
+    # asked. Working right-to-left makes the grouping trivial.
+    lea rdi, [rip + _using_work]
+    lea rsi, [rip + _using_raw]
+    test r14, USING_COMMA
+    jnz .Luse_num_commas
+    # Plain copy.
+    xor rcx, rcx
+.Luse_num_copy:
+    cmp rcx, rbx
+    jae .Luse_num_copied
+    mov al, BYTE PTR [rsi + rcx]
+    mov BYTE PTR [rdi + rcx], al
+    inc rcx
+    jmp .Luse_num_copy
+.Luse_num_copied:
+    mov r8, rbx                 # r8 = work length
+    jmp .Luse_num_decorate
+
+.Luse_num_commas:
+    # Locate the end of the integer part: the '.' or 'E', else the whole text.
+    xor rcx, rcx
+.Luse_num_find_dot:
+    cmp rcx, rbx
+    jae .Luse_num_dot_found
+    mov al, BYTE PTR [rsi + rcx]
+    cmp al, '.'
+    je .Luse_num_dot_found
+    cmp al, 'E'
+    je .Luse_num_dot_found
+    inc rcx
+    jmp .Luse_num_find_dot
+.Luse_num_dot_found:
+    mov r9, rcx                 # r9 = one past the last integer digit
+
+    # Skip any leading sign so it is not counted as a digit.
+    xor rcx, rcx
+    cmp rbx, 0
+    je .Luse_num_no_sign_skip
+    mov al, BYTE PTR [rsi]
+    cmp al, '-'
+    je .Luse_num_skip_one
+    cmp al, '+'
+    jne .Luse_num_no_sign_skip
+.Luse_num_skip_one:
+    mov rcx, 1
+.Luse_num_no_sign_skip:
+    mov r10, rcx                # r10 = index of the first integer digit
+
+    # Single left-to-right pass: a separator goes before digit i whenever the
+    # number of digits remaining, (r9 - i), is a positive multiple of 3.
+    xor r8, r8                  # output length
+    xor rcx, rcx
+.Luse_num_ins:
+    cmp rcx, rbx
+    jae .Luse_num_ins_done
+    cmp rcx, r9
+    jae .Luse_num_ins_copy         # past the integer part: copy verbatim
+    cmp rcx, r10
+    jbe .Luse_num_ins_copy         # first digit (or sign) never gets a separator
+    mov rdx, r9
+    sub rdx, rcx                # digits remaining before the decimal point
+    mov rax, rdx
+    xor rdx, rdx
+    mov r11, 3
+    div r11                     # rdx = (r9 - rcx) mod 3
+    test rdx, rdx
+    jnz .Luse_num_ins_copy
+    lea rdx, [rip + _using_work]
+    mov BYTE PTR [rdx + r8], ','
+    inc r8
+.Luse_num_ins_copy:
+    lea rdx, [rip + _using_work]
+    mov al, BYTE PTR [rsi + rcx]
+    mov BYTE PTR [rdx + r8], al
+    inc r8
+    inc rcx
+    jmp .Luse_num_ins
+.Luse_num_ins_done:
+
+.Luse_num_decorate:
+    # r8 = length in _using_work. Prepend '$' and/or the leading sign.
+    lea rdi, [rip + _using_out]
+    xor r9, r9                  # output length
+
+    test r15b, r15b
+    jz .Luse_num_no_lead_sign
+    test r14, USING_TRAIL_SIGN
+    jnz .Luse_num_no_lead_sign
+    mov BYTE PTR [rdi + r9], r15b
+    inc r9
+.Luse_num_no_lead_sign:
+
+    test r14, USING_DOLLAR
+    jz .Luse_num_no_dollar
+    mov BYTE PTR [rdi + r9], '$'
+    inc r9
+.Luse_num_no_dollar:
+
+    lea rsi, [rip + _using_work]
+    xor rcx, rcx
+.Luse_num_body:
+    cmp rcx, r8
+    jae .Luse_num_body_done
+    mov al, BYTE PTR [rsi + rcx]
+    mov BYTE PTR [rdi + r9], al
+    inc r9
+    inc rcx
+    jmp .Luse_num_body
+.Luse_num_body_done:
+
+    test r14, USING_TRAIL_SIGN
+    jz .Luse_num_no_trail
+    test r15b, r15b
+    jz .Luse_num_no_trail
+    mov BYTE PTR [rdi + r9], r15b
+    inc r9
+.Luse_num_no_trail:
+
+    # Pad on the left to the field width, or mark an overflow with '%'.
+    cmp r9, r12
+    jae .Luse_num_overflow
+
+    mov rcx, r12
+    sub rcx, r9                 # pad count
+    mov al, ' '
+    test r14, USING_STAR
+    jz .Luse_num_pad_char
+    mov al, '*'
+.Luse_num_pad_char:
+    # Shift the text right by rcx, then fill the gap. x86 addressing has no
+    # three-register form, so the shifted destination base is precomputed.
+    lea r8, [rdi + rcx]
+    mov rdx, r9
+.Luse_num_shift:
+    cmp rdx, 0
+    jle .Luse_num_shift_done
+    dec rdx
+    mov r11b, BYTE PTR [rdi + rdx]
+    mov BYTE PTR [r8 + rdx], r11b
+    jmp .Luse_num_shift
+.Luse_num_shift_done:
+    xor rdx, rdx
+.Luse_num_fill:
+    cmp rdx, rcx
+    jae .Luse_num_fill_done
+    mov BYTE PTR [rdi + rdx], al
+    inc rdx
+    jmp .Luse_num_fill
+.Luse_num_fill_done:
+    mov r9, r12
+    jmp .Luse_num_write
+
+.Luse_num_overflow:
+    je .Luse_num_write              # exactly the width: no marker needed
+    # Too wide: shift right by one and write '%' in front.
+    mov rdx, r9
+.Luse_num_ovf_shift:
+    cmp rdx, 0
+    jle .Luse_num_ovf_done
+    dec rdx
+    mov r11b, BYTE PTR [rdi + rdx]
+    mov BYTE PTR [rdi + rdx + 1], r11b
+    jmp .Luse_num_ovf_shift
+.Luse_num_ovf_done:
+    mov BYTE PTR [rdi], '%'
+    inc r9
+
+.Luse_num_write:
+    lea rdi, [rip + _using_out]
+    mov rsi, r9
+    call _rt_print_string
+
+    add rsp, 24
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_using_str - Render one string field
+# ------------------------------------------------------------------------------
+# Arguments:
+#   rdi = string pointer
+#   rsi = string length
+#   rdx = field width, or 0 for "the whole string"
+#
+# A string shorter than the field is padded on the right with spaces; a longer
+# one is truncated, as GW-BASIC does.
+# ------------------------------------------------------------------------------
+.globl _rt_print_using_str
+_rt_print_using_str:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 8
+
+    mov rbx, rdi                # ptr
+    mov r12, rsi                # len
+    mov r13, rdx                # width
+
+    test r13, r13
+    jz .Luse_str_whole              # width 0: print the string as-is
+
+    # Copy up to `width` characters, then pad with spaces.
+    lea rdi, [rip + _using_out]
+    xor rcx, rcx
+.Luse_str_copy:
+    cmp rcx, r13
+    jae .Luse_str_copied
+    cmp rcx, r12
+    jae .Luse_str_pad
+    mov al, BYTE PTR [rbx + rcx]
+    mov BYTE PTR [rdi + rcx], al
+    inc rcx
+    jmp .Luse_str_copy
+.Luse_str_pad:
+    mov BYTE PTR [rdi + rcx], ' '
+    inc rcx
+    jmp .Luse_str_copy
+.Luse_str_copied:
+    lea rdi, [rip + _using_out]
+    mov rsi, r13
+    call _rt_print_string
+    jmp .Luse_str_done
+
+.Luse_str_whole:
+    mov rdi, rbx
+    mov rsi, r12
+    call _rt_print_string
+
+.Luse_str_done:
+    add rsp, 8
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret

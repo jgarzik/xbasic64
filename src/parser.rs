@@ -73,6 +73,8 @@ pub enum StmtKind {
     Print {
         items: Vec<PrintItem>,
         newline: bool,
+        /// PRINT USING format string, when one was given.
+        using: Option<Expr>,
     },
     Input {
         prompt: Option<String>,
@@ -151,6 +153,8 @@ pub enum StmtKind {
         file_num: i32,
         items: Vec<PrintItem>,
         newline: bool,
+        /// PRINT USING format string, when one was given.
+        using: Option<Expr>,
     },
     InputFile {
         file_num: i32,
@@ -716,6 +720,19 @@ impl Parser {
             None
         };
 
+        // PRINT USING "fmt"; items
+        let using = if matches!(self.peek(), Token::Using) {
+            self.advance();
+            let fmt = self.parse_expression()?;
+            // GW-BASIC separates the format from the values with ; or ,
+            if matches!(self.peek(), Token::Semicolon | Token::Comma) {
+                self.advance();
+            }
+            Some(fmt)
+        } else {
+            None
+        };
+
         let mut items = Vec::new();
         let mut newline = true;
 
@@ -743,9 +760,14 @@ impl Parser {
                 file_num,
                 items,
                 newline,
+                using,
             })
         } else {
-            Ok(StmtKind::Print { items, newline })
+            Ok(StmtKind::Print {
+                items,
+                newline,
+                using,
+            })
         }
     }
 
@@ -1672,7 +1694,7 @@ mod tests {
     fn test_print_string() {
         let prog = parse(r#"PRINT "Hello""#).unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Print { items, newline } = &prog.statements[0].kind {
+        if let StmtKind::Print { items, newline, .. } = &prog.statements[0].kind {
             assert_eq!(items.len(), 1);
             assert!(*newline);
         } else {

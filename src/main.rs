@@ -12,6 +12,7 @@ mod lexer;
 mod parser;
 mod runtime;
 mod sema;
+mod using;
 
 use clap::Parser;
 use std::fs;
