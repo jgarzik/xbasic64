@@ -32,6 +32,8 @@ _fmt_input_str: .asciz "%1023[^\n]"
 _input_buf: .skip 1024
 _chr_buf: .skip 2
 _str_buf: .skip 64
+_fmt_hex: .asciz "%llX"
+_fmt_oct: .asciz "%llo"
 _rng_state: .quad 0x12345678DEADBEEF
 _cls_seq: .asciz "\033[2J\033[H"
 _redo_msg: .asciz "?Redo from start\n"

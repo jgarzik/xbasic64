@@ -28,6 +28,8 @@
 
 .data
 _str_buf: .skip 64          # Buffer for STR$() conversion
+_fmt_hex: .asciz "%llX"
+_fmt_oct: .asciz "%llo"
 _chr_buf: .skip 2           # Buffer for CHR$()
 
 .text
@@ -404,5 +406,232 @@ _rt_strcmp:
     sub eax, r10d
 
 .Lstrcmp_done:
+    leave
+    ret
+
+# ==============================================================================
+# Additional string functions
+# ==============================================================================
+#
+# These were all reachable only through the old "unknown $-suffixed call must
+# be an array" heuristic, so every one of them aborted the compiler.
+#
+# Functions that shorten a string (LTRIM$, RTRIM$) return an interior pointer
+# into the original rather than allocating, which is sound because BASIC
+# strings are (ptr, len) pairs and are never mutated in place.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# _rt_space - SPACE$(n): a string of n spaces
+# ------------------------------------------------------------------------------
+# Arguments: rcx = count       Returns: rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_space
+_rt_space:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40
+
+    mov rbx, rcx
+    cmp rbx, 0
+    jge .Lspace_ok
+    xor rbx, rbx            # a negative count yields the empty string
+.Lspace_ok:
+    lea rcx, [rbx + 1]
+    call malloc
+
+    mov rcx, rax            # dest
+    mov rdx, ' '            # fill byte
+    mov r8, rbx             # count
+    push rax
+    sub rsp, 32
+    call memset
+    add rsp, 32
+    pop rax
+    mov rdx, rbx
+
+    add rsp, 40
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_string_n - STRING$(n, ch): a string of n copies of one character
+# ------------------------------------------------------------------------------
+# Arguments: rcx = count, rdx = character code
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_string_n
+_rt_string_n:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 32
+
+    mov rbx, rcx
+    mov r12, rdx
+    cmp rbx, 0
+    jge .Lstringn_ok
+    xor rbx, rbx
+.Lstringn_ok:
+    lea rcx, [rbx + 1]
+    call malloc
+
+    mov rcx, rax
+    mov rdx, r12
+    mov r8, rbx
+    push rax
+    sub rsp, 32
+    call memset
+    add rsp, 32
+    pop rax
+    mov rdx, rbx
+
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_ltrim - LTRIM$(s): drop leading spaces
+# ------------------------------------------------------------------------------
+# Arguments: rcx = pointer, rdx = length
+# Returns:   rax = pointer, rdx = length (an interior view, not a copy)
+# ------------------------------------------------------------------------------
+.globl _rt_ltrim
+_rt_ltrim:
+    xor r8, r8
+.Lltrim_loop:
+    cmp r8, rdx
+    jae .Lltrim_done
+    cmp BYTE PTR [rcx + r8], ' '
+    jne .Lltrim_done
+    inc r8
+    jmp .Lltrim_loop
+.Lltrim_done:
+    lea rax, [rcx + r8]
+    sub rdx, r8
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_rtrim - RTRIM$(s): drop trailing spaces
+# ------------------------------------------------------------------------------
+# Arguments: rcx = pointer, rdx = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_rtrim
+_rt_rtrim:
+.Lrtrim_loop:
+    test rdx, rdx
+    jz .Lrtrim_done
+    cmp BYTE PTR [rcx + rdx - 1], ' '
+    jne .Lrtrim_done
+    dec rdx
+    jmp .Lrtrim_loop
+.Lrtrim_done:
+    mov rax, rcx
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_ucase / _rt_lcase - UCASE$(s) / LCASE$(s)
+# ------------------------------------------------------------------------------
+# These must copy: the source may be a .data literal shared with other uses.
+#
+# Arguments: rcx = pointer, rdx = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_ucase
+_rt_ucase:
+    mov r9b, 1              # r9b != 0 selects upper-casing
+    jmp _rt_case_convert
+
+.globl _rt_lcase
+_rt_lcase:
+    xor r9b, r9b
+
+_rt_case_convert:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    sub rsp, 40
+
+    mov rbx, rcx            # source
+    mov r12, rdx            # length
+    mov r13d, r9d           # direction
+
+    lea rcx, [r12 + 1]
+    call malloc
+
+    xor rcx, rcx
+.Lcase_loop:
+    cmp rcx, r12
+    jae .Lcase_done
+    mov dl, BYTE PTR [rbx + rcx]
+    test r13b, r13b
+    jz .Lcase_lower
+    cmp dl, 'a'
+    jb .Lcase_store
+    cmp dl, 'z'
+    ja .Lcase_store
+    sub dl, 32
+    jmp .Lcase_store
+.Lcase_lower:
+    cmp dl, 'A'
+    jb .Lcase_store
+    cmp dl, 'Z'
+    ja .Lcase_store
+    add dl, 32
+.Lcase_store:
+    mov BYTE PTR [rax + rcx], dl
+    inc rcx
+    jmp .Lcase_loop
+.Lcase_done:
+    mov rdx, r12
+
+    add rsp, 40
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
+# ------------------------------------------------------------------------------
+# Arguments: rcx = value (already truncated to an integer)
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_hex
+_rt_hex:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 40
+    mov r8, rcx
+    lea rcx, [rip + _str_buf]
+    lea rdx, [rip + _fmt_hex]
+    call sprintf
+    mov rdx, rax
+    lea rax, [rip + _str_buf]
+    add rsp, 40
+    leave
+    ret
+
+.globl _rt_oct
+_rt_oct:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 40
+    mov r8, rcx
+    lea rcx, [rip + _str_buf]
+    lea rdx, [rip + _fmt_oct]
+    call sprintf
+    mov rdx, rax
+    lea rax, [rip + _str_buf]
+    add rsp, 40
     leave
     ret

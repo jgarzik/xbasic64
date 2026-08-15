@@ -166,3 +166,54 @@ NEXT I
         "bubble sort by string comparison"
     );
 }
+
+/// String builtins that used to abort the compiler: every unrecognized
+/// $-suffixed call was assumed to be an array access.
+#[test]
+fn test_string_builders() {
+    let output = compile_and_run(
+        "PRINT \"[\"; SPACE$(3); \"]\"\nPRINT STRING$(5, 42)\nPRINT STRING$(3, \"x\")\nPRINT LEN(SPACE$(4))\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["[   ]", "*****", "xxx", "4"]);
+}
+
+/// Trimming and case conversion.
+#[test]
+fn test_string_trim_and_case() {
+    let output = compile_and_run(
+        "PRINT \"[\"; LTRIM$(\"   abc\"); \"]\"\nPRINT \"[\"; RTRIM$(\"abc   \"); \"]\"\nPRINT UCASE$(\"Hello, World!\")\nPRINT LCASE$(\"Hello, World!\")\nA$ = \"  Mixed  \"\nPRINT \"[\" + LTRIM$(RTRIM$(A$)) + \"]\"\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "[abc]",
+            "[abc]",
+            "HELLO, WORLD!",
+            "hello, world!",
+            "[Mixed]"
+        ]
+    );
+}
+
+/// UCASE$ must copy rather than modify in place: the source may be a shared
+/// .data literal.
+#[test]
+fn test_case_conversion_does_not_mutate_source() {
+    let output =
+        compile_and_run("A$ = \"abc\"\nB$ = UCASE$(A$)\nPRINT A$\nPRINT B$\nPRINT \"abc\"\n")
+            .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["abc", "ABC", "abc"]);
+}
+
+/// Radix conversions.
+#[test]
+fn test_hex_and_oct() {
+    let output = compile_and_run("PRINT HEX$(255)\nPRINT OCT$(15)\nPRINT HEX$(16)\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["FF", "17", "10"]);
+}

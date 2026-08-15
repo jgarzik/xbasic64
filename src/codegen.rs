@@ -2815,6 +2815,63 @@ impl CodeGen {
             "TIMER" => {
                 self.emit("    call _rt_timer");
             }
+            // String builders. These allocate, so the result outlives the call.
+            "SPACE$" => {
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_reg(0, "rax");
+                self.emit("    call _rt_space");
+            }
+            "STRING$" => {
+                // STRING$(n, ch) takes either a character code or a string
+                // whose first character is used.
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit("    push rax");
+                self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+                let ct = self.gen_expr(&args[1]);
+                if ct == DataType::String {
+                    self.emit("    movzx eax, BYTE PTR [rax]");
+                } else {
+                    self.gen_coercion(ct, DataType::Long);
+                }
+                self.emit("    mov r10d, eax");
+                self.emit("    add rsp, 8");
+                self.emit("    pop rax");
+                self.emit_arg_reg(0, "rax");
+                self.emit_arg_reg(1, "r10");
+                self.emit("    call _rt_string_n");
+            }
+            // Trimming and case conversion.
+            "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => {
+                self.gen_expr(&args[0]);
+                self.emit("    mov r10, rax");
+                self.emit("    mov r11, rdx");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                let rt = match upper_name.as_str() {
+                    "LTRIM$" => "_rt_ltrim",
+                    "RTRIM$" => "_rt_rtrim",
+                    "UCASE$" => "_rt_ucase",
+                    _ => "_rt_lcase",
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // Radix conversions.
+            "HEX$" | "OCT$" => {
+                let t = self.gen_expr(&args[0]);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_reg(0, "rax");
+                let rt = if upper_name == "HEX$" {
+                    "_rt_hex"
+                } else {
+                    "_rt_oct"
+                };
+                self.emit(&format!("    call {}", rt));
+            }
             // Array bounds. The descriptor stores each dimension's element
             // count, so UBOUND is that minus one and LBOUND is always 0.
             "LBOUND" | "UBOUND" => {
