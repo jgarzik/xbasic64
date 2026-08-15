@@ -58,6 +58,12 @@ _rt_print_string:
     mov rbp, rsp
     sub rsp, 48             # Shadow space + stack args
 
+    # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
+    # prologue both leave it that way. Printing nothing is the correct result,
+    # and returning early avoids handing WriteFile a NULL buffer.
+    test rdx, rdx
+    jz .Lprint_str_done
+
     # Save args
     mov r8, rdx             # length → r8 (3rd arg for WriteFile)
     mov rdx, rcx            # buffer → rdx (2nd arg for WriteFile)
@@ -71,6 +77,7 @@ _rt_print_string:
     mov QWORD PTR [rsp + 32], 0     # NULL → 5th arg (stack)
     call WriteFile
 
+.Lprint_str_done:
     leave
     ret
 

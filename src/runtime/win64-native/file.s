@@ -213,6 +213,11 @@ _rt_file_print_string:
     push rsi
     sub rsp, 40             # Shadow space + stack arg
 
+    # An unassigned string is (NULL, 0); writing nothing is correct and avoids
+    # handing WriteFile a NULL buffer.
+    test r8, r8
+    jz .Lfile_print_str_done
+
     mov ebx, ecx            # save file number
     mov rdi, rdx            # save string ptr
     mov rsi, r8             # save string len
@@ -228,6 +233,7 @@ _rt_file_print_string:
     mov QWORD PTR [rsp + 32], 0  # lpOverlapped = NULL
     call WriteFile
 
+.Lfile_print_str_done:
     add rsp, 40
     pop rsi
     pop rdi

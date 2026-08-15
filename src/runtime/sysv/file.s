@@ -197,6 +197,11 @@ _rt_file_print_string:
     push rbx
     sub rsp, 8              # Align stack to 16 bytes
 
+    # An unassigned string is (NULL, 0); writing nothing is correct and avoids
+    # passing NULL to fprintf.
+    test rdx, rdx
+    jz .Lfile_print_str_done
+
     mov ebx, edi            # save file number
     mov rcx, rsi            # string ptr → 4th arg (for %.*s format)
     mov r8, rdx             # string len → will become 3rd arg
@@ -212,6 +217,7 @@ _rt_file_print_string:
     xor eax, eax            # no vector args
     call {libc}fprintf
 
+.Lfile_print_str_done:
     add rsp, 8
     pop rbx
     leave

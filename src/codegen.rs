@@ -25,7 +25,21 @@
 //! - Left operand is restored to `eax`/`xmm0`
 //! - Right operand is placed in `ecx`/`xmm1`
 //!
-//! # Stack Frame Layout
+//! # Storage Model
+//!
+//! Storage is addressed uniformly as 8-byte words through [`Loc`], which is
+//! either a `.bss` symbol or an `rbp`-relative frame offset. Callers ask for
+//! "word N of this variable" and never compute offsets themselves.
+//!
+//! **Module-level variables and arrays live in `.bss`** (`_var_<NAME>`,
+//! `_arr_<NAME>`, RIP-relative). This gives three things at once: the loader
+//! zero-fills them, so an unassigned variable reads as `0` / `""` as BASIC
+//! requires; a symbol is frame-independent, so a `SUB` and the main program
+//! refer to the same storage; and access costs exactly what a frame reference
+//! did.
+//!
+//! **Procedure locals live on the stack** and are zeroed by the prologue (see
+//! `emit_zero_frame`), so each invocation starts clean and recursion works.
 //!
 //! ```text
 //! High addresses
@@ -44,8 +58,21 @@
 //! Low addresses
 //! ```
 //!
-//! All local variables are allocated 8 bytes regardless of type (for alignment).
-//! Variable offsets are always negative relative to `rbp`.
+//! Word layout within a variable's storage:
+//!
+//! | kind           | word 0          | word 1      | word 1+i      |
+//! |----------------|-----------------|-------------|---------------|
+//! | numeric scalar | value           | --          | --            |
+//! | string scalar  | pointer         | length      | --            |
+//! | array          | element pointer | dim 0 bound | dim *i* bound |
+//!
+//! Numeric scalars occupy one 8-byte word regardless of declared type; the
+//! narrower types are stored and loaded with narrower operands within it.
+//!
+//! Scoping rules follow LANGREF: a name used anywhere at module level is
+//! global and shared with every procedure; parameters and a FUNCTION's return
+//! pseudo-variable are always local and shadow a global of the same name; a
+//! name used only inside a procedure is local to it.
 //!
 //! # Stack Alignment (Critical for ABI Compliance)
 //!
@@ -85,9 +112,11 @@
 //! This allows efficient substring operations without copying.
 //!
 //! - String values: `rax` = pointer to characters, `rdx` = length
-//! - String variables: Two consecutive 8-byte slots at `[rbp + offset]` (ptr) and
-//!   `[rbp + offset - 8]` (len), where offset is negative (e.g., -8, -16).
-//!   The ptr is at higher address, len at lower address (stack grows downward).
+//! - String variables: two words of the variable's own storage -- word 0 is the
+//!   pointer, word 1 the length. Both are reserved when the variable is first
+//!   seen, so the length can never land in a neighbouring variable's slot.
+//! - An unassigned string is `(NULL, 0)`, which the runtime's print helpers
+//!   treat as empty rather than dereferencing.
 //!
 //! String literals are emitted in the `.data` section with labels `_str_N`.
 //!
@@ -204,6 +233,28 @@ fn is_string_var(name: &str) -> bool {
     name.ends_with('$')
 }
 
+/// Map a BASIC identifier to an assembler-safe symbol.
+///
+/// BASIC names keep their type suffixes (`A$`, `N%`), which are not valid
+/// symbol characters. The mapping is injective because `_` escapes itself, so
+/// distinct BASIC names cannot collide: `A_S` becomes `A__S` while `A$`
+/// becomes `A_S`.
+fn mangle(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 2);
+    for c in name.chars() {
+        match c {
+            '_' => out.push_str("__"),
+            '%' => out.push_str("_I"),
+            '&' => out.push_str("_L"),
+            '!' => out.push_str("_F"),
+            '#' => out.push_str("_D"),
+            '$' => out.push_str("_S"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Every nested statement body directly contained by `stmt`.
 ///
 /// This is the single place that knows which `Stmt` variants carry child
@@ -234,17 +285,58 @@ fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
     }
 }
 
+/// Where a variable or array descriptor lives.
+///
+/// Storage is addressed uniformly as a sequence of 8-byte words, so callers ask
+/// for "word N of this variable" and never do offset arithmetic themselves.
+/// Word layout by kind:
+///
+/// | kind            | word 0            | word 1        | word 1+i          |
+/// |-----------------|-------------------|---------------|-------------------|
+/// | numeric scalar  | value             | --            | --                |
+/// | string scalar   | pointer           | length        | --                |
+/// | array           | element pointer   | dim 0 bound   | dim *i* bound     |
+///
+/// Today every `Loc` is a `Frame`; the `Global` variant exists so that moving
+/// module-level storage to `.bss` is a change of location, not of every access
+/// site.
+#[derive(Clone, Debug, PartialEq)]
+enum Loc {
+    /// RIP-relative, at assembler symbol `sym`.
+    Global(String),
+    /// rbp-relative address of word 0 (negative, since the frame grows down).
+    Frame(i32),
+}
+
+impl Loc {
+    /// Operand for word `n`, with an explicit operand size.
+    fn at(&self, size: &str, n: i32) -> String {
+        match self {
+            Loc::Global(sym) => format!("{} [rip + {} + {}]", size, sym, n * 8),
+            Loc::Frame(off) => format!("{} [rbp + {}]", size, off + n * 8),
+        }
+    }
+
+    /// Operand for word `n` as a QWORD, the common case.
+    fn q(&self, n: i32) -> String {
+        self.at("QWORD PTR", n)
+    }
+}
+
 /// Variable storage information
 #[derive(Clone)]
 struct VarInfo {
-    offset: i32,
+    loc: Loc,
     data_type: DataType,
 }
 
 /// Metadata for array storage
+#[derive(Clone)]
 struct ArrayInfo {
-    ptr_offset: i32,       // stack offset where array pointer is stored
-    dim_offsets: Vec<i32>, // stack offsets where dimension bounds are stored
+    /// Word 0 holds the malloc'd element pointer; word 1+i holds dimension i's
+    /// element count (already the declared bound + 1).
+    loc: Loc,
+    ndims: usize,
 }
 
 #[derive(Default)]
@@ -258,6 +350,7 @@ pub struct CodeGen {
     data_items: Vec<Literal>,       // DATA values
     current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
+    proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
     gosub_used: bool,               // whether GOSUB is used (need return stack)
     expr_depth: u32,                // current expression nesting depth
 }
@@ -387,25 +480,57 @@ impl CodeGen {
             return info.clone();
         }
 
-        // Allocate new variable - determine type from suffix
+        // Allocate new variable - determine type from suffix.
+        // A string needs two words (pointer, length); everything else one.
+        // Reserving both here, once, is what keeps the length word inside the
+        // variable's own storage: it used to be scavenged at `offset - 8`,
+        // which is the *next* variable's slot unless something else happened to
+        // reserve it first.
         let data_type = DataType::from_suffix(name);
-        self.stack_offset -= 8; // All types use 8 bytes for alignment
-        let offset = self.stack_offset;
-
-        let info = VarInfo { offset, data_type };
+        let words = Self::words_for(data_type);
 
         if self.current_proc.is_some() {
+            // Not a module-level name, so it is local to this procedure: a
+            // fresh, zeroed slot per invocation, which is what makes recursion
+            // work.
+            self.stack_offset -= 8 * words;
+            let info = VarInfo {
+                loc: Loc::Frame(self.stack_offset),
+                data_type,
+            };
             self.proc_vars.insert(name.to_string(), info.clone());
+            info
         } else {
+            // Module-level: static storage, shared with every procedure and
+            // zero-initialized by the loader.
+            let info = VarInfo {
+                loc: Loc::Global(format!("_var_{}", mangle(name))),
+                data_type,
+            };
             self.vars.insert(name.to_string(), info.clone());
+            info
         }
-
-        info
     }
 
-    /// Get just the stack offset for a variable (convenience method)
-    fn get_var_offset(&mut self, name: &str) -> i32 {
-        self.get_var_info(name).offset
+    /// Find an array, preferring one DIM'd in the current procedure over a
+    /// module-level array of the same name.
+    fn lookup_array(&self, name: &str) -> Option<&ArrayInfo> {
+        if self.current_proc.is_some() {
+            if let Some(info) = self.proc_arrays.get(name) {
+                return Some(info);
+            }
+        }
+        self.arrays.get(name)
+    }
+
+    /// Number of 8-byte words a scalar of this type occupies.
+    fn words_for(data_type: DataType) -> i32 {
+        if data_type == DataType::String { 2 } else { 1 }
+    }
+
+    /// Get just the storage location for a variable (convenience method)
+    fn get_var_loc(&mut self, name: &str) -> Loc {
+        self.get_var_info(name).loc
     }
 
     /// Determine the result type of an expression
@@ -542,6 +667,22 @@ impl CodeGen {
             self.preprocess(stmt);
         }
 
+        // Render main into a scratch buffer *before* the procedures.
+        //
+        // Procedures used to be emitted first, which meant `vars` and `arrays`
+        // were still empty while a procedure body was compiled: a reference to a
+        // module-level variable allocated a fresh procedure local (so globals
+        // read as 0 inside a SUB) and a reference to a module-level array hit
+        // "Array not declared". Compiling main first means that by the time any
+        // procedure is compiled, every module-level name is known and classified
+        // as a global. The alternative -- a separate collect_globals walker --
+        // would have to mirror every name-introducing statement forever.
+        let main_asm = {
+            let saved = std::mem::take(&mut self.output);
+            self.gen_main(program);
+            std::mem::replace(&mut self.output, saved)
+        };
+
         // Emit assembly header
         self.emit(".intel_syntax noprefix");
         self.emit(".text");
@@ -549,7 +690,7 @@ impl CodeGen {
         self.emit(&format!(".globl {}main", p));
         self.emit("");
 
-        // Generate procedures first
+        // Procedures
         for stmt in &program.statements {
             if let Stmt::Sub { name, params, body } = stmt {
                 self.gen_procedure(name, params, body, false);
@@ -558,7 +699,17 @@ impl CodeGen {
             }
         }
 
-        // Generate main
+        self.output.push_str(&main_asm);
+
+        // Emit data section
+        self.emit_data_section();
+
+        self.output.clone()
+    }
+
+    /// Emit `main`: prologue, module-level statements, epilogue.
+    fn gen_main(&mut self, program: &Program) {
+        let p = PREFIX;
         self.emit_label(&format!("{}main", p));
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
@@ -606,16 +757,14 @@ impl CodeGen {
         //
         // Since we use 16-byte sub/add for all temporaries in expression evaluation,
         // we just need sub rsp, N where N is a multiple of 16 to maintain alignment.
+        // Only main's own buffer is in `self.output` here, so this cannot reach
+        // a procedure's placeholder -- note "# STACK_RESERVE" is a prefix of
+        // "# STACK_RESERVE_PROC_<name>".
         let stack_needed = -self.stack_offset;
         let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
         let old = "    sub rsp, 0         # STACK_RESERVE";
         let new = format!("    sub rsp, {}        # STACK_RESERVE", stack_size);
         self.output = self.output.replace(old, &new);
-
-        // Emit data section
-        self.emit_data_section();
-
-        self.output.clone()
     }
 
     /// Preprocess statement: collect DATA items and check for GOSUB usage
@@ -633,9 +782,36 @@ impl CodeGen {
         }
     }
 
+    /// Zero the current frame, from `rsp` up to `rbp`.
+    ///
+    /// Emitted in a procedure prologue right after the stack reserve and before
+    /// parameters are spilled. Uses `r10`/`r11`, which are caller-saved and are
+    /// argument registers on neither System V nor Win64, so the incoming
+    /// arguments stay live. (`rep stosq` would clobber `rdi`/`rcx`/`rax`, all of
+    /// which carry arguments.)
+    ///
+    /// The loop is bottom-tested, so a zero-sized frame runs no iterations, and
+    /// it derives its bounds from the registers rather than the reserve size, so
+    /// it cannot drift out of step with the backpatched `sub rsp, N`.
+    fn emit_zero_frame(&mut self) {
+        let body = self.new_label("zero");
+        let check = self.new_label("zchk");
+        self.emit("    # zero locals: [rsp, rbp)");
+        self.emit("    mov r11, rsp");
+        self.emit("    mov r10, rbp");
+        self.emit(&format!("    jmp {}", check));
+        self.emit_label(&body);
+        self.emit("    mov QWORD PTR [r11], 0");
+        self.emit("    add r11, 8");
+        self.emit_label(&check);
+        self.emit("    cmp r11, r10");
+        self.emit(&format!("    jb {}", body));
+    }
+
     fn gen_procedure(&mut self, name: &str, params: &[String], body: &[Stmt], is_function: bool) {
         self.current_proc = Some(name.to_string());
         self.proc_vars.clear();
+        self.proc_arrays.clear();
         let old_stack_offset = self.stack_offset;
         self.stack_offset = 0;
 
@@ -648,27 +824,31 @@ impl CodeGen {
         let placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
         self.emit(&placeholder);
 
+        // Zero the frame before anything is spilled into it, so that procedure
+        // locals start at 0 / "" on every call the way module-level variables
+        // do. Must come before the parameter spill below, which would otherwise
+        // be wiped.
+        self.emit_zero_frame();
+
         // Parameters are passed in registers (per platform ABI)
         // First N params in registers, rest on stack at [rbp+16], [rbp+24], etc.
         // Store them all in our local stack space
         let int_regs = PlatformAbi::INT_ARG_REGS;
         let max_reg_args = int_regs.len();
         for (i, param) in params.iter().enumerate() {
-            self.stack_offset -= 8;
             let data_type = DataType::from_suffix(param);
+            self.stack_offset -= 8 * Self::words_for(data_type);
+            let loc = Loc::Frame(self.stack_offset);
             self.proc_vars.insert(
                 param.clone(),
                 VarInfo {
-                    offset: self.stack_offset,
+                    loc: loc.clone(),
                     data_type,
                 },
             );
             if i < max_reg_args {
                 // Parameter in register - store to our local stack
-                self.emit(&format!(
-                    "    mov QWORD PTR [rbp + {}], {}",
-                    self.stack_offset, int_regs[i]
-                ));
+                self.emit(&format!("    mov {}, {}", loc.q(0), int_regs[i]));
             } else {
                 // Parameter on call stack - copy to our local stack
                 // Overflow args are at [rbp+16], [rbp+24], etc. (after saved rbp and ret addr)
@@ -677,21 +857,18 @@ impl CodeGen {
                     "    mov rax, QWORD PTR [rbp + {}]",
                     stack_arg_offset
                 ));
-                self.emit(&format!(
-                    "    mov QWORD PTR [rbp + {}], rax",
-                    self.stack_offset
-                ));
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
             }
         }
 
         // If function, allocate return value slot
         if is_function {
-            self.stack_offset -= 8;
             let data_type = DataType::from_suffix(name);
+            self.stack_offset -= 8 * Self::words_for(data_type);
             self.proc_vars.insert(
                 name.to_string(),
                 VarInfo {
-                    offset: self.stack_offset,
+                    loc: Loc::Frame(self.stack_offset),
                     data_type,
                 },
             );
@@ -705,25 +882,25 @@ impl CodeGen {
         // Return - load return value into appropriate register based on type
         if is_function {
             let ret_info = &self.proc_vars[name];
-            let offset = ret_info.offset;
+            let loc = ret_info.loc.clone();
             let data_type = ret_info.data_type;
             match data_type {
                 DataType::Integer => {
-                    self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
                 }
                 DataType::Long => {
-                    self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
                 }
                 DataType::Single => {
-                    self.emit(&format!("    movss xmm0, DWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
                 }
                 DataType::Double => {
-                    self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", offset));
+                    self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
                 }
                 DataType::String => {
                     // Load string (ptr, len) into rax, rdx
-                    self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", offset));
-                    self.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", offset - 8));
+                    self.emit(&format!("    mov rax, {}", loc.q(0)));
+                    self.emit(&format!("    mov rdx, {}", loc.q(1)));
                 }
             }
         }
@@ -771,27 +948,19 @@ impl CodeGen {
                     self.gen_coercion(expr_type, var_info.data_type);
 
                     // Store based on target type
+                    let loc = &var_info.loc;
                     match var_info.data_type {
                         DataType::Integer => {
-                            self.emit(&format!("    mov WORD PTR [rbp + {}], ax", var_info.offset));
+                            self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
                         }
                         DataType::Long => {
-                            self.emit(&format!(
-                                "    mov DWORD PTR [rbp + {}], eax",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
                         }
                         DataType::Single => {
-                            self.emit(&format!(
-                                "    movss DWORD PTR [rbp + {}], xmm0",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
                         }
                         DataType::Double => {
-                            self.emit(&format!(
-                                "    movsd QWORD PTR [rbp + {}], xmm0",
-                                var_info.offset
-                            ));
+                            self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                         }
                         DataType::String => {
                             // Should be handled by gen_string_assign above
@@ -829,13 +998,13 @@ impl CodeGen {
                 for var in vars {
                     if is_string_var(var) {
                         self.emit("    call _rt_input_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+                        let loc = self.get_var_loc(var);
+                        self.emit(&format!("    mov {}, rax", loc.q(0)));
+                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
                     } else {
                         self.emit("    call _rt_input_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
+                        let loc = self.get_var_loc(var);
+                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
                 }
             }
@@ -848,9 +1017,9 @@ impl CodeGen {
                     self.emit("    call _rt_print_string");
                 }
                 self.emit("    call _rt_input_string");
-                let offset = self.get_var_offset(var);
-                self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+                let loc = self.get_var_loc(var);
+                self.emit(&format!("    mov {}, rax", loc.q(0)));
+                self.emit(&format!("    mov {}, rdx", loc.q(1)));
             }
 
             Stmt::If {
@@ -896,12 +1065,12 @@ impl CodeGen {
             } => {
                 let start_label = self.new_label("for");
                 let end_label = self.new_label("endfor");
-                let var_offset = self.get_var_offset(var);
+                let var_loc = self.get_var_loc(var);
 
                 // Initialize loop variable - coerce to double
                 let start_type = self.gen_expr(start);
                 self.gen_coercion(start_type, DataType::Double);
-                self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_offset));
+                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
 
                 // Store end value - coerce to double
                 self.stack_offset -= 8;
@@ -928,7 +1097,7 @@ impl CodeGen {
                 self.emit_label(&start_label);
 
                 // Check condition (var > end for positive step, var < end for negative)
-                self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", var_offset));
+                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
                 self.emit(&format!("    movsd xmm1, QWORD PTR [rbp + {}]", end_offset));
                 self.emit(&format!(
                     "    movsd xmm2, QWORD PTR [rbp + {}]",
@@ -957,12 +1126,12 @@ impl CodeGen {
                 }
 
                 // Increment
-                self.emit(&format!("    movsd xmm0, QWORD PTR [rbp + {}]", var_offset));
+                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
                 self.emit(&format!(
                     "    addsd xmm0, QWORD PTR [rbp + {}]",
                     step_offset
                 ));
-                self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", var_offset));
+                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
@@ -1135,12 +1304,15 @@ impl CodeGen {
                 for var in vars {
                     if is_string_var(var) {
                         self.emit("    call _rt_read_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
+                        let loc = self.get_var_loc(var);
+                        // _rt_read_string returns (ptr, len); the length used to
+                        // be discarded, leaving whatever was in the length word.
+                        self.emit(&format!("    mov {}, rax", loc.q(0)));
+                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
                     } else {
                         self.emit("    call _rt_read_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
+                        let loc = self.get_var_loc(var);
+                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
                 }
             }
@@ -1268,14 +1440,14 @@ impl CodeGen {
                     if is_string_var(var) {
                         self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_string");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-                        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+                        let loc = self.get_var_loc(var);
+                        self.emit(&format!("    mov {}, rax", loc.q(0)));
+                        self.emit(&format!("    mov {}, rdx", loc.q(1)));
                     } else {
                         self.emit_arg_imm(0, *file_num as i64);
                         self.emit("    call _rt_file_input_number");
-                        let offset = self.get_var_offset(var);
-                        self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", offset));
+                        let loc = self.get_var_loc(var);
+                        self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
                     }
                 }
             }
@@ -1310,31 +1482,23 @@ impl CodeGen {
 
             Expr::Variable(name) => {
                 let info = self.get_var_info(name);
+                let loc = &info.loc;
                 match info.data_type {
                     DataType::Integer => {
-                        self.emit(&format!("    movsx eax, WORD PTR [rbp + {}]", info.offset));
+                        self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
                     }
                     DataType::Long => {
-                        self.emit(&format!("    mov eax, DWORD PTR [rbp + {}]", info.offset));
+                        self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
                     }
                     DataType::Single => {
-                        self.emit(&format!(
-                            "    movss xmm0, DWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
                     }
                     DataType::Double => {
-                        self.emit(&format!(
-                            "    movsd xmm0, QWORD PTR [rbp + {}]",
-                            info.offset
-                        ));
+                        self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
                     }
                     DataType::String => {
-                        self.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", info.offset));
-                        self.emit(&format!(
-                            "    mov rdx, QWORD PTR [rbp + {}]",
-                            info.offset - 8
-                        ));
+                        self.emit(&format!("    mov rax, {}", loc.q(0)));
+                        self.emit(&format!("    mov rdx, {}", loc.q(1)));
                     }
                 }
                 info.data_type
@@ -1861,7 +2025,7 @@ impl CodeGen {
             }
             _ => {
                 // User-defined function or array access
-                if self.arrays.contains_key(&upper_name) || upper_name.ends_with('$') {
+                if self.lookup_array(&upper_name).is_some() || upper_name.ends_with('$') {
                     // Array access
                     self.gen_array_load(&upper_name, args);
                 } else {
@@ -2053,10 +2217,21 @@ impl CodeGen {
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
         let elem_size = if is_string_var(&arr.name) { 16 } else { 8 };
 
-        // First, evaluate and store all dimension bounds
+        // Reserve the descriptor as one contiguous block: word 0 is the element
+        // pointer, word 1+i is dimension i's element count. A module-level DIM
+        // gets static storage so procedures can reach the same array; a DIM
+        // inside a procedure is local to it.
+        let ndims = arr.dimensions.len();
+        let loc = if self.current_proc.is_some() {
+            self.stack_offset -= 8 * (1 + ndims as i32);
+            Loc::Frame(self.stack_offset)
+        } else {
+            Loc::Global(format!("_arr_{}", mangle(&arr.name)))
+        };
+
+        // Evaluate and store all dimension bounds.
         // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
-        let mut dim_offsets = Vec::new();
-        for dim in arr.dimensions.iter() {
+        for (i, dim) in arr.dimensions.iter().enumerate() {
             let dim_type = self.gen_expr(dim);
             if dim_type.is_integer() {
                 // Value already in eax, sign-extend to rax
@@ -2065,21 +2240,13 @@ impl CodeGen {
                 self.emit("    cvttsd2si rax, xmm0");
             }
             self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
-            self.stack_offset -= 8;
-            dim_offsets.push(self.stack_offset);
-            self.emit(&format!(
-                "    mov QWORD PTR [rbp + {}], rax",
-                self.stack_offset
-            ));
+            self.emit(&format!("    mov {}, rax", loc.q(1 + i as i32)));
         }
 
         // Calculate total elements: dim0 * dim1 * dim2 * ...
-        self.emit(&format!(
-            "    mov rax, QWORD PTR [rbp + {}]",
-            dim_offsets[0]
-        ));
-        for offset in dim_offsets.iter().skip(1) {
-            self.emit(&format!("    imul rax, QWORD PTR [rbp + {}]", offset));
+        self.emit(&format!("    mov rax, {}", loc.q(1)));
+        for i in 1..ndims {
+            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
         }
 
         // Allocate: total_elements * elem_size
@@ -2088,24 +2255,20 @@ impl CodeGen {
         self.emit_call_libc("malloc");
 
         // Store array pointer
-        self.stack_offset -= 8;
-        let ptr_offset = self.stack_offset;
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", ptr_offset));
+        self.emit(&format!("    mov {}, rax", loc.q(0)));
 
         // Record array info
-        self.arrays.insert(
-            arr.name.clone(),
-            ArrayInfo {
-                ptr_offset,
-                dim_offsets,
-            },
-        );
+        let info = ArrayInfo { loc, ndims };
+        if self.current_proc.is_some() {
+            self.proc_arrays.insert(arr.name.clone(), info);
+        } else {
+            self.arrays.insert(arr.name.clone(), info);
+        }
     }
 
     fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
-        let arr_info = self.arrays.get(name).expect("Array not declared");
-        let ptr_offset = arr_info.ptr_offset;
-        let dim_offsets = arr_info.dim_offsets.clone();
+        let arr_info = self.lookup_array(name).expect("Array not declared");
+        let loc = arr_info.loc.clone();
         let elem_size = if is_string_var(name) { 16 } else { 8 };
 
         // Calculate linear index using row-major order:
@@ -2134,16 +2297,13 @@ impl CodeGen {
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
-            self.emit(&format!(
-                "    imul rax, QWORD PTR [rbp + {}]",
-                dim_offsets[i]
-            ));
+            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
             self.emit("    add rax, rcx");
         }
 
         // Multiply by element size and add to base pointer
         self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+        self.emit(&format!("    add rax, {}", loc.q(0)));
 
         // Load value from computed address
         if is_string_var(name) {
@@ -2156,9 +2316,8 @@ impl CodeGen {
     }
 
     fn gen_array_store(&mut self, name: &str, indices: &[Expr], value: &Expr) {
-        let arr_info = self.arrays.get(name).expect("Array not declared");
-        let ptr_offset = arr_info.ptr_offset;
-        let dim_offsets = arr_info.dim_offsets.clone();
+        let arr_info = self.lookup_array(name).expect("Array not declared");
+        let loc = arr_info.loc.clone();
         let elem_size = if is_string_var(name) { 16 } else { 8 };
 
         // Calculate linear index using row-major order (same as gen_array_load)
@@ -2181,16 +2340,13 @@ impl CodeGen {
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-            self.emit(&format!(
-                "    imul rax, QWORD PTR [rbp + {}]",
-                dim_offsets[i]
-            ));
+            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
             self.emit("    add rax, rcx");
         }
 
         // Compute final address and save it - use 16 bytes for alignment
         self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, QWORD PTR [rbp + {}]", ptr_offset));
+        self.emit(&format!("    add rax, {}", loc.q(0)));
         self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
         self.emit("    mov QWORD PTR [rsp], rax"); // save address
 
@@ -2212,11 +2368,11 @@ impl CodeGen {
 
     fn gen_string_assign(&mut self, name: &str, value: &Expr) {
         self.gen_expr(value);
-        let offset = self.get_var_offset(name);
-        // For strings, also allocate space for length
-        self.stack_offset -= 8; // extra space for length
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", offset));
-        self.emit(&format!("    mov QWORD PTR [rbp + {}], rdx", offset - 8));
+        // Both words were reserved when the variable was first seen, so this no
+        // longer has to scavenge a slot per assignment.
+        let loc = self.get_var_loc(name);
+        self.emit(&format!("    mov {}, rax", loc.q(0)));
+        self.emit(&format!("    mov {}, rdx", loc.q(1)));
     }
 
     fn emit_data_section(&mut self) {
@@ -2266,6 +2422,35 @@ impl CodeGen {
 
         self.emit("");
         self.emit(".bss");
+        self.emit(".p2align 3");
+
+        // Module-level variables and arrays. .bss is zero-filled by the loader,
+        // which is what gives BASIC's "unassigned is 0 / empty string" for free.
+        // Emitted in sorted order so the generated assembly is reproducible.
+        let mut vars: Vec<(&String, &VarInfo)> = self.vars.iter().collect();
+        vars.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in vars {
+            if let Loc::Global(sym) = &info.loc {
+                let bytes = 8 * Self::words_for(info.data_type);
+                self.output
+                    .push_str(&format!("{}: .zero {}  # {}\n", sym, bytes, name));
+            }
+        }
+
+        let mut arrays: Vec<(&String, &ArrayInfo)> = self.arrays.iter().collect();
+        arrays.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, info) in arrays {
+            if let Loc::Global(sym) = &info.loc {
+                // Word 0 is the element pointer (null until DIM runs), then one
+                // word per dimension bound.
+                let bytes = 8 * (1 + info.ndims);
+                self.output.push_str(&format!(
+                    "{}: .zero {}  # {} ptr + {} dim(s)\n",
+                    sym, bytes, name, info.ndims
+                ));
+            }
+        }
+
         // GOSUB stack (if needed)
         if self.gosub_used {
             self.emit(&format!(

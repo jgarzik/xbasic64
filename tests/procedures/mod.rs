@@ -102,3 +102,89 @@ PRINT AddThree(Mul(2, 3), Mul(4, 5), Mul(6, 7))
     assert_eq!(lines[0], "26", "nested: 2*3 + 4*5 = 6+20");
     assert_eq!(lines[1], "68", "nested three: 6+20+42");
 }
+
+/// LANGREF documents module-level variables as "global by default: accessible
+/// everywhere". They used to read as 0 inside a procedure, because procedures
+/// were compiled before main and so allocated their own local instead.
+#[test]
+fn test_module_variables_visible_in_procedures() {
+    let output = compile_and_run(
+        r#"
+G = 99
+SUB Bump
+PRINT G
+G = G + 1
+END SUB
+Bump
+PRINT G
+Bump
+PRINT G
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["99", "100", "100", "101"], "shared storage");
+}
+
+/// An array DIM'd at module level must be usable inside a procedure. This used
+/// to abort the compiler with "Array not declared".
+#[test]
+fn test_module_array_accessible_in_procedure() {
+    let output = compile_and_run(
+        r#"
+DIM A(5)
+A(0) = 7
+SUB Touch
+PRINT A(0)
+A(1) = 8
+END SUB
+Touch
+PRINT A(1)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["7", "8"], "array shared with procedure");
+}
+
+/// A parameter shadows a module-level variable of the same name, and assigning
+/// to the parameter must not disturb the global (parameters are by value).
+#[test]
+fn test_parameter_shadows_global() {
+    let output = compile_and_run(
+        r#"
+X = 1
+SUB Show(X)
+PRINT X
+X = X * 2
+PRINT X
+END SUB
+Show(42)
+PRINT X
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["42", "84", "1"], "parameter is local");
+}
+
+/// A variable used only inside a procedure is local to it: zeroed on entry,
+/// and not retained between calls.
+#[test]
+fn test_procedure_locals_are_fresh_each_call() {
+    let output = compile_and_run(
+        r#"
+SUB Count
+PRINT Q
+Q = Q + 1
+PRINT Q
+END SUB
+Count
+Count
+Count
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["0", "1", "0", "1", "0", "1"], "fresh per call");
+}

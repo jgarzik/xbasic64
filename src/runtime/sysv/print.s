@@ -41,12 +41,18 @@
 _rt_print_string:
     push rbp
     mov rbp, rsp
+    # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
+    # prologue both leave it that way. Printing nothing is the correct result,
+    # and returning early avoids passing NULL to printf, which is undefined.
+    test rsi, rsi
+    jz .Lprint_str_done
     # Rearrange arguments for printf("%.*s", len, ptr)
     mov rdx, rdi        # ptr → rdx (3rd arg to printf)
     # rsi already has len (2nd arg to printf, as precision)
     lea rdi, [rip + _fmt_str]   # format string → rdi (1st arg)
     xor eax, eax        # no vector registers used (required for varargs)
     call {libc}printf
+.Lprint_str_done:
     leave
     ret
 

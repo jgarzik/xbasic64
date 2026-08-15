@@ -47,3 +47,65 @@ PRINT "after"
     assert_eq!(lines[3], "before", "before comment");
     assert_eq!(lines[4], "after", "after comment");
 }
+
+/// An unassigned variable reads as 0 (or the empty string), not whatever was
+/// left in memory. Module-level variables get this from .bss; the check is
+/// repeated because the old behavior was stack garbage that was intermittently
+/// zero by luck.
+#[test]
+fn test_uninitialized_variables_are_zero() {
+    for _ in 0..20 {
+        let output = compile_and_run(
+            r#"
+PRINT X
+PRINT X%
+PRINT X&
+PRINT X!
+PRINT "["; X$; "]"
+"#,
+        )
+        .unwrap();
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines, vec!["0", "0", "0", "0", "[]"], "unassigned defaults");
+    }
+}
+
+/// Reading an unassigned variable in an expression must behave as 0, and a
+/// running total must not pick up stack garbage.
+#[test]
+fn test_uninitialized_in_expressions() {
+    let output = compile_and_run(
+        r#"
+Y = X + 1
+PRINT Y
+FOR I = 1 TO 3
+S = S + I
+NEXT I
+PRINT S
+PRINT LEN(Z$)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1", "6", "0"]);
+}
+
+/// String variables must not alias one another. The length used to be
+/// scavenged from the neighbouring slot rather than reserved with the pointer.
+#[test]
+fn test_string_variables_do_not_alias() {
+    let output = compile_and_run(
+        r#"
+A$ = "first"
+B$ = "second"
+C$ = "third"
+PRINT A$; "/"; B$; "/"; C$
+PRINT LEN(A$); LEN(B$); LEN(C$)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "first/second/third");
+    // LEN of "first", "second", "third", printed adjacently by `;`
+    assert_eq!(lines[1], "565");
+}
