@@ -154,6 +154,8 @@ pub enum StmtKind {
     },
     /// `EXIT SUB` / `EXIT FUNCTION` -- return from the current procedure.
     ExitProc,
+    /// `OPTION BASE 0|1` -- lowest subscript for arrays declared after it.
+    OptionBase(i64),
     Data(Vec<Literal>),
     Read(Vec<LValue>),
     Restore(Option<GotoTarget>),
@@ -637,6 +639,8 @@ impl Parser {
             Token::Swap => self.parse_swap(),
             Token::Const => self.parse_const(),
             Token::Exit => self.parse_exit(),
+            Token::Def => self.parse_def_fn(),
+            Token::Option => self.parse_option_base(),
             Token::Input => self.parse_input(),
             Token::Line => self.parse_line_input(),
             Token::Let => self.parse_let(),
@@ -857,6 +861,63 @@ impl Parser {
             Token::Sub | Token::Function => Ok(StmtKind::ExitProc),
             tok => err(format!(
                 "Expected FOR, DO, SUB or FUNCTION after EXIT, got {}",
+                describe_token(&tok)
+            )),
+        }
+    }
+
+    /// `DEF FNname(params) = expr`
+    ///
+    /// Desugared straight into an ordinary FUNCTION whose body assigns the
+    /// expression to the function name. That reuses the whole procedure path
+    /// and, unlike macro substitution, evaluates each argument exactly once.
+    fn parse_def_fn(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume DEF
+        let name = if let Token::Ident(n) = self.advance() {
+            n
+        } else {
+            return err("Expected a function name after DEF");
+        };
+        if !name.to_uppercase().starts_with("FN") {
+            return err(format!("DEF function name '{}' must begin with FN", name));
+        }
+
+        // parse_param_list expects the parenthesis to be consumed already.
+        let params = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let p = self.parse_param_list()?;
+            self.expect(Token::RParen)?;
+            p
+        } else {
+            Vec::new()
+        };
+
+        self.expect(Token::Eq)?;
+        let line = self.cur_line();
+        let value = self.parse_expression()?;
+
+        Ok(StmtKind::Function {
+            name: name.clone(),
+            params,
+            body: vec![Stmt {
+                line,
+                kind: StmtKind::Let {
+                    name,
+                    indices: None,
+                    value,
+                },
+            }],
+        })
+    }
+
+    /// `OPTION BASE 0` or `OPTION BASE 1`
+    fn parse_option_base(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume OPTION
+        self.expect(Token::Base)?;
+        match self.advance() {
+            Token::Integer(n @ (0 | 1)) => Ok(StmtKind::OptionBase(n)),
+            tok => err(format!(
+                "OPTION BASE takes 0 or 1, got {}",
                 describe_token(&tok)
             )),
         }

@@ -112,6 +112,8 @@ pub struct Symbols {
     pub lines: HashSet<u32>,
     /// CONST names and their folded values.
     pub consts: HashMap<String, Literal>,
+    /// Lowest legal subscript, set by OPTION BASE. Defaults to 0.
+    pub option_base: i64,
 }
 
 impl Symbols {
@@ -153,6 +155,8 @@ struct Analyzer {
     loops: Vec<bool>,
     /// Whether the walk is currently inside a procedure body.
     in_proc: bool,
+    /// Whether an OPTION BASE has already been seen.
+    seen_option_base: bool,
 }
 
 impl Analyzer {
@@ -191,6 +195,15 @@ impl Analyzer {
                     if !self.symbols.labels.insert(name.clone()) {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
                     }
+                }
+                StmtKind::OptionBase(n) => {
+                    if self.seen_option_base {
+                        self.error(stmt.line, "OPTION BASE may appear only once");
+                    } else if !self.symbols.arrays.is_empty() {
+                        self.error(stmt.line, "OPTION BASE must come before any DIM");
+                    }
+                    self.seen_option_base = true;
+                    self.symbols.option_base = *n;
                 }
                 StmtKind::Const { name, value } => {
                     let upper = name.to_uppercase();

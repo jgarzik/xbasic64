@@ -474,3 +474,17 @@ fn test_new_statement_misuse_is_diagnosed() {
         "PRINT USING requires a literal format string",
     );
 }
+
+/// OPTION BASE placement and value are checked, and subscript 0 becomes out of
+/// range once base 1 is in effect.
+#[test]
+fn test_option_base_rules() {
+    expect_rejected("DIM A(3)\nOPTION BASE 1\n", "must come before any DIM");
+    expect_rejected("OPTION BASE 1\nOPTION BASE 0\n", "may appear only once");
+    expect_rejected("OPTION BASE 2\n", "OPTION BASE takes 0 or 1");
+    expect_rejected("DEF ABC(X) = X\n", "must begin with FN");
+
+    let run = compile_and_run_raw("OPTION BASE 1\nDIM A(3)\nPRINT A(0)\n", "").unwrap();
+    assert!(run.stderr.contains("Subscript out of range"));
+    assert_eq!(run.exit_code, Some(1));
+}

@@ -1006,6 +1006,19 @@ impl CodeGen {
             .clone()
     }
 
+    /// With `OPTION BASE 1`, subscript 0 is out of range too.
+    ///
+    /// Element storage is still allocated for it -- the descriptor keeps
+    /// holding N+1 elements and slot 0 simply goes unused -- which leaves the
+    /// linear index arithmetic completely unchanged.
+    fn emit_lower_bound_check(&mut self, reg: &str) {
+        if self.symbols.option_base == 0 {
+            return;
+        }
+        self.emit(&format!("    cmp {}, {}", reg, self.symbols.option_base));
+        self.emit_check("jb", RtError::Subscript);
+    }
+
     /// Emit a check: branch to the error trampoline when `cond` holds.
     ///
     /// The fast path costs only the caller's compare plus this never-taken
@@ -1678,8 +1691,8 @@ impl CodeGen {
 
             StmtKind::Swap(a, b) => self.gen_swap(a, b),
 
-            // CONST is resolved at compile time; nothing is emitted.
-            StmtKind::Const { .. } => {}
+            // CONST and OPTION BASE are resolved at compile time.
+            StmtKind::Const { .. } | StmtKind::OptionBase(_) => {}
 
             StmtKind::ExitLoop { is_for } => {
                 // Leave the innermost matching loop. Sema has already checked
@@ -2968,7 +2981,8 @@ impl CodeGen {
                     _ => 1,
                 };
                 if upper_name == "LBOUND" {
-                    self.emit("    mov eax, 0");
+                    let base = self.symbols.option_base;
+                    self.emit(&format!("    mov eax, {}", base));
                 } else {
                     let loc = self
                         .lookup_array(&arr)
@@ -3210,6 +3224,7 @@ impl CodeGen {
         if self.opts.checks {
             self.emit(&format!("    cmp rax, {}", loc.q(1)));
             self.emit_check("jae", RtError::Subscript);
+            self.emit_lower_bound_check("rax");
         }
 
         // For each subsequent index, multiply by dimension bound and add
@@ -3227,6 +3242,7 @@ impl CodeGen {
             if self.opts.checks {
                 self.emit(&format!("    cmp rcx, {}", loc.q(1 + i as i32)));
                 self.emit_check("jae", RtError::Subscript);
+                self.emit_lower_bound_check("rcx");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));

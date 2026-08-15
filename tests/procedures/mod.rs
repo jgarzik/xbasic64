@@ -337,3 +337,41 @@ PRINT T$
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["changed", "original"]);
 }
+
+/// DEF FN is desugared into an ordinary FUNCTION, so it reuses the whole
+/// procedure path and evaluates each argument exactly once.
+#[test]
+fn test_def_fn() {
+    let output = compile_and_run(
+        "DEF FNA(X) = X * 2\nDEF FNSUM(A, B) = A + B\nDEF FNPI = 3.14159\nDEF FNG$(N$) = \"hi \" + N$\nPRINT FNA(5)\nPRINT FNSUM(3, 4)\nPRINT FNPI\nPRINT FNG$(\"bob\")\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["10", "7", "3.14159", "hi bob"]);
+}
+
+/// A DEF FN body can see module-level variables, like any other procedure.
+#[test]
+fn test_def_fn_sees_globals() {
+    let output = compile_and_run("G = 10\nDEF FNS(X) = X + G\nPRINT FNS(5)\n").unwrap();
+    assert_eq!(output.trim(), "15");
+}
+
+/// OPTION BASE 1 makes 1 the lowest legal subscript. Storage for element 0 is
+/// still allocated and simply unused, which leaves the index arithmetic alone.
+#[test]
+fn test_option_base_one() {
+    let output = compile_and_run(
+        "OPTION BASE 1\nDIM A(3)\nA(1) = 10\nA(3) = 30\nPRINT A(1); A(3)\nPRINT LBOUND(A); UBOUND(A)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1030", "13"]);
+}
+
+/// The default base is still 0.
+#[test]
+fn test_option_base_defaults_to_zero() {
+    let output = compile_and_run("DIM A(3)\nA(0) = 5\nPRINT A(0); LBOUND(A)\n").unwrap();
+    assert_eq!(output.trim(), "50");
+}
