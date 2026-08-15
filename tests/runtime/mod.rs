@@ -50,9 +50,10 @@ fn exported_symbols(dir: &str) -> BTreeSet<String> {
 
 /// Helpers that legitimately exist on only one platform.
 ///
-/// The Win64 runtime writes through Win32 handles, which have to be fetched
-/// once at startup; System V uses libc streams and needs no equivalent.
-const WIN64_ONLY: &[&str] = &["_rt_init_console", "_rt_init_input"];
+/// Empty, and worth keeping that way: both trees now answer to the same
+/// `_rt_platform_init`, each doing whatever its platform needs behind it.
+/// Every name listed here is a divergence this test agrees not to notice.
+const WIN64_ONLY: &[&str] = &[];
 
 #[test]
 fn test_runtimes_export_the_same_helpers() {

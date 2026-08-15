@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: PRINT USING field output
-# ==============================================================================
 #
 # The format string itself is parsed at compile time, so the runtime only has
 # to render one field at a time. That keeps the format-parsing logic in Rust,
@@ -14,7 +12,6 @@
 #   8  TRAILING_SIGN  place the sign after the number
 #   16 FORCE_SIGN     always show a sign, '+' for positives
 #   32 EXPONENTIAL    render in exponential form
-# ==============================================================================
 
 .equ USING_COMMA,      1
 .equ USING_DOLLAR,     2
@@ -40,9 +37,7 @@ _using_out:     .skip 2048      # after sign/currency, padded to the width
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_print_using_num - Render one numeric field
-# ------------------------------------------------------------------------------
 # Arguments:
 #   xmm0 = value
 #   rdi  = field width in characters
@@ -53,7 +48,6 @@ _using_out:     .skip 2048      # after sign/currency, padded to the width
 #
 # A value too wide for its field is printed in full, preceded by '%', which is
 # what GW-BASIC does rather than truncating.
-# ------------------------------------------------------------------------------
 .globl _rt_print_using_num
 _rt_print_using_num:
     push rbp
@@ -119,7 +113,7 @@ _rt_print_using_num:
     mov edx, r13d               # precision
     movsd xmm0, QWORD PTR [rbp - 56]
     mov eax, 1
-    call {libc}sprintf
+    call sprintf
     mov rbx, rax                # rbx = length of the raw text
 
     # Copy into the work buffer, inserting commas in the integer part when
@@ -293,7 +287,7 @@ _rt_print_using_num:
 .Luse_num_write:
     lea rdi, [rip + _using_out]
     mov rsi, r9
-    call _rt_print_string
+    call _rt_con_string
 
     add rsp, 24
     pop r15
@@ -304,9 +298,7 @@ _rt_print_using_num:
     pop rbp
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_print_using_str - Render one string field
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = string pointer
 #   rsi = string length
@@ -314,7 +306,6 @@ _rt_print_using_num:
 #
 # A string shorter than the field is padded on the right with spaces; a longer
 # one is truncated, as GW-BASIC does.
-# ------------------------------------------------------------------------------
 .globl _rt_print_using_str
 _rt_print_using_str:
     push rbp
@@ -356,13 +347,13 @@ _rt_print_using_str:
 .Luse_str_copied:
     lea rdi, [rip + _using_out]
     mov rsi, r13
-    call _rt_print_string
+    call _rt_con_string
     jmp .Luse_str_done
 
 .Luse_str_whole:
     mov rdi, rbx
     mov rsi, r12
-    call _rt_print_string
+    call _rt_con_string
 
 .Luse_str_done:
     add rsp, 8

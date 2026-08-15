@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Print Functions (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # Output functions using Win32 API (WriteFile) instead of libc printf.
 # Uses UCRT sprintf for number formatting.
@@ -10,7 +8,6 @@
 #   - 32-byte shadow space required before every call
 #   - Callee-saved: rbx, rbp, rdi, rsi, r12-r15
 #
-# ==============================================================================
 
 # Win32 API Constants
 .equ STD_OUTPUT_HANDLE, -11
@@ -19,131 +16,39 @@
 .equ SINGLE_BYTE, 1
 .equ CRLF_LEN, 2
 
+
 .data
-_stdout_handle: .quad 0
 _print_buffer: .skip 64          # Buffer for number formatting
 _bytes_written: .quad 0          # For WriteFile output parameter
-# Current output column, so TAB(n) knows how far to advance.
-_print_col: .quad 0
 _newline_str: .ascii "\r\n"      # Windows uses CRLF
 
 .text
 
-# ------------------------------------------------------------------------------
-# _rt_init_console - Initialize stdout handle (call once at startup)
-# ------------------------------------------------------------------------------
-.globl _rt_init_console
-_rt_init_console:
+# _rt_platform_init - Acquire the console handles (call once at startup)
+# The console is file handle 0, so every print helper reaches it the same way
+# it reaches an OPENed file. Windows has to ask the OS for the handle first;
+# System V finds its standard output stream already open.
+#
+# Arguments: none      Returns: nothing
+.globl _rt_platform_init
+_rt_platform_init:
     push rbp
     mov rbp, rsp
     sub rsp, 32
 
-    # GetStdHandle(STD_OUTPUT_HANDLE)
+    # GetStdHandle(STD_OUTPUT_HANDLE) -> _file_handles[0]
     mov ecx, STD_OUTPUT_HANDLE
     call GetStdHandle
-    lea rcx, [rip + _stdout_handle]
+    lea rcx, [rip + _file_handles]
     mov [rcx], rax
 
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_string - Print a string with explicit length
-# ------------------------------------------------------------------------------
-# Arguments:
-#   rcx = pointer to string data
-#   rdx = string length
-# ------------------------------------------------------------------------------
-.globl _rt_print_string
-_rt_print_string:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 48             # Shadow space + stack args
-    mov QWORD PTR [rbp - 8], rdx    # remember the length for the column tracker
-
-    # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
-    # prologue both leave it that way. Printing nothing is the correct result,
-    # and returning early avoids handing WriteFile a NULL buffer.
-    test rdx, rdx
-    jz .Lprint_str_done
-
-    # Save args
-    mov r8, rdx             # length → r8 (3rd arg for WriteFile)
-    mov rdx, rcx            # buffer → rdx (2nd arg for WriteFile)
-
-    # Get stdout handle
-    lea rax, [rip + _stdout_handle]
-    mov rcx, [rax]          # handle → rcx (1st arg)
-
-    # WriteFile(handle, buffer, length, &bytesWritten, NULL)
-    lea r9, [rip + _bytes_written]  # &bytesWritten → r9 (4th arg)
-    mov QWORD PTR [rsp + 32], 0     # NULL → 5th arg (stack)
-    call WriteFile
-    mov rax, QWORD PTR [rbp - 8]
-    add QWORD PTR [rip + _print_col], rax
-
-.Lprint_str_done:
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_char - Print a single ASCII character
-# ------------------------------------------------------------------------------
-# Arguments:
-#   rcx = character code (0-255)
-# ------------------------------------------------------------------------------
-.globl _rt_print_char
-_rt_print_char:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 48
-
-    # Store char in buffer
-    lea rax, [rip + _print_buffer]
-    mov [rax], cl
-
-    # Get stdout handle
-    lea rax, [rip + _stdout_handle]
-    mov rcx, [rax]          # handle
-
-    # WriteFile(handle, buffer, 1, &bytesWritten, NULL)
-    lea rdx, [rip + _print_buffer]
-    mov r8, SINGLE_BYTE
-    lea r9, [rip + _bytes_written]
-    mov QWORD PTR [rsp + 32], 0
-    call WriteFile
-    inc QWORD PTR [rip + _print_col]
+    call _rt_init_input
 
     leave
     ret
 
-# ------------------------------------------------------------------------------
-# _rt_print_newline - Print CRLF newline
-# ------------------------------------------------------------------------------
-.globl _rt_print_newline
-_rt_print_newline:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 48
 
-    # Get stdout handle
-    lea rax, [rip + _stdout_handle]
-    mov rcx, [rax]
-
-    # WriteFile(handle, "\r\n", 2, &bytesWritten, NULL)
-    lea rdx, [rip + _newline_str]
-    mov r8, CRLF_LEN
-    lea r9, [rip + _bytes_written]
-    mov QWORD PTR [rsp + 32], 0
-    call WriteFile
-    mov QWORD PTR [rip + _print_col], 0
-
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
 # _rt_fmt_double - Format a number into _num_buf
-# ------------------------------------------------------------------------------
 # Shared by console and file output so both render numbers identically.
 #
 # GW-BASIC convention: a whole number is written without a decimal point. For
@@ -163,7 +68,6 @@ _rt_print_newline:
 #
 # Returns:
 #   rax = length of the text in _num_buf
-# ------------------------------------------------------------------------------
 .globl _rt_fmt_double
 _rt_fmt_double:
     push rbp
@@ -229,53 +133,8 @@ _rt_fmt_double:
     leave
     ret
 
-# ------------------------------------------------------------------------------
-# _rt_print_float - Print a DOUBLE (or an untyped numeric value)
-# ------------------------------------------------------------------------------
-# Arguments: xmm0 = value        Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_float
-_rt_print_float:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    lea rcx, [rip + _fmt_g_table]
-    xor edx, edx
-    call _rt_fmt_double
-    lea rcx, [rip + _num_buf]
-    mov rdx, rax
-    call _rt_print_string
-    add rsp, 32
-    leave
-    ret
 
-# ------------------------------------------------------------------------------
-# _rt_print_single - Print a SINGLE
-# ------------------------------------------------------------------------------
-# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
-# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
-# print as 3.1415901184082: at 15 digits even a float's value round-trips.
-#
-# Arguments: xmm0 = value, already widened to double     Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_single
-_rt_print_single:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 32
-    lea rcx, [rip + _fmt_g_single_table]
-    mov edx, 1
-    call _rt_fmt_double
-    lea rcx, [rip + _num_buf]
-    mov rdx, rax
-    call _rt_print_string
-    add rsp, 32
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
 # _rt_end - Terminate the program normally (END / STOP)
-# ------------------------------------------------------------------------------
 # Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
 # `leave; ret` for END only terminates when it appears in main; inside a
 # procedure it merely returns to the caller and execution continues.
@@ -285,7 +144,6 @@ _rt_print_single:
 #
 # Arguments: none
 # Returns: never
-# ------------------------------------------------------------------------------
 .globl _rt_end
 _rt_end:
     push rbp
@@ -293,64 +151,3 @@ _rt_end:
     sub rsp, 32             # Shadow space
     xor ecx, ecx            # exit code 0
     call ExitProcess
-
-# ------------------------------------------------------------------------------
-# _rt_print_spc - SPC(n): print n spaces
-# ------------------------------------------------------------------------------
-# Arguments: rcx = count      Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_spc
-_rt_print_spc:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    sub rsp, 40
-    mov rbx, rcx
-.Lspc_loop:
-    cmp rbx, 0
-    jle .Lspc_done
-    mov ecx, ' '
-    call _rt_print_char
-    dec rbx
-    jmp .Lspc_loop
-.Lspc_done:
-    add rsp, 40
-    pop rbx
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_tab - TAB(n): advance to column n
-# ------------------------------------------------------------------------------
-# Columns are 1-based, as in GW-BASIC. If output is already at or past the
-# requested column, a newline is emitted first.
-#
-# Arguments: rcx = target column      Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_tab
-_rt_print_tab:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    sub rsp, 40
-
-    mov rbx, rcx
-    cmp rbx, 1
-    jge .Ltab_have_target
-    mov rbx, 1
-.Ltab_have_target:
-    dec rbx
-
-    cmp rbx, QWORD PTR [rip + _print_col]
-    jge .Ltab_pad
-    call _rt_print_newline
-
-.Ltab_pad:
-    mov rcx, rbx
-    sub rcx, QWORD PTR [rip + _print_col]
-    call _rt_print_spc
-
-    add rsp, 40
-    pop rbx
-    leave
-    ret

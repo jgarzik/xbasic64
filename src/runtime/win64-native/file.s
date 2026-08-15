@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: File I/O Functions (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # File input/output functions using Win32 API instead of libc stdio.
 # Uses CreateFileA, CloseHandle, WriteFile, ReadFile.
@@ -14,7 +12,6 @@
 #   - Args: rcx, rdx, r8, r9 (then stack)
 #   - Callee-saved: rbx, rbp, rdi, rsi, r12-r15
 #   - 32-byte shadow space required before calls
-# ==============================================================================
 
 # Win32 API Constants
 .equ GENERIC_READ,          0x80000000
@@ -47,6 +44,11 @@
 
 .data
 _file_handles: .skip 128        # 16 * 8 bytes = 16 HANDLEs
+# Current output column per file number, so TAB(n) knows how far to advance.
+# Updated by the print helpers and reset by a newline. Slot 0 is the console,
+# which is file handle 0.
+.p2align 3
+_file_col: .skip 128
 _file_name_buf: .skip 1024      # Buffer for null-terminated filename
 _file_output_buf: .skip 256     # Buffer for formatted output
 _file_bytes_written: .quad 0    # For WriteFile output
@@ -59,9 +61,7 @@ _file_newline:     .ascii "\r\n"
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_file_open - Open a file (OPEN statement)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = filename pointer (BASIC string, not null-terminated)
 #   rdx = filename length
@@ -69,7 +69,6 @@ _file_newline:     .ascii "\r\n"
 #   r9  = file number (1-15)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_open
 _rt_file_open:
     push rbp
@@ -133,6 +132,11 @@ _rt_file_open:
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
 
+    # A new file starts at column 1, whatever the last one on this number
+    # left behind.
+    lea rcx, [rip + _file_col]
+    mov QWORD PTR [rcx + rbx*8], 0
+
     # If APPEND mode, seek to end
     cmp r14d, MODE_APPEND
     jne .Lfile_open_done
@@ -155,14 +159,11 @@ _rt_file_open:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_close - Close a file (CLOSE statement)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number (1-15)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_close
 _rt_file_close:
     push rbp
@@ -195,16 +196,13 @@ _rt_file_close:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_string - Write string to file
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #   rdx = string pointer
 #   r8  = string length
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_string
 _rt_file_print_string:
     push rbp
@@ -234,6 +232,9 @@ _rt_file_print_string:
     mov QWORD PTR [rsp + 32], 0  # lpOverlapped = NULL
     call WriteFile
 
+    lea rax, [rip + _file_col]
+    add QWORD PTR [rax + rbx*8], rsi
+
 .Lfile_print_str_done:
     add rsp, 40
     pop rsi
@@ -242,15 +243,12 @@ _rt_file_print_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_float - Write number to file
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #   xmm0 = value to write (double)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_float
 _rt_file_print_float:
     push rbp
@@ -261,23 +259,46 @@ _rt_file_print_float:
 
     mov ebx, ecx            # save file number
 
-    # Format through the shared helper, so file output matches console output
-    # digit for digit.
+    # Format through the shared helper, so every sink renders a number the
+    # same way.
     lea rcx, [rip + _fmt_g_table]
     xor edx, edx
     call _rt_fmt_double
-    mov r12, rax            # length
+    jmp .Lfile_num_emit
 
-    # Get HANDLE from table
-    lea rax, [rip + _file_handles]
-    mov rcx, [rax + rbx*8]  # hFile
+# _rt_file_print_single - Write a SINGLE
+# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
+# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
+# print as 3.1415901184082: at 15 digits even a float's value round-trips.
+#
+# Shares the emit tail below with _rt_file_print_float, whose prologue is
+# identical.
+#
+# Arguments:
+#   rcx = file number
+#   xmm0 = value, already widened to double
+#
+# Returns: nothing
+.globl _rt_file_print_single
+_rt_file_print_single:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 48             # Shadow space + alignment
 
-    # WriteFile(hFile, buffer, length, &bytesWritten, NULL)
+    mov ebx, ecx            # save file number
+
+    lea rcx, [rip + _fmt_g_single_table]
+    mov edx, 1
+    call _rt_fmt_double
+
+.Lfile_num_emit:
+    # rax = length of the text _rt_fmt_double left in _num_buf.
+    mov r8, rax
     lea rdx, [rip + _num_buf]
-    mov r8, r12             # length
-    lea r9, [rip + _file_bytes_written]
-    mov QWORD PTR [rsp + 32], 0
-    call WriteFile
+    mov ecx, ebx
+    call _rt_file_print_string
 
     add rsp, 48
     pop r12
@@ -285,15 +306,105 @@ _rt_file_print_float:
     leave
     ret
 
-# ------------------------------------------------------------------------------
+# _rt_con_string - Write a string to the console
+# The console is file handle 0. This exists for the runtime's own messages and
+# for PRINT USING, which has no file form; generated code passes a handle like
+# any other caller.
+#
+# Arguments:
+#   rcx = string pointer
+#   rdx = string length
+#
+# Returns: nothing
+.globl _rt_con_string
+_rt_con_string:
+    mov r8, rdx             # length  -> 3rd arg
+    mov rdx, rcx            # pointer -> 2nd arg
+    xor ecx, ecx            # console -> 1st arg
+    jmp _rt_file_print_string
+
+# _rt_file_print_spc - SPC(n): write n spaces
+# Arguments:
+#   rcx = file number
+#   rdx = count
+#
+# Returns: nothing
+.globl _rt_file_print_spc
+_rt_file_print_spc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 32             # Shadow space
+
+    mov ebx, ecx            # file number
+    mov r12, rdx            # count remaining
+.Lfile_spc_loop:
+    cmp r12, 0
+    jle .Lfile_spc_done
+    mov ecx, ebx
+    mov edx, ' '
+    call _rt_file_print_char
+    dec r12
+    jmp .Lfile_spc_loop
+.Lfile_spc_done:
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# _rt_file_print_tab - TAB(n): advance to column n
+# Columns are 1-based, as in GW-BASIC. If the sink is already at or past the
+# requested column, a newline is written first and the tab applies to the new
+# line.
+#
+# Arguments:
+#   rcx = file number
+#   rdx = target column
+#
+# Returns: nothing
+.globl _rt_file_print_tab
+_rt_file_print_tab:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 32             # Shadow space
+
+    mov ebx, ecx            # file number
+    mov r12, rdx            # target column
+    cmp r12, 1
+    jge .Lfile_tab_have_target
+    mov r12, 1
+.Lfile_tab_have_target:
+    dec r12                 # 1-based column -> count of characters before it
+
+    lea rax, [rip + _file_col]
+    cmp r12, QWORD PTR [rax + rbx*8]
+    jge .Lfile_tab_pad
+    mov ecx, ebx
+    call _rt_file_print_newline
+
+.Lfile_tab_pad:
+    lea rax, [rip + _file_col]
+    mov rdx, r12
+    sub rdx, QWORD PTR [rax + rbx*8]
+    mov ecx, ebx
+    call _rt_file_print_spc
+
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret
+
 # _rt_file_print_char - Write single character to file
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #   rdx = character code
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_char
 _rt_file_print_char:
     push rbp
@@ -318,19 +429,19 @@ _rt_file_print_char:
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
 
+    lea rax, [rip + _file_col]
+    inc QWORD PTR [rax + rbx*8]
+
     add rsp, 40
     pop rbx
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_print_newline - Write CRLF newline to file
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_print_newline
 _rt_file_print_newline:
     push rbp
@@ -351,17 +462,17 @@ _rt_file_print_newline:
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
 
+    lea rax, [rip + _file_col]
+    mov QWORD PTR [rax + rbx*8], 0
+
     add rsp, 40
     pop rbx
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_getc - Read one byte
-# ------------------------------------------------------------------------------
 # Arguments: rcx = file number
 # Returns:   eax = the byte, or -1 at end of file or on a file that is not open
-# ------------------------------------------------------------------------------
 .globl _rt_file_getc
 _rt_file_getc:
     push rbp
@@ -392,9 +503,7 @@ _rt_file_getc:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_read_field - Read one INPUT # field
-# ------------------------------------------------------------------------------
 # INPUT # reads comma-delimited fields, not whole lines. Reading a line per
 # variable made `INPUT #1, A, B` on "10,20" yield 10 twice, and left the second
 # line unread.
@@ -411,7 +520,6 @@ _rt_file_getc:
 #   rax = pointer to the field (in _file_input_buf), rdx = its length
 #
 # Note: uses a static buffer, so the result is valid only until the next read.
-# ------------------------------------------------------------------------------
 .globl _rt_file_read_field
 _rt_file_read_field:
     push rbp
@@ -515,15 +623,12 @@ _rt_file_read_field:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_input_number - INPUT #: read one numeric field
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #
 # Returns:
 #   xmm0 = value read, or 0.0 for a field that is not a number
-# ------------------------------------------------------------------------------
 .globl _rt_file_input_number
 _rt_file_input_number:
     push rbp
@@ -539,26 +644,20 @@ _rt_file_input_number:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_input_string - INPUT #: read one string field
-# ------------------------------------------------------------------------------
 # Arguments: rcx = file number
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_file_input_string
 _rt_file_input_string:
     jmp _rt_file_read_field
 
-# ------------------------------------------------------------------------------
 # _rt_file_line_input - LINE INPUT #: read a whole line
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #
 # Returns:
 #   rax = pointer to string data (_file_input_buf)
 #   rdx = string length
-# ------------------------------------------------------------------------------
 .globl _rt_file_line_input
 _rt_file_line_input:
     push rbp
@@ -621,12 +720,9 @@ _rt_file_line_input:
     ret
 
 
-# ------------------------------------------------------------------------------
 # _rt_file_close_all - Close every open file (bare CLOSE)
-# ------------------------------------------------------------------------------
 # Arguments: none
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_file_close_all
 _rt_file_close_all:
     push rbp
@@ -654,9 +750,7 @@ _rt_file_close_all:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_eof - EOF(n): has the file been read to the end?
-# ------------------------------------------------------------------------------
 # Compares the current position against the file size, which needs no
 # pushback and so keeps the next read unaffected.
 #
@@ -665,7 +759,6 @@ _rt_file_close_all:
 #
 # Returns:
 #   eax = -1 at end of file, 0 otherwise (BASIC's true/false, as a LONG)
-# ------------------------------------------------------------------------------
 .globl _rt_file_eof
 _rt_file_eof:
     push rbp
@@ -706,15 +799,12 @@ _rt_file_eof:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_file_lof - LOF(n): length of the file in bytes
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = file number
 #
 # Returns:
 #   xmm0 = length in bytes, or 0.0 when the file is not open
-# ------------------------------------------------------------------------------
 .globl _rt_file_lof
 _rt_file_lof:
     push rbp

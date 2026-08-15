@@ -27,6 +27,12 @@
 use crate::parser::*;
 use std::collections::{HashMap, HashSet};
 
+/// Highest BASIC file number the runtime's handle table has a slot for.
+///
+/// The table is 16 pointers wide and slot 0 is the console, so a program may
+/// use 1 through 15.
+pub const MAX_FILE_NUM: i64 = 15;
+
 /// Builtin functions, with the argument counts they accept.
 ///
 /// Kept here rather than in codegen so that "is this name known?" has a single
@@ -260,9 +266,7 @@ impl Analyzer {
         });
     }
 
-    // ------------------------------------------------------------------
     // Pass 1: collect declarations
-    // ------------------------------------------------------------------
 
     /// Record procedures, arrays and branch targets.
     ///
@@ -502,9 +506,7 @@ impl Analyzer {
         }
     }
 
-    // ------------------------------------------------------------------
     // Pass 2: check uses
-    // ------------------------------------------------------------------
 
     fn check(&mut self, stmts: &[Stmt], scope: &Scope) {
         for stmt in stmts {
@@ -588,8 +590,20 @@ impl Analyzer {
             StmtKind::Call { name, args } => {
                 self.check_call(name, args, scope, line, true);
             }
-            StmtKind::Print { items, using, .. } => {
-                self.check_using(using.as_ref(), line);
+            StmtKind::Print {
+                file_num,
+                items,
+                using,
+                ..
+            } => {
+                if let Some(file_num) = file_num {
+                    if using.is_some() {
+                        self.error(line, "PRINT # USING is not supported");
+                    }
+                    self.check_file_num(file_num, scope, line);
+                } else {
+                    self.check_using(using.as_ref(), line);
+                }
                 for item in items {
                     if let PrintItem::Expr(e) = item {
                         self.check_expr(e, scope, line);
@@ -597,14 +611,35 @@ impl Analyzer {
                     }
                 }
             }
-            StmtKind::PrintFile { items, using, .. } => {
-                if using.is_some() {
-                    self.error(line, "PRINT # USING is not supported");
+            StmtKind::Input { file_num, vars, .. } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
                 }
-                for item in items {
-                    if let PrintItem::Expr(e) = item {
-                        self.check_expr(e, scope, line);
-                    }
+                for var in vars {
+                    self.check_lvalue(var, scope, line);
+                }
+            }
+            StmtKind::LineInput { file_num, var, .. } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
+                }
+                self.check_lvalue(var, scope, line);
+                // Codegen reads a string and stores it as-is, so a numeric
+                // target used to be handed a pointer to reinterpret as a
+                // double.
+                if self.expr_is_string(&lvalue_as_expr(var), scope) == Some(false) {
+                    self.error(
+                        line,
+                        format!(
+                            "LINE INPUT needs a string variable, but '{}' is numeric",
+                            var.name
+                        ),
+                    );
+                }
+            }
+            StmtKind::Read(vars) => {
+                for var in vars {
+                    self.check_lvalue(var, scope, line);
                 }
             }
             StmtKind::If {
@@ -747,14 +782,12 @@ impl Analyzer {
                 if self.expr_is_string(filename, scope) == Some(false) {
                     self.error(line, "OPEN needs a string filename");
                 }
-                self.check_expr(file_num, scope, line);
-                self.require_numeric(file_num, scope, line, "a file number");
+                self.check_file_num(file_num, scope, line);
             }
             StmtKind::Close {
                 file_num: Some(file_num),
             } => {
-                self.check_expr(file_num, scope, line);
-                self.require_numeric(file_num, scope, line, "a file number");
+                self.check_file_num(file_num, scope, line);
             }
             _ => {}
         }
@@ -948,6 +981,45 @@ impl Analyzer {
         self.reject_record_value(e, scope, line);
     }
 
+    /// Check an assignment or input target.
+    ///
+    /// Rebuilds the access as an expression so the array, subscript and field
+    /// checks that already exist do the work, then refuses a whole record --
+    /// which has no value to read into any more than it has one to print.
+    fn check_lvalue(&mut self, target: &LValue, scope: &Scope, line: u32) {
+        let e = lvalue_as_expr(target);
+        self.check_expr(&e, scope, line);
+        self.reject_record_value(&e, scope, line);
+    }
+
+    /// A file number must be numeric, and within the runtime's handle table.
+    ///
+    /// The table holds slots 1-15; slot 0 is the console. Nothing checked the
+    /// index, so a constant outside that range indexed off the end of the
+    /// table at run time. A non-constant is checked by codegen instead.
+    fn check_file_num(&mut self, e: &Expr, scope: &Scope, line: u32) {
+        self.check_expr(e, scope, line);
+        self.check_file_num_value(e, scope, line);
+    }
+
+    /// The range half of [`Self::check_file_num`], for a caller that has
+    /// already walked the expression. Walking it twice reports anything wrong
+    /// inside it twice.
+    fn check_file_num_value(&mut self, e: &Expr, scope: &Scope, line: u32) {
+        self.require_numeric(e, scope, line, "a file number");
+        if let Some(n) = self.const_eval(e).and_then(|l| match l {
+            Literal::Integer(n) => Some(n),
+            Literal::Float(f) => Some(f as i64),
+            Literal::String(_) => None,
+        }) && !(1..=MAX_FILE_NUM).contains(&n)
+        {
+            self.error(
+                line,
+                format!("file number {} is not between 1 and {}", n, MAX_FILE_NUM),
+            );
+        }
+    }
+
     /// A PRINT USING format must be a string literal, since it is parsed at
     /// compile time into a sequence of runtime calls.
     fn check_using(&mut self, using: Option<&Expr>, line: u32) {
@@ -1136,6 +1208,9 @@ impl Analyzer {
                         if args.len() == 1 { "was" } else { "were" }
                     ),
                 );
+            } else if matches!(upper.as_str(), "EOF" | "LOF") {
+                // check_expr has already walked the argument on the way here.
+                self.check_file_num_value(&args[0], scope, line);
             }
             return;
         }
@@ -1419,6 +1494,27 @@ fn op_name(op: BinaryOp) -> &'static str {
 }
 
 /// Split a field-access expression into its base variable and field path.
+/// Rebuild an assignment target as the expression that reads it.
+///
+/// Lets one set of checks serve both sides: `A(I).X` as a target and as a
+/// value are the same access, and only one of them had ever been checked.
+fn lvalue_as_expr(target: &LValue) -> Expr {
+    let mut e = match &target.indices {
+        Some(indices) => Expr::ArrayAccess {
+            name: target.name.clone(),
+            indices: indices.clone(),
+        },
+        None => Expr::Variable(target.name.clone()),
+    };
+    for field in &target.fields {
+        e = Expr::Field {
+            base: Box::new(e),
+            field: field.clone(),
+        };
+    }
+    e
+}
+
 fn flatten_field_path(expr: &Expr) -> Option<(String, Vec<String>)> {
     let mut fields = Vec::new();
     let mut cur = expr;

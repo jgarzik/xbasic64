@@ -232,20 +232,40 @@ static INLINE_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock
     ])
 });
 
-/// Symbol prefix from platform ABI (underscore on macOS, empty on Linux/Windows)
-const PREFIX: &str = PlatformAbi::SYMBOL_PREFIX;
+/// How a builtin that is just "evaluate, coerce, call" reaches its helper.
+///
+/// The irregular builtins stay written out in [`CodeGen::gen_fn_call`]; these
+/// differ only in the coercion and the symbol, which is what a table is for.
+enum Builtin {
+    /// Takes no argument.
+    Call0(&'static str),
+    /// One string argument, passed as (pointer, length).
+    CallStr(&'static str),
+    /// One numeric argument, widened to Double in xmm0.
+    CallDouble(&'static str),
+    /// One numeric argument, narrowed to Long and sign-extended.
+    CallLong(&'static str),
+    /// No helper at all: the conversion *is* the coercion.
+    Coerce(DataType),
+}
 
-/// Win64 ABI requires 32 bytes of shadow space before each call
-#[cfg(windows)]
-const WIN64_SHADOW_SPACE: i32 = 32;
-
-/// Win64: stack space for calls with 5 args (shadow + 5th arg + alignment)
-#[cfg(windows)]
-const WIN64_5ARG_STACK_SPACE: i32 = 48;
-
-/// Win64: offset to 5th argument on stack (after shadow space)
-#[cfg(windows)]
-const WIN64_5TH_ARG_OFFSET: i32 = 32;
+static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| {
+    HashMap::from([
+        ("TIMER", Builtin::Call0("_rt_timer")),
+        ("VAL", Builtin::CallStr("_rt_val")),
+        ("LTRIM$", Builtin::CallStr("_rt_ltrim")),
+        ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
+        ("UCASE$", Builtin::CallStr("_rt_ucase")),
+        ("LCASE$", Builtin::CallStr("_rt_lcase")),
+        ("STR$", Builtin::CallDouble("_rt_str")),
+        ("CHR$", Builtin::CallLong("_rt_chr")),
+        ("SPACE$", Builtin::CallLong("_rt_space")),
+        ("HEX$", Builtin::CallLong("_rt_hex")),
+        ("OCT$", Builtin::CallLong("_rt_oct")),
+        ("CSNG", Builtin::Coerce(DataType::Single)),
+        ("CDBL", Builtin::Coerce(DataType::Double)),
+    ])
+});
 
 /// Stack space for temporary values (must be 16-byte aligned)
 const STACK_TEMP_SPACE: i32 = 16;
@@ -259,6 +279,10 @@ const GOSUB_STACK_SIZE: i32 = 524288;
 /// ASCII character codes
 const ASCII_TAB: i64 = 9;
 const ASCII_COMMA: i64 = 44;
+/// The console's file number. The runtime seeds handle 0 with standard
+/// output, so PRINT and PRINT # are the same helpers with a different handle.
+const CONSOLE: i64 = 0;
+
 const ASCII_QUOTE: i64 = 34;
 
 fn is_string_var(name: &str) -> bool {
@@ -347,6 +371,7 @@ enum RtError {
     Undim,
     OutOfMemory,
     GosubOverflow,
+    BadFileNum,
 }
 
 impl RtError {
@@ -360,6 +385,7 @@ impl RtError {
             RtError::Undim => "_err_undim",
             RtError::OutOfMemory => "_err_memory",
             RtError::GosubOverflow => "_err_gosub",
+            RtError::BadFileNum => "_err_badfile",
         }
     }
 
@@ -373,6 +399,7 @@ impl RtError {
             RtError::Undim => "undim",
             RtError::OutOfMemory => "mem",
             RtError::GosubOverflow => "gosub",
+            RtError::BadFileNum => "badfile",
         }
     }
 }
@@ -518,17 +545,49 @@ impl CodeGen {
         self.emit(&format!("    lea {}, {}", dst, mem));
     }
 
-    /// Call a libc function with proper shadow space on Win64
+    /// Call a libc function, whose arguments are already in place.
     fn emit_call_libc(&mut self, func: &str) {
-        #[cfg(windows)]
-        {
-            self.emit(&format!("    sub rsp, {}", WIN64_SHADOW_SPACE));
-            self.emit(&format!("    call {}{}", PREFIX, func));
-            self.emit(&format!("    add rsp, {}", WIN64_SHADOW_SPACE));
+        self.emit_call_with_args(func, &[]);
+    }
+
+    /// Call `sym` with `srcs` as its integer arguments, in order.
+    ///
+    /// The ABIs differ in how much of a call they can carry in registers --
+    /// six arguments on System V, four on Win64 -- and in whether the caller
+    /// owes the callee shadow space. Both follow from the register list, so
+    /// this computes the split instead of spelling out a platform each time.
+    ///
+    /// Arguments are assigned last-first, so a register that is both a source
+    /// and a destination is read before it is overwritten. Callers choose
+    /// sources with that order in mind.
+    fn emit_call_with_args(&mut self, sym: &str, srcs: &[&str]) {
+        let regs = PlatformAbi::INT_ARG_REGS;
+        let shadow = PlatformAbi::SHADOW_SPACE;
+        let on_stack = srcs.len().saturating_sub(regs.len()) as i32;
+
+        // Whatever is reserved has to leave rsp 16-byte aligned at the call.
+        let reserve = match shadow + on_stack * 8 {
+            0 => 0,
+            bytes => (bytes + 15) / 16 * 16,
+        };
+        if reserve > 0 {
+            self.emit(&format!("    sub rsp, {}", reserve));
         }
-        #[cfg(not(windows))]
-        {
-            self.emit(&format!("    call {}{}", PREFIX, func));
+
+        for (i, src) in srcs.iter().enumerate().rev() {
+            match regs.get(i) {
+                Some(reg) if reg == src => {} // already there
+                Some(reg) => self.emit(&format!("    mov {}, {}", reg, src)),
+                None => {
+                    let off = shadow + (i - regs.len()) as i32 * 8;
+                    self.emit(&format!("    mov QWORD PTR [rsp + {}], {}", off, src));
+                }
+            }
+        }
+
+        self.emit(&format!("    call {}", sym));
+        if reserve > 0 {
+            self.emit(&format!("    add rsp, {}", reserve));
         }
     }
 
@@ -989,8 +1048,7 @@ impl CodeGen {
         // Emit assembly header
         self.emit(".intel_syntax noprefix");
         self.emit(".text");
-        let p = PREFIX;
-        self.emit(&format!(".globl {}main", p));
+        self.emit(".globl main");
         self.emit("");
 
         // Procedures
@@ -1055,8 +1113,7 @@ impl CodeGen {
     /// Emit `main`: prologue, module-level statements, epilogue.
     fn gen_main(&mut self, program: &Program) {
         self.reserve_array_descriptors(&SemaScope::Module);
-        let p = PREFIX;
-        self.emit_label(&format!("{}main", p));
+        self.emit_label("main");
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
@@ -1073,13 +1130,10 @@ impl CodeGen {
             self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
-        // Windows: Initialize console handles for Win32 API
-        #[cfg(windows)]
-        {
-            self.emit("    # Initialize Windows console handles");
-            self.emit("    call _rt_init_console");
-            self.emit("    call _rt_init_input");
-        }
+        // The console is file handle 0, and each platform's runtime seeds that
+        // slot its own way -- a libc stream on System V, a handle from the OS
+        // on Windows. Both answer to the same call.
+        self.emit("    call _rt_platform_init");
 
         // Generate main body
         for stmt in &program.statements {
@@ -1581,16 +1635,19 @@ impl CodeGen {
             } => {
                 self.gen_print_using(fmt, items);
                 if *newline {
-                    self.emit("    call _rt_print_newline");
+                    self.emit_arg_imm(0, CONSOLE);
+                    self.emit("    call _rt_file_print_newline");
                 }
             }
 
             StmtKind::Print {
+                file_num,
                 items,
                 newline,
                 write,
                 ..
             } => {
+                let sink = self.gen_sink(file_num.as_ref());
                 let mut first = true;
                 for item in items {
                     match item {
@@ -1599,42 +1656,58 @@ impl CodeGen {
                             // strings; PRINT emits them bare.
                             if *write {
                                 if !first {
-                                    self.emit_arg_imm(0, ASCII_COMMA);
-                                    self.emit("    call _rt_print_char");
+                                    self.emit_arg_file_num(0, &sink);
+                                    self.emit_arg_imm(1, ASCII_COMMA);
+                                    self.emit("    call _rt_file_print_char");
                                 }
-                                self.gen_write_expr(expr);
+                                self.gen_write_expr(expr, &sink);
                             } else {
-                                self.gen_print_expr(expr);
+                                self.gen_print_expr(expr, &sink);
                             }
                             first = false;
                         }
                         PrintItem::Tab => {
+                            // For WRITE the comma is only a separator, and one
+                            // is already emitted before each value; emitting a
+                            // tab as well wrote "10\t,20".
                             if !*write {
-                                self.emit_arg_imm(0, ASCII_TAB);
-                                self.emit("    call _rt_print_char");
+                                self.emit_arg_file_num(0, &sink);
+                                self.emit_arg_imm(1, ASCII_TAB);
+                                self.emit("    call _rt_file_print_char");
                             }
                         }
                         PrintItem::Empty => {}
                     }
                 }
                 if *newline {
-                    self.emit("    call _rt_print_newline");
+                    self.emit_arg_file_num(0, &sink);
+                    self.emit("    call _rt_file_print_newline");
                 }
             }
 
-            StmtKind::Input { prompt, vars } => {
+            StmtKind::Input {
+                prompt,
+                vars,
+                file_num,
+            } => {
                 if let Some(pstr) = prompt {
-                    let idx = self.add_string_literal(pstr);
-                    self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
-                    self.emit_arg_imm(1, pstr.len() as i64);
-                    self.emit("    call _rt_print_string");
+                    self.gen_console_prompt(pstr);
                 }
+                let fnum = file_num.as_ref().map(|e| self.gen_file_num(e));
                 for var in vars {
-                    if is_string_var(&var.name) {
-                        self.emit("    call _rt_input_string");
-                    } else {
-                        self.emit("    call _rt_input_number");
-                    }
+                    let rt = match (&fnum, is_string_var(&var.name)) {
+                        (Some(f), string) => {
+                            self.emit_arg_file_num(0, f);
+                            if string {
+                                "_rt_file_input_string"
+                            } else {
+                                "_rt_file_input_number"
+                            }
+                        }
+                        (None, true) => "_rt_input_string",
+                        (None, false) => "_rt_input_number",
+                    };
+                    self.emit(&format!("    call {}", rt));
                     self.gen_store_lvalue(var);
                 }
             }
@@ -1645,10 +1718,7 @@ impl CodeGen {
                 file_num,
             } => {
                 if let Some(pstr) = prompt {
-                    let idx = self.add_string_literal(pstr);
-                    self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
-                    self.emit_arg_imm(1, pstr.len() as i64);
-                    self.emit("    call _rt_print_string");
+                    self.gen_console_prompt(pstr);
                 }
                 match file_num {
                     Some(e) => {
@@ -2134,75 +2204,6 @@ impl CodeGen {
                 // Bare CLOSE closes every open file.
                 None => self.emit("    call _rt_file_close_all"),
             },
-
-            StmtKind::PrintFile {
-                file_num,
-                items,
-                newline,
-                using: Some(_),
-                ..
-            } => {
-                // Sema rejects USING on file output for now, so this is only
-                // reachable if that check is removed without adding support.
-                let _ = (file_num, items, newline);
-                unreachable!("PRINT # USING is rejected by semantic analysis")
-            }
-
-            StmtKind::PrintFile {
-                file_num,
-                items,
-                newline,
-                write,
-                ..
-            } => {
-                let fnum = self.gen_file_num(file_num);
-                let mut first = true;
-                for item in items {
-                    match item {
-                        PrintItem::Expr(expr) => {
-                            if *write && !first {
-                                self.emit_arg_file_num(0, &fnum);
-                                self.emit_arg_imm(1, ASCII_COMMA);
-                                self.emit("    call _rt_file_print_char");
-                            }
-                            if *write {
-                                self.gen_write_expr_to_file(expr, &fnum);
-                            } else {
-                                self.gen_print_expr_to_file(expr, &fnum);
-                            }
-                            first = false;
-                        }
-                        PrintItem::Tab => {
-                            // For WRITE the comma is only a separator, and one
-                            // is already emitted before each value; emitting a
-                            // tab as well wrote "10\t,20".
-                            if !*write {
-                                self.emit_arg_file_num(0, &fnum);
-                                self.emit_arg_imm(1, ASCII_TAB);
-                                self.emit("    call _rt_file_print_char");
-                            }
-                        }
-                        PrintItem::Empty => {}
-                    }
-                }
-                if *newline {
-                    self.emit_arg_file_num(0, &fnum);
-                    self.emit("    call _rt_file_print_newline");
-                }
-            }
-
-            StmtKind::InputFile { file_num, vars } => {
-                let fnum = self.gen_file_num(file_num);
-                for var in vars {
-                    self.emit_arg_file_num(0, &fnum);
-                    if is_string_var(&var.name) {
-                        self.emit("    call _rt_file_input_string");
-                    } else {
-                        self.emit("    call _rt_file_input_number");
-                    }
-                    self.gen_store_lvalue(var);
-                }
-            }
         }
     }
 
@@ -2638,10 +2639,40 @@ impl CodeGen {
         }
         let ty = self.gen_expr(e);
         self.gen_coercion(ty, DataType::Long);
+        self.emit_file_num_check();
         self.stack_offset -= 8;
         let loc = Loc::Frame(self.stack_offset);
         self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
         FileNum::Slot(loc)
+    }
+
+    /// Resolve where a PRINT writes: a file number, or the console.
+    fn gen_sink(&mut self, file_num: Option<&Expr>) -> FileNum {
+        match file_num {
+            Some(e) => self.gen_file_num(e),
+            None => FileNum::Imm(CONSOLE),
+        }
+    }
+
+    /// Write an INPUT prompt, which always goes to the console.
+    fn gen_console_prompt(&mut self, prompt: &str) {
+        let idx = self.add_string_literal(prompt);
+        self.emit_arg_file_num(0, &FileNum::Imm(CONSOLE));
+        self.emit_arg_lea(1, &format!("[rip + _str_{}]", idx));
+        self.emit_arg_imm(2, prompt.len() as i64);
+        self.emit("    call _rt_file_print_string");
+    }
+
+    /// Check the file number in `eax` against the handle table's slots.
+    ///
+    /// The table has a slot per legal file number and no more, so an unchecked
+    /// index reached outside it -- far enough, for a large enough number, to
+    /// take the process down with it.
+    fn emit_file_num_check(&mut self) {
+        self.emit("    cmp eax, 1");
+        self.emit_check("jl", RtError::BadFileNum);
+        self.emit(&format!("    cmp eax, {}", crate::sema::MAX_FILE_NUM));
+        self.emit_check("jg", RtError::BadFileNum);
     }
 
     /// Place a previously evaluated file number in an argument register.
@@ -3429,10 +3460,7 @@ impl CodeGen {
         if text.is_empty() {
             return;
         }
-        let idx = self.add_string_literal(text);
-        self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
-        self.emit_arg_imm(1, text.len() as i64);
-        self.emit("    call _rt_print_string");
+        self.gen_console_prompt(text);
     }
 
     /// Emit one CASE alternative: jump to `body_label` when it matches.
@@ -3545,90 +3573,74 @@ impl CodeGen {
     }
 
     /// Emit one WRITE value: strings are quoted, numbers printed as usual.
-    fn gen_write_expr(&mut self, expr: &Expr) {
+    /// `WRITE` quotes a string; a number is written the same as by `PRINT`.
+    fn gen_write_expr(&mut self, expr: &Expr, sink: &FileNum) {
         if self.expr_type(expr) == DataType::String {
-            self.emit_arg_imm(0, ASCII_QUOTE);
-            self.emit("    call _rt_print_char");
-            self.gen_print_expr(expr);
-            self.emit_arg_imm(0, ASCII_QUOTE);
-            self.emit("    call _rt_print_char");
-        } else {
-            self.gen_print_expr(expr);
-        }
-    }
-
-    /// WRITE # equivalent of [`Self::gen_write_expr`].
-    fn gen_write_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
-        if self.expr_type(expr) == DataType::String {
-            self.emit_arg_file_num(0, file_num);
+            self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
             self.emit("    call _rt_file_print_char");
-            self.gen_print_expr_to_file(expr, file_num);
-            self.emit_arg_file_num(0, file_num);
+            self.gen_print_expr(expr, sink);
+            self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
             self.emit("    call _rt_file_print_char");
         } else {
-            self.gen_print_expr_to_file(expr, file_num);
+            self.gen_print_expr(expr, sink);
         }
     }
 
-    fn gen_print_expr(&mut self, expr: &Expr) {
+    /// Write one PRINT item to `sink`, which is the console when it is 0.
+    ///
+    /// There is one of these rather than one per destination: the file copy
+    /// this replaced had missed both the TAB/SPC case and the SINGLE one, so
+    /// `PRINT #1, A!` wrote digits a SINGLE does not carry and `PRINT #1,
+    /// TAB(10)` positioned the console.
+    fn gen_print_expr(&mut self, expr: &Expr, sink: &FileNum) {
         // TAB() and SPC() position the cursor rather than producing a value,
         // so they are emitted for their effect and nothing is printed after.
         if let Expr::FnCall { name, args } = expr {
             let upper = name.to_uppercase();
             if upper == "TAB" || upper == "SPC" {
-                self.gen_fn_call(&upper, args);
+                self.gen_print_position(&upper, &args[0], sink);
                 return;
             }
         }
 
-        // Check the expression type first
-        let expected_type = self.expr_type(expr);
-
-        if expected_type == DataType::String {
-            // String expression - evaluate and print as string
-            // gen_expr for strings puts ptr in rax, len in rdx
+        if self.expr_type(expr) == DataType::String {
+            // gen_expr for strings puts ptr in rax, len in rdx. The length has
+            // to move first: on Win64 the pointer's argument register is rdx.
             self.gen_expr(expr);
-            self.emit_arg_reg(0, "rax"); // ptr
-            self.emit_arg_reg(1, "rdx"); // len
-            self.emit("    call _rt_print_string");
+            self.emit_arg_reg(2, "rdx"); // len
+            self.emit_arg_reg(1, "rax"); // ptr
+            self.emit_arg_file_num(0, sink);
+            self.emit("    call _rt_file_print_string");
         } else {
-            // Numeric expression - evaluate and convert to double for printing.
-            // A Single is printed via its own helper, which round-trips against
-            // 32-bit precision: widening 3.14159! to a double and printing all
-            // the digits that survive would show 3.141590118408203.
+            // A Single is printed via its own helper, which round-trips
+            // against 32-bit precision: widening 3.14159! to a double and
+            // printing every digit that survives would show 3.141590118408203.
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
+            self.emit_arg_file_num(0, sink);
             if expr_type == DataType::Single {
-                self.emit("    call _rt_print_single");
+                self.emit("    call _rt_file_print_single");
             } else {
-                self.emit("    call _rt_print_float");
+                self.emit("    call _rt_file_print_float");
             }
         }
     }
 
-    fn gen_print_expr_to_file(&mut self, expr: &Expr, file_num: &FileNum) {
-        // Check the expression type first
-        let expected_type = self.expr_type(expr);
-
-        if expected_type == DataType::String {
-            // String expression - evaluate and print as string
-            // gen_expr for strings puts ptr in rax, len in rdx
-            self.gen_expr(expr);
-            // On Win64, arg1=rdx, arg2=r8. Must save rdx (len) to r8 BEFORE
-            // clobbering rdx with ptr. Order matters to avoid register conflicts.
-            self.emit_arg_reg(2, "rdx"); // len → r8 (on Win64) or rdx (on SysV, no-op)
-            self.emit_arg_reg(1, "rax"); // ptr → rdx (on Win64) or rsi (on SysV)
-            self.emit_arg_file_num(0, file_num); // file_num → rcx or rdi
-            self.emit("    call _rt_file_print_string");
+    /// `TAB(n)` / `SPC(n)`: move the write position within `sink`.
+    fn gen_print_position(&mut self, name: &str, arg: &Expr, sink: &FileNum) {
+        let t = self.gen_expr(arg);
+        self.gen_coercion(t, DataType::Long);
+        self.emit("    movsxd rax, eax");
+        self.emit_arg_file_num(0, sink);
+        self.emit_arg_reg(1, "rax");
+        let rt = if name == "TAB" {
+            "_rt_file_print_tab"
         } else {
-            // Numeric expression - evaluate and convert to double for printing
-            let expr_type = self.gen_expr(expr);
-            self.gen_coercion(expr_type, DataType::Double);
-            self.emit_arg_file_num(0, file_num);
-            self.emit("    call _rt_file_print_float");
-        }
+            "_rt_file_print_spc"
+        };
+        self.emit(&format!("    call {}", rt));
     }
 
     fn gen_fn_call(&mut self, name: &str, args: &[Expr]) {
@@ -3657,6 +3669,39 @@ impl CodeGen {
                 self.emit_domain_check("jb");
             }
             self.emit(&format!("    {}", instr));
+            return;
+        }
+
+        // Table-driven: evaluate one argument, coerce it, call the helper.
+        if let Some(builtin) = RT_BUILTINS.get(upper_name.as_str()) {
+            match builtin {
+                Builtin::Call0(sym) => self.emit(&format!("    call {}", sym)),
+                Builtin::CallStr(sym) => {
+                    // gen_expr leaves a string in rax/rdx. Loading the length
+                    // first keeps Win64, where the pointer's register is rdx,
+                    // from overwriting it.
+                    self.gen_expr(&args[0]);
+                    self.emit_arg_reg(1, "rdx");
+                    self.emit_arg_reg(0, "rax");
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::CallDouble(sym) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, DataType::Double);
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::CallLong(sym) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, DataType::Long);
+                    self.emit("    movsxd rax, eax");
+                    self.emit_arg_reg(0, "rax");
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::Coerce(ty) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, *ty);
+                }
+            }
             return;
         }
 
@@ -3805,32 +3850,12 @@ impl CodeGen {
                 self.gen_expr(needle_arg);
                 // rax = needle ptr, rdx = needle len
 
-                // Set up arguments based on ABI
-                // SysV: rdi=hay_ptr, rsi=hay_len, rdx=needle_ptr, rcx=needle_len, r8=start
-                // Win64: rcx=hay_ptr, rdx=hay_len, r8=needle_ptr, r9=needle_len, [rsp+32]=start
-                #[cfg(windows)]
-                {
-                    self.emit(&format!("    sub rsp, {}", WIN64_5ARG_STACK_SPACE));
-                    self.emit(&format!(
-                        "    mov QWORD PTR [rsp + {}], rbx",
-                        WIN64_5TH_ARG_OFFSET
-                    )); // 5th arg: start
-                    self.emit("    mov r9, rdx"); // needle len
-                    self.emit("    mov r8, rax"); // needle ptr
-                    self.emit("    mov rdx, r13"); // haystack len
-                    self.emit("    mov rcx, r12"); // haystack ptr
-                    self.emit("    call _rt_instr");
-                    self.emit(&format!("    add rsp, {}", WIN64_5ARG_STACK_SPACE));
-                }
-                #[cfg(not(windows))]
-                {
-                    self.emit("    mov r8, rbx"); // start
-                    self.emit("    mov rcx, rdx"); // needle len
-                    self.emit("    mov rdx, rax"); // needle ptr
-                    self.emit("    mov rsi, r13"); // haystack len
-                    self.emit("    mov rdi, r12"); // haystack ptr
-                    self.emit("    call _rt_instr");
-                }
+                // Five arguments: the one call in the compiler that Win64
+                // cannot carry in registers alone. The sources are chosen so
+                // that assigning them last-first never clobbers one still to
+                // be read -- rdx holds the needle length and is also System
+                // V's third argument register.
+                self.emit_call_with_args("_rt_instr", &["r12", "r13", "rax", "rdx", "rbx"]);
 
                 self.emit("    pop r13");
                 self.emit("    pop r12");
@@ -3842,30 +3867,6 @@ impl CodeGen {
                 self.gen_expr(&args[0]);
                 self.emit("    movzx eax, BYTE PTR [rax]");
                 // ASC returns integer in eax (Long type)
-            }
-            "CHR$" => {
-                // _rt_chr(char_code)
-                let arg_type = self.gen_expr(&args[0]);
-                let arg0 = Self::arg_reg(0);
-                if arg_type.is_integer() {
-                    self.emit(&format!("    movsxd {}, eax", arg0));
-                } else {
-                    self.emit(&format!("    cvttsd2si {}, xmm0", arg0));
-                }
-                self.emit("    call _rt_chr");
-            }
-            "VAL" => {
-                // _rt_val(ptr, len)
-                self.gen_expr(&args[0]);
-                self.emit_arg_reg(0, "rax"); // ptr
-                self.emit_arg_reg(1, "rdx"); // len
-                self.emit("    call _rt_val");
-            }
-            "STR$" => {
-                let arg_type = self.gen_expr(&args[0]);
-                // STR$ expects double in xmm0
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    call _rt_str");
             }
             "CINT" | "CLNG" => {
                 let arg_type = self.gen_expr(&args[0]);
@@ -3879,25 +3880,7 @@ impl CodeGen {
                 }
                 // Result is integer (Long) in eax
             }
-            "CSNG" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Single);
-            }
-            "CDBL" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-            }
-            "TIMER" => {
-                self.emit("    call _rt_timer");
-            }
             // String builders. These allocate, so the result outlives the call.
-            "SPACE$" => {
-                let t = self.gen_expr(&args[0]);
-                self.gen_coercion(t, DataType::Long);
-                self.emit("    movsxd rax, eax");
-                self.emit_arg_reg(0, "rax");
-                self.emit("    call _rt_space");
-            }
             "STRING$" => {
                 // STRING$(n, ch) takes either a character code or a string
                 // whose first character is used.
@@ -3920,33 +3903,7 @@ impl CodeGen {
                 self.emit("    call _rt_string_n");
             }
             // Trimming and case conversion.
-            "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => {
-                self.gen_expr(&args[0]);
-                self.emit("    mov r10, rax");
-                self.emit("    mov r11, rdx");
-                self.emit_arg_reg(0, "r10");
-                self.emit_arg_reg(1, "r11");
-                let rt = match upper_name.as_str() {
-                    "LTRIM$" => "_rt_ltrim",
-                    "RTRIM$" => "_rt_rtrim",
-                    "UCASE$" => "_rt_ucase",
-                    _ => "_rt_lcase",
-                };
-                self.emit(&format!("    call {}", rt));
-            }
             // Radix conversions.
-            "HEX$" | "OCT$" => {
-                let t = self.gen_expr(&args[0]);
-                self.gen_coercion(t, DataType::Long);
-                self.emit("    movsxd rax, eax");
-                self.emit_arg_reg(0, "rax");
-                let rt = if upper_name == "HEX$" {
-                    "_rt_hex"
-                } else {
-                    "_rt_oct"
-                };
-                self.emit(&format!("    call {}", rt));
-            }
             // Array bounds. The descriptor stores each dimension's element
             // count, so UBOUND is that minus one and LBOUND is always 0.
             "LBOUND" | "UBOUND" => {
@@ -4001,6 +3958,7 @@ impl CodeGen {
             "EOF" | "LOF" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Long);
+                self.emit_file_num_check();
                 self.emit_arg_reg(0, "rax");
                 let rt = if upper_name == "EOF" {
                     "_rt_file_eof"
@@ -4012,15 +3970,7 @@ impl CodeGen {
             // Print positioning. These emit output rather than yielding a
             // value, so they are only meaningful inside PRINT.
             "TAB" | "SPC" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Long);
-                self.emit_arg_reg(0, "rax");
-                let rt = if upper_name == "TAB" {
-                    "_rt_print_tab"
-                } else {
-                    "_rt_print_spc"
-                };
-                self.emit(&format!("    call {}", rt));
+                self.gen_print_position(&upper_name, &args[0], &FileNum::Imm(CONSOLE));
                 // Leave a zero so PRINT has a well-defined value to render...
                 // but PRINT special-cases these, so it is never printed.
                 self.emit("    xorpd xmm0, xmm0");

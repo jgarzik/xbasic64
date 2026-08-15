@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: String Functions (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # String manipulation functions. Uses HeapAlloc instead of malloc.
 # Keeps UCRT functions: strtod, sprintf, memcpy, memcmp
@@ -21,7 +19,6 @@
 #   - Args: rcx, rdx, r8, r9 (then stack)
 #   - Callee-saved: rbx, rbp, rdi, rsi, r12-r15
 #   - 32-byte shadow space required before calls
-# ==============================================================================
 
 # String length constants
 .equ CHR_RESULT_LEN, 1          # CHR$() always returns 1 character
@@ -34,16 +31,13 @@ _chr_buf: .skip 2           # Buffer for CHR$()
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_val - Convert string to number (VAL function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = pointer to string
 #   rdx = length (ignored - strtod reads until non-numeric)
 #
 # Returns:
 #   xmm0 = parsed double value
-# ------------------------------------------------------------------------------
 .globl _rt_val
 _rt_val:
     push rbp
@@ -54,16 +48,13 @@ _rt_val:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_str - Convert number to string (STR$ function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   xmm0 = number to convert (double)
 #
 # Returns:
 #   rax = pointer to string (_str_buf)
 #   rdx = length of string
-# ------------------------------------------------------------------------------
 .globl _rt_str
 _rt_str:
     push rbp
@@ -91,16 +82,13 @@ _rt_str:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_chr - Convert ASCII code to single character (CHR$ function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = ASCII code (0-255)
 #
 # Returns:
 #   rax = pointer to string (_chr_buf)
 #   rdx = 1 (length)
-# ------------------------------------------------------------------------------
 .globl _rt_chr
 _rt_chr:
     push rbp
@@ -112,9 +100,7 @@ _rt_chr:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_left - Extract leftmost characters (LEFT$ function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = source string pointer
 #   rdx = source string length
@@ -123,7 +109,6 @@ _rt_chr:
 # Returns:
 #   rax = pointer to start of result
 #   rdx = result length
-# ------------------------------------------------------------------------------
 .globl _rt_left
 _rt_left:
     mov rax, rcx
@@ -132,9 +117,7 @@ _rt_left:
     mov rdx, r8
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_right - Extract rightmost characters (RIGHT$ function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = source string pointer
 #   rdx = source string length
@@ -143,7 +126,6 @@ _rt_left:
 # Returns:
 #   rax = pointer to start of result
 #   rdx = result length
-# ------------------------------------------------------------------------------
 .globl _rt_right
 _rt_right:
     cmp r8, rdx
@@ -154,9 +136,7 @@ _rt_right:
     mov rdx, r8
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_mid - Extract substring (MID$ function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = source string pointer
 #   rdx = source string length
@@ -166,7 +146,6 @@ _rt_right:
 # Returns:
 #   rax = pointer to start of result
 #   rdx = result length
-# ------------------------------------------------------------------------------
 .globl _rt_mid
 _rt_mid:
     dec r8                  # Convert to 0-based index
@@ -188,9 +167,7 @@ _rt_mid:
     xor rdx, rdx
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_instr - Find substring position (INSTR function)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = haystack pointer
 #   rdx = haystack length
@@ -200,7 +177,6 @@ _rt_mid:
 #
 # Returns:
 #   rax = position (1-based) or 0 if not found
-# ------------------------------------------------------------------------------
 .globl _rt_instr
 _rt_instr:
     push rbp
@@ -275,9 +251,7 @@ _rt_instr:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_strcat - Concatenate two strings (+ operator)
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rcx = left string pointer
 #   rdx = left string length
@@ -287,7 +261,6 @@ _rt_instr:
 # Returns:
 #   rax = pointer to new string
 #   rdx = total length
-# ------------------------------------------------------------------------------
 .globl _rt_strcat
 _rt_strcat:
     push rbp
@@ -349,9 +322,7 @@ _rt_strcat:
     ret
 
 
-# ------------------------------------------------------------------------------
 # _rt_strcmp - Compare two BASIC strings
-# ------------------------------------------------------------------------------
 # BASIC strings are (ptr, len) pairs and are not null-terminated, so CRT strcmp
 # cannot be used. Compares lexicographically by unsigned byte value, then by
 # length when one string is a prefix of the other -- so "ab" < "abc".
@@ -365,7 +336,6 @@ _rt_strcat:
 #
 # A length of 0 is valid and means the empty string; the pointer is then never
 # dereferenced, so an unassigned (NULL, 0) string compares correctly.
-# ------------------------------------------------------------------------------
 .globl _rt_strcmp
 _rt_strcmp:
     push rbp
@@ -409,9 +379,7 @@ _rt_strcmp:
     leave
     ret
 
-# ==============================================================================
 # Additional string functions
-# ==============================================================================
 #
 # These were all reachable only through the old "unknown $-suffixed call must
 # be an array" heuristic, so every one of them aborted the compiler.
@@ -419,13 +387,9 @@ _rt_strcmp:
 # Functions that shorten a string (LTRIM$, RTRIM$) return an interior pointer
 # into the original rather than allocating, which is sound because BASIC
 # strings are (ptr, len) pairs and are never mutated in place.
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_space - SPACE$(n): a string of n spaces
-# ------------------------------------------------------------------------------
 # Arguments: rcx = count       Returns: rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_space
 _rt_space:
     push rbp
@@ -456,12 +420,9 @@ _rt_space:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_string_n - STRING$(n, ch): a string of n copies of one character
-# ------------------------------------------------------------------------------
 # Arguments: rcx = count, rdx = character code
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_string_n
 _rt_string_n:
     push rbp
@@ -494,12 +455,9 @@ _rt_string_n:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_ltrim - LTRIM$(s): drop leading spaces
-# ------------------------------------------------------------------------------
 # Arguments: rcx = pointer, rdx = length
 # Returns:   rax = pointer, rdx = length (an interior view, not a copy)
-# ------------------------------------------------------------------------------
 .globl _rt_ltrim
 _rt_ltrim:
     xor r8, r8
@@ -515,12 +473,9 @@ _rt_ltrim:
     sub rdx, r8
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_rtrim - RTRIM$(s): drop trailing spaces
-# ------------------------------------------------------------------------------
 # Arguments: rcx = pointer, rdx = length
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_rtrim
 _rt_rtrim:
 .Lrtrim_loop:
@@ -534,14 +489,11 @@ _rt_rtrim:
     mov rax, rcx
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_ucase / _rt_lcase - UCASE$(s) / LCASE$(s)
-# ------------------------------------------------------------------------------
 # These must copy: the source may be a .data literal shared with other uses.
 #
 # Arguments: rcx = pointer, rdx = length
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_ucase
 _rt_ucase:
     mov r9b, 1              # r9b != 0 selects upper-casing
@@ -599,12 +551,9 @@ _rt_case_convert:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
-# ------------------------------------------------------------------------------
 # Arguments: rcx = value (already truncated to an integer)
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_hex
 _rt_hex:
     push rbp
@@ -635,16 +584,13 @@ _rt_oct:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_strdup - Copy a string onto the heap
-# ------------------------------------------------------------------------------
 # String assignment copies, so that mutating one variable cannot be seen
 # through another -- or, worse, through the shared .data literal a string
 # constant points at.
 #
 # Arguments: rcx = pointer, rdx = length
 # Returns:   rax = pointer, rdx = length
-# ------------------------------------------------------------------------------
 .globl _rt_strdup
 _rt_strdup:
     push rbp
@@ -674,9 +620,7 @@ _rt_strdup:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_mid_assign - MID$(s, start [, len]) = value
-# ------------------------------------------------------------------------------
 # Overwrites characters of the target in place. The target's length never
 # changes. Positions are 1-based.
 #
@@ -686,7 +630,6 @@ _rt_strdup:
 #   [rsp+40] = source pointer, [rsp+48] = source length
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_mid_assign
 _rt_mid_assign:
     mov r10, QWORD PTR [rsp + 40]   # source pointer

@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Math and Utility Functions (Win64 Native - Pure Win32 API)
-# ==============================================================================
 #
 # Miscellaneous functions. Uses Win32 API instead of libc.
 #
@@ -10,7 +8,6 @@
 # Win64 ABI:
 #   - Args: rcx, rdx, r8, r9
 #   - 32-byte shadow space required before calls
-# ==============================================================================
 
 # Win32 API Constants
 .equ STD_OUTPUT_HANDLE, -11
@@ -23,9 +20,7 @@ _cls_bytes_written: .quad 0
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_rnd - Generate random number (RND function)
-# ------------------------------------------------------------------------------
 # Returns a pseudo-random number in the range [0, 1).
 #
 # Arguments:
@@ -35,7 +30,6 @@ _cls_bytes_written: .quad 0
 #   xmm0 = random double in [0, 1)
 #
 # Algorithm: Xorshift64
-# ------------------------------------------------------------------------------
 .globl _rt_rnd
 _rt_rnd:
     push rbp
@@ -74,9 +68,7 @@ _rt_rnd:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_timer - TIMER: seconds since midnight, UTC
-# ------------------------------------------------------------------------------
 # This used to return GetTickCount64() / 1000, which is seconds since the
 # machine booted -- not what LANGREF documents, not what the System V runtime
 # returns, and not what any BASIC program expects. A CI runner three minutes
@@ -90,7 +82,6 @@ _rt_rnd:
 #
 # Returns:
 #   xmm0 = seconds since midnight (double, 0 <= t < 86400)
-# ------------------------------------------------------------------------------
 .equ ST_HOUR,   8
 .equ ST_MINUTE, 10
 .equ ST_SECOND, 12
@@ -124,14 +115,11 @@ _rt_timer:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_cls - Clear screen (CLS statement)
-# ------------------------------------------------------------------------------
 # Uses ANSI escape sequences via console output.
 #
 # Arguments: none
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_cls
 _rt_cls:
     push rbp

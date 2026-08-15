@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: DATA/READ/RESTORE Support
-# ==============================================================================
 #
 # Functions implementing BASIC's DATA/READ/RESTORE statements.
 #
@@ -29,11 +27,8 @@
 #
 # Note: The compiler generates _data_table with entries for all DATA statements
 # in order of appearance in the source code.
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_read_number - Read next DATA value as a number
-# ------------------------------------------------------------------------------
 # Reads the next value from the DATA table and returns it as a double.
 # Type conversion is performed automatically:
 #   - Integer (type 0): Convert to double
@@ -49,7 +44,6 @@
 #
 # Error handling: No bounds checking - reading past end is undefined behavior.
 # BASIC programs are expected to READ only as many values as they DATA'd.
-# ------------------------------------------------------------------------------
 .globl _rt_read_number
 _rt_read_number:
     push rbp
@@ -79,14 +73,12 @@ _rt_read_number:
     # String: parse with strtod
     mov rdi, QWORD PTR [rcx + 8]        # string pointer
     xor rsi, rsi                        # endptr = NULL
-    call {libc}strtod                   # returns double in xmm0
+    call strtod                   # returns double in xmm0
     inc QWORD PTR [rip + _data_ptr]     # advance to next entry
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_read_string - Read next DATA value as a string
-# ------------------------------------------------------------------------------
 # Reads the next value from the DATA table and returns it as a string.
 # Currently only handles string-typed DATA entries; numeric entries
 # should not be READ into string variables (BASIC would convert, we don't).
@@ -98,7 +90,6 @@ _rt_read_number:
 #   rdx = string length
 #
 # Side effect: Advances _data_ptr to next entry
-# ------------------------------------------------------------------------------
 .globl _rt_read_string
 _rt_read_string:
     push rbp
@@ -112,7 +103,7 @@ _rt_read_string:
     mov rax, QWORD PTR [rcx + 8]        # rax = string pointer
     # Calculate length using strlen (DATA strings are null-terminated)
     mov rdi, rax                        # string pointer for strlen
-    call {libc}strlen                   # returns length in rax
+    call strlen                   # returns length in rax
     mov rdx, rax                        # length → rdx
     # Reload string pointer (strlen clobbered rax)
     mov rax, QWORD PTR [rip + _data_ptr]
@@ -125,9 +116,7 @@ _rt_read_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_restore - Reset DATA pointer (RESTORE statement)
-# ------------------------------------------------------------------------------
 # Resets the DATA read position, allowing DATA to be re-read from the beginning
 # or from a specific position.
 #
@@ -137,7 +126,6 @@ _rt_read_string:
 #         RESTORE n would pass the index of DATA following line n (not implemented)
 #
 # Returns: nothing
-# ------------------------------------------------------------------------------
 .globl _rt_restore
 _rt_restore:
     mov QWORD PTR [rip + _data_ptr], rdi

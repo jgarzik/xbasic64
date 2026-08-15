@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Input Functions
-# ==============================================================================
 #
 # Keyboard input functions for the BASIC INPUT statement. These read from stdin
 # using libc scanf.
@@ -18,11 +16,8 @@
 #   Strings are returned as (pointer, length) pairs:
 #   - rax = pointer to string data
 #   - rdx = length in bytes
-# ==============================================================================
 
-# ------------------------------------------------------------------------------
 # _rt_input_string - Read a line of text from stdin
-# ------------------------------------------------------------------------------
 # Reads characters until newline (which is not included in result).
 # Uses a static buffer, so the returned pointer is only valid until the next
 # call to _rt_input_string.
@@ -38,7 +33,6 @@
 #   2. scanf("%1023[^\n]", buffer) - read up to 1023 chars
 #   3. getchar() - consume the trailing newline
 #   4. Calculate string length by scanning for null terminator
-# ------------------------------------------------------------------------------
 .globl _rt_input_string
 _rt_input_string:
     push rbp
@@ -51,9 +45,9 @@ _rt_input_string:
     lea rsi, [rip + _input_buf]     # destination buffer (2nd arg)
     lea rdi, [rip + _fmt_input_str] # format string (1st arg)
     xor eax, eax                    # no vector args
-    call {libc}scanf
+    call scanf
     # Consume trailing newline that scanf left behind
-    call {libc}getchar
+    call getchar
     # Calculate string length (scan for null terminator)
     lea rax, [rip + _input_buf]     # rax = start of string
     xor rdx, rdx                    # rdx = length counter
@@ -67,9 +61,7 @@ _rt_input_string:
     leave
     ret
 
-# ------------------------------------------------------------------------------
 # _rt_input_number - Read a numeric value from stdin
-# ------------------------------------------------------------------------------
 # Reads a double-precision floating point number. BASIC's INPUT statement
 # converts this to the appropriate type (Integer, Long, Single, Double).
 #
@@ -82,7 +74,6 @@ _rt_input_string:
 #   1. scanf("%lf", &local_var) - read double into stack
 #   2. getchar() - consume trailing newline
 #   3. Load result into xmm0
-# ------------------------------------------------------------------------------
 .globl _rt_input_number
 _rt_input_number:
     push rbp
@@ -94,7 +85,7 @@ _rt_input_number:
     lea rsi, [rbp - 8]              # address of local variable (2nd arg)
     lea rdi, [rip + _fmt_input]     # format string "%lf" (1st arg)
     xor eax, eax                    # no vector args
-    call {libc}scanf
+    call scanf
     # scanf returns the number of items converted; EOF (-1) means the input
     # ended, and 0 means the text was not a number.
     cmp eax, 1
@@ -105,14 +96,14 @@ _rt_input_number:
     # Not a number: discard the rest of the line and ask again, as GW-BASIC
     # does. Without this, typing text silently yielded 0.
 .Linput_num_flush:
-    call {libc}getchar
+    call getchar
     cmp eax, -1
     je .Linput_num_eof
     cmp eax, 10                     # newline
     jne .Linput_num_flush
     lea rdi, [rip + _redo_msg]
     xor eax, eax
-    call {libc}printf
+    call printf
     jmp .Linput_num_try
 
 .Linput_num_eof:
@@ -123,7 +114,7 @@ _rt_input_number:
 
 .Linput_num_ok:
     # Consume trailing newline
-    call {libc}getchar
+    call getchar
     # Load result into xmm0
     movsd xmm0, QWORD PTR [rbp - 8]
     leave

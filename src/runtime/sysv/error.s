@@ -1,6 +1,4 @@
-# ==============================================================================
 # BASIC Runtime: Error Reporting
-# ==============================================================================
 #
 # One abort path for every runtime check. The message text is passed in and the
 # BASIC line number is a register argument, so only a handful of message
@@ -15,7 +13,6 @@
 #
 # Diagnostics go to stderr, so a program's real output on stdout stays clean
 # and a test can still check partial output followed by an abort.
-# ==============================================================================
 
 .data
 _err_fmt_line: .asciz "?%s in %ld\n"
@@ -28,18 +25,16 @@ _err_overflow:  .asciz "Overflow"
 _err_undim:     .asciz "Array used before DIM"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
+_err_badfile:   .asciz "Bad file number"
 
 .text
 
-# ------------------------------------------------------------------------------
 # _rt_error - Report a runtime error and terminate
-# ------------------------------------------------------------------------------
 # Arguments:
 #   rdi = message pointer (NUL-terminated)
 #   rsi = BASIC line number, or 0 when unknown
 #
 # Returns: never (exit code 1)
-# ------------------------------------------------------------------------------
 .globl _rt_error
 _rt_error:
     push rbp
@@ -55,22 +50,22 @@ _rt_error:
     # Flush stdout first, so output written before the error is not lost when
     # the process exits.
     xor edi, edi
-    call {libc}fflush
+    call fflush
 
-    mov rdi, QWORD PTR [rip + {libc}stderr]
+    mov rdi, QWORD PTR [rip + stderr]
     mov rdx, rbx            # message -> 3rd arg
     test r12, r12
     jz .Lerr_bare
     lea rsi, [rip + _err_fmt_line]
     mov rcx, r12            # line -> 4th arg
     xor eax, eax
-    call {libc}fprintf
+    call fprintf
     jmp .Lerr_exit
 .Lerr_bare:
     lea rsi, [rip + _err_fmt_bare]
     xor eax, eax
-    call {libc}fprintf
+    call fprintf
 
 .Lerr_exit:
     mov edi, 1
-    call {libc}exit
+    call exit

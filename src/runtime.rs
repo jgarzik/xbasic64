@@ -14,7 +14,7 @@
 //! - using.s: PRINT USING field output
 //!
 //! Platform-specific runtimes:
-//! - sysv/: System V AMD64 ABI (Linux, macOS, BSD)
+//! - sysv/: System V AMD64 ABI (Linux)
 //! - win64-native/: Windows x64 ABI
 
 // Copyright (c) 2025-2026 Jeff Garzik
@@ -59,10 +59,7 @@ const WIN64: Runtime = Runtime {
 };
 
 /// Concatenate one runtime tree into a single assembly unit.
-///
-/// `libc_prefix` is what `{libc}` becomes: macOS decorates C symbols with a
-/// leading underscore, Linux and Windows do not.
-fn emit(rt: &Runtime, libc_prefix: &str) -> String {
+fn emit(rt: &Runtime) -> String {
     let mut output = String::new();
 
     output.push_str("# BASIC Runtime Library\n");
@@ -73,7 +70,7 @@ fn emit(rt: &Runtime, libc_prefix: &str) -> String {
     output.push_str("\n.text\n\n");
 
     for part in rt.parts {
-        output.push_str(&part.replace("{libc}", libc_prefix));
+        output.push_str(part);
         output.push('\n');
     }
 
@@ -81,19 +78,12 @@ fn emit(rt: &Runtime, libc_prefix: &str) -> String {
 }
 
 pub fn generate_runtime() -> String {
-    // On macOS, C library functions need underscore prefix
-    // On Linux and Windows, no prefix
-    #[cfg(target_os = "macos")]
-    let libc_prefix = "_";
-    #[cfg(not(target_os = "macos"))]
-    let libc_prefix = "";
-
     #[cfg(windows)]
     let rt = &WIN64;
     #[cfg(not(windows))]
     let rt = &SYSV;
 
-    emit(rt, libc_prefix)
+    emit(rt)
 }
 
 #[cfg(test)]
@@ -114,11 +104,6 @@ mod tests {
     /// assembles the whole tree rather than each file alone: `.L` labels are
     /// not file-local the way they look.
     ///
-    /// The macOS spelling of the System V tree is covered too. macOS decorates
-    /// C symbols with a leading underscore, and no CI job builds for it, so
-    /// `{libc}` expanding to `_` is otherwise a substitution nothing ever
-    /// performs.
-    ///
     /// This is a Unix-host check, which is where it is worth having: GNU `as`
     /// assembles every variant, so the Linux job catches a Win64 mistake before
     /// Windows CI ever sees it. The reverse is not needed -- a System V
@@ -127,20 +112,16 @@ mod tests {
     #[test]
     #[cfg_attr(windows, ignore = "GNU as assembles every tree; Windows uses clang")]
     fn test_both_runtimes_assemble() {
-        // Every (tree, symbol prefix) pair the compiler can emit.
-        let variants = [
-            ("sysv", &SYSV, ""),
-            ("sysv-macos", &SYSV, "_"),
-            ("win64-native", &WIN64, ""),
-        ];
+        // Every tree the compiler can emit.
+        let variants = [("sysv", &SYSV), ("win64-native", &WIN64)];
 
-        for (name, rt, libc_prefix) in variants {
+        for (name, rt) in variants {
             let dir = std::env::temp_dir().join(format!("xbasic64-asm-{name}"));
             std::fs::create_dir_all(&dir).expect("writable temp directory");
             let asm = dir.join("runtime.s");
             let obj = dir.join("runtime.o");
 
-            std::fs::write(&asm, emit(rt, libc_prefix)).expect("writable assembly file");
+            std::fs::write(&asm, emit(rt)).expect("writable assembly file");
 
             let output = Command::new("as")
                 .arg("-o")

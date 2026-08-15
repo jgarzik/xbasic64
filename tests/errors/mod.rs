@@ -559,6 +559,90 @@ fn test_whole_record_is_not_a_value() {
     expect_rejected(&format!("{ty}PRINT Q + 1\n"), "has no value");
 }
 
+/// An input target is checked the way a value of the same shape would be.
+///
+/// Nothing checked these at all: `LINE INPUT N` compiled, and since codegen
+/// reads a string and stores it as it stands, N was handed a pointer to
+/// reinterpret as a double -- it printed 4.3e-315. A whole record, or a field
+/// that does not exist, went the same way unnoticed.
+#[test]
+fn test_input_targets_are_checked() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM R AS P\n";
+    expect_rejected("LINE INPUT N\n", "LINE INPUT needs a string variable");
+    expect_rejected(
+        "OPEN \"f\" FOR INPUT AS #1\nLINE INPUT #1, N\n",
+        "LINE INPUT needs a string variable",
+    );
+    expect_rejected(&format!("{ty}INPUT R\n"), "has no value");
+    expect_rejected(&format!("{ty}READ R\n"), "has no value");
+    expect_rejected(&format!("{ty}INPUT R.NOSUCH\n"), "has no field 'NOSUCH'");
+}
+
+/// ...and the forms that were always legal still are.
+#[test]
+fn test_valid_input_targets_still_compile() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM R AS P\n";
+    for source in [
+        "LINE INPUT S$\n",
+        "INPUT N\n",
+        "INPUT A$, B\n",
+        "DIM A(3)\nINPUT A(1)\n",
+        &format!("{ty}INPUT R.X\n"),
+        &format!("{ty}DATA 1\nREAD R.X\n"),
+    ] {
+        compile_only(source).unwrap_or_else(|e| panic!("{source:?} should compile:\n{}", e.stderr));
+    }
+}
+
+/// A file number outside 1-15 is refused rather than indexing off the table.
+///
+/// The runtime's handle table is 16 slots; nothing checked the index, so
+/// `AS #900000` wrote a FILE* far outside it and the program died with a
+/// segfault instead of a diagnostic. Slot 0 is stdout, so it is not a
+/// program's to open either.
+#[test]
+fn test_file_number_out_of_range() {
+    expect_rejected("OPEN \"a\" FOR OUTPUT AS #0\n", "file number");
+    expect_rejected("OPEN \"a\" FOR OUTPUT AS #16\n", "file number");
+    expect_rejected("CLOSE #99\n", "file number");
+    expect_rejected("PRINT EOF(0)\n", "file number");
+}
+
+/// The same check at run time, when the number is not a constant.
+#[test]
+fn test_file_number_out_of_range_at_runtime() {
+    for source in [
+        "PRINT \"before\"\nN = 900000\nCLOSE #N\n",
+        "PRINT \"before\"\nN = 900000\nPRINT EOF(N)\n",
+        "PRINT \"before\"\nN = 900000\nPRINT LOF(N)\n",
+        "PRINT \"before\"\nN = 0\nOPEN \"a\" FOR OUTPUT AS #N\n",
+    ] {
+        let run = compile_and_run_raw(source, "").unwrap();
+        assert!(
+            run.stderr.contains("Bad file number"),
+            "expected a diagnostic for {:?}, got {:?} / {:?}",
+            source,
+            run.stdout,
+            run.stderr
+        );
+        assert_eq!(run.exit_code, Some(1), "for {:?}", source);
+    }
+}
+
+/// ...including on the way to a file.
+///
+/// Sema's `PrintFile` arm is a copy of the `Print` one that never called
+/// `reject_record_value`, so `PRINT #1, Q` compiled and wrote garbage while
+/// `PRINT Q` was correctly refused.
+#[test]
+fn test_whole_record_is_not_a_value_to_a_file() {
+    let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\n";
+    expect_rejected(
+        &format!("{ty}OPEN \"r.txt\" FOR OUTPUT AS #1\nPRINT #1, Q\n"),
+        "has no value",
+    );
+}
+
 /// Using an array before its DIM has executed is a runtime error, not a
 /// compiler panic: the descriptor exists from the start, with a null element
 /// pointer until the DIM runs.
