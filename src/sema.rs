@@ -952,9 +952,7 @@ impl Analyzer {
                 );
                 return None;
             };
-            let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
-                return None;
-            };
+            let info = self.symbols.records.get(&rec.to_uppercase())?;
             match info.field(field) {
                 Some(f) => ty = f.ty.clone(),
                 None => {
