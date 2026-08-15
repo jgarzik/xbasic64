@@ -185,7 +185,9 @@ pub enum StmtKind {
     Cls,
     SelectCase {
         expr: Expr,
-        cases: Vec<(Option<Expr>, Vec<Stmt>)>, // (None = ELSE, Some = value)
+        /// `None` marks `CASE ELSE`; otherwise the alternatives, any of which
+        /// may match.
+        cases: Vec<(Option<Vec<CaseClause>>, Vec<Stmt>)>,
     },
     End,
     Stop,
@@ -239,6 +241,17 @@ pub enum TypeRef {
     FixedString(usize),
     /// A user-defined TYPE, by name.
     Record(String),
+}
+
+/// One alternative within a `CASE`.
+#[derive(Debug, Clone)]
+pub enum CaseClause {
+    /// `CASE 1`
+    Value(Expr),
+    /// `CASE 1 TO 10`, inclusive at both ends
+    Range(Expr, Expr),
+    /// `CASE IS > 100`
+    Compare(BinaryOp, Expr),
 }
 
 /// One procedure parameter.
@@ -1493,7 +1506,7 @@ impl Parser {
         let expr = self.parse_expression()?;
         self.skip_newlines();
 
-        let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
+        let mut cases: Vec<(Option<Vec<CaseClause>>, Vec<Stmt>)> = Vec::new();
 
         // Parse CASE blocks until END SELECT
         loop {
@@ -1517,7 +1530,7 @@ impl Parser {
                 self.advance();
                 None
             } else {
-                Some(self.parse_expression()?)
+                Some(self.parse_case_clauses()?)
             };
 
             self.skip_newlines();
@@ -1539,6 +1552,51 @@ impl Parser {
         }
 
         Ok(StmtKind::SelectCase { expr, cases })
+    }
+
+    /// Parse the alternatives of one `CASE`, which may be values, ranges or
+    /// `IS` comparisons, separated by commas.
+    fn parse_case_clauses(&mut self) -> PResult<Vec<CaseClause>> {
+        let mut clauses = Vec::new();
+        loop {
+            // `CASE IS > 100` compares the selector against a value.
+            let is_comparison = matches!(self.peek(), Token::Ident(n) if n == "IS");
+            if is_comparison {
+                self.advance();
+                let op = match self.advance() {
+                    Token::Eq => BinaryOp::Eq,
+                    Token::Ne => BinaryOp::Ne,
+                    Token::Lt => BinaryOp::Lt,
+                    Token::Gt => BinaryOp::Gt,
+                    Token::Le => BinaryOp::Le,
+                    Token::Ge => BinaryOp::Ge,
+                    tok => {
+                        return err(format!(
+                            "Expected a comparison after CASE IS, got {}",
+                            describe_token(&tok)
+                        ));
+                    }
+                };
+                clauses.push(CaseClause::Compare(op, self.parse_expression()?));
+            } else {
+                let first = self.parse_expression()?;
+                // `CASE 1 TO 10` is an inclusive range.
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                    let last = self.parse_expression()?;
+                    clauses.push(CaseClause::Range(first, last));
+                } else {
+                    clauses.push(CaseClause::Value(first));
+                }
+            }
+
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(clauses)
     }
 
     fn parse_goto(&mut self) -> PResult<StmtKind> {
@@ -2576,10 +2634,11 @@ mod tests {
         if let StmtKind::SelectCase { expr, cases } = &prog.statements[0].kind {
             assert!(matches!(expr, Expr::Variable(_)));
             assert_eq!(cases.len(), 1);
-            if let Some(Expr::Literal(Literal::String(s))) = &cases[0].0 {
-                assert_eq!(s, "yes");
-            } else {
-                panic!("Expected string literal in CASE");
+            match cases[0].0.as_deref() {
+                Some([CaseClause::Value(Expr::Literal(Literal::String(s)))]) => {
+                    assert_eq!(s, "yes")
+                }
+                other => panic!("Expected a single string CASE value, got {:?}", other),
             }
         } else {
             panic!("Expected SelectCase");

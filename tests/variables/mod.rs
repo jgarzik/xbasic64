@@ -109,3 +109,24 @@ PRINT LEN(A$); LEN(B$); LEN(C$)
     // LEN of "first", "second", "third", printed adjacently by `;`
     assert_eq!(lines[1], "565");
 }
+
+/// A variable may be named after a keyword when it carries a type suffix:
+/// keywords have no type, so `Line$` is a string variable. Stripping the
+/// suffix before the keyword lookup made LANGREF's own `LINE INPUT #1, Line$`
+/// example fail to parse.
+#[test]
+fn test_keyword_named_variables() {
+    let output = compile_and_run(
+        "Line$ = \"a\"\nPrint$ = \"b\"\nData$ = \"c\"\nEnd$ = \"d\"\nNext$ = \"e\"\nPRINT Line$; Print$; Data$; End$; Next$\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "abcde");
+}
+
+/// A float literal may start with the decimal point, as LANGREF documents.
+#[test]
+fn test_leading_dot_literals() {
+    let output = compile_and_run("PRINT .5\nPRINT .25 + .25\nPRINT .5E1\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["0.5", "0.5", "5"]);
+}

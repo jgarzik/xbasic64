@@ -259,7 +259,8 @@ impl<'a> Lexer<'a> {
         let mut s = String::new();
         s.push(first);
 
-        let mut is_float = false;
+        // A leading '.' means the decimal point is already consumed.
+        let mut is_float = first == '.';
         let mut has_exponent = false;
 
         while let Some(c) = self.peek() {
@@ -355,10 +356,19 @@ impl<'a> Lexer<'a> {
         s
     }
 
+    /// Classify a scanned word as a keyword or an identifier.
+    ///
+    /// A word carrying a type suffix is always an identifier: keywords have no
+    /// type, so `Line$` is a string variable, not the LINE keyword. Stripping
+    /// the suffix before the lookup -- as this used to -- made every variable
+    /// whose name matched a keyword unusable, which is why LANGREF's own
+    /// `LINE INPUT #1, Line$` example did not compile.
     fn keyword_or_ident(&self, s: &str) -> Token {
-        let base = s.trim_end_matches(['%', '&', '!', '#', '$']);
+        if s.ends_with(['%', '&', '!', '#', '$']) {
+            return Token::Ident(s.to_string());
+        }
         KEYWORDS
-            .get(base)
+            .get(s)
             .cloned()
             .unwrap_or_else(|| Token::Ident(s.to_string()))
     }
@@ -419,10 +429,16 @@ impl<'a> Lexer<'a> {
             '(' => Ok(Token::LParen),
             ')' => Ok(Token::RParen),
             ',' => Ok(Token::Comma),
-            // A '.' outside a number separates a record variable from a field.
-            // Numbers consume their own '.' in read_number, so this only fires
-            // for field access.
-            '.' => Ok(Token::Dot),
+            // A '.' introduces a number when a digit follows (`.5`), and
+            // otherwise separates a record variable from a field. Numbers that
+            // start with a digit consume their own '.' in read_number.
+            '.' => {
+                if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.read_number('.')
+                } else {
+                    Ok(Token::Dot)
+                }
+            }
             ';' => Ok(Token::Semicolon),
             ':' => Ok(Token::Colon),
             '#' => Ok(Token::Hash),

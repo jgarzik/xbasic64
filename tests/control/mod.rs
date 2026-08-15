@@ -421,3 +421,46 @@ fn test_exit_leaves_innermost_matching_loop() {
         "inner loop exited, outer continued"
     );
 }
+
+/// LANGREF documents four CASE forms; only single values worked. Ranges are
+/// inclusive at both ends.
+#[test]
+fn test_case_ranges() {
+    let output = compile_and_run(
+        "FOR G = 95 TO 65 STEP -10\nSELECT CASE G\nCASE 90 TO 100\nPRINT \"A\";\nCASE 80 TO 89\nPRINT \"B\";\nCASE 70 TO 79\nPRINT \"C\";\nCASE ELSE\nPRINT \"F\";\nEND SELECT\nNEXT G\nPRINT \"\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "ABCF");
+}
+
+/// A CASE may list several alternatives, and mix values with ranges.
+#[test]
+fn test_case_lists() {
+    let output = compile_and_run(
+        "FOR G = 1 TO 5\nSELECT CASE G\nCASE 1, 2\nPRINT \"low\";\nCASE 3, 4\nPRINT \"mid\";\nCASE ELSE\nPRINT \"hi\";\nEND SELECT\nNEXT G\nPRINT \"\"\nG = 7\nSELECT CASE G\nCASE 1, 5 TO 9, 20\nPRINT \"in\"\nCASE ELSE\nPRINT \"out\"\nEND SELECT\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["lowlowmidmidhi", "in"]);
+}
+
+/// CASE IS compares the selector rather than matching it.
+#[test]
+fn test_case_is_comparison() {
+    let output = compile_and_run(
+        "FOR G = 1 TO 3\nSELECT CASE G\nCASE IS > 2\nPRINT \"big\";\nCASE IS < 2\nPRINT \"small\";\nCASE ELSE\nPRINT \"two\";\nEND SELECT\nNEXT G\nPRINT \"\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "smalltwobig");
+}
+
+/// A string selector, which used to abort the compiler.
+#[test]
+fn test_case_on_strings() {
+    let output = compile_and_run(
+        "S$ = \"b\"\nSELECT CASE S$\nCASE \"a\"\nPRINT \"is a\"\nCASE \"b\"\nPRINT \"is b\"\nEND SELECT\nT$ = \"cat\"\nSELECT CASE T$\nCASE \"a\" TO \"m\"\nPRINT \"first half\"\nCASE ELSE\nPRINT \"second half\"\nEND SELECT\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["is b", "first half"]);
+}

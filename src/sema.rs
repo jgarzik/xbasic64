@@ -591,9 +591,17 @@ impl Analyzer {
             }
             StmtKind::SelectCase { expr, cases } => {
                 self.check_expr(expr, scope, line);
-                for (value, body) in cases {
-                    if let Some(v) = value {
-                        self.check_expr(v, scope, line);
+                for (clauses, body) in cases {
+                    for clause in clauses.iter().flatten() {
+                        match clause {
+                            CaseClause::Value(e) | CaseClause::Compare(_, e) => {
+                                self.check_expr(e, scope, line)
+                            }
+                            CaseClause::Range(lo, hi) => {
+                                self.check_expr(lo, scope, line);
+                                self.check_expr(hi, scope, line);
+                            }
+                        }
                     }
                     self.check(body, scope);
                 }

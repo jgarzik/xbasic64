@@ -99,3 +99,34 @@ PRINT D$
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["1", "two", "3.5", "four"]);
 }
+
+/// RESTORE with a line number resumes at that line's DATA. It used to accept
+/// the argument and silently restart from the beginning.
+#[test]
+fn test_restore_to_line() {
+    let output = compile_and_run(
+        "100 DATA 1, 2\n110 DATA 3, 4\n120 READ A\n130 READ B\n140 RESTORE 110\n150 READ C\n160 PRINT A; B; C\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "123");
+}
+
+/// Bare RESTORE still restarts from the first DATA item.
+#[test]
+fn test_restore_to_start() {
+    let output = compile_and_run(
+        "100 DATA 1, 2\n110 DATA 3, 4\n120 READ A\n130 READ B\n140 RESTORE\n150 READ C\n160 PRINT A; B; C\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "121");
+}
+
+/// RESTORE also accepts a named label.
+#[test]
+fn test_restore_to_label() {
+    let output = compile_and_run(
+        "DATA 1, 2\nLater:\nDATA 3, 4\nREAD A\nRESTORE Later\nREAD B\nPRINT A; B\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "13");
+}

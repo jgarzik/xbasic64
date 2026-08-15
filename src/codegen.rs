@@ -439,6 +439,10 @@ pub struct CodeGen {
     record_globals: BTreeMap<String, i32>,
     /// Element size in words for arrays of records, by upper-case name.
     record_elem_words: HashMap<String, i32>,
+    /// DATA item index reached at each numeric line label, for RESTORE.
+    data_line_index: HashMap<u32, usize>,
+    /// The same for named labels.
+    data_label_index: HashMap<String, usize>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -1008,6 +1012,15 @@ impl CodeGen {
         match &stmt.kind {
             StmtKind::Data(values) => self.data_items.extend(values.clone()),
             StmtKind::Gosub(_) => self.gosub_used = true,
+            // Record where each label sits in the DATA stream, so RESTORE can
+            // resume from it.
+            StmtKind::Label(n) => {
+                self.data_line_index.insert(*n, self.data_items.len());
+            }
+            StmtKind::LabelName(name) => {
+                self.data_label_index
+                    .insert(name.to_uppercase(), self.data_items.len());
+            }
             _ => {}
         }
         // Recurse into nested statements
@@ -1781,13 +1794,20 @@ impl CodeGen {
             }
 
             StmtKind::Restore(target) => {
-                let idx = if let Some(_t) = target {
-                    // TODO: find DATA line index
-                    0
-                } else {
-                    0
+                // RESTORE <line> resumes reading at the first DATA item at or
+                // after that line. preprocess recorded how many items had been
+                // seen when each label was reached; without that this always
+                // restarted from the beginning, silently.
+                let idx = match target {
+                    Some(GotoTarget::Line(n)) => self.data_line_index.get(n).copied().unwrap_or(0),
+                    Some(GotoTarget::Label(name)) => self
+                        .data_label_index
+                        .get(&name.to_uppercase())
+                        .copied()
+                        .unwrap_or(0),
+                    None => 0,
                 };
-                self.emit_arg_imm(0, idx);
+                self.emit_arg_imm(0, idx as i64);
                 self.emit("    call _rt_restore");
             }
 
@@ -1877,15 +1897,28 @@ impl CodeGen {
             StmtKind::SelectCase { expr, cases } => {
                 let end_label = self.new_label("endselect");
 
-                // Evaluate SELECT expression and save to temp
+                // Evaluate the selector once, into a frame slot. A string
+                // needs two words, for its pointer and length.
+                let is_string = self.expr_type(expr) == DataType::String;
                 let expr_type = self.gen_expr(expr);
-                self.gen_coercion(expr_type, DataType::Double);
-                self.stack_offset -= 8;
-                let temp_offset = self.stack_offset;
-                self.emit(&format!(
-                    "    movsd QWORD PTR [rbp + {}], xmm0",
-                    temp_offset
-                ));
+                let temp_offset;
+                if is_string {
+                    self.stack_offset -= 16;
+                    temp_offset = self.stack_offset;
+                    self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", temp_offset));
+                    self.emit(&format!(
+                        "    mov QWORD PTR [rbp + {}], rdx",
+                        temp_offset + 8
+                    ));
+                } else {
+                    self.gen_coercion(expr_type, DataType::Double);
+                    self.stack_offset -= 8;
+                    temp_offset = self.stack_offset;
+                    self.emit(&format!(
+                        "    movsd QWORD PTR [rbp + {}], xmm0",
+                        temp_offset
+                    ));
+                }
 
                 // Generate code for each case
                 for (i, (case_value, body)) in cases.iter().enumerate() {
@@ -1895,16 +1928,15 @@ impl CodeGen {
                         end_label.clone()
                     };
 
-                    if let Some(value) = case_value {
-                        // Evaluate case value and compare
-                        let val_type = self.gen_expr(value);
-                        self.gen_coercion(val_type, DataType::Double);
-                        self.emit(&format!(
-                            "    movsd xmm1, QWORD PTR [rbp + {}]",
-                            temp_offset
-                        ));
-                        self.emit("    ucomisd xmm0, xmm1");
-                        self.emit(&format!("    jne {}", next_case_label));
+                    if let Some(clauses) = case_value {
+                        // Any alternative matching enters the body; all of them
+                        // failing moves on to the next CASE.
+                        let body_label = self.new_label("casebody");
+                        for clause in clauses {
+                            self.gen_case_clause(clause, temp_offset, is_string, &body_label);
+                        }
+                        self.emit(&format!("    jmp {}", next_case_label));
+                        self.emit_label(&body_label);
                     }
                     // CASE ELSE (None) falls through without comparison
 
@@ -3090,6 +3122,115 @@ impl CodeGen {
         self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
         self.emit_arg_imm(1, text.len() as i64);
         self.emit("    call _rt_print_string");
+    }
+
+    /// Emit one CASE alternative: jump to `body_label` when it matches.
+    ///
+    /// The selector was evaluated once, into the frame slot at `temp_offset`.
+    fn gen_case_clause(
+        &mut self,
+        clause: &CaseClause,
+        temp_offset: i32,
+        is_string: bool,
+        body_label: &str,
+    ) {
+        if is_string {
+            return self.gen_case_clause_string(clause, temp_offset, body_label);
+        }
+        let sel = format!("QWORD PTR [rbp + {}]", temp_offset);
+        match clause {
+            CaseClause::Value(e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    je {}", body_label));
+            }
+            CaseClause::Range(lo, hi) => {
+                // Inclusive at both ends. The low bound is tested first, and a
+                // failure skips the high test.
+                let skip = self.new_label("caseskip");
+                let t = self.gen_expr(lo);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    jb {}", skip));
+                let t = self.gen_expr(hi);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                self.emit(&format!("    jbe {}", body_label));
+                self.emit_label(&skip);
+            }
+            CaseClause::Compare(op, e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Double);
+                self.emit(&format!("    movsd xmm1, {}", sel));
+                self.emit("    ucomisd xmm1, xmm0");
+                // Unsigned conditions, since ucomisd sets the carry flag.
+                let cc = match op {
+                    BinaryOp::Eq => "je",
+                    BinaryOp::Ne => "jne",
+                    BinaryOp::Lt => "jb",
+                    BinaryOp::Gt => "ja",
+                    BinaryOp::Le => "jbe",
+                    BinaryOp::Ge => "jae",
+                    _ => unreachable!("the parser only builds comparisons here"),
+                };
+                self.emit(&format!("    {} {}", cc, body_label));
+            }
+        }
+    }
+
+    /// A CASE alternative on a string selector.
+    ///
+    /// Comparison goes through `_rt_strcmp`, the same helper the relational
+    /// operators use, so ordering is consistent between `CASE "a" TO "m"` and
+    /// `IF S$ >= "a" AND S$ <= "m"`.
+    fn gen_case_clause_string(&mut self, clause: &CaseClause, temp: i32, body_label: &str) {
+        // Compare the selector against the expression, leaving memcmp-style
+        // ordering in eax.
+        let compare = |s: &mut Self, e: &Expr| {
+            s.gen_expr(e);
+            s.emit("    mov r10, rax");
+            s.emit("    mov r11, rdx");
+            s.emit(&format!("    mov rax, QWORD PTR [rbp + {}]", temp));
+            s.emit(&format!("    mov rdx, QWORD PTR [rbp + {}]", temp + 8));
+            s.emit_arg_reg(0, "rax");
+            s.emit_arg_reg(1, "rdx");
+            s.emit_arg_reg(2, "r10");
+            s.emit_arg_reg(3, "r11");
+            s.emit("    call _rt_strcmp");
+            s.emit("    test eax, eax");
+        };
+
+        match clause {
+            CaseClause::Value(e) => {
+                compare(self, e);
+                self.emit(&format!("    je {}", body_label));
+            }
+            CaseClause::Range(lo, hi) => {
+                let skip = self.new_label("caseskip");
+                compare(self, lo);
+                self.emit(&format!("    jl {}", skip));
+                compare(self, hi);
+                self.emit(&format!("    jle {}", body_label));
+                self.emit_label(&skip);
+            }
+            CaseClause::Compare(op, e) => {
+                compare(self, e);
+                let cc = match op {
+                    BinaryOp::Eq => "je",
+                    BinaryOp::Ne => "jne",
+                    BinaryOp::Lt => "jl",
+                    BinaryOp::Gt => "jg",
+                    BinaryOp::Le => "jle",
+                    BinaryOp::Ge => "jge",
+                    _ => unreachable!("the parser only builds comparisons here"),
+                };
+                self.emit(&format!("    {} {}", cc, body_label));
+            }
+        }
     }
 
     /// Emit one WRITE value: strings are quoted, numbers printed as usual.

@@ -9,6 +9,7 @@ mod arithmetic;
 mod arrays;
 mod control;
 mod data;
+mod docs;
 mod errors;
 mod file_io;
 mod input;
