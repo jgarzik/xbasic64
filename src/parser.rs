@@ -46,9 +46,22 @@ pub struct Program {
     pub statements: Vec<Stmt>,
 }
 
+/// A statement together with the source line it started on.
+///
+/// The line is recorded once, at the statement level: BASIC is line-oriented,
+/// so that is the resolution diagnostics actually need, and it avoids threading
+/// spans through every token and expression.
 #[derive(Debug, Clone)]
-pub enum Stmt {
+pub struct Stmt {
+    pub line: u32,
+    pub kind: StmtKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum StmtKind {
     Label(u32), // Line number label
+    /// A named label definition (`Retry:`), usable as a GOTO/GOSUB target.
+    LabelName(String),
     Let {
         name: String,
         indices: Option<Vec<Expr>>, // For array assignment
@@ -253,6 +266,38 @@ impl DataType {
     }
 }
 
+/// Every nested statement body directly contained by `stmt`.
+///
+/// This is the single place that knows which `Stmt` variants carry child
+/// statements. Any pass that walks the AST must go through it, so that adding a
+/// block-bearing statement cannot silently leave a walker behind: omitting
+/// `SelectCase` here previously caused `GOSUB` inside a `SELECT CASE` to fail to
+/// link and `DATA` inside one to be dropped.
+pub fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
+    match &stmt.kind {
+        StmtKind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            let mut v = vec![then_branch.as_slice()];
+            if let Some(eb) = else_branch {
+                v.push(eb.as_slice());
+            }
+            v
+        }
+        StmtKind::SelectCase { cases, .. } => {
+            cases.iter().map(|(_, body)| body.as_slice()).collect()
+        }
+        StmtKind::For { body, .. }
+        | StmtKind::While { body, .. }
+        | StmtKind::DoLoop { body, .. }
+        | StmtKind::Sub { body, .. }
+        | StmtKind::Function { body, .. } => vec![body.as_slice()],
+        _ => vec![],
+    }
+}
+
 // ============================================================================
 // Parse errors and block terminators
 // ============================================================================
@@ -332,6 +377,20 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+/// A parse error together with the source line it was found on.
+#[derive(Debug, Clone)]
+pub struct LocatedParseError {
+    /// Source line, or 0 when the line is unknown.
+    pub line: u32,
+    pub error: ParseError,
+}
+
+impl std::fmt::Display for LocatedParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+
 /// Shorthand for the parser's result type.
 type PResult<T> = Result<T, ParseError>;
 
@@ -347,17 +406,44 @@ fn err<T>(msg: impl Into<String>) -> PResult<T> {
 #[derive(Default)]
 pub struct Parser {
     tokens: Vec<Token>,
+    /// Source line of each token, parallel to `tokens`. Empty when unknown.
+    lines: Vec<u32>,
     pos: usize,
     /// Tracks declared array names for distinguishing array access from function calls
     declared_arrays: HashSet<String>,
+    /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
+    /// start of a line is not mistaken for a label definition.
+    declared_procs: HashSet<String>,
 }
 
 impl Parser {
-    pub fn new(tokens: Vec<Token>) -> Self {
+    /// Build a parser. `lines` gives each token's source line, and may be
+    /// empty when position information is unavailable.
+    pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
+        let declared_procs = Self::scan_proc_names(&tokens);
         Parser {
             tokens,
+            lines,
+            declared_procs,
             ..Default::default()
         }
+    }
+
+    /// Collect the names following SUB and FUNCTION, before parsing.
+    ///
+    /// Needed up front because a procedure may be defined after the line that
+    /// calls it, and `Name:` has to be classified as a label or a call at the
+    /// point it is parsed.
+    fn scan_proc_names(tokens: &[Token]) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for pair in tokens.windows(2) {
+            if matches!(pair[0], Token::Sub | Token::Function) {
+                if let Token::Ident(n) = &pair[1] {
+                    names.insert(n.to_uppercase());
+                }
+            }
+        }
+        names
     }
 
     fn peek(&self) -> &Token {
@@ -367,6 +453,39 @@ impl Parser {
     /// Look `n` tokens past the current one without consuming anything.
     fn peek_at(&self, n: usize) -> &Token {
         self.tokens.get(self.pos + n).unwrap_or(&Token::Eof)
+    }
+
+    /// Source line of the current token, or 0 when unknown (no line map).
+    fn cur_line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(0)
+    }
+
+    /// True if the current token begins a logical line, so that `Name:` there
+    /// can be a label definition.
+    fn at_line_start(&self) -> bool {
+        match self.pos.checked_sub(1) {
+            None => true,
+            Some(prev) => matches!(
+                self.tokens.get(prev),
+                Some(Token::Newline) | Some(Token::LineNumber(_)) | None
+            ),
+        }
+    }
+
+    /// True if `Name :` at the current position is a label definition.
+    ///
+    /// `Name:` is ambiguous in principle -- it could be a label, or a call to a
+    /// parameterless SUB followed by the `:` statement separator. BASIC resolves
+    /// this by position (a label starts a line), and we additionally refuse to
+    /// read a declared procedure's name as a label, so `MySub : PRINT "x"`
+    /// still calls the procedure.
+    fn at_label_definition(&self) -> bool {
+        let Token::Ident(name) = self.peek() else {
+            return false;
+        };
+        matches!(self.peek_at(1), Token::Colon)
+            && self.at_line_start()
+            && !self.declared_procs.contains(&name.to_uppercase())
     }
 
     /// True if the upcoming tokens close a SELECT CASE.
@@ -399,8 +518,12 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> Result<Program, String> {
-        self.parse_program().map_err(|e| e.to_string())
+    pub fn parse(&mut self) -> Result<Program, LocatedParseError> {
+        self.parse_program().map_err(|error| LocatedParseError {
+            // `pos` is left at the token that stopped the parse.
+            line: self.cur_line(),
+            error,
+        })
     }
 
     fn parse_program(&mut self) -> PResult<Program> {
@@ -416,17 +539,36 @@ impl Parser {
         Ok(Program { statements })
     }
 
+    /// Parse one statement, tagging it with the line it started on.
+    ///
+    /// `?` propagates `ParseError::Block` unchanged, so the block-terminator
+    /// protocol is unaffected by the wrapping.
     fn parse_statement(&mut self) -> PResult<Stmt> {
+        let line = self.cur_line();
+        let kind = self.parse_statement_kind()?;
+        Ok(Stmt { line, kind })
+    }
+
+    fn parse_statement_kind(&mut self) -> PResult<StmtKind> {
         // Handle line numbers as labels
         if let Token::LineNumber(n) = self.peek().clone() {
             self.advance();
-            return Ok(Stmt::Label(n));
+            return Ok(StmtKind::Label(n));
+        }
+
+        // A named label definition: `Retry:` at the start of a line.
+        if self.at_label_definition() {
+            let Token::Ident(name) = self.advance() else {
+                unreachable!("at_label_definition checked for an identifier")
+            };
+            self.advance(); // consume ':'
+            return Ok(StmtKind::LabelName(name));
         }
 
         // Handle colon as statement separator
         if matches!(self.peek(), Token::Colon) {
             self.advance();
-            return self.parse_statement();
+            return self.parse_statement_kind();
         }
 
         match self.peek().clone() {
@@ -442,7 +584,7 @@ impl Parser {
             Token::Gosub => self.parse_gosub(),
             Token::Return => {
                 self.advance();
-                Ok(Stmt::Return)
+                Ok(StmtKind::Return)
             }
             Token::On => self.parse_on_goto(),
             Token::Dim => self.parse_dim(),
@@ -453,7 +595,7 @@ impl Parser {
             Token::Restore => self.parse_restore(),
             Token::Cls => {
                 self.advance();
-                Ok(Stmt::Cls)
+                Ok(StmtKind::Cls)
             }
             Token::Open => self.parse_open(),
             Token::Close => self.parse_close(),
@@ -478,7 +620,7 @@ impl Parser {
                         self.advance();
                         Err(ParseError::Block(BlockEnd::EndSelect))
                     }
-                    _ => Ok(Stmt::End),
+                    _ => Ok(StmtKind::End),
                 }
             }
             Token::EndIf => {
@@ -499,7 +641,7 @@ impl Parser {
             }
             Token::Stop => {
                 self.advance();
-                Ok(Stmt::Stop)
+                Ok(StmtKind::Stop)
             }
             Token::Next => {
                 self.advance();
@@ -547,13 +689,13 @@ impl Parser {
             Token::Ident(_) => self.parse_assignment_or_call(),
             Token::Newline => {
                 self.advance();
-                self.parse_statement()
+                self.parse_statement_kind()
             }
             _ => err(format!("Unexpected token: {:?}", self.peek())),
         }
     }
 
-    fn parse_print(&mut self) -> PResult<Stmt> {
+    fn parse_print(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume PRINT
 
         // Check for PRINT #n (file output)
@@ -594,17 +736,17 @@ impl Parser {
         }
 
         if let Some(file_num) = file_num {
-            Ok(Stmt::PrintFile {
+            Ok(StmtKind::PrintFile {
                 file_num,
                 items,
                 newline,
             })
         } else {
-            Ok(Stmt::Print { items, newline })
+            Ok(StmtKind::Print { items, newline })
         }
     }
 
-    fn parse_input(&mut self) -> PResult<Stmt> {
+    fn parse_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume INPUT
 
         // Check for INPUT #n (file input)
@@ -629,7 +771,7 @@ impl Parser {
                 }
             }
 
-            return Ok(Stmt::InputFile { file_num, vars });
+            return Ok(StmtKind::InputFile { file_num, vars });
         }
 
         let mut prompt = None;
@@ -656,10 +798,10 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::Input { prompt, vars })
+        Ok(StmtKind::Input { prompt, vars })
     }
 
-    fn parse_line_input(&mut self) -> PResult<Stmt> {
+    fn parse_line_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LINE
         self.expect(Token::Input)?;
 
@@ -680,15 +822,15 @@ impl Parser {
             return err("Expected variable name after LINE INPUT");
         };
 
-        Ok(Stmt::LineInput { prompt, var })
+        Ok(StmtKind::LineInput { prompt, var })
     }
 
-    fn parse_let(&mut self) -> PResult<Stmt> {
+    fn parse_let(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LET
         self.parse_assignment()
     }
 
-    fn parse_assignment(&mut self) -> PResult<Stmt> {
+    fn parse_assignment(&mut self) -> PResult<StmtKind> {
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
@@ -708,14 +850,14 @@ impl Parser {
         self.expect(Token::Eq)?;
         let value = self.parse_expression()?;
 
-        Ok(Stmt::Let {
+        Ok(StmtKind::Let {
             name,
             indices,
             value,
         })
     }
 
-    fn parse_assignment_or_call(&mut self) -> PResult<Stmt> {
+    fn parse_assignment_or_call(&mut self) -> PResult<StmtKind> {
         let name = if let Token::Ident(n) = self.advance() {
             n
         } else {
@@ -735,20 +877,20 @@ impl Parser {
                 // Array assignment
                 self.advance();
                 let value = self.parse_expression()?;
-                Ok(Stmt::Let {
+                Ok(StmtKind::Let {
                     name,
                     indices: Some(args),
                     value,
                 })
             } else {
                 // Subroutine call
-                Ok(Stmt::Call { name, args })
+                Ok(StmtKind::Call { name, args })
             }
         } else if matches!(self.peek(), Token::Eq) {
             // Simple assignment
             self.advance();
             let value = self.parse_expression()?;
-            Ok(Stmt::Let {
+            Ok(StmtKind::Let {
                 name,
                 indices: None,
                 value,
@@ -767,11 +909,11 @@ impl Parser {
                     break;
                 }
             }
-            Ok(Stmt::Call { name, args })
+            Ok(StmtKind::Call { name, args })
         }
     }
 
-    fn parse_if(&mut self) -> PResult<Stmt> {
+    fn parse_if(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
         self.expect(Token::Then)?;
@@ -788,7 +930,7 @@ impl Parser {
                 None
             };
 
-            return Ok(Stmt::If {
+            return Ok(StmtKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -799,7 +941,7 @@ impl Parser {
         self.skip_newlines();
         let (then_branch, else_branch) = self.parse_if_body()?;
 
-        Ok(Stmt::If {
+        Ok(StmtKind::If {
             condition,
             then_branch,
             else_branch,
@@ -812,6 +954,9 @@ impl Parser {
         let mut body = Vec::new();
 
         loop {
+            // Captured before parsing so an ELSEIF's synthesized nested IF can
+            // be attributed to the ELSEIF line rather than to END IF.
+            let stmt_line = self.cur_line();
             match self.parse_statement() {
                 Ok(stmt) => {
                     body.push(stmt);
@@ -838,10 +983,13 @@ impl Parser {
                     self.skip_newlines();
                     let (nested_then, nested_else) = self.parse_if_body()?;
 
-                    let nested_if = Stmt::If {
-                        condition: elseif_condition,
-                        then_branch: nested_then,
-                        else_branch: nested_else,
+                    let nested_if = Stmt {
+                        line: stmt_line,
+                        kind: StmtKind::If {
+                            condition: elseif_condition,
+                            then_branch: nested_then,
+                            else_branch: nested_else,
+                        },
                     };
 
                     return Ok((body, Some(vec![nested_if])));
@@ -852,7 +1000,7 @@ impl Parser {
         }
     }
 
-    fn parse_for(&mut self) -> PResult<Stmt> {
+    fn parse_for(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume FOR
         let var = if let Token::Ident(n) = self.advance() {
             n
@@ -884,7 +1032,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(Stmt::For {
+        Ok(StmtKind::For {
             var,
             start,
             end,
@@ -893,7 +1041,7 @@ impl Parser {
         })
     }
 
-    fn parse_while(&mut self) -> PResult<Stmt> {
+    fn parse_while(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume WHILE
         let condition = self.parse_expression()?;
         self.skip_newlines();
@@ -908,10 +1056,10 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(Stmt::While { condition, body })
+        Ok(StmtKind::While { condition, body })
     }
 
-    fn parse_do_loop(&mut self) -> PResult<Stmt> {
+    fn parse_do_loop(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DO
 
         // Check for DO WHILE/UNTIL at start
@@ -955,7 +1103,7 @@ impl Parser {
         // Use end condition if no start condition, or start condition takes precedence
         let final_condition = condition.or(end_condition);
 
-        Ok(Stmt::DoLoop {
+        Ok(StmtKind::DoLoop {
             condition: final_condition,
             cond_at_start,
             is_until: if cond_at_start {
@@ -967,7 +1115,7 @@ impl Parser {
         })
     }
 
-    fn parse_select_case(&mut self) -> PResult<Stmt> {
+    fn parse_select_case(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume SELECT
         self.expect(Token::Case)?;
         let expr = self.parse_expression()?;
@@ -1018,19 +1166,19 @@ impl Parser {
             cases.push((case_value, body));
         }
 
-        Ok(Stmt::SelectCase { expr, cases })
+        Ok(StmtKind::SelectCase { expr, cases })
     }
 
-    fn parse_goto(&mut self) -> PResult<Stmt> {
+    fn parse_goto(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume GOTO
         let target = self.parse_goto_target()?;
-        Ok(Stmt::Goto(target))
+        Ok(StmtKind::Goto(target))
     }
 
-    fn parse_gosub(&mut self) -> PResult<Stmt> {
+    fn parse_gosub(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume GOSUB
         let target = self.parse_goto_target()?;
-        Ok(Stmt::Gosub(target))
+        Ok(StmtKind::Gosub(target))
     }
 
     fn parse_goto_target(&mut self) -> PResult<GotoTarget> {
@@ -1042,7 +1190,7 @@ impl Parser {
         }
     }
 
-    fn parse_on_goto(&mut self) -> PResult<Stmt> {
+    fn parse_on_goto(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ON
         let expr = self.parse_expression()?;
         self.expect(Token::Goto)?;
@@ -1057,10 +1205,10 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::OnGoto { expr, targets })
+        Ok(StmtKind::OnGoto { expr, targets })
     }
 
-    fn parse_dim(&mut self) -> PResult<Stmt> {
+    fn parse_dim(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DIM
         let mut arrays = Vec::new();
 
@@ -1087,10 +1235,10 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::Dim { arrays })
+        Ok(StmtKind::Dim { arrays })
     }
 
-    fn parse_sub(&mut self) -> PResult<Stmt> {
+    fn parse_sub(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume SUB
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -1119,10 +1267,10 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(Stmt::Sub { name, params, body })
+        Ok(StmtKind::Sub { name, params, body })
     }
 
-    fn parse_function(&mut self) -> PResult<Stmt> {
+    fn parse_function(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume FUNCTION
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -1151,7 +1299,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(Stmt::Function { name, params, body })
+        Ok(StmtKind::Function { name, params, body })
     }
 
     fn parse_param_list(&mut self) -> PResult<Vec<String>> {
@@ -1168,7 +1316,7 @@ impl Parser {
         Ok(params)
     }
 
-    fn parse_data(&mut self) -> PResult<Stmt> {
+    fn parse_data(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DATA
         let mut values = Vec::new();
 
@@ -1203,10 +1351,10 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::Data(values))
+        Ok(StmtKind::Data(values))
     }
 
-    fn parse_read(&mut self) -> PResult<Stmt> {
+    fn parse_read(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume READ
         let mut vars = Vec::new();
 
@@ -1220,20 +1368,20 @@ impl Parser {
             }
         }
 
-        Ok(Stmt::Read(vars))
+        Ok(StmtKind::Read(vars))
     }
 
-    fn parse_restore(&mut self) -> PResult<Stmt> {
+    fn parse_restore(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume RESTORE
         let target = if matches!(self.peek(), Token::Integer(_) | Token::Ident(_)) {
             Some(self.parse_goto_target()?)
         } else {
             None
         };
-        Ok(Stmt::Restore(target))
+        Ok(StmtKind::Restore(target))
     }
 
-    fn parse_open(&mut self) -> PResult<Stmt> {
+    fn parse_open(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume OPEN
 
         // Parse filename expression
@@ -1269,14 +1417,14 @@ impl Parser {
             tok => return err(format!("Expected file number after #, got {:?}", tok)),
         };
 
-        Ok(Stmt::Open {
+        Ok(StmtKind::Open {
             filename,
             mode,
             file_num,
         })
     }
 
-    fn parse_close(&mut self) -> PResult<Stmt> {
+    fn parse_close(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume CLOSE
 
         // Expect #n
@@ -1286,7 +1434,7 @@ impl Parser {
             tok => return err(format!("Expected file number after #, got {:?}", tok)),
         };
 
-        Ok(Stmt::Close { file_num })
+        Ok(StmtKind::Close { file_num })
     }
 
     // Expression parsing with precedence climbing
@@ -1411,8 +1559,9 @@ mod tests {
     fn parse(input: &str) -> Result<Program, String> {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
-        let mut parser = Parser::new(tokens);
-        parser.parse()
+        let lines = lexer.line_map().to_vec();
+        let mut parser = Parser::new(tokens, lines);
+        parser.parse().map_err(|e| e.to_string())
     }
 
     // ===================
@@ -1423,7 +1572,7 @@ mod tests {
     fn test_label() {
         let prog = parse("10 PRINT X").unwrap();
         assert_eq!(prog.statements.len(), 2);
-        if let Stmt::Label(n) = &prog.statements[0] {
+        if let StmtKind::Label(n) = &prog.statements[0].kind {
             assert_eq!(*n, 10);
         } else {
             panic!("Expected Label");
@@ -1434,9 +1583,9 @@ mod tests {
     fn test_multiple_labels() {
         let prog = parse("10 X = 1\n20 Y = 2\n30 END").unwrap();
         assert_eq!(prog.statements.len(), 6); // 3 labels + 3 statements
-        assert!(matches!(&prog.statements[0], Stmt::Label(10)));
-        assert!(matches!(&prog.statements[2], Stmt::Label(20)));
-        assert!(matches!(&prog.statements[4], Stmt::Label(30)));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Label(10)));
+        assert!(matches!(&prog.statements[2].kind, StmtKind::Label(20)));
+        assert!(matches!(&prog.statements[4].kind, StmtKind::Label(30)));
     }
 
     // ===================
@@ -1447,11 +1596,11 @@ mod tests {
     fn test_let_simple() {
         let prog = parse("X = 42").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Let {
+        if let StmtKind::Let {
             name,
             indices,
             value,
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(name, "X");
             assert!(indices.is_none());
@@ -1465,7 +1614,7 @@ mod tests {
     fn test_let_with_keyword() {
         let prog = parse("LET X = 42").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Let { name, .. } = &prog.statements[0] {
+        if let StmtKind::Let { name, .. } = &prog.statements[0].kind {
             assert_eq!(name, "X");
         } else {
             panic!("Expected Let");
@@ -1476,11 +1625,11 @@ mod tests {
     fn test_let_array_assignment() {
         let prog = parse("A(5) = 100").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Let {
+        if let StmtKind::Let {
             name,
             indices,
             value,
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(name, "A");
             assert!(indices.is_some());
@@ -1496,7 +1645,7 @@ mod tests {
     fn test_let_expression() {
         let prog = parse("X = 1 + 2 * 3").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             // Should be 1 + (2 * 3) due to precedence
             if let Expr::Binary { op, .. } = value {
                 assert_eq!(*op, BinaryOp::Add);
@@ -1516,7 +1665,7 @@ mod tests {
     fn test_print_string() {
         let prog = parse(r#"PRINT "Hello""#).unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Print { items, newline } = &prog.statements[0] {
+        if let StmtKind::Print { items, newline } = &prog.statements[0].kind {
             assert_eq!(items.len(), 1);
             assert!(*newline);
         } else {
@@ -1527,7 +1676,7 @@ mod tests {
     #[test]
     fn test_print_multiple_items() {
         let prog = parse(r#"PRINT "A"; B; C"#).unwrap();
-        if let Stmt::Print { items, .. } = &prog.statements[0] {
+        if let StmtKind::Print { items, .. } = &prog.statements[0].kind {
             assert_eq!(items.len(), 5); // "A", Empty, B, Empty, C
         } else {
             panic!("Expected Print");
@@ -1537,7 +1686,7 @@ mod tests {
     #[test]
     fn test_print_with_tab() {
         let prog = parse(r#"PRINT A, B"#).unwrap();
-        if let Stmt::Print { items, .. } = &prog.statements[0] {
+        if let StmtKind::Print { items, .. } = &prog.statements[0].kind {
             assert!(items.iter().any(|i| matches!(i, PrintItem::Tab)));
         } else {
             panic!("Expected Print");
@@ -1547,7 +1696,7 @@ mod tests {
     #[test]
     fn test_print_no_newline() {
         let prog = parse(r#"PRINT X;"#).unwrap();
-        if let Stmt::Print { newline, .. } = &prog.statements[0] {
+        if let StmtKind::Print { newline, .. } = &prog.statements[0].kind {
             assert!(!*newline);
         } else {
             panic!("Expected Print");
@@ -1562,7 +1711,7 @@ mod tests {
     fn test_input_simple() {
         let prog = parse("INPUT X").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Input { prompt, vars } = &prog.statements[0] {
+        if let StmtKind::Input { prompt, vars } = &prog.statements[0].kind {
             assert!(prompt.is_none());
             assert_eq!(vars.len(), 1);
             assert_eq!(vars[0], "X");
@@ -1574,7 +1723,7 @@ mod tests {
     #[test]
     fn test_input_with_prompt() {
         let prog = parse(r#"INPUT "Enter value: ", X"#).unwrap();
-        if let Stmt::Input { prompt, vars } = &prog.statements[0] {
+        if let StmtKind::Input { prompt, vars } = &prog.statements[0].kind {
             assert_eq!(prompt.as_ref().unwrap(), "Enter value: ");
             assert_eq!(vars[0], "X");
         } else {
@@ -1585,7 +1734,7 @@ mod tests {
     #[test]
     fn test_input_multiple_vars() {
         let prog = parse("INPUT A, B, C").unwrap();
-        if let Stmt::Input { vars, .. } = &prog.statements[0] {
+        if let StmtKind::Input { vars, .. } = &prog.statements[0].kind {
             assert_eq!(vars.len(), 3);
         } else {
             panic!("Expected Input");
@@ -1600,7 +1749,7 @@ mod tests {
     fn test_line_input_simple() {
         let prog = parse("LINE INPUT X$").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::LineInput { prompt, var } = &prog.statements[0] {
+        if let StmtKind::LineInput { prompt, var } = &prog.statements[0].kind {
             assert!(prompt.is_none());
             assert_eq!(var, "X$");
         } else {
@@ -1611,7 +1760,7 @@ mod tests {
     #[test]
     fn test_line_input_with_prompt() {
         let prog = parse(r#"LINE INPUT "Name: ", NAME$"#).unwrap();
-        if let Stmt::LineInput { prompt, var } = &prog.statements[0] {
+        if let StmtKind::LineInput { prompt, var } = &prog.statements[0].kind {
             assert_eq!(prompt.as_ref().unwrap(), "Name: ");
             assert_eq!(var, "NAME$");
         } else {
@@ -1627,11 +1776,11 @@ mod tests {
     fn test_if_single_line() {
         let prog = parse("IF X > 0 THEN PRINT X").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::If {
+        if let StmtKind::If {
             condition,
             then_branch,
             else_branch,
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert!(matches!(
                 condition,
@@ -1650,11 +1799,11 @@ mod tests {
     #[test]
     fn test_if_single_line_with_else() {
         let prog = parse("IF X > 0 THEN PRINT X ELSE PRINT Y").unwrap();
-        if let Stmt::If {
+        if let StmtKind::If {
             then_branch,
             else_branch,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(then_branch.len(), 1);
             assert!(else_branch.is_some());
@@ -1667,11 +1816,11 @@ mod tests {
     #[test]
     fn test_if_block() {
         let prog = parse("IF X > 0 THEN\nPRINT X\nEND IF").unwrap();
-        if let Stmt::If {
+        if let StmtKind::If {
             then_branch,
             else_branch,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(then_branch.len(), 1);
             assert!(else_branch.is_none());
@@ -1683,11 +1832,11 @@ mod tests {
     #[test]
     fn test_if_block_with_else() {
         let prog = parse("IF X > 0 THEN\nPRINT X\nELSE\nPRINT Y\nEND IF").unwrap();
-        if let Stmt::If {
+        if let StmtKind::If {
             then_branch,
             else_branch,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(then_branch.len(), 1);
             assert!(else_branch.is_some());
@@ -1704,13 +1853,13 @@ mod tests {
     fn test_for_simple() {
         let prog = parse("FOR I = 1 TO 10\nPRINT I\nNEXT I").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::For {
+        if let StmtKind::For {
             var,
             start,
             end,
             step,
             body,
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert_eq!(var, "I");
             assert!(matches!(start, Expr::Literal(Literal::Integer(1))));
@@ -1725,7 +1874,7 @@ mod tests {
     #[test]
     fn test_for_with_step() {
         let prog = parse("FOR I = 0 TO 100 STEP 10\nNEXT").unwrap();
-        if let Stmt::For { step, .. } = &prog.statements[0] {
+        if let StmtKind::For { step, .. } = &prog.statements[0].kind {
             assert!(step.is_some());
             assert!(matches!(
                 step.as_ref().unwrap(),
@@ -1739,7 +1888,7 @@ mod tests {
     #[test]
     fn test_for_negative_step() {
         let prog = parse("FOR I = 10 TO 1 STEP -1\nNEXT").unwrap();
-        if let Stmt::For { step, .. } = &prog.statements[0] {
+        if let StmtKind::For { step, .. } = &prog.statements[0].kind {
             assert!(step.is_some());
         } else {
             panic!("Expected For");
@@ -1754,7 +1903,7 @@ mod tests {
     fn test_while_simple() {
         let prog = parse("WHILE X < 10\nX = X + 1\nWEND").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::While { condition, body } = &prog.statements[0] {
+        if let StmtKind::While { condition, body } = &prog.statements[0].kind {
             assert!(matches!(
                 condition,
                 Expr::Binary {
@@ -1776,12 +1925,12 @@ mod tests {
     fn test_do_loop_simple() {
         let prog = parse("DO\nX = X + 1\nLOOP").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::DoLoop {
+        if let StmtKind::DoLoop {
             condition,
             cond_at_start,
             body,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert!(condition.is_none());
             assert!(!*cond_at_start);
@@ -1794,12 +1943,12 @@ mod tests {
     #[test]
     fn test_do_while() {
         let prog = parse("DO WHILE X < 10\nX = X + 1\nLOOP").unwrap();
-        if let Stmt::DoLoop {
+        if let StmtKind::DoLoop {
             condition,
             cond_at_start,
             is_until,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert!(condition.is_some());
             assert!(*cond_at_start);
@@ -1812,12 +1961,12 @@ mod tests {
     #[test]
     fn test_do_until() {
         let prog = parse("DO UNTIL X >= 10\nX = X + 1\nLOOP").unwrap();
-        if let Stmt::DoLoop {
+        if let StmtKind::DoLoop {
             condition,
             cond_at_start,
             is_until,
             ..
-        } = &prog.statements[0]
+        } = &prog.statements[0].kind
         {
             assert!(condition.is_some());
             assert!(*cond_at_start);
@@ -1835,7 +1984,7 @@ mod tests {
     fn test_select_case_simple() {
         let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nEND SELECT").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::SelectCase { expr, cases } = &prog.statements[0] {
+        if let StmtKind::SelectCase { expr, cases } = &prog.statements[0].kind {
             assert!(matches!(expr, Expr::Variable(_)));
             assert_eq!(cases.len(), 1);
             assert!(cases[0].0.is_some()); // Has a value
@@ -1848,7 +1997,7 @@ mod tests {
     #[test]
     fn test_select_case_multiple() {
         let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nCASE 2\nPRINT 2\nEND SELECT").unwrap();
-        if let Stmt::SelectCase { cases, .. } = &prog.statements[0] {
+        if let StmtKind::SelectCase { cases, .. } = &prog.statements[0].kind {
             assert_eq!(cases.len(), 2);
         } else {
             panic!("Expected SelectCase");
@@ -1858,7 +2007,7 @@ mod tests {
     #[test]
     fn test_select_case_with_else() {
         let prog = parse("SELECT CASE X\nCASE 1\nPRINT 1\nCASE ELSE\nPRINT 0\nEND SELECT").unwrap();
-        if let Stmt::SelectCase { cases, .. } = &prog.statements[0] {
+        if let StmtKind::SelectCase { cases, .. } = &prog.statements[0].kind {
             assert_eq!(cases.len(), 2);
             assert!(cases[0].0.is_some()); // CASE 1
             assert!(cases[1].0.is_none()); // CASE ELSE
@@ -1870,7 +2019,7 @@ mod tests {
     #[test]
     fn test_select_case_string() {
         let prog = parse("SELECT CASE A$\nCASE \"yes\"\nPRINT 1\nEND SELECT").unwrap();
-        if let Stmt::SelectCase { expr, cases } = &prog.statements[0] {
+        if let StmtKind::SelectCase { expr, cases } = &prog.statements[0].kind {
             assert!(matches!(expr, Expr::Variable(_)));
             assert_eq!(cases.len(), 1);
             if let Some(Expr::Literal(Literal::String(s))) = &cases[0].0 {
@@ -1891,7 +2040,7 @@ mod tests {
     fn test_goto_line_number() {
         let prog = parse("GOTO 100").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Goto(target) = &prog.statements[0] {
+        if let StmtKind::Goto(target) = &prog.statements[0].kind {
             assert!(matches!(target, GotoTarget::Line(100)));
         } else {
             panic!("Expected Goto");
@@ -1901,7 +2050,7 @@ mod tests {
     #[test]
     fn test_goto_label() {
         let prog = parse("GOTO MYLOOP").unwrap();
-        if let Stmt::Goto(target) = &prog.statements[0] {
+        if let StmtKind::Goto(target) = &prog.statements[0].kind {
             if let GotoTarget::Label(name) = target {
                 assert_eq!(name, "MYLOOP");
             } else {
@@ -1920,7 +2069,7 @@ mod tests {
     fn test_gosub_line_number() {
         let prog = parse("GOSUB 1000").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Gosub(target) = &prog.statements[0] {
+        if let StmtKind::Gosub(target) = &prog.statements[0].kind {
             assert!(matches!(target, GotoTarget::Line(1000)));
         } else {
             panic!("Expected Gosub");
@@ -1930,7 +2079,7 @@ mod tests {
     #[test]
     fn test_gosub_label() {
         let prog = parse("GOSUB MYSUB").unwrap();
-        if let Stmt::Gosub(target) = &prog.statements[0] {
+        if let StmtKind::Gosub(target) = &prog.statements[0].kind {
             assert!(matches!(target, GotoTarget::Label(_)));
         } else {
             panic!("Expected Gosub");
@@ -1945,7 +2094,7 @@ mod tests {
     fn test_return() {
         let prog = parse("RETURN").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0], Stmt::Return));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Return));
     }
 
     // ===================
@@ -1956,7 +2105,7 @@ mod tests {
     fn test_on_goto() {
         let prog = parse("ON X GOTO 10, 20, 30").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::OnGoto { expr, targets } = &prog.statements[0] {
+        if let StmtKind::OnGoto { expr, targets } = &prog.statements[0].kind {
             assert!(matches!(expr, Expr::Variable(_)));
             assert_eq!(targets.len(), 3);
         } else {
@@ -1972,7 +2121,7 @@ mod tests {
     fn test_dim_single() {
         let prog = parse("DIM A(10)").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Dim { arrays } = &prog.statements[0] {
+        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
             assert_eq!(arrays.len(), 1);
             assert_eq!(arrays[0].name, "A");
             assert_eq!(arrays[0].dimensions.len(), 1);
@@ -1984,7 +2133,7 @@ mod tests {
     #[test]
     fn test_dim_multiple() {
         let prog = parse("DIM A(10), B$(100), C(50)").unwrap();
-        if let Stmt::Dim { arrays } = &prog.statements[0] {
+        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
             assert_eq!(arrays.len(), 3);
             assert_eq!(arrays[0].name, "A");
             assert_eq!(arrays[1].name, "B$");
@@ -1997,7 +2146,7 @@ mod tests {
     #[test]
     fn test_dim_2d() {
         let prog = parse("DIM A(10, 20)").unwrap();
-        if let Stmt::Dim { arrays } = &prog.statements[0] {
+        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
             assert_eq!(arrays.len(), 1);
             assert_eq!(arrays[0].name, "A");
             assert_eq!(arrays[0].dimensions.len(), 2);
@@ -2009,7 +2158,7 @@ mod tests {
     #[test]
     fn test_dim_3d() {
         let prog = parse("DIM Matrix(5, 10, 15)").unwrap();
-        if let Stmt::Dim { arrays } = &prog.statements[0] {
+        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
             assert_eq!(arrays.len(), 1);
             assert_eq!(arrays[0].name, "MATRIX");
             assert_eq!(arrays[0].dimensions.len(), 3);
@@ -2021,7 +2170,7 @@ mod tests {
     #[test]
     fn test_array_access_2d() {
         let prog = parse("X = A(1, 2)").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::FnCall { name, args } = value {
                 assert_eq!(name, "A");
                 assert_eq!(args.len(), 2);
@@ -2036,7 +2185,7 @@ mod tests {
     #[test]
     fn test_array_assign_2d() {
         let prog = parse("A(1, 2) = 42").unwrap();
-        if let Stmt::Let { name, indices, .. } = &prog.statements[0] {
+        if let StmtKind::Let { name, indices, .. } = &prog.statements[0].kind {
             assert_eq!(name, "A");
             assert!(indices.is_some());
             assert_eq!(indices.as_ref().unwrap().len(), 2);
@@ -2053,7 +2202,7 @@ mod tests {
     fn test_sub_no_params() {
         let prog = parse("SUB MySub\nPRINT X\nEND SUB").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Sub { name, params, body } = &prog.statements[0] {
+        if let StmtKind::Sub { name, params, body } = &prog.statements[0].kind {
             assert_eq!(name, "MYSUB");
             assert!(params.is_empty());
             assert_eq!(body.len(), 1);
@@ -2065,7 +2214,7 @@ mod tests {
     #[test]
     fn test_sub_with_params() {
         let prog = parse("SUB MySub(A, B, C)\nPRINT A + B + C\nEND SUB").unwrap();
-        if let Stmt::Sub { params, .. } = &prog.statements[0] {
+        if let StmtKind::Sub { params, .. } = &prog.statements[0].kind {
             assert_eq!(params.len(), 3);
         } else {
             panic!("Expected Sub");
@@ -2080,7 +2229,7 @@ mod tests {
     fn test_function_no_params() {
         let prog = parse("FUNCTION GetValue\nGetValue = 42\nEND FUNCTION").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Function { name, params, body } = &prog.statements[0] {
+        if let StmtKind::Function { name, params, body } = &prog.statements[0].kind {
             assert_eq!(name, "GETVALUE");
             assert!(params.is_empty());
             assert_eq!(body.len(), 1);
@@ -2092,7 +2241,7 @@ mod tests {
     #[test]
     fn test_function_with_params() {
         let prog = parse("FUNCTION Add(A, B)\nAdd = A + B\nEND FUNCTION").unwrap();
-        if let Stmt::Function { name, params, .. } = &prog.statements[0] {
+        if let StmtKind::Function { name, params, .. } = &prog.statements[0].kind {
             assert_eq!(name, "ADD");
             assert_eq!(params.len(), 2);
         } else {
@@ -2108,7 +2257,7 @@ mod tests {
     fn test_call_no_args() {
         let prog = parse("MySub").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Call { name, args } = &prog.statements[0] {
+        if let StmtKind::Call { name, args } = &prog.statements[0].kind {
             assert_eq!(name, "MYSUB");
             assert!(args.is_empty());
         } else {
@@ -2119,7 +2268,7 @@ mod tests {
     #[test]
     fn test_call_with_parens() {
         let prog = parse("MySub(1, 2, 3)").unwrap();
-        if let Stmt::Call { name, args } = &prog.statements[0] {
+        if let StmtKind::Call { name, args } = &prog.statements[0].kind {
             assert_eq!(name, "MYSUB");
             assert_eq!(args.len(), 3);
         } else {
@@ -2130,7 +2279,7 @@ mod tests {
     #[test]
     fn test_call_without_parens() {
         let prog = parse("MySub 1, 2, 3").unwrap();
-        if let Stmt::Call { args, .. } = &prog.statements[0] {
+        if let StmtKind::Call { args, .. } = &prog.statements[0].kind {
             assert_eq!(args.len(), 3);
         } else {
             panic!("Expected Call");
@@ -2145,7 +2294,7 @@ mod tests {
     fn test_data_integers() {
         let prog = parse("DATA 1, 2, 3, 4, 5").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Data(values) = &prog.statements[0] {
+        if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 5);
             assert!(matches!(values[0], Literal::Integer(1)));
         } else {
@@ -2156,7 +2305,7 @@ mod tests {
     #[test]
     fn test_data_mixed() {
         let prog = parse(r#"DATA 1, 3.14, "hello""#).unwrap();
-        if let Stmt::Data(values) = &prog.statements[0] {
+        if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 3);
             assert!(matches!(values[0], Literal::Integer(1)));
             assert!(matches!(values[1], Literal::Float(_)));
@@ -2169,7 +2318,7 @@ mod tests {
     #[test]
     fn test_data_negative() {
         let prog = parse("DATA -5, -3.14").unwrap();
-        if let Stmt::Data(values) = &prog.statements[0] {
+        if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert!(matches!(values[0], Literal::Integer(-5)));
         } else {
             panic!("Expected Data");
@@ -2184,7 +2333,7 @@ mod tests {
     fn test_read_single() {
         let prog = parse("READ X").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Read(vars) = &prog.statements[0] {
+        if let StmtKind::Read(vars) = &prog.statements[0].kind {
             assert_eq!(vars.len(), 1);
             assert_eq!(vars[0], "X");
         } else {
@@ -2195,7 +2344,7 @@ mod tests {
     #[test]
     fn test_read_multiple() {
         let prog = parse("READ A, B, C$").unwrap();
-        if let Stmt::Read(vars) = &prog.statements[0] {
+        if let StmtKind::Read(vars) = &prog.statements[0].kind {
             assert_eq!(vars.len(), 3);
         } else {
             panic!("Expected Read");
@@ -2210,7 +2359,7 @@ mod tests {
     fn test_restore_simple() {
         let prog = parse("RESTORE").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let Stmt::Restore(target) = &prog.statements[0] {
+        if let StmtKind::Restore(target) = &prog.statements[0].kind {
             assert!(target.is_none());
         } else {
             panic!("Expected Restore");
@@ -2220,7 +2369,7 @@ mod tests {
     #[test]
     fn test_restore_with_target() {
         let prog = parse("RESTORE 100").unwrap();
-        if let Stmt::Restore(target) = &prog.statements[0] {
+        if let StmtKind::Restore(target) = &prog.statements[0].kind {
             assert!(target.is_some());
         } else {
             panic!("Expected Restore");
@@ -2235,7 +2384,7 @@ mod tests {
     fn test_cls() {
         let prog = parse("CLS").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0], Stmt::Cls));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Cls));
     }
 
     // ===================
@@ -2246,7 +2395,7 @@ mod tests {
     fn test_end() {
         let prog = parse("END").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0], Stmt::End));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::End));
     }
 
     // ===================
@@ -2257,7 +2406,7 @@ mod tests {
     fn test_stop() {
         let prog = parse("STOP").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0], Stmt::Stop));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Stop));
     }
 
     // ===================
@@ -2268,7 +2417,7 @@ mod tests {
     fn test_expr_precedence() {
         // 2 + 3 * 4 should be 2 + (3 * 4) = 14, not (2 + 3) * 4 = 20
         let prog = parse("X = 2 + 3 * 4").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::Binary { op, right, .. } = value {
                 assert_eq!(*op, BinaryOp::Add);
                 assert!(matches!(
@@ -2290,7 +2439,7 @@ mod tests {
     fn test_expr_power_right_associative() {
         // 2 ^ 3 ^ 2 should be 2 ^ (3 ^ 2) = 512, not (2 ^ 3) ^ 2 = 64
         let prog = parse("X = 2 ^ 3 ^ 2").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::Binary { op, right, .. } = value {
                 assert_eq!(*op, BinaryOp::Pow);
                 assert!(matches!(
@@ -2311,7 +2460,7 @@ mod tests {
     #[test]
     fn test_expr_parentheses() {
         let prog = parse("X = (2 + 3) * 4").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::Binary { op, left, .. } = value {
                 assert_eq!(*op, BinaryOp::Mul);
                 assert!(matches!(
@@ -2332,7 +2481,7 @@ mod tests {
     #[test]
     fn test_expr_unary_neg() {
         let prog = parse("X = -5").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             assert!(matches!(
                 value,
                 Expr::Unary {
@@ -2348,7 +2497,7 @@ mod tests {
     #[test]
     fn test_expr_unary_not() {
         let prog = parse("X = NOT Y").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             assert!(matches!(
                 value,
                 Expr::Unary {
@@ -2364,7 +2513,7 @@ mod tests {
     #[test]
     fn test_expr_logical_operators() {
         let prog = parse("X = A AND B OR C XOR D").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             // OR has lowest precedence, then XOR, then AND
             assert!(matches!(
                 value,
@@ -2381,7 +2530,7 @@ mod tests {
     #[test]
     fn test_expr_comparison() {
         let prog = parse("X = A < B").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             assert!(matches!(
                 value,
                 Expr::Binary {
@@ -2405,7 +2554,7 @@ mod tests {
             ("X = A >= B", BinaryOp::Ge),
         ] {
             let prog = parse(input).unwrap();
-            if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
                 if let Expr::Binary { op, .. } = value {
                     assert_eq!(*op, expected_op, "Failed for input: {}", input);
                 } else {
@@ -2429,7 +2578,7 @@ mod tests {
             ("X = A ^ B", BinaryOp::Pow),
         ] {
             let prog = parse(input).unwrap();
-            if let Stmt::Let { value, .. } = &prog.statements[0] {
+            if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
                 if let Expr::Binary { op, .. } = value {
                     assert_eq!(*op, expected_op, "Failed for input: {}", input);
                 } else {
@@ -2444,7 +2593,7 @@ mod tests {
     #[test]
     fn test_expr_function_call() {
         let prog = parse("X = SIN(3.14)").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::FnCall { name, args } = value {
                 assert_eq!(name, "SIN");
                 assert_eq!(args.len(), 1);
@@ -2459,7 +2608,7 @@ mod tests {
     #[test]
     fn test_expr_function_multiple_args() {
         let prog = parse("X = MID$(A$, 1, 5)").unwrap();
-        if let Stmt::Let { value, .. } = &prog.statements[0] {
+        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
             if let Expr::FnCall { name, args } = value {
                 assert_eq!(name, "MID$");
                 assert_eq!(args.len(), 3);

@@ -255,36 +255,6 @@ fn mangle(name: &str) -> String {
     out
 }
 
-/// Every nested statement body directly contained by `stmt`.
-///
-/// This is the single place that knows which `Stmt` variants carry child
-/// statements. Any pass that walks the AST must go through it, so that adding a
-/// block-bearing statement cannot silently leave a walker behind: omitting
-/// `SelectCase` here previously caused `GOSUB` inside a `SELECT CASE` to fail to
-/// link and `DATA` inside one to be dropped.
-fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
-    match stmt {
-        Stmt::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            let mut v = vec![then_branch.as_slice()];
-            if let Some(eb) = else_branch {
-                v.push(eb.as_slice());
-            }
-            v
-        }
-        Stmt::SelectCase { cases, .. } => cases.iter().map(|(_, body)| body.as_slice()).collect(),
-        Stmt::For { body, .. }
-        | Stmt::While { body, .. }
-        | Stmt::DoLoop { body, .. }
-        | Stmt::Sub { body, .. }
-        | Stmt::Function { body, .. } => vec![body.as_slice()],
-        _ => vec![],
-    }
-}
-
 /// Where a variable or array descriptor lives.
 ///
 /// Storage is addressed uniformly as a sequence of 8-byte words, so callers ask
@@ -692,9 +662,9 @@ impl CodeGen {
 
         // Procedures
         for stmt in &program.statements {
-            if let Stmt::Sub { name, params, body } = stmt {
+            if let StmtKind::Sub { name, params, body } = &stmt.kind {
                 self.gen_procedure(name, params, body, false);
-            } else if let Stmt::Function { name, params, body } = stmt {
+            } else if let StmtKind::Function { name, params, body } = &stmt.kind {
                 self.gen_procedure(name, params, body, true);
             }
         }
@@ -737,8 +707,8 @@ impl CodeGen {
 
         // Generate main body
         for stmt in &program.statements {
-            match stmt {
-                Stmt::Sub { .. } | Stmt::Function { .. } => {}
+            match stmt.kind {
+                StmtKind::Sub { .. } | StmtKind::Function { .. } => {}
                 _ => self.gen_stmt(stmt),
             }
         }
@@ -769,9 +739,9 @@ impl CodeGen {
 
     /// Preprocess statement: collect DATA items and check for GOSUB usage
     fn preprocess(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Data(values) => self.data_items.extend(values.clone()),
-            Stmt::Gosub(_) => self.gosub_used = true,
+        match &stmt.kind {
+            StmtKind::Data(values) => self.data_items.extend(values.clone()),
+            StmtKind::Gosub(_) => self.gosub_used = true,
             _ => {}
         }
         // Recurse into nested statements
@@ -924,12 +894,16 @@ impl CodeGen {
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
-        match stmt {
-            Stmt::Label(n) => {
+        match &stmt.kind {
+            StmtKind::Label(n) => {
                 self.emit_label(&format!("_line_{}", n));
             }
 
-            Stmt::Let {
+            StmtKind::LabelName(name) => {
+                self.emit_label(&format!("_label_{}", mangle(name)));
+            }
+
+            StmtKind::Let {
                 name,
                 indices,
                 value,
@@ -970,7 +944,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::Print { items, newline } => {
+            StmtKind::Print { items, newline } => {
                 for item in items {
                     match item {
                         PrintItem::Expr(expr) => {
@@ -988,7 +962,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::Input { prompt, vars } => {
+            StmtKind::Input { prompt, vars } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
                     self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
@@ -1009,7 +983,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::LineInput { prompt, var } => {
+            StmtKind::LineInput { prompt, var } => {
                 if let Some(pstr) = prompt {
                     let idx = self.add_string_literal(pstr);
                     self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
@@ -1022,7 +996,7 @@ impl CodeGen {
                 self.emit(&format!("    mov {}, rdx", loc.q(1)));
             }
 
-            Stmt::If {
+            StmtKind::If {
                 condition,
                 then_branch,
                 else_branch,
@@ -1056,7 +1030,7 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::For {
+            StmtKind::For {
                 var,
                 start,
                 end,
@@ -1137,7 +1111,7 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::While { condition, body } => {
+            StmtKind::While { condition, body } => {
                 let start_label = self.new_label("while");
                 let end_label = self.new_label("endwhile");
 
@@ -1160,7 +1134,7 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::DoLoop {
+            StmtKind::DoLoop {
                 condition,
                 cond_at_start,
                 is_until,
@@ -1226,18 +1200,18 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::Goto(target) => {
+            StmtKind::Goto(target) => {
                 let label = match target {
                     GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", s),
+                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                 };
                 self.emit(&format!("    jmp {}", label));
             }
 
-            Stmt::Gosub(target) => {
+            StmtKind::Gosub(target) => {
                 let label = match target {
                     GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", s),
+                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                 };
                 let ret_label = self.new_label("gosub_ret");
                 // Check for stack overflow before push
@@ -1254,7 +1228,7 @@ impl CodeGen {
                 self.emit_label(&ret_label);
             }
 
-            Stmt::Return => {
+            StmtKind::Return => {
                 // Pop return address from GOSUB stack and jump (use rcx - caller-saved on both ABIs)
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
                 self.emit("    mov rax, QWORD PTR [rcx]");
@@ -1263,7 +1237,7 @@ impl CodeGen {
                 self.emit("    jmp rax");
             }
 
-            Stmt::OnGoto { expr, targets } => {
+            StmtKind::OnGoto { expr, targets } => {
                 let expr_type = self.gen_expr(expr);
                 // Convert to integer in rax
                 if expr_type.is_integer() {
@@ -1275,32 +1249,32 @@ impl CodeGen {
                 for (i, target) in targets.iter().enumerate() {
                     let label = match target {
                         GotoTarget::Line(n) => format!("_line_{}", n),
-                        GotoTarget::Label(s) => format!("_label_{}", s),
+                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                     };
                     self.emit(&format!("    cmp rax, {}", i + 1));
                     self.emit(&format!("    je {}", label));
                 }
             }
 
-            Stmt::Dim { arrays } => {
+            StmtKind::Dim { arrays } => {
                 for arr in arrays {
                     self.gen_dim_array(arr);
                 }
             }
 
-            Stmt::Sub { .. } | Stmt::Function { .. } => {
+            StmtKind::Sub { .. } | StmtKind::Function { .. } => {
                 // Already handled in first pass
             }
 
-            Stmt::Call { name, args } => {
+            StmtKind::Call { name, args } => {
                 self.gen_call(name, args);
             }
 
-            Stmt::Data(_) => {
+            StmtKind::Data(_) => {
                 // Data already collected in first pass
             }
 
-            Stmt::Read(vars) => {
+            StmtKind::Read(vars) => {
                 for var in vars {
                     if is_string_var(var) {
                         self.emit("    call _rt_read_string");
@@ -1317,7 +1291,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::Restore(target) => {
+            StmtKind::Restore(target) => {
                 let idx = if let Some(_t) = target {
                     // TODO: find DATA line index
                     0
@@ -1328,11 +1302,11 @@ impl CodeGen {
                 self.emit("    call _rt_restore");
             }
 
-            Stmt::Cls => {
+            StmtKind::Cls => {
                 self.emit("    call _rt_cls");
             }
 
-            Stmt::SelectCase { expr, cases } => {
+            StmtKind::SelectCase { expr, cases } => {
                 let end_label = self.new_label("endselect");
 
                 // Evaluate SELECT expression and save to temp
@@ -1381,14 +1355,14 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            Stmt::End | Stmt::Stop => {
+            StmtKind::End | StmtKind::Stop => {
                 // Terminate the program, not just the current frame. A plain
                 // `leave; ret` only ends the program when END appears in main;
                 // inside a SUB or FUNCTION it just returns to the caller.
                 self.emit("    call _rt_end");
             }
 
-            Stmt::Open {
+            StmtKind::Open {
                 filename,
                 mode,
                 file_num,
@@ -1407,12 +1381,12 @@ impl CodeGen {
                 self.emit("    call _rt_file_open");
             }
 
-            Stmt::Close { file_num } => {
+            StmtKind::Close { file_num } => {
                 self.emit_arg_imm(0, *file_num as i64);
                 self.emit("    call _rt_file_close");
             }
 
-            Stmt::PrintFile {
+            StmtKind::PrintFile {
                 file_num,
                 items,
                 newline,
@@ -1436,7 +1410,7 @@ impl CodeGen {
                 }
             }
 
-            Stmt::InputFile { file_num, vars } => {
+            StmtKind::InputFile { file_num, vars } => {
                 for var in vars {
                     if is_string_var(var) {
                         self.emit_arg_imm(0, *file_num as i64);

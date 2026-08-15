@@ -206,3 +206,118 @@ PRINT "after"
     .expect("nested IF inside a case body should parse");
     assert_eq!(run.lines(), vec!["two", "after"]);
 }
+
+/// Helper: a program must be rejected with a diagnostic containing `expected`,
+/// and must be rejected cleanly rather than by panicking.
+fn expect_rejected(source: &str, expected: &str) {
+    let e = compile_only(source).expect_err(&format!(
+        "expected rejection of:\n{source}\nbut it compiled"
+    ));
+    assert!(
+        e.contains(expected),
+        "expected {expected:?} in diagnostics for:\n{source}\ngot stderr:\n{}",
+        e.stderr
+    );
+    assert!(
+        e.is_clean_rejection(),
+        "should be diagnosed, not panic; exit={:?} stderr:\n{}",
+        e.exit_code,
+        e.stderr
+    );
+}
+
+/// Unknown names used to reach the linker as `_proc_<NAME>`, producing
+/// `ld: undefined reference to _proc_PRIN`. They are now diagnosed by name.
+#[test]
+fn test_unknown_names_are_diagnosed() {
+    expect_rejected("PRIN \"hello\"\n", "unknown subroutine 'PRIN'");
+    expect_rejected("PRIN \"hello\"\n", "did you mean 'PRINT'?");
+    expect_rejected("NoSuchSub(1)\n", "unknown subroutine 'NOSUCHSUB'");
+    expect_rejected(
+        "PRINT NOSUCHFN(1)\n",
+        "unknown function or array 'NOSUCHFN'",
+    );
+    expect_rejected("PRINT SQRT(4)\n", "did you mean 'SQR'?");
+}
+
+/// Using an array without DIM used to abort the compiler with a Rust panic
+/// ("Array not declared"), as did a subscript-count mismatch.
+#[test]
+fn test_undeclared_array_is_diagnosed() {
+    expect_rejected("A(0) = 1\n", "array 'A' is used but never declared");
+    expect_rejected(
+        "DIM M(3,3)\nPRINT M(1)\n",
+        "array 'M' has 2 dimensions, but 1 subscript was given",
+    );
+}
+
+/// Argument counts are checked for both user procedures and builtins.
+#[test]
+fn test_argument_count_is_checked() {
+    expect_rejected(
+        "SUB T(A, B)\nPRINT A\nEND SUB\nT(1)\n",
+        "'T' expects 2 arguments, but 1 was given",
+    );
+    expect_rejected(
+        "SUB T(A)\nPRINT A\nEND SUB\nT(1, 2)\n",
+        "'T' expects 1 argument, but 2 were given",
+    );
+    expect_rejected(
+        "PRINT LEFT$(\"abc\")\n",
+        "'LEFT$' expects 2 arguments, but 1 was given",
+    );
+}
+
+/// Mixing strings and numbers used to panic in gen_coercion.
+#[test]
+fn test_type_mismatches_are_diagnosed() {
+    expect_rejected("A = \"hello\"\n", "cannot assign string value to numeric");
+    expect_rejected("A$ = 42\n", "cannot assign numeric value to string");
+    expect_rejected(
+        "PRINT 1 + \"a\"\n",
+        "cannot mix string and numeric operands",
+    );
+    expect_rejected(
+        "PRINT \"a\" * \"b\"\n",
+        "operator * cannot be applied to strings",
+    );
+}
+
+/// A SUB has no value, and a FUNCTION's result cannot be silently discarded.
+#[test]
+fn test_procedure_kind_is_checked() {
+    expect_rejected(
+        "FUNCTION F(N)\nF = N\nEND FUNCTION\nF(1)\n",
+        "is a FUNCTION",
+    );
+    expect_rejected(
+        "SUB S(N)\nPRINT N\nEND SUB\nPRINT S(1)\n",
+        "is a SUB and has no value",
+    );
+}
+
+/// Branch targets must exist. Previously an undefined one became a link error.
+#[test]
+fn test_branch_targets_are_checked() {
+    expect_rejected(
+        "GOTO Nowhere\nPRINT \"x\"\n",
+        "target 'NOWHERE' is not defined",
+    );
+    expect_rejected("GOTO 999\nPRINT \"x\"\n", "target line 999 does not exist");
+    expect_rejected(
+        "GOTO Finsh\nFinish:\nPRINT \"done\"\n",
+        "did you mean 'FINISH'?",
+    );
+    expect_rejected("Foo:\nFoo:\nPRINT \"x\"\n", "duplicate label 'FOO'");
+}
+
+/// Diagnostics carry the source line of the offending statement.
+#[test]
+fn test_diagnostics_report_source_line() {
+    let e = compile_only("PRINT 1\nPRINT 2\nPRIN 3\n").expect_err("should be rejected");
+    assert!(
+        e.contains(":3: error:"),
+        "expected the error on line 3, got:\n{}",
+        e.stderr
+    );
+}

@@ -154,6 +154,8 @@ pub struct Lexer<'a> {
     pos: usize,
     line: u32,
     at_line_start: bool,
+    /// Source line of each token produced by `tokenize`, parallel to its output.
+    lines: Vec<u32>,
 }
 
 impl<'a> Lexer<'a> {
@@ -164,6 +166,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             line: 1,
             at_line_start: true,
+            lines: Vec::new(),
         }
     }
 
@@ -414,15 +417,34 @@ impl<'a> Lexer<'a> {
 
     pub fn tokenize(&mut self) -> Result<Vec<Token>, String> {
         let mut tokens = Vec::new();
+        self.lines.clear();
         loop {
+            // Capture the line *before* scanning: consuming a newline advances
+            // the counter, so afterwards a Newline token would report the line
+            // it begins rather than the one it ends.
+            let line = self.line;
             let tok = self.next_token()?;
             let is_eof = tok == Token::Eof;
             tokens.push(tok);
+            self.lines.push(line);
             if is_eof {
                 break;
             }
         }
         Ok(tokens)
+    }
+
+    /// Source line of each token from the last `tokenize` call.
+    ///
+    /// Kept alongside the token vector rather than inside `Token` so that the
+    /// token type stays comparable and the lexer's own tests keep working.
+    pub fn line_map(&self) -> &[u32] {
+        &self.lines
+    }
+
+    /// The line the lexer is currently on, for error reporting.
+    pub fn current_line(&self) -> u32 {
+        self.line
     }
 }
 

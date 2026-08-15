@@ -11,6 +11,7 @@ mod codegen;
 mod lexer;
 mod parser;
 mod runtime;
+mod sema;
 
 use clap::Parser;
 use std::fs;
@@ -35,6 +36,16 @@ struct Args {
     asm_only: bool,
 }
 
+/// Format a diagnostic position as `file:line`, or just `file` when the line is
+/// unknown. GCC-style, so editors and IDEs can parse it.
+fn locate(file: &str, line: u32) -> String {
+    if line == 0 {
+        file.to_string()
+    } else {
+        format!("{}:{}", file, line)
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -54,20 +65,36 @@ fn main() {
     let tokens = match lexer.tokenize() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Lexer error: {}", e);
+            eprintln!("{}: error: {}", locate(input_file, lexer.current_line()), e);
+            std::process::exit(1);
+        }
+    };
+    let line_map = lexer.line_map().to_vec();
+
+    // Parse
+    let mut parser = parser::Parser::new(tokens, line_map);
+    let program = match parser.parse() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}: error: {}", locate(input_file, e.line), e);
             std::process::exit(1);
         }
     };
 
-    // Parse
-    let mut parser = parser::Parser::new(tokens);
-    let program = match parser.parse() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Parse error: {}", e);
-            std::process::exit(1);
+    // Semantic analysis: reject bad programs here, with a source line, rather
+    // than letting them reach codegen and become a panic or a linker error.
+    let (_symbols, diagnostics) = sema::analyze(&program);
+    if !diagnostics.is_empty() {
+        for d in &diagnostics {
+            eprintln!("{}: error: {}", locate(input_file, d.line), d.message);
+            if let Some(note) = &d.note {
+                eprintln!("{}: note: {}", locate(input_file, d.line), note);
+            }
         }
-    };
+        let n = diagnostics.len();
+        eprintln!("xbasic64: {} error{}", n, if n == 1 { "" } else { "s" });
+        std::process::exit(1);
+    }
 
     // Generate code
     let mut codegen = codegen::CodeGen::default();

@@ -275,3 +275,58 @@ PRINT Half(8)
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["start", "computing"], "STOP ends the program");
 }
+
+/// LANGREF documents GOTO/GOSUB targets as "line number or label", but named
+/// labels were never implemented: `GOTO Finish` emitted a jump to `_label_FINISH`
+/// that nothing defined, and a bare `Finish:` was parsed as a procedure call, so
+/// both failed at link time.
+#[test]
+fn test_named_labels() {
+    let output = compile_and_run(
+        r#"
+GOTO Finish
+PRINT "skipped"
+Finish:
+PRINT "done"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "done");
+}
+
+/// GOSUB to a named label, and RETURN back.
+#[test]
+fn test_gosub_named_label() {
+    let output = compile_and_run(
+        r#"
+PRINT "start"
+GOSUB Helper
+PRINT "back"
+END
+Helper:
+PRINT "in helper"
+RETURN
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["start", "in helper", "back"]);
+}
+
+/// `Name:` is only a label at the start of a line, and never when `Name` is a
+/// declared procedure -- otherwise calling a parameterless SUB as the first
+/// statement of a multi-statement line would be misread as a label.
+#[test]
+fn test_procedure_call_is_not_mistaken_for_label() {
+    let output = compile_and_run(
+        r#"
+SUB Greet
+PRINT "called"
+END SUB
+Greet : PRINT "after"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["called", "after"]);
+}
