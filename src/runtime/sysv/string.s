@@ -372,3 +372,63 @@ _rt_strcat:
     pop r12
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_strcmp - Compare two BASIC strings
+# ------------------------------------------------------------------------------
+# BASIC strings are (ptr, len) pairs and are not null-terminated, so libc strcmp
+# cannot be used. Compares lexicographically by unsigned byte value, then by
+# length when one string is a prefix of the other -- so "ab" < "abc".
+#
+# Arguments:
+#   rdi = left pointer,  rsi = left length
+#   rdx = right pointer, rcx = right length
+#
+# Returns:
+#   eax < 0 if left < right, 0 if equal, > 0 if left > right (like memcmp)
+#
+# A length of 0 is valid and means the empty string; the pointer is then never
+# dereferenced, so an unassigned (NULL, 0) string compares correctly.
+# ------------------------------------------------------------------------------
+.globl _rt_strcmp
+_rt_strcmp:
+    push rbp
+    mov rbp, rsp
+
+    # r8 = number of bytes to compare = min(left_len, right_len)
+    mov r8, rsi
+    cmp r8, rcx
+    jbe .Lstrcmp_have_min
+    mov r8, rcx
+.Lstrcmp_have_min:
+
+    xor r9, r9              # r9 = byte index
+    jmp .Lstrcmp_check
+.Lstrcmp_loop:
+    movzx eax, BYTE PTR [rdi + r9]
+    movzx r10d, BYTE PTR [rdx + r9]
+    cmp eax, r10d
+    jne .Lstrcmp_differ
+    inc r9
+.Lstrcmp_check:
+    cmp r9, r8
+    jb .Lstrcmp_loop
+
+    # Common prefix is equal: the shorter string sorts first.
+    xor eax, eax
+    cmp rsi, rcx
+    je .Lstrcmp_done        # same length -> equal
+    jb .Lstrcmp_shorter
+    mov eax, 1              # left is longer -> greater
+    jmp .Lstrcmp_done
+.Lstrcmp_shorter:
+    mov eax, -1
+    jmp .Lstrcmp_done
+
+.Lstrcmp_differ:
+    # eax and r10d hold the differing bytes; return their difference.
+    sub eax, r10d
+
+.Lstrcmp_done:
+    leave
+    ret

@@ -75,3 +75,94 @@ PRINT A$ + B$ + C$
     .unwrap();
     assert_eq!(output.trim(), "Hello World");
 }
+
+/// Every relational operator on strings. These used to compile to a
+/// floating-point compare of registers that never held the operands, so `<`,
+/// `>`, `<=` and `>=` always yielded false and `=` always yielded true.
+#[test]
+fn test_string_comparison_operators() {
+    let output = compile_and_run(
+        r#"
+PRINT ("abc" < "abd")
+PRINT ("abd" < "abc")
+PRINT ("abc" > "abd")
+PRINT ("abd" > "abc")
+PRINT ("abc" = "abc")
+PRINT ("abc" = "abd")
+PRINT ("abc" <> "abd")
+PRINT ("abc" <> "abc")
+PRINT ("abc" <= "abc")
+PRINT ("abc" >= "abc")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-1", "0", "0", "-1", "-1", "0", "-1", "0", "-1", "-1"],
+        "BASIC booleans are -1 for true, 0 for false"
+    );
+}
+
+/// A prefix sorts before the longer string, comparison is by byte value (so
+/// case-sensitive), and the empty/unassigned string compares as empty.
+#[test]
+fn test_string_comparison_edge_cases() {
+    let output = compile_and_run(
+        r#"
+IF "ab" < "abc" THEN PRINT "prefix-lt" ELSE PRINT "prefix-bad"
+IF "A" < "a" THEN PRINT "case-lt" ELSE PRINT "case-bad"
+E$ = ""
+IF E$ < "a" THEN PRINT "empty-lt" ELSE PRINT "empty-bad"
+IF Z$ = "" THEN PRINT "unassigned-empty" ELSE PRINT "unassigned-bad"
+IF "ab" + "c" = "abc" THEN PRINT "concat-eq" ELSE PRINT "concat-bad"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "prefix-lt",
+            "case-lt",
+            "empty-lt",
+            "unassigned-empty",
+            "concat-eq"
+        ]
+    );
+}
+
+/// String comparison in anger: sorting an array, which is what silently
+/// produced wrong answers before.
+#[test]
+fn test_string_sort() {
+    let output = compile_and_run(
+        r#"
+DIM S$(4)
+S$(0) = "pear"
+S$(1) = "apple"
+S$(2) = "fig"
+S$(3) = "cherry"
+S$(4) = "banana"
+FOR I = 0 TO 3
+FOR J = 0 TO 3 - I
+IF S$(J) > S$(J+1) THEN
+T$ = S$(J)
+S$(J) = S$(J+1)
+S$(J+1) = T$
+END IF
+NEXT J
+NEXT I
+FOR I = 0 TO 4
+PRINT S$(I)
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["apple", "banana", "cherry", "fig", "pear"],
+        "bubble sort by string comparison"
+    );
+}

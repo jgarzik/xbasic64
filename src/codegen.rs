@@ -1560,6 +1560,14 @@ impl CodeGen {
     }
 
     /// Generate code for a binary expression
+    /// True for the six relational operators.
+    fn is_comparison(op: BinaryOp) -> bool {
+        matches!(
+            op,
+            BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
+        )
+    }
+
     fn gen_binary_expr(&mut self, op: BinaryOp, left: &Expr, right: &Expr) -> DataType {
         // Track expression nesting depth and warn if too deep
         self.expr_depth += 1;
@@ -1601,6 +1609,58 @@ impl CodeGen {
             // Result: ptr in rax, len in rdx
             self.expr_depth -= 1;
             return DataType::String;
+        }
+
+        // Handle string comparison specially.
+        //
+        // Without this, comparing two strings fell through to the numeric path:
+        // gen_coercion(String, String) is a no-op so nothing complained, and
+        // emit_typed dropped through to the float branch, emitting
+        // `ucomisd xmm0, xmm1` on registers that never held the operands. Every
+        // relational operator on strings silently returned a constant.
+        // (Guarded on the operand types, not `result_type`: a comparison always
+        // promotes to Long, which is the type of its -1/0 result.)
+        if Self::is_comparison(op)
+            && self.expr_type(left) == DataType::String
+            && self.expr_type(right) == DataType::String
+        {
+            // Evaluate left string (ptr in rax, len in rdx)
+            self.gen_expr(left);
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
+            self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
+
+            // Evaluate right string (ptr in rax, len in rdx)
+            self.gen_expr(right);
+            self.emit("    mov r8, rax"); // right ptr
+            self.emit("    mov r9, rdx"); // right len
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit_arg_reg(0, "rax");
+            self.emit_arg_reg(1, "rdx");
+            self.emit_arg_reg(2, "r8");
+            self.emit_arg_reg(3, "r9");
+            self.emit("    call _rt_strcmp");
+
+            // _rt_strcmp returns <0, 0 or >0 in eax, like memcmp. Turn that
+            // into BASIC's -1 / 0 by testing it against zero with the signed
+            // condition for this operator.
+            let setcc = match op {
+                BinaryOp::Eq => "sete",
+                BinaryOp::Ne => "setne",
+                BinaryOp::Lt => "setl",
+                BinaryOp::Gt => "setg",
+                BinaryOp::Le => "setle",
+                BinaryOp::Ge => "setge",
+                _ => unreachable!("guarded by is_comparison"),
+            };
+            self.emit("    test eax, eax");
+            self.emit(&format!("    {} al", setcc));
+            self.emit("    movzx eax, al");
+            self.emit("    neg eax"); // BASIC true is -1
+            self.expr_depth -= 1;
+            return DataType::Long;
         }
 
         // For comparison/logical ops, we'll work in the promoted type but return Long
