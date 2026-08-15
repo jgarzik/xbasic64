@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run_with_files;
+use crate::common::{compile_and_run, compile_and_run_with_files};
 use std::fs;
 
 #[test]
@@ -150,4 +150,17 @@ CLOSE #1
     assert_eq!(lines[2], "three");
     assert_eq!(lines[3], "lines:3");
     assert_eq!(lines[4], "bytes:14", "3 lines plus their newlines");
+}
+
+/// `WRITE #` separates values with commas only.
+///
+/// Each comma in the source became both a separator and a literal tab, so the
+/// file held `10\t,20\t,"ab"` -- which no INPUT # could read back.
+#[test]
+fn test_write_file_separators() {
+    let output = compile_and_run(
+        "OPEN \"wsep.txt\" FOR OUTPUT AS #1\nWRITE #1, 10, 20, \"ab\"\nCLOSE #1\nOPEN \"wsep.txt\" FOR INPUT AS #1\nLINE INPUT #1, L$\nCLOSE #1\nPRINT \"[\"; L$; \"]\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "[10,20,\"ab\"]");
 }

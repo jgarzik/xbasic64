@@ -2127,9 +2127,14 @@ impl CodeGen {
                             first = false;
                         }
                         PrintItem::Tab => {
-                            self.emit_arg_file_num(0, &fnum);
-                            self.emit_arg_imm(1, ASCII_TAB);
-                            self.emit("    call _rt_file_print_char");
+                            // For WRITE the comma is only a separator, and one
+                            // is already emitted before each value; emitting a
+                            // tab as well wrote "10\t,20".
+                            if !*write {
+                                self.emit_arg_file_num(0, &fnum);
+                                self.emit_arg_imm(1, ASCII_TAB);
+                                self.emit("    call _rt_file_print_char");
+                            }
                         }
                         PrintItem::Empty => {}
                     }
@@ -2664,7 +2669,9 @@ impl CodeGen {
     /// Both are read before either is written, so `SWAP A(I), A(J)` is correct
     /// even when the subscripts alias.
     fn gen_swap(&mut self, a: &LValue, b: &LValue) {
-        let is_string = is_string_var(&a.name);
+        // A field's type comes from its declaration, not from the base
+        // variable's name, which carries no suffix for a record.
+        let is_string = self.expr_type(&Self::lvalue_expr(a)) == DataType::String;
 
         // Read A into a temp.
         self.gen_read_lvalue(a);
@@ -2694,18 +2701,34 @@ impl CodeGen {
     /// Load an assignment target's current value, in the same registers
     /// `gen_expr` would leave it in.
     fn gen_read_lvalue(&mut self, target: &LValue) {
-        let expr = match &target.indices {
+        let expr = Self::lvalue_expr(target);
+        let ty = self.gen_expr(&expr);
+        if ty != DataType::String {
+            // gen_store_lvalue expects a Double, as the runtime readers produce.
+            self.gen_coercion(ty, DataType::Double);
+        }
+    }
+
+    /// The expression form of an assignment target.
+    ///
+    /// Reading a target is exactly evaluating this, so SWAP and the compound
+    /// readers do not need a second implementation of field and subscript
+    /// resolution -- and, before this, simply dropped the field path.
+    fn lvalue_expr(target: &LValue) -> Expr {
+        let mut expr = match &target.indices {
             Some(indices) => Expr::ArrayAccess {
                 name: target.name.clone(),
                 indices: indices.clone(),
             },
             None => Expr::Variable(target.name.clone()),
         };
-        let ty = self.gen_expr(&expr);
-        if ty != DataType::String {
-            // gen_store_lvalue expects a Double, as the runtime readers produce.
-            self.gen_coercion(ty, DataType::Double);
+        for field in &target.fields {
+            expr = Expr::Field {
+                base: Box::new(expr),
+                field: field.clone(),
+            };
         }
+        expr
     }
 
     /// Copy the string in `rax`/`rdx` onto the heap.
@@ -2793,8 +2816,6 @@ impl CodeGen {
         }
         DataType::from_type_ref(&ty)
     }
-
-    /// The value representation of a declared type.
 
     /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
     fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
@@ -2938,26 +2959,33 @@ impl CodeGen {
                 self.gen_array_addr(&target.name, &indices);
                 self.emit(&format!("    add rax, {}", byte_offset));
                 self.emit("    mov rcx, rax");
-
-                if DataType::from_type_ref(&ty) == DataType::String {
-                    self.emit("    mov rax, QWORD PTR [rsp]");
-                    self.emit("    mov rdx, QWORD PTR [rsp + 8]");
-                    self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-                    self.emit("    mov QWORD PTR [rcx], rax");
-                    self.emit("    mov QWORD PTR [rcx + 8], rdx");
-                } else {
-                    self.emit("    movsd xmm0, QWORD PTR [rsp]");
-                    self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-                    self.gen_coercion(DataType::Double, DataType::from_type_ref(&ty));
-                    match ty {
-                        TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
-                        TypeRef::Long => self.emit("    mov DWORD PTR [rcx], eax"),
-                        TypeRef::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
-                        _ => self.emit("    movsd QWORD PTR [rcx], xmm0"),
-                    }
-                }
+                self.emit_store_parked(&ty);
                 DataType::Double
             }
+        }
+    }
+
+    /// Store a value parked on the stack through the address in `rcx`.
+    ///
+    /// The pairing with the `sub rsp` that parked it is the caller's, so that
+    /// the value can be produced before the address that would clobber it.
+    fn emit_store_parked(&mut self, ty: &TypeRef) {
+        if DataType::from_type_ref(ty) == DataType::String {
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rcx], rax");
+            self.emit("    mov QWORD PTR [rcx + 8], rdx");
+            return;
+        }
+        self.emit("    movsd xmm0, QWORD PTR [rsp]");
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_coercion(DataType::Double, DataType::from_type_ref(ty));
+        match ty {
+            TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+            TypeRef::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+            TypeRef::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+            _ => self.emit("    movsd QWORD PTR [rcx], xmm0"),
         }
     }
 
@@ -3180,6 +3208,26 @@ impl CodeGen {
         // A record field is addressed by a base location plus a word offset,
         // so it stores exactly like a scalar.
         if !target.fields.is_empty() {
+            // `arr(i).f`: the address is only known at run time, so the value
+            // is parked across the address calculation that clobbers it.
+            if let Some(indices) = target.indices.clone() {
+                if let Some(base) = self.array_elem_type(&target.name) {
+                    if let Some((offset, ty)) = self.field_byte_offset(&base, &target.fields) {
+                        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                        if DataType::from_type_ref(&ty) == DataType::String {
+                            self.emit("    mov QWORD PTR [rsp], rax");
+                            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                        } else {
+                            self.emit("    movsd QWORD PTR [rsp], xmm0");
+                        }
+                        self.gen_array_addr(&target.name, &indices);
+                        self.emit(&format!("    add rax, {}", offset));
+                        self.emit("    mov rcx, rax");
+                        self.emit_store_parked(&ty);
+                        return;
+                    }
+                }
+            }
             if let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields) {
                 self.gen_store_typed(&loc, &ty, DataType::Double);
                 return;

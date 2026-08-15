@@ -911,6 +911,10 @@ impl Parser {
             }
         }
 
+        // WRITE always ends its line, so a trailing separator does not
+        // suppress the newline the way it does for PRINT.
+        let newline = newline || write;
+
         if let Some(file_num) = file_num {
             Ok(StmtKind::PrintFile {
                 file_num,

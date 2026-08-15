@@ -366,6 +366,41 @@ fn test_const() {
     assert_eq!(lines, vec!["10", "5", "hi", "7"]);
 }
 
+/// SWAP must follow a record field path, not just a variable name.
+///
+/// Reading a target dropped its field path entirely, so both sides read the
+/// record's base word and the exchange wrote zeros back.
+#[test]
+fn test_swap_record_fields() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A AS P\nA.X = 7\nA.Y = 3\nSWAP A.X, A.Y\nPRINT A.X; A.Y\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "37");
+}
+
+/// The same for a string field, whose type comes from the field rather than
+/// from the record variable's (suffix-less) name.
+#[test]
+fn test_swap_record_string_fields() {
+    let output = compile_and_run(
+        "TYPE P\nN AS STRING * 8\nEND TYPE\nDIM A AS P\nDIM B AS P\nA.N = \"aa\"\nB.N = \"bb\"\nSWAP A.N, B.N\nPRINT A.N; \" \"; B.N\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "bb aa");
+}
+
+/// And for a field of an array element, whose address is only known at run
+/// time.
+#[test]
+fn test_swap_array_record_fields() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM A(3) AS P\nA(0).X = 1\nA(1).X = 2\nSWAP A(0).X, A(1).X\nPRINT A(0).X; A(1).X\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "21");
+}
+
 /// WRITE separates values with commas and quotes strings.
 #[test]
 fn test_write() {
