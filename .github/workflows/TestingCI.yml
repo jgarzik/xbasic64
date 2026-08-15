@@ -60,12 +60,18 @@ jobs:
       # Worth repeating here rather than trusting the Linux job: this is the
       # only step that drives link.exe over whole programs, and the Win64
       # runtime is the half that cannot be run anywhere else.
+      #
+      # Deliberately PowerShell, the shell the rest of this job uses. Under
+      # `shell: bash` the PATH leads with Git for Windows' usr/bin, whose GNU
+      # coreutils `link.exe` shadows the MSVC linker -- the compiler then hands
+      # MSVC flags to coreutils and gets "extra operand '/SUBSYSTEM:CONSOLE'".
       - name: Compile and run the examples
-        shell: bash
+        shell: pwsh
         run: |
-          set -euo pipefail
-          for f in examples/*.bas; do
-            echo "== $f"
-            ./target/release/xbasic64.exe "$f" -o example.exe
-            ./example.exe </dev/null >/dev/null
-          done
+          Get-ChildItem examples/*.bas | ForEach-Object {
+            Write-Host "== $($_.Name)"
+            & ./target/release/xbasic64.exe $_.FullName -o example.exe
+            if ($LASTEXITCODE -ne 0) { throw "compile failed: $($_.Name)" }
+            & ./example.exe | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "run failed: $($_.Name)" }
+          }
