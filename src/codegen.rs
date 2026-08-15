@@ -1351,15 +1351,33 @@ impl CodeGen {
                 };
                 // Assigning one whole record to another copies its words.
                 if let TypeRef::Record(_) = &ty {
-                    if let Expr::Variable(src) = value {
-                        let words = self.symbols.type_words(&ty);
-                        let src_ty = self.typed_var(src).expect("sema checked the source");
-                        let src_loc = self.get_record_loc(src, &src_ty);
-                        for w in 0..words {
-                            self.emit(&format!("    mov rax, {}", src_loc.q(w)));
-                            self.emit(&format!("    mov {}, rax", loc.q(w)));
+                    let words = self.symbols.type_words(&ty);
+                    match value {
+                        Expr::Variable(src) => {
+                            let src_ty = self.typed_var(src).expect("sema checked the source");
+                            let src_loc = self.get_record_loc(src, &src_ty);
+                            for w in 0..words {
+                                self.emit(&format!("    mov rax, {}", src_loc.q(w)));
+                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                            }
+                            return;
                         }
-                        return;
+                        // An array element's address is only known at run time.
+                        Expr::ArrayAccess { name, indices }
+                        | Expr::FnCall {
+                            name,
+                            args: indices,
+                        } => {
+                            let indices = indices.clone();
+                            self.gen_array_addr(name, &indices);
+                            self.emit("    mov r10, rax");
+                            for w in 0..words {
+                                self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
+                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                            }
+                            return;
+                        }
+                        _ => {}
                     }
                 }
                 let vt = self.gen_expr(value);

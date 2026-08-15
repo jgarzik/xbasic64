@@ -487,22 +487,26 @@ impl Analyzer {
                     }
                 } else if let Some(target_ty) = self.symbols.typed_var(scope, name).cloned() {
                     if let TypeRef::Record(rname) = &target_ty {
-                        match value {
-                            Expr::Variable(src) => match self.symbols.typed_var(scope, src) {
+                        // The source may be another record variable, or an
+                        // element of an array of the same record type.
+                        let src_name = match value {
+                            Expr::Variable(src)
+                            | Expr::ArrayAccess { name: src, .. }
+                            | Expr::FnCall { name: src, .. } => Some(src),
+                            _ => None,
+                        };
+                        let matches_type = src_name.is_some_and(|src| {
+                            matches!(
+                                self.symbols.typed_var(scope, src),
                                 Some(TypeRef::Record(sname))
-                                    if sname.to_uppercase() == rname.to_uppercase() => {}
-                                _ => self.error(
-                                    line,
-                                    format!(
-                                        "'{}' can only be assigned another {} record",
-                                        name, rname
-                                    ),
-                                ),
-                            },
-                            _ => self.error(
+                                    if sname.to_uppercase() == rname.to_uppercase()
+                            )
+                        });
+                        if !matches_type {
+                            self.error(
                                 line,
                                 format!("'{}' can only be assigned another {} record", name, rname),
-                            ),
+                            );
                         }
                     }
                 } else {

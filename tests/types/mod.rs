@@ -318,3 +318,15 @@ fn test_as_typed_parameters_and_result() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["7hi", "42"]);
 }
+
+/// A record variable may be assigned from an array element, whose address is
+/// only known at run time.
+#[test]
+fn test_record_assignment_from_array_element() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A(2) AS P\nDIM One AS P\nA(1).X = 3\nA(1).Y = 4\nOne = A(1)\nPRINT One.X; One.Y\nA(1).X = 99\nPRINT One.X\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["34", "3"], "the copy is independent");
+}
