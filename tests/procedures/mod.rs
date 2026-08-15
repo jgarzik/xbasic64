@@ -188,3 +188,152 @@ Count
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["0", "1", "0", "1", "0", "1"], "fresh per call");
 }
+
+/// LANGREF's own SUB example. A string argument occupies two slots (pointer and
+/// length) at the call site, but the callee bound one register per parameter,
+/// so the string arrived empty and printed "Hello, !".
+#[test]
+fn test_string_parameter() {
+    let output = compile_and_run(
+        r#"
+SUB PrintGreeting(Name$)
+PRINT "Hello, "; Name$; "!"
+END SUB
+PrintGreeting("World")
+PrintGreeting "Again"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["Hello, World!", "Hello, Again!"]);
+}
+
+/// A parameter following a string was also corrupted, because the caller and
+/// callee disagreed about how many slots the string consumed.
+#[test]
+fn test_string_and_numeric_parameters() {
+    let output = compile_and_run(
+        r#"
+SUB A(S$, N)
+PRINT S$
+PRINT N
+END SUB
+SUB B(N, S$)
+PRINT N
+PRINT S$
+END SUB
+A("hi", 42)
+B(7, "world")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["hi", "42", "7", "world"]);
+}
+
+/// Enough string parameters to exhaust the argument registers and spill to the
+/// stack, on both the 6-register System V and 4-register Win64 conventions.
+#[test]
+fn test_parameter_register_overflow() {
+    let output = compile_and_run(
+        r#"
+SUB S3(A$, B$, C$)
+PRINT A$; B$; C$
+END SUB
+SUB M(A, B$, C, D$, E, F$)
+PRINT A; B$; C; D$; E; F$
+END SUB
+S3("a", "b", "c")
+M(1, "x", 2, "y", 3, "z")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["abc", "1x2y3z"]);
+}
+
+/// Parameters declared with a type suffix must arrive narrowed to that type.
+#[test]
+fn test_typed_parameters() {
+    let output = compile_and_run(
+        r#"
+SUB T(I%, L&, S!, D#)
+PRINT I%
+PRINT L&
+PRINT S!
+PRINT D#
+END SUB
+T(3, 100000, 2.5, 1.25)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["3", "100000", "2.5", "1.25"]);
+}
+
+/// A FUNCTION with a `$` suffix returns a string. This used to abort the
+/// compiler: any unrecognized `$`-suffixed call was assumed to be an array.
+#[test]
+fn test_string_returning_function() {
+    let output = compile_and_run(
+        r#"
+FUNCTION Greet$(N$)
+Greet$ = "Hello, " + N$
+END FUNCTION
+FUNCTION Twice$(S$)
+Twice$ = S$ + S$
+END FUNCTION
+PRINT Greet$("World")
+PRINT Twice$(Twice$("ab"))
+PRINT "[" + Greet$("x") + "]"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["Hello, World", "abababab", "[Hello, x]"],
+        "string functions compose"
+    );
+}
+
+/// A parameterless FUNCTION is called by naming it. Inside its own body the
+/// same name is the return variable, which must not recurse.
+#[test]
+fn test_parameterless_function() {
+    let output = compile_and_run(
+        r#"
+FUNCTION Name$
+Name$ = "bob"
+END FUNCTION
+FUNCTION Answer
+Answer = 42
+END FUNCTION
+PRINT Name$
+PRINT Answer
+IF Name$ = "bob" THEN PRINT "eq" ELSE PRINT "ne"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["bob", "42", "eq"]);
+}
+
+/// String parameters are by value, like numeric ones.
+#[test]
+fn test_string_parameters_are_by_value() {
+    let output = compile_and_run(
+        r#"
+SUB Change(S$)
+S$ = "changed"
+PRINT S$
+END SUB
+T$ = "original"
+Change(T$)
+PRINT T$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["changed", "original"]);
+}

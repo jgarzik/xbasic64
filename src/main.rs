@@ -83,7 +83,7 @@ fn main() {
 
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
-    let (_symbols, diagnostics) = sema::analyze(&program);
+    let (symbols, diagnostics) = sema::analyze(&program);
     if !diagnostics.is_empty() {
         for d in &diagnostics {
             eprintln!("{}: error: {}", locate(input_file, d.line), d.message);
@@ -98,7 +98,7 @@ fn main() {
 
     // Generate code
     let mut codegen = codegen::CodeGen::default();
-    let asm = codegen.generate(&program);
+    let asm = codegen.generate(&program, symbols);
 
     // Add runtime
     let runtime_asm = runtime::generate_runtime();

@@ -178,6 +178,7 @@
 
 use crate::abi::{Abi, PlatformAbi};
 use crate::parser::*;
+use crate::sema::Symbols;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
@@ -293,6 +294,25 @@ impl Loc {
     }
 }
 
+/// One 8-byte physical argument slot in the private `_proc_*` convention.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Slot {
+    /// `INT_ARG_REGS[i]`.
+    Reg(usize),
+    /// Caller: `[rsp + 8*i]` at the moment of the `call`.
+    /// Callee: `[rbp + 16 + 8*i]` after `push rbp; mov rbp, rsp`.
+    Stk(usize),
+}
+
+/// Where one parameter's words are passed.
+#[derive(Clone, Debug)]
+struct ParamPlace {
+    ty: DataType,
+    ptr: Slot,
+    /// Second slot, for a string's length.
+    len: Option<Slot>,
+}
+
 /// Variable storage information
 #[derive(Clone)]
 struct VarInfo {
@@ -321,8 +341,11 @@ pub struct CodeGen {
     current_proc: Option<String>,   // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>, // local variables for current proc
     proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
-    gosub_used: bool,               // whether GOSUB is used (need return stack)
-    expr_depth: u32,                // current expression nesting depth
+    /// Names resolved by semantic analysis; codegen consults this instead of
+    /// guessing from an identifier's spelling.
+    symbols: Symbols,
+    gosub_used: bool, // whether GOSUB is used (need return stack)
+    expr_depth: u32,  // current expression nesting depth
 }
 
 impl CodeGen {
@@ -493,6 +516,70 @@ impl CodeGen {
         self.arrays.get(name)
     }
 
+    /// Assign physical slots to a procedure's parameters.
+    ///
+    /// This is the single definition of the private `_proc_*` calling
+    /// convention. Both the call site and the procedure prologue call it with
+    /// the same input -- the declared parameter types, in order -- so the two
+    /// sides cannot drift apart. They previously open-coded their own slot
+    /// arithmetic and disagreed about strings: a string argument occupies two
+    /// slots (pointer and length) but the callee bound only one register per
+    /// parameter, so the string arrived empty and every parameter after it was
+    /// read from the wrong register.
+    ///
+    /// Two rules keep the assignment simple enough to be obviously the same on
+    /// both sides:
+    ///
+    /// * A parameter is never split between registers and the stack. Splitting
+    ///   would buy at most one register, and `_proc_*` is a private symbol with
+    ///   no external ABI obligation.
+    /// * Spilling is monotone: once one parameter goes to the stack, so do all
+    ///   later ones, which keeps stack slot indices contiguous in declaration
+    ///   order.
+    ///
+    /// Returns the placements and the number of stack slots needed.
+    fn classify_params(types: &[DataType]) -> (Vec<ParamPlace>, usize) {
+        let n_regs = PlatformAbi::INT_ARG_REGS.len();
+        let mut next_reg = 0usize;
+        let mut next_stk = 0usize;
+        let mut places = Vec::with_capacity(types.len());
+
+        for &ty in types {
+            let words = Self::words_for(ty) as usize;
+            // If it does not fit entirely in the remaining registers, this
+            // parameter and every later one go on the stack.
+            if next_reg + words > n_regs {
+                next_reg = n_regs;
+            }
+            let in_regs = next_reg < n_regs;
+
+            let take = |counter: &mut usize| -> Slot {
+                let slot = if in_regs {
+                    Slot::Reg(*counter)
+                } else {
+                    Slot::Stk(*counter)
+                };
+                *counter += 1;
+                slot
+            };
+            let counter = if in_regs {
+                &mut next_reg
+            } else {
+                &mut next_stk
+            };
+
+            let ptr = take(counter);
+            let len = if words == 2 {
+                Some(take(counter))
+            } else {
+                None
+            };
+            places.push(ParamPlace { ty, ptr, len });
+        }
+
+        (places, next_stk)
+    }
+
     /// Number of 8-byte words a scalar of this type occupies.
     fn words_for(data_type: DataType) -> i32 {
         if data_type == DataType::String { 2 } else { 1 }
@@ -631,7 +718,8 @@ impl CodeGen {
         }
     }
 
-    pub fn generate(&mut self, program: &Program) -> String {
+    pub fn generate(&mut self, program: &Program, symbols: Symbols) -> String {
+        self.symbols = symbols;
         // First pass: collect DATA statements and check for GOSUB
         for stmt in &program.statements {
             self.preprocess(stmt);
@@ -786,7 +874,7 @@ impl CodeGen {
         self.stack_offset = 0;
 
         // Procedure label
-        self.emit_label(&format!("_proc_{}", name));
+        self.emit_label(&format!("_proc_{}", mangle(name)));
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
 
@@ -800,34 +888,70 @@ impl CodeGen {
         // be wiped.
         self.emit_zero_frame();
 
-        // Parameters are passed in registers (per platform ABI)
-        // First N params in registers, rest on stack at [rbp+16], [rbp+24], etc.
-        // Store them all in our local stack space
+        // Spill parameters into the frame, using the same placement the call
+        // site computed from the same declared types.
         let int_regs = PlatformAbi::INT_ARG_REGS;
-        let max_reg_args = int_regs.len();
-        for (i, param) in params.iter().enumerate() {
-            let data_type = DataType::from_suffix(param);
-            self.stack_offset -= 8 * Self::words_for(data_type);
+        let param_types: Vec<DataType> = params.iter().map(|p| DataType::from_suffix(p)).collect();
+        let (places, _) = Self::classify_params(&param_types);
+
+        for (param, place) in params.iter().zip(&places) {
+            self.stack_offset -= 8 * Self::words_for(place.ty);
             let loc = Loc::Frame(self.stack_offset);
             self.proc_vars.insert(
                 param.clone(),
                 VarInfo {
                     loc: loc.clone(),
-                    data_type,
+                    data_type: place.ty,
                 },
             );
-            if i < max_reg_args {
-                // Parameter in register - store to our local stack
-                self.emit(&format!("    mov {}, {}", loc.q(0), int_regs[i]));
-            } else {
-                // Parameter on call stack - copy to our local stack
-                // Overflow args are at [rbp+16], [rbp+24], etc. (after saved rbp and ret addr)
-                let stack_arg_offset = 16 + (i - max_reg_args) * 8;
-                self.emit(&format!(
-                    "    mov rax, QWORD PTR [rbp + {}]",
-                    stack_arg_offset
-                ));
-                self.emit(&format!("    mov {}, rax", loc.q(0)));
+
+            // Bring a slot's value into a register we can store from. r11 is
+            // caller-saved and an argument register on neither ABI, so using it
+            // as scratch cannot clobber a parameter still to be spilled.
+            let fetch = |s: &mut Self, slot: Slot| -> String {
+                match slot {
+                    Slot::Reg(i) => int_regs[i].to_string(),
+                    Slot::Stk(i) => {
+                        s.emit(&format!(
+                            "    mov r11, QWORD PTR [rbp + {}]",
+                            16 + 8 * i as i32
+                        ));
+                        "r11".to_string()
+                    }
+                }
+            };
+
+            match place.ty {
+                DataType::String => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                    let l = fetch(self, place.len.expect("string parameter has a length slot"));
+                    self.emit(&format!("    mov {}, {}", loc.q(1), l));
+                }
+                DataType::Double => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                }
+                // Numeric arguments arrive as f64 bit patterns; narrow to the
+                // declared type. rax/xmm0 are safe scratch: neither is an
+                // argument register on either ABI.
+                DataType::Single => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    movq xmm0, {}", p));
+                    self.emit("    cvtsd2ss xmm0, xmm0");
+                    self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+                }
+                DataType::Integer | DataType::Long => {
+                    let p = fetch(self, place.ptr);
+                    self.emit(&format!("    movq xmm0, {}", p));
+                    self.emit("    cvttsd2si eax, xmm0");
+                    let (size, reg) = if place.ty == DataType::Integer {
+                        ("WORD PTR", "ax")
+                    } else {
+                        ("DWORD PTR", "eax")
+                    };
+                    self.emit(&format!("    mov {}, {}", loc.at(size, 0), reg));
+                }
             }
         }
 
@@ -1456,6 +1580,23 @@ impl CodeGen {
             },
 
             Expr::Variable(name) => {
+                // A bare reference to a parameterless FUNCTION calls it, as in
+                // QuickBASIC. Inside the function's own body the same name is
+                // its return variable, so that case must not become infinite
+                // recursion.
+                let upper = name.to_uppercase();
+                let is_own_name = self.current_proc.as_deref() == Some(upper.as_str());
+                if !is_own_name
+                    && self
+                        .symbols
+                        .procs
+                        .get(&upper)
+                        .is_some_and(|p| p.is_function && p.params.is_empty())
+                {
+                    self.gen_call(&upper, &[]);
+                    return self.fn_return_type(&upper);
+                }
+
                 let info = self.get_var_info(name);
                 let loc = &info.loc;
                 match info.data_type {
@@ -2060,193 +2201,113 @@ impl CodeGen {
             }
             _ => {
                 // User-defined function or array access
-                if self.lookup_array(&upper_name).is_some() || upper_name.ends_with('$') {
-                    // Array access
-                    self.gen_array_load(&upper_name, args);
+                // Sema has already established that this name is a procedure
+                // or an array, so no spelling heuristic is needed. Procedures
+                // win: an array and a procedure cannot share a name.
+                if self.symbols.procs.contains_key(&upper_name) {
+                    self.gen_call(&upper_name, args);
                 } else {
-                    // User function call
-                    self.gen_call(name, args);
+                    self.gen_array_load(&upper_name, args);
                 }
             }
         }
     }
 
+    /// Emit a call to a user SUB or FUNCTION.
+    ///
+    /// Argument placement comes from `classify_params`, driven by the callee's
+    /// *declared* parameter types. Classifying by the argument expressions'
+    /// types instead -- as this used to -- lets caller and callee disagree, and
+    /// silently corrupts the callee's frame.
     fn gen_call(&mut self, name: &str, args: &[Expr]) {
-        let int_regs = PlatformAbi::INT_ARG_REGS;
-        let max_reg_args = int_regs.len();
+        let upper = name.to_uppercase();
+        let param_types: Vec<DataType> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.iter().map(|s| DataType::from_suffix(s)).collect())
+            .unwrap_or_default();
 
+        let mangled = mangle(&upper);
         if args.is_empty() {
-            self.emit(&format!("    call _proc_{}", name));
+            self.emit(&format!("    call _proc_{}", mangled));
             return;
         }
 
-        // Phase 1: Evaluate ALL arguments to stack temporaries
-        // This prevents clobbering of registers when args contain nested function calls
-        // Each arg needs 8 bytes (numeric as double bits, string ptr only - len follows)
-        let mut arg_info: Vec<(DataType, i32)> = Vec::new(); // (type, stack_offset)
+        let (places, stack_slots) = Self::classify_params(&param_types);
 
-        // Calculate total slots needed (strings need 2 slots: ptr + len)
-        let mut total_slots = 0;
-        for arg in args.iter() {
-            let arg_type = self.expr_type(arg);
-            if arg_type == DataType::String {
-                total_slots += 2; // ptr + len
-            } else {
-                total_slots += 1;
-            }
-        }
+        // Phase 1: evaluate every argument into a temp block, so that a nested
+        // call inside a later argument cannot clobber an earlier one.
+        let words: usize = param_types
+            .iter()
+            .map(|t| Self::words_for(*t) as usize)
+            .sum();
+        let temp_bytes = ((words * 8 + 15) & !15) as i32;
+        self.emit(&format!("    sub rsp, {}", temp_bytes));
 
-        // Allocate stack space (16-byte aligned)
-        let stack_space = (total_slots * 8 + 15) & !15;
-        self.emit(&format!("    sub rsp, {}", stack_space));
-
-        // Evaluate each argument and save to stack
-        let mut slot_offset = 0i32;
-        for arg in args.iter() {
+        let mut temp_of: Vec<i32> = Vec::with_capacity(args.len());
+        let mut w = 0i32;
+        for (arg, ty) in args.iter().zip(&param_types) {
             let arg_type = self.gen_expr(arg);
-            if arg_type == DataType::String {
-                // String: save ptr and len to consecutive slots
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", slot_offset));
-                self.emit(&format!(
-                    "    mov QWORD PTR [rsp + {}], rdx",
-                    slot_offset + 8
-                ));
-                arg_info.push((arg_type, slot_offset));
-                slot_offset += 16;
+            if *ty == DataType::String {
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8));
+                temp_of.push(w * 8);
+                w += 2;
             } else {
-                // Numeric: coerce to double and save
+                // Numeric arguments travel as f64 bit patterns in integer
+                // slots; the callee narrows to the declared type.
                 self.gen_coercion(arg_type, DataType::Double);
+                self.emit(&format!("    movsd QWORD PTR [rsp + {}], xmm0", w * 8));
+                temp_of.push(w * 8);
+                w += 1;
+            }
+        }
+
+        // Phase 2: copy the stack-passed slots into place.
+        let stack_bytes = ((stack_slots * 8 + 15) & !15) as i32;
+        if stack_slots > 0 {
+            self.emit(&format!("    sub rsp, {}", stack_bytes));
+        }
+        for (place, off) in places.iter().zip(&temp_of) {
+            // r11 is caller-saved and an argument register on neither ABI.
+            if let Slot::Stk(i) = place.ptr {
                 self.emit(&format!(
-                    "    movsd QWORD PTR [rsp + {}], xmm0",
-                    slot_offset
+                    "    mov r11, QWORD PTR [rsp + {}]",
+                    stack_bytes + off
                 ));
-                arg_info.push((arg_type, slot_offset));
-                slot_offset += 8;
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
             }
-        }
-
-        // Phase 2: Count register slots used
-        let mut reg_slots_used: usize = 0;
-        for (arg_type, _) in arg_info.iter() {
-            if *arg_type == DataType::String {
-                reg_slots_used += 2; // ptr + len
-            } else {
-                reg_slots_used += 1;
-            }
-        }
-
-        // Calculate overflow args (those that don't fit in registers)
-        let overflow_slots = reg_slots_used.saturating_sub(max_reg_args);
-
-        // Phase 3: Handle overflow args (push to call stack for >6 params)
-        let overflow_space = if overflow_slots > 0 {
-            let space = ((overflow_slots * 8 + 15) & !15) as i32;
-            self.emit(&format!("    sub rsp, {}", space));
-
-            // Copy overflow args from temp stack to call stack
-            let mut reg_count = 0;
-            let mut overflow_idx = 0;
-            for (arg_type, temp_offset) in arg_info.iter() {
-                if *arg_type == DataType::String {
-                    // String takes 2 register slots
-                    if reg_count >= max_reg_args {
-                        // Both ptr and len are overflow
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space, temp_offset
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space,
-                            temp_offset + 8
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    } else if reg_count + 1 >= max_reg_args {
-                        // Only len is overflow (ptr fits in last register)
-                        reg_count += 1; // ptr in register
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space,
-                            temp_offset + 8
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    }
-                    reg_count += 2;
-                } else {
-                    if reg_count >= max_reg_args {
-                        // This arg is overflow
-                        self.emit(&format!(
-                            "    mov rax, QWORD PTR [rsp + {} + {}]",
-                            space, temp_offset
-                        ));
-                        self.emit(&format!(
-                            "    mov QWORD PTR [rsp + {}], rax",
-                            overflow_idx * 8
-                        ));
-                        overflow_idx += 1;
-                    }
-                    reg_count += 1;
-                }
-            }
-            space
-        } else {
-            0
-        };
-
-        // Phase 4: Load arguments into registers (immediately before call)
-        let mut reg_idx = 0;
-        let base_offset = overflow_space; // Offset to temp stack from current rsp
-        for (arg_type, temp_offset) in arg_info.iter() {
-            if reg_idx >= max_reg_args {
-                break;
-            }
-            if *arg_type == DataType::String {
-                // String: load ptr and len into consecutive registers
-                if reg_idx < max_reg_args {
-                    self.emit(&format!(
-                        "    mov {}, QWORD PTR [rsp + {} + {}]",
-                        int_regs[reg_idx], base_offset, temp_offset
-                    ));
-                    reg_idx += 1;
-                }
-                if reg_idx < max_reg_args {
-                    self.emit(&format!(
-                        "    mov {}, QWORD PTR [rsp + {} + {}]",
-                        int_regs[reg_idx],
-                        base_offset,
-                        temp_offset + 8
-                    ));
-                    reg_idx += 1;
-                }
-            } else {
-                // Numeric: load as 64-bit value
+            if let Some(Slot::Stk(i)) = place.len {
                 self.emit(&format!(
-                    "    mov {}, QWORD PTR [rsp + {} + {}]",
-                    int_regs[reg_idx], base_offset, temp_offset
+                    "    mov r11, QWORD PTR [rsp + {}]",
+                    stack_bytes + off + 8
                 ));
-                reg_idx += 1;
+                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
             }
         }
 
-        // Make the call
-        self.emit(&format!("    call _proc_{}", name));
+        // Phase 3: load the register slots last, so nothing can clobber them.
+        let regs = PlatformAbi::INT_ARG_REGS;
+        for (place, off) in places.iter().zip(&temp_of) {
+            if let Slot::Reg(i) = place.ptr {
+                self.emit(&format!(
+                    "    mov {}, QWORD PTR [rsp + {}]",
+                    regs[i],
+                    stack_bytes + off
+                ));
+            }
+            if let Some(Slot::Reg(i)) = place.len {
+                self.emit(&format!(
+                    "    mov {}, QWORD PTR [rsp + {}]",
+                    regs[i],
+                    stack_bytes + off + 8
+                ));
+            }
+        }
 
-        // Clean up: overflow space + temp stack space
-        let total_cleanup = overflow_space + stack_space;
-        self.emit(&format!("    add rsp, {}", total_cleanup));
+        self.emit(&format!("    call _proc_{}", mangled));
+        self.emit(&format!("    add rsp, {}", stack_bytes + temp_bytes));
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
