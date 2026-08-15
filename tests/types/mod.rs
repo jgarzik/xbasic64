@@ -275,6 +275,31 @@ fn test_local_record_is_fresh_each_call() {
     assert_eq!(lines, vec!["0", "0"]);
 }
 
+/// A record parameter's frame slot must not outlive its procedure.
+///
+/// Storage for typed variables used to live in one map that `gen_procedure`
+/// never cleared, so a later procedure -- or module-level code -- resolved the
+/// name to the earlier procedure's frame offset and read stack garbage.
+#[test]
+fn test_record_storage_does_not_leak_between_procedures() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB First(G AS P)\nPRINT G.X\nEND SUB\nSUB Second\nPRINT G.X\nEND SUB\nG.X = 7\nSecond\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "7");
+}
+
+/// Two procedures each declaring a local record must get distinct slots, and
+/// neither may inherit the other's.
+#[test]
+fn test_local_records_in_sibling_procedures() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB A(Z AS P)\nPRINT Z.X\nEND SUB\nSUB B\nDIM Z AS P\nZ.X = 5\nZ.Y = 6\nPRINT Z.X; Z.Y\nEND SUB\nB\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "56");
+}
+
 /// A record is passed to a procedure by value: the callee gets the address of
 /// the caller's copy and copies it into a local slot, so changes do not escape.
 #[test]

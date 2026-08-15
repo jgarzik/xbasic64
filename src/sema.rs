@@ -181,6 +181,14 @@ impl Symbols {
         self.typed_vars.get(&(Scope::Module, upper))
     }
 
+    /// Look up a typed variable declared in exactly `scope`, with no fallback.
+    ///
+    /// Codegen uses this to tell a procedure-local record from a module-level
+    /// one it merely refers to, which decides frame slot versus `.bss`.
+    pub fn typed_var_in(&self, scope: &Scope, name: &str) -> Option<&TypeRef> {
+        self.typed_vars.get(&(scope.clone(), name.to_uppercase()))
+    }
+
     /// Look up an array visible from `scope`: a procedure-local declaration
     /// shadows a module-level one of the same name.
     pub fn lookup_array(&self, scope: &Scope, name: &str) -> Option<&ArrayInfo> {

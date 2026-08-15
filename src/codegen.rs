@@ -458,14 +458,22 @@ pub struct CodeGen {
     loop_stack: Vec<(bool, String)>,
     /// Label of the current procedure's epilogue, for EXIT SUB / EXIT FUNCTION.
     proc_exit_label: Option<String>,
-    /// Storage for variables declared with `DIM ... AS`.
+    /// Storage for module-level variables declared with `DIM ... AS`.
     record_vars: HashMap<String, Loc>,
+    /// The same, for the current procedure's typed locals and parameters.
+    /// Kept separate from `record_vars` and cleared per procedure: a shared
+    /// map let one procedure's frame slot be reused by the next, which then
+    /// read and wrote below its own `rsp`.
+    proc_record_vars: HashMap<String, Loc>,
     /// Declared types of the current procedure's typed parameters.
     proc_types: HashMap<String, TypeRef>,
     /// Module-level typed variables and their size in words, for .bss.
     record_globals: BTreeMap<String, i32>,
-    /// Element size in words for arrays of records, by upper-case name.
+    /// Element size in words for module-level arrays of records, by
+    /// upper-case name.
     record_elem_words: HashMap<String, i32>,
+    /// The same, for arrays declared inside the current procedure.
+    proc_record_elem_words: HashMap<String, i32>,
     /// DATA item index reached at each numeric line label, for RESTORE.
     data_line_index: HashMap<u32, usize>,
     /// The same for named labels.
@@ -730,7 +738,7 @@ impl CodeGen {
     fn elem_size_for(&self, name: &str) -> i32 {
         // An array declared with `DIM ... AS T` has records for elements, so
         // its element size comes from the type rather than a name suffix.
-        if let Some(words) = self.record_elem_words.get(&name.to_uppercase()) {
+        if let Some(words) = self.record_elem_words_of(name) {
             return words * 8;
         }
         Self::elem_size(name)
@@ -1207,6 +1215,8 @@ impl CodeGen {
         self.proc_vars.clear();
         self.proc_arrays.clear();
         self.proc_types.clear();
+        self.proc_record_vars.clear();
+        self.proc_record_elem_words.clear();
         let old_stack_offset = self.stack_offset;
         self.stack_offset = 0;
 
@@ -1259,7 +1269,7 @@ impl CodeGen {
                     self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
                     self.emit(&format!("    mov {}, rax", loc.q(w)));
                 }
-                self.record_vars.insert(param.clone(), loc);
+                self.proc_record_vars.insert(param.clone(), loc);
                 self.proc_types.insert(param.clone(), ty);
                 continue;
             }
@@ -2770,9 +2780,7 @@ impl CodeGen {
     /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
     fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
         let ty = self.typed_var(name)?;
-        self.record_elem_words
-            .contains_key(&name.to_uppercase())
-            .then_some(ty)
+        self.record_elem_words_of(name).is_some().then_some(ty)
     }
 
     /// Load or store a field of an array element.
@@ -2903,7 +2911,7 @@ impl CodeGen {
     /// Typed storage for a variable declared with `AS`, if that is where it
     /// actually lives.
     fn typed_storage(&mut self, name: &str) -> Option<(Loc, TypeRef)> {
-        if self.has_plain_slot(name) && !self.record_vars.contains_key(name) {
+        if self.has_plain_slot(name) && self.record_loc_of(name).is_none() {
             return None;
         }
         let ty = self.typed_var(name)?;
@@ -2947,21 +2955,60 @@ impl CodeGen {
     /// Storage for a variable declared with `DIM ... AS`, allocating it the
     /// first time it is seen.
     fn get_record_loc(&mut self, name: &str, ty: &TypeRef) -> Loc {
-        if let Some(info) = self.record_vars.get(name) {
-            return info.clone();
+        if let Some(loc) = self.record_loc_of(name) {
+            return loc;
         }
         let words = self.symbols.type_words(ty);
-        let loc = if self.current_proc.is_some() {
+
+        // A record is local only when the current procedure actually declares
+        // it. Deciding on `current_proc.is_some()` alone gave a frame slot to a
+        // module-level record merely *referred to* from inside a procedure.
+        if self.declared_in_current_proc(name) {
             self.stack_offset -= 8 * words;
-            Loc::Frame(self.stack_offset)
-        } else {
-            Loc::Global(format!("_rec_{}", mangle(name)))
-        };
-        self.record_vars.insert(name.to_string(), loc.clone());
-        if let Loc::Global(_) = loc {
-            self.record_globals.insert(name.to_string(), words);
+            let loc = Loc::Frame(self.stack_offset);
+            self.proc_record_vars.insert(name.to_string(), loc.clone());
+            return loc;
         }
+
+        let loc = Loc::Global(format!("_rec_{}", mangle(name)));
+        self.record_vars.insert(name.to_string(), loc.clone());
+        self.record_globals.insert(name.to_string(), words);
         loc
+    }
+
+    /// Where a typed variable already lives, preferring the current
+    /// procedure's own declarations over module-level ones.
+    fn record_loc_of(&self, name: &str) -> Option<Loc> {
+        if self.current_proc.is_some() {
+            if let Some(loc) = self.proc_record_vars.get(name) {
+                return Some(loc.clone());
+            }
+        }
+        self.record_vars.get(name).cloned()
+    }
+
+    /// Element size in words of an array of records, with the same preference.
+    fn record_elem_words_of(&self, name: &str) -> Option<i32> {
+        let upper = name.to_uppercase();
+        if self.current_proc.is_some() {
+            if let Some(w) = self.proc_record_elem_words.get(&upper) {
+                return Some(*w);
+            }
+        }
+        self.record_elem_words.get(&upper).copied()
+    }
+
+    /// Whether the current procedure declares `name` itself, as a typed
+    /// parameter or a local `DIM ... AS`.
+    fn declared_in_current_proc(&self, name: &str) -> bool {
+        let Some(proc) = &self.current_proc else {
+            return false;
+        };
+        self.proc_types.contains_key(name)
+            || self
+                .symbols
+                .typed_var_in(&SemaScope::Proc(proc.clone()), name)
+                .is_some()
     }
 
     /// Load a scalar of the given declared type from `loc`.
@@ -3902,8 +3949,12 @@ impl CodeGen {
                     dimensions: dims.clone(),
                 };
                 let words = self.symbols.type_words(ty);
-                self.record_elem_words
-                    .insert(decl.name.to_uppercase(), words);
+                let key = decl.name.to_uppercase();
+                if self.current_proc.is_some() {
+                    self.proc_record_elem_words.insert(key, words);
+                } else {
+                    self.record_elem_words.insert(key, words);
+                }
                 self.gen_array_alloc(&arr, preserve);
             }
             (Some(dims), None) => {
