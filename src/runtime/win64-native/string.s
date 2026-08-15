@@ -441,14 +441,14 @@ _rt_space:
     lea rcx, [rbx + 1]
     call malloc
 
+    # memset returns its destination, so the pointer needs no saving -- and
+    # saving it with a bare push would leave rsp misaligned for the call.
     mov rcx, rax            # dest
     mov rdx, ' '            # fill byte
     mov r8, rbx             # count
-    push rax
     sub rsp, 32
     call memset
     add rsp, 32
-    pop rax
     mov rdx, rbx
 
     add rsp, 40
@@ -479,14 +479,13 @@ _rt_string_n:
     lea rcx, [rbx + 1]
     call malloc
 
+    # memset returns its destination; see _rt_space.
     mov rcx, rax
     mov rdx, r12
     mov r8, rbx
-    push rax
     sub rsp, 32
     call memset
     add rsp, 32
-    pop rax
     mov rdx, rbx
 
     add rsp, 32
@@ -610,14 +609,14 @@ _rt_case_convert:
 _rt_hex:
     push rbp
     mov rbp, rsp
-    sub rsp, 40
+    sub rsp, 48    # shadow space; 48 realigns after push rbp
     mov r8, rcx
     lea rcx, [rip + _str_buf]
     lea rdx, [rip + _fmt_hex]
     call sprintf
     mov rdx, rax
     lea rax, [rip + _str_buf]
-    add rsp, 40
+    add rsp, 48
     leave
     ret
 
@@ -625,14 +624,14 @@ _rt_hex:
 _rt_oct:
     push rbp
     mov rbp, rsp
-    sub rsp, 40
+    sub rsp, 48    # shadow space; 48 realigns after push rbp
     mov r8, rcx
     lea rcx, [rip + _str_buf]
     lea rdx, [rip + _fmt_oct]
     call sprintf
     mov rdx, rax
     lea rax, [rip + _str_buf]
-    add rsp, 40
+    add rsp, 48
     leave
     ret
 
@@ -660,14 +659,13 @@ _rt_strdup:
     lea rcx, [r12 + 1]
     call malloc
 
+    # memcpy returns its destination; see _rt_space.
     mov rcx, rax
-    push rax
     sub rsp, 32
     mov rdx, rbx
     mov r8, r12
     call memcpy
     add rsp, 32
-    pop rax
     mov rdx, r12
 
     add rsp, 32

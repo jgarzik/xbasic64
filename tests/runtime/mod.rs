@@ -12,6 +12,23 @@
 
 use std::collections::BTreeSet;
 
+/// Every `.s` file in one runtime tree, as (path, text).
+fn runtime_sources(dir: &str) -> Vec<(String, String)> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {dir}: {e}"));
+    for entry in entries {
+        let path = entry.expect("readable directory entry").path();
+        if path.extension().is_none_or(|e| e != "s") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).expect("readable .s file");
+        files.push((path.display().to_string(), text));
+    }
+    files.sort();
+    assert!(!files.is_empty(), "no .s files found in {dir}");
+    files
+}
+
 /// Every `.globl` symbol exported by one runtime tree.
 fn exported_symbols(dir: &str) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -78,8 +95,18 @@ fn test_message_lengths_are_computed() {
             }
             let text = std::fs::read_to_string(&path).expect("readable .s file");
             for (i, line) in text.lines().enumerate() {
-                let trimmed = line.trim();
-                if !trimmed.starts_with(".equ ") || !trimmed.contains("_len") {
+                // Both spellings of an assembler constant: `.equ N, v` and
+                // `N = v`. Only checking `.equ` let a hand-counted `=` through
+                // in the Win64 tree.
+                let trimmed = line.split('#').next().unwrap_or("").trim();
+                let name = match trimmed.strip_prefix(".equ ") {
+                    Some(rest) => rest.split(',').next().unwrap_or("").trim(),
+                    None => match trimmed.split_once('=') {
+                        Some((lhs, _)) if !lhs.trim().contains(char::is_whitespace) => lhs.trim(),
+                        _ => continue,
+                    },
+                };
+                if !name.ends_with("_len") {
                     continue;
                 }
                 assert!(
@@ -92,4 +119,80 @@ fn test_message_lengths_are_computed() {
             }
         }
     }
+}
+
+/// Both ABIs require `rsp` to be 16-byte aligned immediately before a `call`.
+///
+/// This is not a performance nicety: the CRT spills SSE registers with
+/// `movaps`, which faults outright on a misaligned address. A wrong prologue
+/// reserve in `_rt_fmt_double` -- on the path of every numeric PRINT -- crashed
+/// most of the Windows test suite with STATUS_ACCESS_VIOLATION, and the same
+/// class of defect sat latent in the System V tree.
+///
+/// On entry `rsp` is 8 (mod 16), because the caller's `call` pushed a return
+/// address. Walking each function linearly is sound because none of them
+/// changes `rsp` inside a branch that rejoins at a different depth; a
+/// `lea rsp, ...` restores a frame, after which the model stops trusting
+/// itself rather than reporting a guess.
+#[test]
+fn test_runtime_calls_are_stack_aligned() {
+    let mut problems = Vec::new();
+
+    for dir in ["src/runtime/sysv", "src/runtime/win64-native"] {
+        for (path, text) in runtime_sources(dir) {
+            let mut func = String::new();
+            let mut offset: i64 = 8;
+            let mut unknown = false;
+
+            for (i, raw) in text.lines().enumerate() {
+                let line = raw.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Some(sym) = line.strip_prefix(".globl ") {
+                    func = sym.trim().to_string();
+                    continue;
+                }
+                // A top-level label reopening the current function resets the
+                // model; a local `.L` label is inside one and does not.
+                if let Some(name) = line.strip_suffix(':') {
+                    if name == func {
+                        offset = 8;
+                        unknown = false;
+                    }
+                    continue;
+                }
+
+                if line.starts_with("lea rsp,") {
+                    unknown = true;
+                } else if line.starts_with("push ") || line.starts_with("pop ") {
+                    offset = (offset + 8) % 16;
+                } else if let Some(n) = line.strip_prefix("sub rsp, ") {
+                    offset =
+                        (offset - n.trim().parse::<i64>().expect("literal reserve")).rem_euclid(16);
+                } else if let Some(n) = line.strip_prefix("add rsp, ") {
+                    offset = (offset + n.trim().parse::<i64>().expect("literal release")) % 16;
+                } else if let Some(target) = line.strip_prefix("call ") {
+                    if !unknown && offset != 0 {
+                        problems.push(format!(
+                            "{}:{}: in {}: call {} with rsp % 16 == {} (want 0)",
+                            path,
+                            i + 1,
+                            func,
+                            target.trim(),
+                            offset
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{} misaligned call site(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
 }

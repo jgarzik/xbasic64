@@ -466,12 +466,12 @@ _rt_space:
     lea rdi, [rbx + 1]
     call {libc}malloc
 
+    # memset returns its destination, so the pointer needs no saving -- and
+    # saving it with a bare push would leave rsp misaligned for the call.
     mov rdi, rax            # dest
     mov esi, ' '            # fill byte
     mov rdx, rbx            # count
-    push rax
     call {libc}memset
-    pop rax
     mov rdx, rbx
 
     add rsp, 8
@@ -501,12 +501,11 @@ _rt_string_n:
     lea rdi, [rbx + 1]
     call {libc}malloc
 
+    # memset returns its destination; see _rt_space.
     mov rdi, rax
     mov esi, r12d
     mov rdx, rbx
-    push rax
     call {libc}memset
-    pop rax
     mov rdx, rbx
 
     pop r12
@@ -681,12 +680,11 @@ _rt_strdup:
     lea rdi, [r12 + 1]
     call {libc}malloc
 
-    push rax
+    # memcpy returns its destination; see _rt_space.
     mov rdi, rax
     mov rsi, rbx
     mov rdx, r12
     call {libc}memcpy
-    pop rax
     mov rdx, r12
 
     pop r12

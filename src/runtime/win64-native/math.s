@@ -18,7 +18,7 @@
 .data
 _rng_state: .quad 0x12345678DEADBEEF
 _cls_seq: .ascii "\033[2J\033[H"
-_cls_seq_len = 7
+.equ _cls_seq_len, . - _cls_seq
 _cls_bytes_written: .quad 0
 
 .text

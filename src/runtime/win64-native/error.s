@@ -49,7 +49,7 @@ _rt_error:
     mov rbp, rsp
     push rbx
     push rsi
-    sub rsp, 40             # shadow space, keeps rsp 16-byte aligned
+    sub rsp, 48             # shadow space, keeps rsp 16-byte aligned
 
     mov rbx, rcx            # message
     mov rsi, rdx            # line number

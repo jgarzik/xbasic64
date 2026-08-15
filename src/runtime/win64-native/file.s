@@ -549,7 +549,7 @@ _rt_file_eof:
     mov rbp, rsp
     push rbx
     push rsi
-    sub rsp, 40
+    sub rsp, 48    # two pushes plus the return address, so 48 realigns
 
     mov ebx, ecx
     lea rax, [rip + _file_handles]
@@ -577,7 +577,7 @@ _rt_file_eof:
 .Leof_false:
     xor eax, eax
 .Leof_done:
-    add rsp, 40
+    add rsp, 48
     pop rsi
     pop rbx
     leave

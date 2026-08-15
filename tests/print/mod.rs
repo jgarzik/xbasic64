@@ -26,6 +26,35 @@ PRINT "C"
     assert_eq!(lines[4], "C", "multi-c");
 }
 
+/// A value far too wide for its field must not run past the runtime's buffers.
+///
+/// `sprintf` of 1D300 into a "##.##" field wrote over 300 characters into a
+/// 160-byte buffer, destroying every global laid out after it.
+#[test]
+fn test_using_overflow_does_not_corrupt_globals() {
+    let output = compile_and_run(
+        "A = 111\nB = 222\nC = 333\nPRINT USING \"##.##\"; 1D300\nPRINT A\nPRINT B\nPRINT C\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines.len(), 4);
+    // Too wide for the field, so GW-BASIC's '%' marker precedes the full value.
+    assert!(lines[0].starts_with('%'), "got {}", lines[0]);
+    assert_eq!(&lines[1..], ["111", "222", "333"]);
+}
+
+/// An absurdly wide field is clamped rather than overrunning the output buffer.
+#[test]
+fn test_using_absurd_field_width() {
+    let format = "#".repeat(400);
+    let source = format!("PRINT USING \"{format}\"; 7\nPRINT \"after\"\n");
+    let output = compile_and_run(&source).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0].len(), 255);
+    assert!(lines[0].ends_with('7'));
+    assert_eq!(lines[1], "after");
+}
+
 /// PRINT USING used to print an uninitialized variable's garbage: USING was not
 /// a keyword, so it lexed as an identifier and the format string was printed
 /// verbatim after it.

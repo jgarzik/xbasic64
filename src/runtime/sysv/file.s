@@ -519,6 +519,7 @@ _rt_file_lof:
     mov rbp, rsp
     push rbx
     push r12
+    sub rsp, 16             # one local, and keeps rsp 16-byte aligned
     mov ebx, edi
 
     lea rax, [rip + _file_handles]
@@ -539,7 +540,8 @@ _rt_file_lof:
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]
     call {libc}ftell
-    push rax                        # length
+    mov QWORD PTR [rbp - 24], rax   # length; pushing it here would misalign
+                                    # rsp for the fseek below
 
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]
@@ -547,7 +549,7 @@ _rt_file_lof:
     xor edx, edx                    # SEEK_SET
     call {libc}fseek
 
-    pop rax
+    mov rax, QWORD PTR [rbp - 24]
     cvtsi2sd xmm0, rax
     jmp .Llof_done
 
@@ -555,6 +557,7 @@ _rt_file_lof:
     xorpd xmm0, xmm0
 
 .Llof_done:
+    add rsp, 16
     pop r12
     pop rbx
     leave

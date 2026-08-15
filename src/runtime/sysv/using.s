@@ -26,9 +26,17 @@
 .data
 _using_fmt_f:   .asciz "%.*f"
 _using_fmt_e:   .asciz "%.*E"
-_using_raw:     .skip 160       # sprintf target
-_using_work:    .skip 160       # after comma insertion and sign/currency
-_using_out:     .skip 192       # padded to the field width
+# Buffer sizes are proved, not guessed. A double's widest %f rendering is a
+# sign, 309 integer digits, a point and USING_MAX_DEC fractional digits -- 351
+# characters -- so 512 bytes cannot be overrun at any clamped precision.
+# Comma grouping adds at most one separator per three integer digits, and the
+# decorations add a sign, a currency symbol and an overflow marker.
+.equ USING_MAX_WIDTH, 255       # must match using::MAX_WIDTH
+.equ USING_MAX_DEC,   40        # must match using::MAX_DECIMALS
+
+_using_raw:     .skip 512       # sprintf target
+_using_work:    .skip 1024      # after comma insertion
+_using_out:     .skip 2048      # after sign/currency, padded to the width
 
 .text
 
@@ -61,6 +69,19 @@ _rt_print_using_num:
     mov r13, rsi                # decimals
     mov r14, rdx                # flags
     movsd QWORD PTR [rbp - 56], xmm0    # value
+
+    # Clamp both to what the buffers below are sized for. The compiler already
+    # clamps them, so this only guards against a hand-written or future caller;
+    # without it a value such as 1D300 in a "##.##" field ran sprintf past the
+    # end of _using_raw and destroyed everything after it in .data.
+    cmp r13, USING_MAX_DEC
+    jbe .Luse_num_dec_ok
+    mov r13, USING_MAX_DEC
+.Luse_num_dec_ok:
+    cmp r12, USING_MAX_WIDTH
+    jbe .Luse_num_width_ok
+    mov r12, USING_MAX_WIDTH
+.Luse_num_width_ok:
 
     # A trailing sign, or a forced sign we place ourselves, means the number
     # itself is formatted without one.
@@ -306,6 +327,12 @@ _rt_print_using_str:
     mov rbx, rdi                # ptr
     mov r12, rsi                # len
     mov r13, rdx                # width
+
+    # Clamp to the buffer's capacity, as in _rt_print_using_num.
+    cmp r13, USING_MAX_WIDTH
+    jbe .Luse_str_width_ok
+    mov r13, USING_MAX_WIDTH
+.Luse_str_width_ok:
 
     test r13, r13
     jz .Luse_str_whole              # width 0: print the string as-is

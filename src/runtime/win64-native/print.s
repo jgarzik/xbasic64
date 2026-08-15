@@ -170,7 +170,7 @@ _rt_fmt_double:
     mov rbp, rsp
     push rbx
     push rsi
-    sub rsp, 56             # shadow space + locals, keeps rsp 16-byte aligned
+    sub rsp, 64             # shadow space + locals; 64 realigns after 3 pushes
 
     movsd QWORD PTR [rbp - 32], xmm0    # original value
     mov rbx, rcx            # table cursor
@@ -223,7 +223,7 @@ _rt_fmt_double:
 
 .Lfd_done:
     # sprintf and lstrlenA both leave the length in rax.
-    add rsp, 56
+    add rsp, 64
     pop rsi
     pop rbx
     leave

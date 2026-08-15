@@ -95,6 +95,20 @@ impl UsingPart {
     }
 }
 
+/// Largest field width the runtime will render.
+///
+/// The runtime lays a field out in fixed buffers, so the width it is asked for
+/// has to be bounded. 255 columns is far past any real report line, and the
+/// alternative -- an unbounded width from a long format string -- was a buffer
+/// overflow.
+pub const MAX_WIDTH: usize = 255;
+
+/// Largest number of fractional digits the runtime will render.
+///
+/// A `double`'s widest `%f` rendering is 309 integer digits, so this bounds the
+/// formatted text at well under the runtime's buffer.
+pub const MAX_DECIMALS: usize = 40;
+
 /// Parse a PRINT USING format string.
 ///
 /// Unrecognized characters are treated as literal text, which is what GW-BASIC
@@ -150,7 +164,7 @@ pub fn parse(format: &str) -> Vec<UsingPart> {
                     flush!();
                     parts.push(UsingPart::Str {
                         kind: StrFieldKind::Fixed,
-                        width: j - i + 1,
+                        width: (j - i + 1).min(MAX_WIDTH),
                     });
                     i = j + 1;
                 } else {
@@ -258,8 +272,10 @@ fn parse_numeric(chars: &[char], start: usize) -> Option<(UsingPart, usize)> {
             j += 1;
         }
         if d > 0 {
-            decimals = d;
-            width += 1 + d; // the point plus its digits
+            // Clamp before it reaches the width, so the field is padded to the
+            // digits actually rendered rather than to the ones asked for.
+            decimals = d.min(MAX_DECIMALS);
+            width += 1 + decimals; // the point plus its digits
             i = j;
         }
     }
@@ -288,7 +304,7 @@ fn parse_numeric(chars: &[char], start: usize) -> Option<(UsingPart, usize)> {
 
     Some((
         UsingPart::Num {
-            width,
+            width: width.min(MAX_WIDTH),
             decimals,
             flags,
         },
@@ -298,6 +314,31 @@ fn parse_numeric(chars: &[char], start: usize) -> Option<(UsingPart, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absurd_widths_are_clamped() {
+        let wide = "#".repeat(600);
+        let super::UsingPart::Num { width, .. } = super::parse(&wide)[0] else {
+            panic!("expected a numeric field");
+        };
+        assert_eq!(width, super::MAX_WIDTH);
+
+        let deep = format!("#.{}", "#".repeat(200));
+        let super::UsingPart::Num {
+            width, decimals, ..
+        } = super::parse(&deep)[0]
+        else {
+            panic!("expected a numeric field");
+        };
+        assert_eq!(decimals, super::MAX_DECIMALS);
+        assert_eq!(width, 2 + super::MAX_DECIMALS);
+
+        let gap = format!("\\{}\\", " ".repeat(600));
+        let super::UsingPart::Str { width, .. } = super::parse(&gap)[0] else {
+            panic!("expected a string field");
+        };
+        assert_eq!(width, super::MAX_WIDTH);
+    }
+
     use super::*;
 
     #[test]
