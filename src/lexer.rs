@@ -225,7 +225,12 @@ impl<'a> Lexer<'a> {
         Ok(s)
     }
 
-    fn read_number(&mut self, first: char) -> Token {
+    /// Scan a decimal number.
+    ///
+    /// An integer too large for LONG becomes a Double rather than silently
+    /// wrapping, which is what MS BASIC does; a malformed number is an error
+    /// rather than a silent 0.
+    fn read_number(&mut self, first: char) -> Result<Token, String> {
         let mut s = String::new();
         s.push(first);
 
@@ -257,23 +262,50 @@ impl<'a> Lexer<'a> {
         let s = s.replace(['d', 'D'], "e");
 
         if is_float {
-            Token::Float(s.parse().unwrap_or(0.0))
-        } else {
-            Token::Integer(s.parse().unwrap_or(0))
+            return s
+                .parse::<f64>()
+                .map(Token::Float)
+                .map_err(|_| format!("malformed number '{}'", s));
+        }
+
+        match s.parse::<i32>() {
+            Ok(n) => Ok(Token::Integer(n as i64)),
+            // Outside LONG range: widen to Double, as MS BASIC does, rather
+            // than truncating to 32 bits.
+            Err(_) => s
+                .parse::<f64>()
+                .map(Token::Float)
+                .map_err(|_| format!("number '{}' is too large", s)),
         }
     }
 
-    fn read_hex(&mut self) -> Token {
+    /// Scan the digits of a radix literal (`&H`, `&O`, `&B`, or bare `&`).
+    ///
+    /// GW-BASIC treats these as 32-bit values, so `&HFFFFFFFF` is -1. An empty
+    /// digit run or an out-of-range value is an error; both used to yield 0.
+    fn read_radix(&mut self, radix: u32, sigil: &str) -> Result<Token, String> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
-            if c.is_ascii_hexdigit() {
+            if c.is_digit(radix) {
                 s.push(self.advance().unwrap());
             } else {
                 break;
             }
         }
-        let val = i64::from_str_radix(&s, 16).unwrap_or(0);
-        Token::Integer(val)
+        if s.is_empty() {
+            return Err(format!(
+                "'{}' must be followed by at least one digit",
+                sigil
+            ));
+        }
+        // An optional type suffix may follow the digits, e.g. &HFFFF&
+        if matches!(self.peek(), Some('%') | Some('&')) {
+            self.advance();
+        }
+        match u32::from_str_radix(&s, radix) {
+            Ok(v) => Ok(Token::Integer(v as i32 as i64)),
+            Err(_) => Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        }
     }
 
     fn read_identifier(&mut self, first: char) -> String {
@@ -387,17 +419,28 @@ impl<'a> Lexer<'a> {
                 }
             }
 
-            '&' => {
-                if self.peek() == Some('H') || self.peek() == Some('h') {
+            // Radix literals. GW-BASIC spells these &H (hex), &O (octal) and
+            // &B (binary); a bare & followed by digits is octal. Previously
+            // only &H was recognized, so &O17 lexed as Ident("&") plus
+            // Ident("O17") and silently produced garbage.
+            '&' => match self.peek() {
+                Some('H') | Some('h') => {
                     self.advance();
-                    Ok(self.read_hex())
-                } else {
-                    // & alone could be long suffix but we handle that in identifiers
-                    Ok(Token::Ident("&".to_string()))
+                    self.read_radix(16, "&H")
                 }
-            }
+                Some('O') | Some('o') => {
+                    self.advance();
+                    self.read_radix(8, "&O")
+                }
+                Some('B') | Some('b') => {
+                    self.advance();
+                    self.read_radix(2, "&B")
+                }
+                Some(d) if d.is_digit(8) => self.read_radix(8, "&"),
+                _ => Err("stray '&': expected &H, &O, &B or octal digits".to_string()),
+            },
 
-            _ if c.is_ascii_digit() => Ok(self.read_number(c)),
+            _ if c.is_ascii_digit() => self.read_number(c),
 
             _ if c.is_ascii_alphabetic() => {
                 let ident = self.read_identifier(c);

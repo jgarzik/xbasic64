@@ -59,3 +59,63 @@ PRINT Cube(0, 0, 0) + Cube(1, 1, 1)
     // 1 + 8 = 9
     assert_eq!(output.trim(), "9");
 }
+
+/// LANGREF documents `DIM Values%(50)`, but typed numeric arrays returned
+/// garbage: every element was stored as an f64 while an array access is typed
+/// by its name's suffix, so the bit pattern was reinterpreted.
+#[test]
+fn test_typed_numeric_arrays() {
+    let output = compile_and_run(
+        r#"
+DIM A%(3)
+DIM B&(3)
+DIM C!(3)
+DIM D#(3)
+A%(0) = 3
+B&(0) = 100000
+C!(0) = 3.5
+D#(0) = 3.5
+PRINT A%(0)
+PRINT B&(0)
+PRINT C!(0)
+PRINT D#(0)
+A%(1) = 3.7
+PRINT A%(1)
+A%(2) = 2
+PRINT A%(0) + A%(2)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["3", "100000", "3.5", "3.5", "3", "5"],
+        "typed elements keep their declared type; INTEGER truncates"
+    );
+}
+
+/// Multi-dimensional typed arrays index correctly at the narrower element size.
+#[test]
+fn test_typed_multidim_array() {
+    let output = compile_and_run(
+        r#"
+DIM M%(2,2)
+M%(0,1) = 5
+M%(1,1) = 7
+M%(2,0) = 9
+PRINT M%(0,1); M%(1,1); M%(2,0)
+DIM V%(4)
+FOR I = 0 TO 4
+V%(I) = I * I
+NEXT I
+FOR I = 0 TO 4
+PRINT V%(I);
+NEXT I
+PRINT ""
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "579");
+    assert_eq!(lines[1], "014916");
+}

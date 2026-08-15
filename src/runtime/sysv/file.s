@@ -243,30 +243,20 @@ _rt_file_print_float:
 
     mov ebx, edi            # save file number
 
-    # Check if value is a whole number
-    cvttsd2si rax, xmm0     # truncate to integer
-    cvtsi2sd xmm1, rax      # convert back
-    ucomisd xmm0, xmm1      # compare
-    jne .Lfile_print_as_float
+    # Format through the shared helper, so file output matches console output
+    # digit for digit.
+    lea rdi, [rip + _fmt_g_table]
+    xor esi, esi
+    call _rt_fmt_double
 
-    # Print as integer (cleaner output)
-    lea rax, [rip + _file_handles]
-    mov rdi, [rax + rbx*8]  # FILE*
-    lea rsi, [rip + _file_fmt_int]
-    cvttsd2si rdx, xmm0     # integer value
+    lea rcx, [rip + _file_handles]
+    mov rdi, [rcx + rbx*8]  # FILE*
+    lea rsi, [rip + _file_fmt_str]  # "%.*s"
+    mov rdx, rax            # length
+    lea rcx, [rip + _num_buf]
     xor eax, eax
     call {libc}fprintf
-    jmp .Lfile_print_float_done
 
-.Lfile_print_as_float:
-    # Print as floating point
-    lea rax, [rip + _file_handles]
-    mov rdi, [rax + rbx*8]  # FILE*
-    lea rsi, [rip + _file_fmt_float]
-    mov eax, 1              # 1 vector register arg
-    call {libc}fprintf
-
-.Lfile_print_float_done:
     add rsp, 8
     pop rbx
     leave

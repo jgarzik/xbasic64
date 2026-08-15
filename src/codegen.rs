@@ -580,6 +580,22 @@ impl CodeGen {
         (places, next_stk)
     }
 
+    /// Size in bytes of one element of an array, from the name's type suffix.
+    ///
+    /// Elements are stored at their declared width, the same way scalars are.
+    /// Storing every numeric element as f64 regardless -- as this used to --
+    /// meant `A%(0)` wrote 8 bytes of double but was *read* as an integer,
+    /// because expr_type types an array access by its suffix. Typed numeric
+    /// arrays returned garbage as a result.
+    fn elem_size(name: &str) -> i32 {
+        match DataType::from_suffix(name) {
+            DataType::String => 16, // pointer + length
+            DataType::Integer => 2,
+            DataType::Long | DataType::Single => 4,
+            DataType::Double => 8,
+        }
+    }
+
     /// Number of 8-byte words a scalar of this type occupies.
     fn words_for(data_type: DataType) -> i32 {
         if data_type == DataType::String { 2 } else { 1 }
@@ -600,7 +616,7 @@ impl CodeGen {
             },
             Expr::Variable(name) => DataType::from_suffix(name),
             Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
-            Expr::FnCall { name, .. } => self.fn_return_type(name),
+            Expr::FnCall { name, args } => self.call_return_type(name, args),
             Expr::Unary { operand, .. } => self.expr_type(operand),
             Expr::Binary { left, right, op } => {
                 let lt = self.expr_type(left);
@@ -611,6 +627,24 @@ impl CodeGen {
     }
 
     /// Get the return type of a function (built-in or user-defined)
+    /// Result type of ABS, which preserves its argument's type.
+    fn abs_result_type(arg: DataType) -> DataType {
+        match arg {
+            DataType::Integer | DataType::Long => DataType::Long,
+            DataType::Single => DataType::Single,
+            _ => DataType::Double,
+        }
+    }
+
+    /// Return type of a call, including builtins whose result type depends on
+    /// their argument.
+    fn call_return_type(&self, name: &str, args: &[Expr]) -> DataType {
+        if name.to_uppercase() == "ABS" && !args.is_empty() {
+            return Self::abs_result_type(self.expr_type(&args[0]));
+        }
+        self.fn_return_type(name)
+    }
+
     fn fn_return_type(&self, name: &str) -> DataType {
         // Built-in functions that return strings
         let upper = name.to_uppercase();
@@ -620,6 +654,9 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
+            // CSNG converts to SINGLE; saying Double here made its result print
+            // with a Double's digits.
+            "CSNG" => DataType::Single,
             // Most built-ins and user functions: check suffix, default to Double
             _ => DataType::from_suffix(name),
         }
@@ -1559,11 +1596,23 @@ impl CodeGen {
     fn gen_expr(&mut self, expr: &Expr) -> DataType {
         match expr {
             Expr::Literal(lit) => match lit {
-                Literal::Integer(n) => {
-                    // Load as integer into eax
-                    self.emit(&format!("    mov eax, {}", *n as i32));
-                    DataType::Long
-                }
+                Literal::Integer(n) => match i32::try_from(*n) {
+                    Ok(v) => {
+                        // Load as integer into eax
+                        self.emit(&format!("    mov eax, {}", v));
+                        DataType::Long
+                    }
+                    // Wider than LONG: emit as a Double rather than truncating
+                    // to 32 bits, which silently turned 1000000000000001 into
+                    // -1530494975. The lexer widens such literals already; this
+                    // also covers values arriving from DATA.
+                    Err(_) => {
+                        let bits = (*n as f64).to_bits();
+                        self.emit(&format!("    mov rax, 0x{:X}", bits));
+                        self.emit("    movq xmm0, rax");
+                        DataType::Double
+                    }
+                },
                 Literal::Float(f) => {
                     // Load as double into xmm0
                     let bits = f.to_bits();
@@ -1669,7 +1718,7 @@ impl CodeGen {
 
             Expr::FnCall { name, args } => {
                 self.gen_fn_call(name, args);
-                self.fn_return_type(name)
+                self.call_return_type(name, args)
             }
         }
     }
@@ -1926,10 +1975,17 @@ impl CodeGen {
             self.emit_arg_reg(1, "rdx"); // len
             self.emit("    call _rt_print_string");
         } else {
-            // Numeric expression - evaluate and convert to double for printing
+            // Numeric expression - evaluate and convert to double for printing.
+            // A Single is printed via its own helper, which round-trips against
+            // 32-bit precision: widening 3.14159! to a double and printing all
+            // the digits that survive would show 3.141590118408203.
             let expr_type = self.gen_expr(expr);
             self.gen_coercion(expr_type, DataType::Double);
-            self.emit("    call _rt_print_float");
+            if expr_type == DataType::Single {
+                self.emit("    call _rt_print_single");
+            } else {
+                self.emit("    call _rt_print_float");
+            }
         }
     }
 
@@ -1983,6 +2039,9 @@ impl CodeGen {
                 self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
                 self.emit("    movq xmm1, rax");
                 self.emit("    andpd xmm0, xmm1");
+                // ABS preserves its argument's type: narrow back so the value
+                // matches what call_return_type promises.
+                self.gen_coercion(DataType::Double, Self::abs_result_type(arg_type));
             }
             "SGN" => {
                 let arg_type = self.gen_expr(&args[0]);
@@ -2191,9 +2250,12 @@ impl CodeGen {
                 }
                 // Result is integer (Long) in eax
             }
-            "CSNG" | "CDBL" => {
+            "CSNG" => {
                 let arg_type = self.gen_expr(&args[0]);
-                // Convert to double
+                self.gen_coercion(arg_type, DataType::Single);
+            }
+            "CDBL" => {
+                let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Double);
             }
             "TIMER" => {
@@ -2311,7 +2373,7 @@ impl CodeGen {
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {
-        let elem_size = if is_string_var(&arr.name) { 16 } else { 8 };
+        let elem_size = Self::elem_size(&arr.name);
 
         // Reserve the descriptor as one contiguous block: word 0 is the element
         // pointer, word 1+i is dimension i's element count. A module-level DIM
@@ -2365,7 +2427,7 @@ impl CodeGen {
     fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
         let arr_info = self.lookup_array(name).expect("Array not declared");
         let loc = arr_info.loc.clone();
-        let elem_size = if is_string_var(name) { 16 } else { 8 };
+        let elem_size = Self::elem_size(name);
 
         // Calculate linear index using row-major order:
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
@@ -2402,19 +2464,23 @@ impl CodeGen {
         self.emit(&format!("    add rax, {}", loc.q(0)));
 
         // Load value from computed address
-        if is_string_var(name) {
-            self.emit("    mov rcx, rax");
-            self.emit("    mov rax, QWORD PTR [rcx]");
-            self.emit("    mov rdx, QWORD PTR [rcx + 8]");
-        } else {
-            self.emit("    movsd xmm0, QWORD PTR [rax]");
+        match DataType::from_suffix(name) {
+            DataType::String => {
+                self.emit("    mov rcx, rax");
+                self.emit("    mov rax, QWORD PTR [rcx]");
+                self.emit("    mov rdx, QWORD PTR [rcx + 8]");
+            }
+            DataType::Integer => self.emit("    movsx eax, WORD PTR [rax]"),
+            DataType::Long => self.emit("    mov eax, DWORD PTR [rax]"),
+            DataType::Single => self.emit("    movss xmm0, DWORD PTR [rax]"),
+            DataType::Double => self.emit("    movsd xmm0, QWORD PTR [rax]"),
         }
     }
 
     fn gen_array_store(&mut self, name: &str, indices: &[Expr], value: &Expr) {
         let arr_info = self.lookup_array(name).expect("Array not declared");
         let loc = arr_info.loc.clone();
-        let elem_size = if is_string_var(name) { 16 } else { 8 };
+        let elem_size = Self::elem_size(name);
 
         // Calculate linear index using row-major order (same as gen_array_load)
         let idx_type = self.gen_expr(&indices[0]);
@@ -2452,13 +2518,21 @@ impl CodeGen {
         // Store value at computed address
         self.emit("    mov rcx, QWORD PTR [rsp]");
         self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-        if is_string_var(name) {
+        let elem_type = DataType::from_suffix(name);
+        if elem_type == DataType::String {
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
         } else {
-            // Coerce to double for array storage
-            self.gen_coercion(val_type, DataType::Double);
-            self.emit("    movsd QWORD PTR [rcx], xmm0");
+            // Coerce to the element's declared type, then store at its width,
+            // exactly as a scalar assignment does.
+            self.gen_coercion(val_type, elem_type);
+            match elem_type {
+                DataType::Integer => self.emit("    mov WORD PTR [rcx], ax"),
+                DataType::Long => self.emit("    mov DWORD PTR [rcx], eax"),
+                DataType::Single => self.emit("    movss DWORD PTR [rcx], xmm0"),
+                DataType::Double => self.emit("    movsd QWORD PTR [rcx], xmm0"),
+                DataType::String => unreachable!("handled above"),
+            }
         }
     }
 

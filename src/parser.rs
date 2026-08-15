@@ -32,10 +32,13 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
         Token::Backslash => Some((6, BinaryOp::IntDiv)),
         Token::Mod => Some((6, BinaryOp::Mod)),
         // Precedence 7: power (handled specially for right-associativity)
-        Token::Caret => Some((7, BinaryOp::Pow)),
+        Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
 }
+
+/// Precedence of `^`, the tightest-binding binary operator.
+const POWER_PREC: u8 = 7;
 
 // ============================================================================
 // AST Definitions
@@ -1479,7 +1482,11 @@ impl Parser {
         match self.peek() {
             Token::Minus => {
                 self.advance();
-                let operand = self.parse_unary()?;
+                // `^` binds tighter than unary minus, so -2^2 is -(2^2) = -4,
+                // per LANGREF's precedence table and GW-BASIC. Parsing the
+                // operand at the power level is what folds the exponentiation
+                // in before the negation.
+                let operand = self.parse_prec(POWER_PREC)?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
@@ -1487,7 +1494,7 @@ impl Parser {
             }
             Token::Plus => {
                 self.advance();
-                self.parse_unary()
+                self.parse_prec(POWER_PREC)
             }
             _ => self.parse_primary(),
         }

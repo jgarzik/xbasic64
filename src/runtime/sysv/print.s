@@ -96,44 +96,134 @@ _rt_print_newline:
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_print_float - Print a numeric value (integer or floating point)
+# _rt_fmt_double - Format a number into _num_buf
 # ------------------------------------------------------------------------------
-# GW-BASIC convention: if a number is a whole number, print without decimal.
-# We achieve this by:
-#   1. Truncate to integer and convert back to double
-#   2. Compare with original: if equal, it's a whole number
-#   3. Print as integer (%ld) or float (%g) accordingly
+# Shared by console and file output so both render numbers identically.
+#
+# GW-BASIC convention: a whole number is written without a decimal point. For
+# fractional values, write the *shortest* decimal that reads back as the same
+# value: try each format in the given table in turn and keep the first whose
+# text strtod's back unchanged. A plain %g gives only 6 significant digits,
+# which for a dialect whose default type is Double discards most of the value
+# (1/3 became 0.333333); going straight to %.17g instead would render 3.14159
+# as 3.1415899999999999.
 #
 # Arguments:
-#   xmm0 = value to print (double)
+#   xmm0 = value (a SINGLE arrives already widened to double)
+#   rdi  = pointer to a NULL-terminated table of format-string pointers
+#   esi  = nonzero to compare at SINGLE precision
 #
-# Returns: nothing
-#
-# Note: %g format automatically chooses between %f and %e notation and
-# strips trailing zeros, giving clean output like "3.14159" not "3.141590".
+# Returns:
+#   rax = length of the text in _num_buf
+# ------------------------------------------------------------------------------
+.globl _rt_fmt_double
+_rt_fmt_double:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 16             # rsp stays 16-byte aligned across the calls below
+    movsd QWORD PTR [rbp - 24], xmm0    # original value
+    mov rbx, rdi            # table cursor
+    mov r12d, esi           # precision flag
+
+    # Whole number? Format as an integer.
+    # Out-of-range values saturate in cvttsd2si and so fail this test, which is
+    # what sends 1e300 down the floating-point path.
+    cvttsd2si rax, xmm0
+    cvtsi2sd xmm1, rax
+    ucomisd xmm0, xmm1
+    jne .Lfd_fractional
+    jp .Lfd_fractional
+    lea rdi, [rip + _num_buf]
+    lea rsi, [rip + _fmt_int]
+    mov rdx, rax
+    xor eax, eax
+    call {libc}sprintf
+    jmp .Lfd_done
+
+.Lfd_fractional:
+    mov rsi, QWORD PTR [rbx]
+    test rsi, rsi
+    jz .Lfd_len             # table exhausted: keep the last attempt
+    lea rdi, [rip + _num_buf]
+    movsd xmm0, QWORD PTR [rbp - 24]
+    mov eax, 1              # one vector register argument
+    call {libc}sprintf
+
+    # Does it read back as the same value?
+    lea rdi, [rip + _num_buf]
+    xor esi, esi
+    call {libc}strtod
+    movsd xmm1, QWORD PTR [rbp - 24]
+    test r12d, r12d
+    jz .Lfd_cmp_double
+    cvtsd2ss xmm0, xmm0
+    cvtsd2ss xmm1, xmm1
+    ucomiss xmm0, xmm1
+    jmp .Lfd_cmp_done
+.Lfd_cmp_double:
+    ucomisd xmm0, xmm1
+.Lfd_cmp_done:
+    jp .Lfd_next            # unordered: keep trying
+    je .Lfd_len
+.Lfd_next:
+    add rbx, 8
+    jmp .Lfd_fractional
+
+.Lfd_len:
+    lea rdi, [rip + _num_buf]
+    call {libc}strlen
+
+.Lfd_done:
+    # sprintf and strlen both leave the length in rax.
+    add rsp, 16
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_float - Print a DOUBLE (or an untyped numeric value)
+# ------------------------------------------------------------------------------
+# Arguments: xmm0 = value        Returns: nothing
 # ------------------------------------------------------------------------------
 .globl _rt_print_float
 _rt_print_float:
     push rbp
     mov rbp, rsp
-    sub rsp, 16         # Stack alignment for potential printf call
-    # Check if value is a whole number
-    cvttsd2si rax, xmm0     # truncate to integer
-    cvtsi2sd xmm1, rax      # convert back to double
-    ucomisd xmm0, xmm1      # compare original with truncated
-    jne .Lprint_as_float    # if different, has fractional part
-    # Print as integer (cleaner output)
-    mov rsi, rax            # integer value → rsi (2nd arg)
-    lea rdi, [rip + _fmt_int]
+    lea rdi, [rip + _fmt_g_table]
+    xor esi, esi
+    call _rt_fmt_double
+    lea rdi, [rip + _fmt_str]   # "%.*s"
+    mov rsi, rax                # length
+    lea rdx, [rip + _num_buf]
     xor eax, eax
     call {libc}printf
-    jmp .Lprint_float_done
-.Lprint_as_float:
-    # Print as floating point - value still in xmm0
-    lea rdi, [rip + _fmt_float]
-    mov eax, 1              # 1 = one vector register argument (xmm0)
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_print_single - Print a SINGLE
+# ------------------------------------------------------------------------------
+# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
+# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
+# print as 3.1415901184082: at 15 digits even a float's value round-trips.
+#
+# Arguments: xmm0 = value, already widened to double     Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_print_single
+_rt_print_single:
+    push rbp
+    mov rbp, rsp
+    lea rdi, [rip + _fmt_g_single_table]
+    mov esi, 1
+    call _rt_fmt_double
+    lea rdi, [rip + _fmt_str]
+    mov rsi, rax
+    lea rdx, [rip + _num_buf]
+    xor eax, eax
     call {libc}printf
-.Lprint_float_done:
     leave
     ret
 
