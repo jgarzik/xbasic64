@@ -549,7 +549,9 @@ _rt_file_line_input:
     call {libc}strlen
     mov rdx, rax            # length → rdx
 
-    # Strip trailing newline if present
+    # Strip the trailing newline, and the CR before it in a file written on a
+    # platform that uses CRLF. Dropping only the LF handed every line back with
+    # a stray CR, which then showed up in every comparison and every LEN.
     test rdx, rdx
     jz .Lfile_input_string_done
     lea rax, [rip + _file_input_buf]
@@ -558,6 +560,14 @@ _rt_file_line_input:
     jne .Lfile_input_string_done
     dec rdx                 # reduce length
     mov BYTE PTR [rax + rdx], 0         # remove newline
+
+    test rdx, rdx
+    jz .Lfile_input_string_done
+    mov cl, BYTE PTR [rax + rdx - 1]
+    cmp cl, 13              # carriage return?
+    jne .Lfile_input_string_done
+    dec rdx
+    mov BYTE PTR [rax + rdx], 0
 
 .Lfile_input_string_done:
     lea rax, [rip + _file_input_buf]

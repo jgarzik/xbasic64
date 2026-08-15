@@ -149,7 +149,16 @@ CLOSE #1
     assert_eq!(lines[1], "two");
     assert_eq!(lines[2], "three");
     assert_eq!(lines[3], "lines:3");
-    assert_eq!(lines[4], "bytes:14", "3 lines plus their newlines");
+
+    // Text files carry the host's line terminator, so LOF counts CRLF on
+    // Windows and LF elsewhere: 11 characters of text plus three terminators.
+    let terminator = if cfg!(windows) { 2 } else { 1 };
+    assert_eq!(
+        lines[4],
+        format!("bytes:{}", 11 + 3 * terminator),
+        "3 lines plus their {} terminators",
+        if terminator == 2 { "CRLF" } else { "LF" }
+    );
 }
 
 /// `WRITE #` separates values with commas only.
@@ -215,4 +224,37 @@ fn test_line_input_takes_whole_line() {
     .unwrap()
     .0;
     assert_eq!(output.trim(), "[a, b][c]");
+}
+
+/// A file written on the other platform must read correctly.
+///
+/// Text files carry the host's line terminator, so a CRLF file is the ordinary
+/// case for anything produced on Windows. `LINE INPUT #` stripped only the LF
+/// and handed back a trailing CR on every line, which then reappeared in every
+/// comparison and every LEN.
+#[test]
+fn test_crlf_file_reads_without_stray_carriage_returns() {
+    let output = compile_and_run_with_files(
+        "OPEN \"crlf.txt\" FOR INPUT AS #1\nINPUT #1, A$, B$\nLINE INPUT #1, C$\nCLOSE #1\nPRINT \"[\"; A$; \"][\"; B$; \"][\"; C$; \"]\"\nPRINT LEN(A$); LEN(B$); LEN(C$)\n",
+        |dir| {
+            fs::write(dir.join("crlf.txt"), "one,two\r\nthree\r\n").map_err(|e| e.to_string())
+        },
+    )
+    .unwrap()
+    .0;
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "[one][two][three]");
+    assert_eq!(lines[1], "335", "no line may keep its carriage return");
+}
+
+/// Numbers too: a CRLF file must not leave a CR to derail the next field.
+#[test]
+fn test_crlf_numeric_fields() {
+    let output = compile_and_run_with_files(
+        "OPEN \"crlfn.txt\" FOR INPUT AS #1\nINPUT #1, A, B\nINPUT #1, C\nCLOSE #1\nPRINT A; \"/\"; B; \"/\"; C\n",
+        |dir| fs::write(dir.join("crlfn.txt"), "10,20\r\n30\r\n").map_err(|e| e.to_string()),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(output.trim(), "10/20/30");
 }

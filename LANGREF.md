@@ -818,6 +818,11 @@ PRINT #1, X; Y; Z
 PRINT #1, A$
 ```
 
+Lines end with the host's terminator -- CRLF on Windows, LF elsewhere --
+so `LOF` counts two bytes per line ending on Windows and one elsewhere.
+Reading accepts either, so a file written on one platform reads correctly
+on the other.
+
 ### Reading from Files
 
 ```basic
