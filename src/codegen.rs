@@ -232,6 +232,41 @@ static INLINE_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock
     ])
 });
 
+/// How a builtin that is just "evaluate, coerce, call" reaches its helper.
+///
+/// The irregular builtins stay written out in [`CodeGen::gen_fn_call`]; these
+/// differ only in the coercion and the symbol, which is what a table is for.
+enum Builtin {
+    /// Takes no argument.
+    Call0(&'static str),
+    /// One string argument, passed as (pointer, length).
+    CallStr(&'static str),
+    /// One numeric argument, widened to Double in xmm0.
+    CallDouble(&'static str),
+    /// One numeric argument, narrowed to Long and sign-extended.
+    CallLong(&'static str),
+    /// No helper at all: the conversion *is* the coercion.
+    Coerce(DataType),
+}
+
+static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| {
+    HashMap::from([
+        ("TIMER", Builtin::Call0("_rt_timer")),
+        ("VAL", Builtin::CallStr("_rt_val")),
+        ("LTRIM$", Builtin::CallStr("_rt_ltrim")),
+        ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
+        ("UCASE$", Builtin::CallStr("_rt_ucase")),
+        ("LCASE$", Builtin::CallStr("_rt_lcase")),
+        ("STR$", Builtin::CallDouble("_rt_str")),
+        ("CHR$", Builtin::CallLong("_rt_chr")),
+        ("SPACE$", Builtin::CallLong("_rt_space")),
+        ("HEX$", Builtin::CallLong("_rt_hex")),
+        ("OCT$", Builtin::CallLong("_rt_oct")),
+        ("CSNG", Builtin::Coerce(DataType::Single)),
+        ("CDBL", Builtin::Coerce(DataType::Double)),
+    ])
+});
+
 /// Symbol prefix from platform ABI (underscore on macOS, empty on Linux/Windows)
 const PREFIX: &str = PlatformAbi::SYMBOL_PREFIX;
 
@@ -3643,6 +3678,39 @@ impl CodeGen {
             return;
         }
 
+        // Table-driven: evaluate one argument, coerce it, call the helper.
+        if let Some(builtin) = RT_BUILTINS.get(upper_name.as_str()) {
+            match builtin {
+                Builtin::Call0(sym) => self.emit(&format!("    call {}", sym)),
+                Builtin::CallStr(sym) => {
+                    // gen_expr leaves a string in rax/rdx. Loading the length
+                    // first keeps Win64, where the pointer's register is rdx,
+                    // from overwriting it.
+                    self.gen_expr(&args[0]);
+                    self.emit_arg_reg(1, "rdx");
+                    self.emit_arg_reg(0, "rax");
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::CallDouble(sym) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, DataType::Double);
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::CallLong(sym) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, DataType::Long);
+                    self.emit("    movsxd rax, eax");
+                    self.emit_arg_reg(0, "rax");
+                    self.emit(&format!("    call {}", sym));
+                }
+                Builtin::Coerce(ty) => {
+                    let arg_type = self.gen_expr(&args[0]);
+                    self.gen_coercion(arg_type, *ty);
+                }
+            }
+            return;
+        }
+
         // Complex built-in functions
         match upper_name.as_str() {
             "ABS" => {
@@ -3806,30 +3874,6 @@ impl CodeGen {
                 self.emit("    movzx eax, BYTE PTR [rax]");
                 // ASC returns integer in eax (Long type)
             }
-            "CHR$" => {
-                // _rt_chr(char_code)
-                let arg_type = self.gen_expr(&args[0]);
-                let arg0 = Self::arg_reg(0);
-                if arg_type.is_integer() {
-                    self.emit(&format!("    movsxd {}, eax", arg0));
-                } else {
-                    self.emit(&format!("    cvttsd2si {}, xmm0", arg0));
-                }
-                self.emit("    call _rt_chr");
-            }
-            "VAL" => {
-                // _rt_val(ptr, len)
-                self.gen_expr(&args[0]);
-                self.emit_arg_reg(0, "rax"); // ptr
-                self.emit_arg_reg(1, "rdx"); // len
-                self.emit("    call _rt_val");
-            }
-            "STR$" => {
-                let arg_type = self.gen_expr(&args[0]);
-                // STR$ expects double in xmm0
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    call _rt_str");
-            }
             "CINT" | "CLNG" => {
                 let arg_type = self.gen_expr(&args[0]);
                 // Convert to integer with rounding - result in eax
@@ -3842,25 +3886,7 @@ impl CodeGen {
                 }
                 // Result is integer (Long) in eax
             }
-            "CSNG" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Single);
-            }
-            "CDBL" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-            }
-            "TIMER" => {
-                self.emit("    call _rt_timer");
-            }
             // String builders. These allocate, so the result outlives the call.
-            "SPACE$" => {
-                let t = self.gen_expr(&args[0]);
-                self.gen_coercion(t, DataType::Long);
-                self.emit("    movsxd rax, eax");
-                self.emit_arg_reg(0, "rax");
-                self.emit("    call _rt_space");
-            }
             "STRING$" => {
                 // STRING$(n, ch) takes either a character code or a string
                 // whose first character is used.
@@ -3883,33 +3909,7 @@ impl CodeGen {
                 self.emit("    call _rt_string_n");
             }
             // Trimming and case conversion.
-            "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => {
-                self.gen_expr(&args[0]);
-                self.emit("    mov r10, rax");
-                self.emit("    mov r11, rdx");
-                self.emit_arg_reg(0, "r10");
-                self.emit_arg_reg(1, "r11");
-                let rt = match upper_name.as_str() {
-                    "LTRIM$" => "_rt_ltrim",
-                    "RTRIM$" => "_rt_rtrim",
-                    "UCASE$" => "_rt_ucase",
-                    _ => "_rt_lcase",
-                };
-                self.emit(&format!("    call {}", rt));
-            }
             // Radix conversions.
-            "HEX$" | "OCT$" => {
-                let t = self.gen_expr(&args[0]);
-                self.gen_coercion(t, DataType::Long);
-                self.emit("    movsxd rax, eax");
-                self.emit_arg_reg(0, "rax");
-                let rt = if upper_name == "HEX$" {
-                    "_rt_hex"
-                } else {
-                    "_rt_oct"
-                };
-                self.emit(&format!("    call {}", rt));
-            }
             // Array bounds. The descriptor stores each dimension's element
             // count, so UBOUND is that minus one and LBOUND is always 0.
             "LBOUND" | "UBOUND" => {
