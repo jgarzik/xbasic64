@@ -164,3 +164,55 @@ fn test_write_file_separators() {
     .unwrap();
     assert_eq!(output.trim(), "[10,20,\"ab\"]");
 }
+
+/// `INPUT #` reads one comma-delimited field per variable, not one line.
+///
+/// Reading a line per variable made `INPUT #1, A, B` on "10,20" yield 10
+/// twice and leave the second line unread.
+#[test]
+fn test_input_file_multiple_fields() {
+    let output = compile_and_run_with_files(
+        "OPEN \"nums.txt\" FOR INPUT AS #1\nINPUT #1, A, B\nINPUT #1, C\nCLOSE #1\nPRINT A; \"/\"; B; \"/\"; C\n",
+        |dir| fs::write(dir.join("nums.txt"), "10,20\n30\n").map_err(|e| e.to_string()),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(output.trim(), "10/20/30");
+}
+
+/// A quoted field may contain the delimiter, and blanks around a field are
+/// separators rather than data.
+#[test]
+fn test_input_file_quoted_fields() {
+    let output = compile_and_run_with_files(
+        "OPEN \"q.txt\" FOR INPUT AS #1\nINPUT #1, X$, Y$\nINPUT #1, Z$, W$\nCLOSE #1\nPRINT \"[\"; X$; \"][\"; Y$; \"][\"; Z$; \"][\"; W$; \"]\"\n",
+        |dir| {
+            fs::write(dir.join("q.txt"), "a, b\n\"c,d\" , e\n").map_err(|e| e.to_string())
+        },
+    )
+    .unwrap()
+    .0;
+    assert_eq!(output.trim(), "[a][b][c,d][e]");
+}
+
+/// What WRITE # writes, INPUT # reads back.
+#[test]
+fn test_write_file_round_trip() {
+    let output = compile_and_run(
+        "OPEN \"wrt.txt\" FOR OUTPUT AS #1\nWRITE #1, 10, 20, \"ab\"\nCLOSE #1\nOPEN \"wrt.txt\" FOR INPUT AS #1\nINPUT #1, A, B, C$\nCLOSE #1\nPRINT A; B; \"[\"; C$; \"]\"\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1020[ab]");
+}
+
+/// LINE INPUT # still takes the whole line, commas and all.
+#[test]
+fn test_line_input_takes_whole_line() {
+    let output = compile_and_run_with_files(
+        "OPEN \"l.txt\" FOR INPUT AS #1\nLINE INPUT #1, L$\nLINE INPUT #1, M$\nCLOSE #1\nPRINT \"[\"; L$; \"][\"; M$; \"]\"\n",
+        |dir| fs::write(dir.join("l.txt"), "a, b\nc\n").map_err(|e| e.to_string()),
+    )
+    .unwrap()
+    .0;
+    assert_eq!(output.trim(), "[a, b][c]");
+}

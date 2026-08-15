@@ -1608,9 +1608,11 @@ impl CodeGen {
                 }
                 match file_num {
                     Some(e) => {
+                        // LINE INPUT # takes the whole line; INPUT # takes one
+                        // comma-delimited field, which is a different reader.
                         let fnum = self.gen_file_num(e);
                         self.emit_arg_file_num(0, &fnum);
-                        self.emit("    call _rt_file_input_string");
+                        self.emit("    call _rt_file_line_input");
                     }
                     None => self.emit("    call _rt_input_string"),
                 }

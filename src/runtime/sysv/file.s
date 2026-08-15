@@ -58,6 +58,9 @@ _file_fmt_char:    .asciz "%c"      # Single character
 _file_fmt_newline: .asciz "\n"      # Newline
 _file_fmt_input:   .asciz "%lf"     # Read double
 
+# Longest INPUT # field kept, leaving room for the NUL in _file_input_buf.
+.equ MAX_FIELD_LEN, 1023
+
 # Buffer for string input from files
 _file_input_buf: .skip 1024
 
@@ -323,43 +326,194 @@ _rt_file_print_newline:
     leave
     ret
 
+
 # ------------------------------------------------------------------------------
-# _rt_file_input_number - Read number from file (INPUT# with number)
+# _rt_file_read_field - Read one INPUT # field
 # ------------------------------------------------------------------------------
+# INPUT # reads comma-delimited fields, not whole lines. Reading a line per
+# variable made `INPUT #1, A, B` on "10,20" yield 10 twice, and reading through
+# fscanf("%lf") was worse: it stopped at the comma without consuming it, so
+# every later read failed on the same character.
+#
+# Leading blanks and line breaks are skipped. A field either is quoted, in
+# which case it runs to the closing quote and everything up to the next
+# delimiter is discarded, or runs to the next comma, newline or end of file
+# with trailing blanks trimmed. The delimiter is consumed.
+#
 # Arguments:
 #   rdi = file number
 #
 # Returns:
-#   xmm0 = value read (double)
+#   rax = pointer to the field (in _file_input_buf), rdx = its length
+#
+# Note: uses a static buffer, so the result is valid only until the next read.
 # ------------------------------------------------------------------------------
-.globl _rt_file_input_number
-_rt_file_input_number:
+# ------------------------------------------------------------------------------
+# _rt_file_getc - Read one byte
+# ------------------------------------------------------------------------------
+# Arguments: rdi = file number
+# Returns:   eax = the byte, or -1 at end of file or on a file that is not open
+# ------------------------------------------------------------------------------
+.globl _rt_file_getc
+_rt_file_getc:
+    push rbp
+    mov rbp, rsp
+
+    lea rax, [rip + _file_handles]
+    mov rdi, [rax + rdi*8]
+    test rdi, rdi
+    jz .Lfile_getc_eof
+    call {libc}fgetc
+    leave
+    ret
+.Lfile_getc_eof:
+    mov eax, -1
+    leave
+    ret
+
+.globl _rt_file_read_field
+_rt_file_read_field:
     push rbp
     mov rbp, rsp
     push rbx
+    push r12
+    push r13
     sub rsp, 8
 
-    mov ebx, edi            # save file number
+    mov ebx, edi                # file number, reloaded before every read
+    xor r12d, r12d              # length written so far
 
-    # fscanf(file, "%lf", &result)
-    lea rax, [rip + _file_handles]
-    mov rdi, [rax + rbx*8]  # FILE*
-    lea rsi, [rip + _file_fmt_input]  # format "%lf"
-    lea rdx, [rbp - 16]     # pointer to local variable for result
-    xor eax, eax
-    call {libc}fscanf
+    # Skip leading blanks, tabs and line breaks.
+.Lfield_skip:
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, ' '
+    je .Lfield_skip
+    cmp eax, 9                  # tab
+    je .Lfield_skip
+    cmp eax, 13                 # CR
+    je .Lfield_skip
+    cmp eax, 10                 # LF
+    je .Lfield_skip
 
-    # Load result into xmm0
-    movsd xmm0, QWORD PTR [rbp - 16]
+    cmp eax, '"'
+    je .Lfield_quoted
+
+    # Unquoted: this character and everything up to the delimiter.
+    mov r13d, eax
+.Lfield_plain_store:
+    cmp r12d, MAX_FIELD_LEN
+    jge .Lfield_plain_next
+    lea rax, [rip + _file_input_buf]
+    mov BYTE PTR [rax + r12], r13b
+    inc r12d
+.Lfield_plain_next:
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_trim
+    cmp eax, ','
+    je .Lfield_trim
+    cmp eax, 10
+    je .Lfield_trim
+    cmp eax, 13
+    je .Lfield_plain_next
+    mov r13d, eax
+    jmp .Lfield_plain_store
+
+.Lfield_trim:
+    # Drop trailing blanks, which are separators rather than data.
+    test r12d, r12d
+    jz .Lfield_done
+    lea rax, [rip + _file_input_buf]
+    movzx ecx, BYTE PTR [rax + r12 - 1]
+    cmp ecx, ' '
+    je .Lfield_trim_one
+    cmp ecx, 9
+    jne .Lfield_done
+.Lfield_trim_one:
+    dec r12d
+    jmp .Lfield_trim
+
+.Lfield_quoted:
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, '"'
+    je .Lfield_after_quote
+    cmp r12d, MAX_FIELD_LEN
+    jge .Lfield_quoted
+    mov r13d, eax
+    lea rax, [rip + _file_input_buf]
+    mov BYTE PTR [rax + r12], r13b
+    inc r12d
+    jmp .Lfield_quoted
+
+.Lfield_after_quote:
+    # Discard whatever separates the closing quote from the delimiter.
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, ','
+    je .Lfield_done
+    cmp eax, 10
+    je .Lfield_done
+    jmp .Lfield_after_quote
+
+.Lfield_done:
+    lea rax, [rip + _file_input_buf]
+    mov BYTE PTR [rax + r12], 0
+    mov rdx, r12
+
     add rsp, 8
+    pop r13
+    pop r12
     pop rbx
     leave
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_file_input_string - Read string from file (INPUT# with string, or LINE INPUT#)
+# _rt_file_input_number - INPUT #: read one numeric field
 # ------------------------------------------------------------------------------
-# Reads a line from file, stripping trailing newline.
+# Arguments:
+#   rdi = file number
+#
+# Returns:
+#   xmm0 = value read, or 0.0 for a field that is not a number
+# ------------------------------------------------------------------------------
+.globl _rt_file_input_number
+_rt_file_input_number:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+
+    call _rt_file_read_field
+    mov rdi, rax                # NUL-terminated by _rt_file_read_field
+    xor esi, esi                # endptr = NULL
+    call {libc}strtod
+
+    add rsp, 16
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_input_string - INPUT #: read one string field
+# ------------------------------------------------------------------------------
+# Arguments: rdi = file number
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_file_input_string
+_rt_file_input_string:
+    jmp _rt_file_read_field
+
+# ------------------------------------------------------------------------------
+# _rt_file_line_input - LINE INPUT #: read a whole line
+# ------------------------------------------------------------------------------
+# Reads a line from file, stripping the trailing newline.
 #
 # Arguments:
 #   rdi = file number
@@ -370,8 +524,8 @@ _rt_file_input_number:
 #
 # Note: Uses static buffer - result only valid until next file string read.
 # ------------------------------------------------------------------------------
-.globl _rt_file_input_string
-_rt_file_input_string:
+.globl _rt_file_line_input
+_rt_file_line_input:
     push rbp
     mov rbp, rsp
     push rbx
