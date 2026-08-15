@@ -355,3 +355,27 @@ fn test_record_assignment_from_array_element() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["34", "3"], "the copy is independent");
 }
+
+/// A record argument may be any record lvalue, not only a plain variable.
+///
+/// The callee is handed the address of the caller's copy; `A(1)` used to miss
+/// that path entirely and pass a float, which the prologue then dereferenced.
+#[test]
+fn test_record_argument_from_array_element() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X\nEND SUB\nDIM A(3) AS P\nA(1).X = 9\nA(2).X = 4\nShow A(1)\nShow A(2)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["9", "4"]);
+}
+
+/// The same for a nested record reached through a field path.
+#[test]
+fn test_record_argument_from_nested_field() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nTYPE Q\nI AS P\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X\nEND SUB\nDIM W AS Q\nW.I.X = 4\nShow W.I\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "4");
+}

@@ -572,3 +572,37 @@ fn test_use_before_dim_runs() {
     );
     assert_eq!(run.exit_code, Some(1));
 }
+
+/// Anything that is not a record lvalue must be rejected where a record
+/// parameter is expected, rather than crashing at run time.
+#[test]
+fn test_record_parameter_rejects_non_records() {
+    let header = "TYPE P\nX AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X\nEND SUB\n";
+
+    for arg in ["1", "N", "\"s\""] {
+        let source = format!("{header}Show {arg}\n");
+        let err = compile_only(&source).expect_err("should be rejected");
+        assert!(err.is_clean_rejection(), "{}", err.stderr);
+        assert!(
+            err.stderr.contains("must be TYPE P"),
+            "wrong message for {arg}: {}",
+            err.stderr
+        );
+    }
+}
+
+/// A record of the wrong type names both types in the diagnostic.
+#[test]
+fn test_record_parameter_rejects_wrong_type() {
+    let err = compile_only(
+        "TYPE P\nX AS INTEGER\nEND TYPE\nTYPE R\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X\nEND SUB\nDIM W AS R\nShow W\n",
+    )
+    .expect_err("should be rejected");
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(
+        err.stderr
+            .contains("is TYPE P, but a TYPE R value was given"),
+        "{}",
+        err.stderr
+    );
+}

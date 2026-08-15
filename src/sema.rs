@@ -936,7 +936,47 @@ impl Analyzer {
                 .collect();
             let (expected, is_function) = (proc.params.len(), proc.is_function);
 
+            // A record parameter takes the address of the caller's variable,
+            // so the argument has to be a record lvalue of the same type --
+            // anything else would hand the callee a value to dereference.
+            let param_records: Vec<Option<String>> = proc
+                .params
+                .iter()
+                .map(|p| match &p.ty {
+                    Some(TypeRef::Record(r)) => Some(r.to_uppercase()),
+                    _ => None,
+                })
+                .collect();
+
             for (i, arg) in args.iter().enumerate() {
+                let Some(Some(want)) = param_records.get(i) else {
+                    continue;
+                };
+                match self.record_type_of(arg, scope) {
+                    Some(TypeRef::Record(got)) if got.to_uppercase() == *want => {}
+                    Some(TypeRef::Record(got)) => self.error(
+                        line,
+                        format!(
+                            "argument {} of '{}' is TYPE {}, but a TYPE {} value was given",
+                            i + 1,
+                            name,
+                            want,
+                            got
+                        ),
+                    ),
+                    _ => self.error_with_note(
+                        line,
+                        format!("argument {} of '{}' must be TYPE {}", i + 1, name, want),
+                        "pass a variable declared with DIM ... AS, or one of its record fields"
+                            .to_string(),
+                    ),
+                }
+            }
+
+            for (i, arg) in args.iter().enumerate() {
+                if matches!(param_records.get(i), Some(Some(_))) {
+                    continue;
+                }
                 let Some(want_string) = param_strings.get(i).copied() else {
                     break;
                 };
@@ -1123,6 +1163,29 @@ impl Analyzer {
                 self.check_field_path(expr, scope, line);
             }
         }
+    }
+
+    /// The record type an expression denotes, or None when it denotes no
+    /// record at all.
+    ///
+    /// Unlike [`Self::check_field_path`] this reports nothing; it is used to
+    /// decide whether an argument can be passed where a record is expected.
+    fn record_type_of(&self, expr: &Expr, scope: &Scope) -> Option<TypeRef> {
+        let (name, fields) = flatten_field_path(expr)?;
+        let mut ty = self.symbols.typed_var(scope, &name).cloned()?;
+        for field in &fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            ty = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())?
+                .field(field)?
+                .ty
+                .clone();
+        }
+        matches!(ty, TypeRef::Record(_)).then_some(ty)
     }
 
     /// Check that a field path names real fields of a real record type.

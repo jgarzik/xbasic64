@@ -2788,27 +2788,110 @@ impl CodeGen {
     /// The element address is computed into `rax` and kept in `rcx`, and the
     /// field is reached at a fixed byte offset from it. Unlike a scalar record,
     /// this address is not known until run time, so it cannot go through `Loc`.
+    /// Emit the address of a record lvalue into `rax`.
+    ///
+    /// Returns false when the expression does not denote one, leaving no code
+    /// emitted, so the caller can fall back to its ordinary value path.
+    fn gen_record_addr(&mut self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Variable(name) => {
+                let Some(ty) = self.typed_var(name) else {
+                    return false;
+                };
+                if !matches!(ty, TypeRef::Record(_)) {
+                    return false;
+                }
+                let loc = self.get_record_loc(name, &ty);
+                match &loc {
+                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
+                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                }
+                true
+            }
+
+            // An element of an array of records: the address is only known at
+            // run time, so it is computed rather than taken from a `Loc`.
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } => {
+                match self.array_elem_type(name) {
+                    Some(TypeRef::Record(_)) => {}
+                    _ => return false,
+                }
+                let indices = indices.clone();
+                self.gen_array_addr(name, &indices);
+                true
+            }
+
+            // A nested record reached through a field path, on either base.
+            Expr::Field { .. } => {
+                if let Some((name, indices, fields)) = Self::flatten_indexed_field_path(expr) {
+                    let Some(base) = self.array_elem_type(&name) else {
+                        return false;
+                    };
+                    let Some((offset, ty)) = self.field_byte_offset(&base, &fields) else {
+                        return false;
+                    };
+                    if !matches!(ty, TypeRef::Record(_)) {
+                        return false;
+                    }
+                    self.gen_array_addr(&name, &indices);
+                    if offset != 0 {
+                        self.emit(&format!("    add rax, {}", offset));
+                    }
+                    return true;
+                }
+
+                let Some((name, fields)) = Self::flatten_field_path(expr) else {
+                    return false;
+                };
+                let Some((loc, ty)) = self.resolve_field_path(&name, &fields) else {
+                    return false;
+                };
+                if !matches!(ty, TypeRef::Record(_)) {
+                    return false;
+                }
+                match &loc {
+                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
+                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                }
+                true
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Byte offset of a field path within `base`, and the type it arrives at.
+    fn field_byte_offset(&self, base: &TypeRef, fields: &[String]) -> Option<(i32, TypeRef)> {
+        let mut ty = base.clone();
+        let mut offset = 0i32;
+        for field in fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            let f = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())?
+                .field(field)?;
+            offset += f.word * 8;
+            ty = f.ty.clone();
+        }
+        Some((offset, ty))
+    }
+
     fn gen_array_field(&mut self, target: &LValue, value: Option<&Expr>) -> DataType {
         let indices = target.indices.clone().unwrap_or_default();
-        let Some(mut ty) = self.array_elem_type(&target.name) else {
+        let Some(ty) = self.array_elem_type(&target.name) else {
             unreachable!("sema checked this is an array of records")
         };
 
-        // Walk the field path for its byte offset and final type.
-        let mut byte_offset = 0i32;
-        for field in &target.fields {
-            let TypeRef::Record(rec) = &ty else {
-                unreachable!("sema checked the field path")
-            };
-            let info = self
-                .symbols
-                .records
-                .get(&rec.to_uppercase())
-                .expect("sema checked the type exists");
-            let f = info.field(field).expect("sema checked the field exists");
-            byte_offset += f.word * 8;
-            ty = f.ty.clone();
-        }
+        let Some((byte_offset, ty)) = self.field_byte_offset(&ty, &target.fields) else {
+            unreachable!("sema checked the field path")
+        };
 
         match value {
             None => {
@@ -3855,23 +3938,19 @@ impl CodeGen {
         let mut w = 0i32;
         for (i, (arg, ty)) in args.iter().zip(&param_types).enumerate() {
             // A record argument is passed as the address of the caller's copy.
+            // Any record lvalue qualifies, not just a plain variable: passing
+            // `A(1)` used to fall through to the numeric path below and hand
+            // the callee a float where it expected a pointer.
             if let Some(Param {
                 ty: Some(TypeRef::Record(_)),
                 ..
             }) = param_decls.get(i)
             {
-                if let Expr::Variable(src) = arg {
-                    if let Some(src_ty) = self.typed_var(src) {
-                        let src_loc = self.get_record_loc(src, &src_ty);
-                        match &src_loc {
-                            Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
-                            Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
-                        }
-                        self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
-                        temp_of.push(w * 8);
-                        w += 1;
-                        continue;
-                    }
+                if self.gen_record_addr(arg) {
+                    self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                    temp_of.push(w * 8);
+                    w += 1;
+                    continue;
                 }
             }
             let arg_type = self.gen_expr(arg);
