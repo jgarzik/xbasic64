@@ -2437,41 +2437,56 @@ impl CodeGen {
     }
 
     fn emit_data_section(&mut self) {
+        // Pass 1: intern every DATA string and build the table rows as text.
+        //
+        // Nothing is emitted yet, so `string_literals` may still grow. Emitting
+        // the `_str_N` labels first and interning DATA strings afterwards -- as
+        // this used to -- left the trailing labels referenced by the table but
+        // never defined, so any program with a string in a DATA statement
+        // failed to link.
+        let data_items = std::mem::take(&mut self.data_items);
+        let mut rows: Vec<(u8, String)> = Vec::with_capacity(data_items.len());
+        for item in &data_items {
+            rows.push(match item {
+                Literal::Integer(n) => (0, n.to_string()),
+                Literal::Float(f) => (1, format!("0x{:X}", f.to_bits())),
+                Literal::String(s) => {
+                    let idx = self.add_string_literal(s);
+                    (2, format!("_str_{}", idx))
+                }
+            });
+        }
+
+        // Pass 2: emit. `string_literals` is final from here on.
         self.output.push_str("\n.data\n");
 
-        // String literals - clone to avoid borrow issues
         let strings = self.string_literals.clone();
         for (i, s) in strings.iter().enumerate() {
             self.output.push_str(&format!("_str_{}:\n", i));
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            // .asciz, not .ascii: _rt_read_string measures DATA strings with
+            // strlen/lstrlenA, so without a terminator a string READ runs past
+            // its own literal into the next one. The trailing NUL is invisible
+            // to everything that uses the (ptr, len) representation.
             self.output
-                .push_str(&format!("    .ascii \"{}\"\n", escaped));
+                .push_str(&format!("    .asciz \"{}\"\n", escaped));
         }
 
         // DATA table - always define it (even if empty) to avoid linker errors
+        self.output.push_str(".p2align 3\n");
         self.output.push_str("_data_table:\n");
-        let data_items = self.data_items.clone();
-        for item in &data_items {
-            match item {
-                Literal::Integer(n) => {
-                    self.output.push_str("    .quad 0  # type int\n");
-                    self.output.push_str(&format!("    .quad {}\n", n));
-                }
-                Literal::Float(f) => {
-                    self.output.push_str("    .quad 1  # type float\n");
-                    self.output
-                        .push_str(&format!("    .quad 0x{:X}\n", f.to_bits()));
-                }
-                Literal::String(s) => {
-                    let idx = self.string_literals.len();
-                    self.string_literals.push(s.clone());
-                    self.output.push_str("    .quad 2  # type string\n");
-                    self.output.push_str(&format!("    .quad _str_{}\n", idx));
-                }
-            }
+        for (tag, value) in &rows {
+            let kind = match tag {
+                0 => "int",
+                1 => "float",
+                _ => "string",
+            };
+            self.output
+                .push_str(&format!("    .quad {}  # type {}\n", tag, kind));
+            self.output.push_str(&format!("    .quad {}\n", value));
         }
         self.output
-            .push_str(&format!("_data_count: .quad {}\n", data_items.len()));
+            .push_str(&format!("_data_count: .quad {}\n", rows.len()));
 
         // DATA pointer
         self.emit("_data_ptr: .quad 0");
