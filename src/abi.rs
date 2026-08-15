@@ -13,6 +13,11 @@ pub trait Abi {
 
     /// Symbol prefix for external symbols ("_" on macOS, "" elsewhere)
     const SYMBOL_PREFIX: &'static str;
+
+    /// Bytes the caller reserves for the callee to spill its register
+    /// arguments into. Win64 requires this "home space" before every call;
+    /// System V requires none.
+    const SHADOW_SPACE: i32;
 }
 
 /// System V AMD64 ABI (Linux, macOS, BSD)
@@ -26,6 +31,8 @@ pub struct SysV64;
 #[cfg(any(not(windows), test))]
 impl Abi for SysV64 {
     const INT_ARG_REGS: &'static [&'static str] = &["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
+
+    const SHADOW_SPACE: i32 = 0;
 
     #[cfg(target_os = "macos")]
     const SYMBOL_PREFIX: &'static str = "_";
@@ -41,6 +48,7 @@ pub struct Win64;
 impl Abi for Win64 {
     const INT_ARG_REGS: &'static [&'static str] = &["rcx", "rdx", "r8", "r9"];
     const SYMBOL_PREFIX: &'static str = "";
+    const SHADOW_SPACE: i32 = 32;
 }
 
 /// Type alias for the current platform's ABI

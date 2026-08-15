@@ -235,18 +235,6 @@ static INLINE_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock
 /// Symbol prefix from platform ABI (underscore on macOS, empty on Linux/Windows)
 const PREFIX: &str = PlatformAbi::SYMBOL_PREFIX;
 
-/// Win64 ABI requires 32 bytes of shadow space before each call
-#[cfg(windows)]
-const WIN64_SHADOW_SPACE: i32 = 32;
-
-/// Win64: stack space for calls with 5 args (shadow + 5th arg + alignment)
-#[cfg(windows)]
-const WIN64_5ARG_STACK_SPACE: i32 = 48;
-
-/// Win64: offset to 5th argument on stack (after shadow space)
-#[cfg(windows)]
-const WIN64_5TH_ARG_OFFSET: i32 = 32;
-
 /// Stack space for temporary values (must be 16-byte aligned)
 const STACK_TEMP_SPACE: i32 = 16;
 
@@ -525,17 +513,50 @@ impl CodeGen {
         self.emit(&format!("    lea {}, {}", dst, mem));
     }
 
-    /// Call a libc function with proper shadow space on Win64
+    /// Call a libc function, whose arguments are already in place.
     fn emit_call_libc(&mut self, func: &str) {
-        #[cfg(windows)]
-        {
-            self.emit(&format!("    sub rsp, {}", WIN64_SHADOW_SPACE));
-            self.emit(&format!("    call {}{}", PREFIX, func));
-            self.emit(&format!("    add rsp, {}", WIN64_SHADOW_SPACE));
+        let sym = format!("{}{}", PREFIX, func);
+        self.emit_call_with_args(&sym, &[]);
+    }
+
+    /// Call `sym` with `srcs` as its integer arguments, in order.
+    ///
+    /// The ABIs differ in how much of a call they can carry in registers --
+    /// six arguments on System V, four on Win64 -- and in whether the caller
+    /// owes the callee shadow space. Both follow from the register list, so
+    /// this computes the split instead of spelling out a platform each time.
+    ///
+    /// Arguments are assigned last-first, so a register that is both a source
+    /// and a destination is read before it is overwritten. Callers choose
+    /// sources with that order in mind.
+    fn emit_call_with_args(&mut self, sym: &str, srcs: &[&str]) {
+        let regs = PlatformAbi::INT_ARG_REGS;
+        let shadow = PlatformAbi::SHADOW_SPACE;
+        let on_stack = srcs.len().saturating_sub(regs.len()) as i32;
+
+        // Whatever is reserved has to leave rsp 16-byte aligned at the call.
+        let reserve = match shadow + on_stack * 8 {
+            0 => 0,
+            bytes => (bytes + 15) / 16 * 16,
+        };
+        if reserve > 0 {
+            self.emit(&format!("    sub rsp, {}", reserve));
         }
-        #[cfg(not(windows))]
-        {
-            self.emit(&format!("    call {}{}", PREFIX, func));
+
+        for (i, src) in srcs.iter().enumerate().rev() {
+            match regs.get(i) {
+                Some(reg) if reg == src => {} // already there
+                Some(reg) => self.emit(&format!("    mov {}, {}", reg, src)),
+                None => {
+                    let off = shadow + (i - regs.len()) as i32 * 8;
+                    self.emit(&format!("    mov QWORD PTR [rsp + {}], {}", off, src));
+                }
+            }
+        }
+
+        self.emit(&format!("    call {}", sym));
+        if reserve > 0 {
+            self.emit(&format!("    add rsp, {}", reserve));
         }
     }
 
@@ -3767,32 +3788,12 @@ impl CodeGen {
                 self.gen_expr(needle_arg);
                 // rax = needle ptr, rdx = needle len
 
-                // Set up arguments based on ABI
-                // SysV: rdi=hay_ptr, rsi=hay_len, rdx=needle_ptr, rcx=needle_len, r8=start
-                // Win64: rcx=hay_ptr, rdx=hay_len, r8=needle_ptr, r9=needle_len, [rsp+32]=start
-                #[cfg(windows)]
-                {
-                    self.emit(&format!("    sub rsp, {}", WIN64_5ARG_STACK_SPACE));
-                    self.emit(&format!(
-                        "    mov QWORD PTR [rsp + {}], rbx",
-                        WIN64_5TH_ARG_OFFSET
-                    )); // 5th arg: start
-                    self.emit("    mov r9, rdx"); // needle len
-                    self.emit("    mov r8, rax"); // needle ptr
-                    self.emit("    mov rdx, r13"); // haystack len
-                    self.emit("    mov rcx, r12"); // haystack ptr
-                    self.emit("    call _rt_instr");
-                    self.emit(&format!("    add rsp, {}", WIN64_5ARG_STACK_SPACE));
-                }
-                #[cfg(not(windows))]
-                {
-                    self.emit("    mov r8, rbx"); // start
-                    self.emit("    mov rcx, rdx"); // needle len
-                    self.emit("    mov rdx, rax"); // needle ptr
-                    self.emit("    mov rsi, r13"); // haystack len
-                    self.emit("    mov rdi, r12"); // haystack ptr
-                    self.emit("    call _rt_instr");
-                }
+                // Five arguments: the one call in the compiler that Win64
+                // cannot carry in registers alone. The sources are chosen so
+                // that assigning them last-first never clobbers one still to
+                // be read -- rdx holds the needle length and is also System
+                // V's third argument register.
+                self.emit_call_with_args("_rt_instr", &["r12", "r13", "rax", "rdx", "rbx"]);
 
                 self.emit("    pop r13");
                 self.emit("    pop r12");
