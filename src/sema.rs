@@ -31,6 +31,12 @@ use std::collections::{HashMap, HashSet};
 ///
 /// Kept here rather than in codegen so that "is this name known?" has a single
 /// answer. Codegen still owns *how* each one is emitted.
+/// Highest BASIC file number the runtime's handle table has a slot for.
+///
+/// The table is 16 pointers wide and slot 0 is the console, so a program may
+/// use 1 through 15.
+pub const MAX_FILE_NUM: i64 = 15;
+
 const BUILTINS: &[(&str, usize, usize)] = &[
     // name, min args, max args
     ("ABS", 1, 1),
@@ -597,15 +603,31 @@ impl Analyzer {
                     }
                 }
             }
-            StmtKind::PrintFile { items, using, .. } => {
+            StmtKind::PrintFile {
+                file_num,
+                items,
+                using,
+                ..
+            } => {
                 if using.is_some() {
                     self.error(line, "PRINT # USING is not supported");
                 }
+                self.check_file_num(file_num, scope, line);
                 for item in items {
                     if let PrintItem::Expr(e) = item {
                         self.check_expr(e, scope, line);
+                        self.reject_record_value(e, scope, line);
                     }
                 }
+            }
+            StmtKind::InputFile { file_num, .. } => {
+                self.check_file_num(file_num, scope, line);
+            }
+            StmtKind::LineInput {
+                file_num: Some(file_num),
+                ..
+            } => {
+                self.check_file_num(file_num, scope, line);
             }
             StmtKind::If {
                 condition,
@@ -747,14 +769,12 @@ impl Analyzer {
                 if self.expr_is_string(filename, scope) == Some(false) {
                     self.error(line, "OPEN needs a string filename");
                 }
-                self.check_expr(file_num, scope, line);
-                self.require_numeric(file_num, scope, line, "a file number");
+                self.check_file_num(file_num, scope, line);
             }
             StmtKind::Close {
                 file_num: Some(file_num),
             } => {
-                self.check_expr(file_num, scope, line);
-                self.require_numeric(file_num, scope, line, "a file number");
+                self.check_file_num(file_num, scope, line);
             }
             _ => {}
         }
@@ -948,6 +968,27 @@ impl Analyzer {
         self.reject_record_value(e, scope, line);
     }
 
+    /// A file number must be numeric, and within the runtime's handle table.
+    ///
+    /// The table holds slots 1-15; slot 0 is the console. Nothing checked the
+    /// index, so a constant outside that range indexed off the end of the
+    /// table at run time. A non-constant is checked by codegen instead.
+    fn check_file_num(&mut self, e: &Expr, scope: &Scope, line: u32) {
+        self.check_expr(e, scope, line);
+        self.require_numeric(e, scope, line, "a file number");
+        if let Some(n) = self.const_eval(e).and_then(|l| match l {
+            Literal::Integer(n) => Some(n),
+            Literal::Float(f) => Some(f as i64),
+            Literal::String(_) => None,
+        }) && !(1..=MAX_FILE_NUM).contains(&n)
+        {
+            self.error(
+                line,
+                format!("file number {} is not between 1 and {}", n, MAX_FILE_NUM),
+            );
+        }
+    }
+
     /// A PRINT USING format must be a string literal, since it is parsed at
     /// compile time into a sequence of runtime calls.
     fn check_using(&mut self, using: Option<&Expr>, line: u32) {
@@ -1136,6 +1177,8 @@ impl Analyzer {
                         if args.len() == 1 { "was" } else { "were" }
                     ),
                 );
+            } else if matches!(upper.as_str(), "EOF" | "LOF") {
+                self.check_file_num(&args[0], scope, line);
             }
             return;
         }

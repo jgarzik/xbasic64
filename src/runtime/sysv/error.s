@@ -28,6 +28,7 @@ _err_overflow:  .asciz "Overflow"
 _err_undim:     .asciz "Array used before DIM"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
+_err_badfile:   .asciz "Bad file number"
 
 .text
 

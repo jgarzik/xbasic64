@@ -830,7 +830,9 @@ OPEN "filename.txt" FOR OUTPUT AS #1   ' Write mode (truncate)
 OPEN "filename.txt" FOR APPEND AS #1   ' Write mode (append)
 ```
 
-File numbers range from `#1` to `#255`.
+File numbers range from `#1` to `#15`; the runtime has a handle slot for each.
+One outside that range is refused at compile time, or reported as
+`?Bad file number` when it is not a constant.
 
 ### Closing Files
 
@@ -989,8 +991,9 @@ line it happened on to standard error, and exits with status 1:
 Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
 run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
-overflows, `SQR` of a negative number, `LOG` of a non-positive number,
-`GOSUB` nested deeper than the return stack holds, and allocation failure.
+overflows, `SQR` of a negative number, `LOG` of a non-positive number, a file
+number outside 1 to 15, `GOSUB` nested deeper than the return stack holds, and
+allocation failure.
 
 The message names the fault:
 
@@ -1001,6 +1004,7 @@ The message names the fault:
 | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`              |
 | `Overflow`               | A `\` or `MOD` whose quotient does not fit       |
 | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive     |
+| `Bad file number`        | A file number outside 1 to 15                    |
 | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth     |
 | `Out of memory`          | A string or array allocation that failed         |
 

@@ -347,6 +347,7 @@ enum RtError {
     Undim,
     OutOfMemory,
     GosubOverflow,
+    BadFileNum,
 }
 
 impl RtError {
@@ -360,6 +361,7 @@ impl RtError {
             RtError::Undim => "_err_undim",
             RtError::OutOfMemory => "_err_memory",
             RtError::GosubOverflow => "_err_gosub",
+            RtError::BadFileNum => "_err_badfile",
         }
     }
 
@@ -373,6 +375,7 @@ impl RtError {
             RtError::Undim => "undim",
             RtError::OutOfMemory => "mem",
             RtError::GosubOverflow => "gosub",
+            RtError::BadFileNum => "badfile",
         }
     }
 }
@@ -2638,10 +2641,23 @@ impl CodeGen {
         }
         let ty = self.gen_expr(e);
         self.gen_coercion(ty, DataType::Long);
+        self.emit_file_num_check();
         self.stack_offset -= 8;
         let loc = Loc::Frame(self.stack_offset);
         self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
         FileNum::Slot(loc)
+    }
+
+    /// Check the file number in `eax` against the handle table's slots.
+    ///
+    /// The table has a slot per legal file number and no more, so an unchecked
+    /// index reached outside it -- far enough, for a large enough number, to
+    /// take the process down with it.
+    fn emit_file_num_check(&mut self) {
+        self.emit("    cmp eax, 1");
+        self.emit_check("jl", RtError::BadFileNum);
+        self.emit(&format!("    cmp eax, {}", crate::sema::MAX_FILE_NUM));
+        self.emit_check("jg", RtError::BadFileNum);
     }
 
     /// Place a previously evaluated file number in an argument register.
@@ -4001,6 +4017,7 @@ impl CodeGen {
             "EOF" | "LOF" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Long);
+                self.emit_file_num_check();
                 self.emit_arg_reg(0, "rax");
                 let rt = if upper_name == "EOF" {
                     "_rt_file_eof"
