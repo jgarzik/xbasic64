@@ -635,3 +635,87 @@ _rt_oct:
     add rsp, 40
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_strdup - Copy a string onto the heap
+# ------------------------------------------------------------------------------
+# String assignment copies, so that mutating one variable cannot be seen
+# through another -- or, worse, through the shared .data literal a string
+# constant points at.
+#
+# Arguments: rcx = pointer, rdx = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_strdup
+_rt_strdup:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 32
+
+    mov rbx, rcx
+    mov r12, rdx
+
+    lea rcx, [r12 + 1]
+    call malloc
+
+    mov rcx, rax
+    push rax
+    sub rsp, 32
+    mov rdx, rbx
+    mov r8, r12
+    call memcpy
+    add rsp, 32
+    pop rax
+    mov rdx, r12
+
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_mid_assign - MID$(s, start [, len]) = value
+# ------------------------------------------------------------------------------
+# Overwrites characters of the target in place. The target's length never
+# changes. Positions are 1-based.
+#
+# Arguments (Win64):
+#   rcx = target pointer, rdx = target length
+#   r8  = start (1-based), r9 = maximum characters to replace
+#   [rsp+40] = source pointer, [rsp+48] = source length
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_mid_assign
+_rt_mid_assign:
+    mov r10, QWORD PTR [rsp + 40]   # source pointer
+    mov r11, QWORD PTR [rsp + 48]   # source length
+
+    cmp r9, r11
+    jbe .Lmid_have_count
+    mov r9, r11
+.Lmid_have_count:
+
+    cmp r8, 1
+    jl .Lmid_done
+    dec r8
+
+    push rbx
+    xor rbx, rbx                    # characters copied
+.Lmid_loop:
+    cmp rbx, r9
+    jae .Lmid_pop_done
+    lea rax, [r8 + rbx]
+    cmp rax, rdx
+    jae .Lmid_pop_done
+    mov r11b, BYTE PTR [r10 + rbx]
+    mov BYTE PTR [rcx + rax], r11b
+    inc rbx
+    jmp .Lmid_loop
+.Lmid_pop_done:
+    pop rbx
+.Lmid_done:
+    ret

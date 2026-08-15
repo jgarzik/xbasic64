@@ -217,3 +217,41 @@ fn test_hex_and_oct() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["FF", "17", "10"]);
 }
+
+/// String assignment copies, so mutating one variable is not visible through
+/// another, and a string constant's shared .data literal can never be written
+/// through.
+#[test]
+fn test_string_assignment_copies() {
+    let output = compile_and_run(
+        "A$ = \"HELLO\"\nB$ = A$\nMID$(A$,1,1) = \"J\"\nPRINT A$\nPRINT B$\nPRINT \"HELLO\"\nC$ = \"HELLO\"\nPRINT C$\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["JELLO", "HELLO", "HELLO", "HELLO"],
+        "only A$ changed; the literal is intact"
+    );
+}
+
+/// MID$ as an assignment target overwrites in place and never changes the
+/// target's length.
+#[test]
+fn test_mid_assignment() {
+    let output = compile_and_run(
+        "A$ = \"hello\"\nMID$(A$,1,1) = \"J\"\nPRINT A$\nB$ = \"hello\"\nMID$(B$,2) = \"XY\"\nPRINT B$\nC$ = \"abc\"\nMID$(C$,2) = \"ZZZZZ\"\nPRINT C$\nPRINT LEN(C$)\n",
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["Jello", "hXYlo", "aZZ", "3"]);
+}
+
+/// MID$ assignment works on an array element too.
+#[test]
+fn test_mid_assignment_into_array() {
+    let output =
+        compile_and_run("DIM S$(2)\nS$(0) = \"hello\"\nMID$(S$(0),1,1) = \"J\"\nPRINT S$(0)\n")
+            .unwrap();
+    assert_eq!(output.trim(), "Jello");
+}

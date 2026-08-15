@@ -656,3 +656,81 @@ _rt_oct:
     lea rax, [rip + _str_buf]
     leave
     ret
+
+# ------------------------------------------------------------------------------
+# _rt_strdup - Copy a string onto the heap
+# ------------------------------------------------------------------------------
+# String assignment copies, so that mutating one variable cannot be seen
+# through another -- or, worse, through the shared .data literal a string
+# constant points at. Without this, MID$(A$,1,1) = "J" after A$ = "HELLO"
+# would rewrite the literal for every other use of "HELLO" in the program.
+#
+# Arguments: rdi = pointer, rsi = length
+# Returns:   rax = pointer, rdx = length
+# ------------------------------------------------------------------------------
+.globl _rt_strdup
+_rt_strdup:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    mov rbx, rdi
+    mov r12, rsi
+
+    lea rdi, [r12 + 1]
+    call {libc}malloc
+
+    push rax
+    mov rdi, rax
+    mov rsi, rbx
+    mov rdx, r12
+    call {libc}memcpy
+    pop rax
+    mov rdx, r12
+
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_mid_assign - MID$(s, start [, len]) = value
+# ------------------------------------------------------------------------------
+# Overwrites characters of the target in place. The target's length never
+# changes: at most `len` characters are replaced, and never past the end.
+# Positions are 1-based.
+#
+# Arguments:
+#   rdi = target pointer, rsi = target length
+#   rdx = start (1-based), rcx = maximum characters to replace
+#   r8  = source pointer,  r9  = source length
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_mid_assign
+_rt_mid_assign:
+    # Clamp the count to the source length.
+    cmp rcx, r9
+    jbe .Lmid_have_count
+    mov rcx, r9
+.Lmid_have_count:
+
+    # Convert the 1-based start to an index; a start below 1 writes nothing.
+    cmp rdx, 1
+    jl .Lmid_done
+    dec rdx
+
+    xor r10, r10            # characters copied
+.Lmid_loop:
+    cmp r10, rcx
+    jae .Lmid_done
+    lea r11, [rdx + r10]
+    cmp r11, rsi            # stop at the end of the target
+    jae .Lmid_done
+    mov al, BYTE PTR [r8 + r10]
+    mov BYTE PTR [rdi + r11], al
+    inc r10
+    jmp .Lmid_loop
+.Lmid_done:
+    ret

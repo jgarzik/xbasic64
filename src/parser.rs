@@ -134,6 +134,13 @@ pub enum StmtKind {
         name: String,
         args: Vec<Expr>,
     },
+    /// `MID$(s, start [, len]) = value` -- overwrite characters in place.
+    MidAssign {
+        target: LValue,
+        start: Expr,
+        len: Option<Expr>,
+        value: Expr,
+    },
     /// `SWAP a, b` -- exchange two values of the same type class.
     Swap(LValue, LValue),
     /// `CONST N = expr` -- a compile-time constant.
@@ -1009,9 +1016,15 @@ impl Parser {
             self.expect(Token::RParen)?;
 
             if matches!(self.peek(), Token::Eq) {
-                // Array assignment
                 self.advance();
                 let value = self.parse_expression()?;
+
+                // MID$(s, start [, len]) = value overwrites characters of an
+                // existing string rather than assigning an array element.
+                if name.to_uppercase() == "MID$" {
+                    return self.mid_assign(args, value);
+                }
+
                 Ok(StmtKind::Let {
                     name,
                     indices: Some(args),
@@ -1046,6 +1059,32 @@ impl Parser {
             }
             Ok(StmtKind::Call { name, args })
         }
+    }
+
+    /// Build a `MID$(...) = value` statement from its parsed argument list.
+    fn mid_assign(&mut self, mut args: Vec<Expr>, value: Expr) -> PResult<StmtKind> {
+        if args.len() < 2 || args.len() > 3 {
+            return err("MID$ assignment takes a string, a start, and an optional length");
+        }
+        let len = if args.len() == 3 { args.pop() } else { None };
+        let start = args.pop().expect("checked above");
+        let target = match args.pop().expect("checked above") {
+            Expr::Variable(name) => LValue {
+                name,
+                indices: None,
+            },
+            Expr::ArrayAccess { name, indices } => LValue {
+                name,
+                indices: Some(indices),
+            },
+            _ => return err("MID$ assignment requires a string variable"),
+        };
+        Ok(StmtKind::MidAssign {
+            target,
+            start,
+            len,
+            value,
+        })
     }
 
     fn parse_if(&mut self) -> PResult<StmtKind> {

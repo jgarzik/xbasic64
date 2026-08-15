@@ -1669,6 +1669,13 @@ impl CodeGen {
                 self.emit("    call _rt_restore");
             }
 
+            StmtKind::MidAssign {
+                target,
+                start,
+                len,
+                value,
+            } => self.gen_mid_assign(target, start, len.as_ref(), value),
+
             StmtKind::Swap(a, b) => self.gen_swap(a, b),
 
             // CONST is resolved at compile time; nothing is emitted.
@@ -2268,6 +2275,65 @@ impl CodeGen {
         }
     }
 
+    /// `MID$(s, start [, len]) = value` -- overwrite characters in place.
+    ///
+    /// The six arguments exceed Win64's four argument registers, so the last
+    /// two go on the stack; `emit_arg_reg` handles only the register slots.
+    fn gen_mid_assign(&mut self, target: &LValue, start: &Expr, len: Option<&Expr>, value: &Expr) {
+        // Everything is evaluated into a temp block first, because each
+        // evaluation clobbers the value registers.
+        const SLOTS: i32 = 96; // 6 values, 16-byte aligned with room to spare
+        self.emit(&format!("    sub rsp, {}", SLOTS));
+
+        self.gen_read_lvalue(target);
+        self.emit("    mov QWORD PTR [rsp], rax"); // target pointer
+        self.emit("    mov QWORD PTR [rsp + 8], rdx"); // target length
+
+        let t = self.gen_expr(start);
+        self.gen_coercion(t, DataType::Long);
+        self.emit("    movsxd rax, eax");
+        self.emit("    mov QWORD PTR [rsp + 16], rax");
+
+        match len {
+            Some(e) => {
+                let t = self.gen_expr(e);
+                self.gen_coercion(t, DataType::Long);
+                self.emit("    movsxd rax, eax");
+            }
+            // No length given: replace as much as the value provides.
+            None => self.emit("    mov rax, 0x7FFFFFFF"),
+        }
+        self.emit("    mov QWORD PTR [rsp + 24], rax");
+
+        self.gen_expr(value);
+        self.emit("    mov QWORD PTR [rsp + 32], rax"); // source pointer
+        self.emit("    mov QWORD PTR [rsp + 40], rdx"); // source length
+
+        // Load the register arguments, then the stack ones on Win64.
+        let regs = PlatformAbi::INT_ARG_REGS;
+        for (i, off) in [0, 8, 16, 24].iter().enumerate() {
+            if i < regs.len() {
+                self.emit(&format!("    mov {}, QWORD PTR [rsp + {}]", regs[i], off));
+            }
+        }
+        if regs.len() >= 6 {
+            self.emit(&format!("    mov {}, QWORD PTR [rsp + 32]", regs[4]));
+            self.emit(&format!("    mov {}, QWORD PTR [rsp + 40]", regs[5]));
+            self.emit("    call _rt_mid_assign");
+        } else {
+            // Win64: the 5th and 6th arguments go above the shadow space.
+            self.emit("    mov r10, QWORD PTR [rsp + 32]");
+            self.emit("    mov r11, QWORD PTR [rsp + 40]");
+            self.emit("    sub rsp, 64");
+            self.emit("    mov QWORD PTR [rsp + 40], r10");
+            self.emit("    mov QWORD PTR [rsp + 48], r11");
+            self.emit("    call _rt_mid_assign");
+            self.emit("    add rsp, 64");
+        }
+
+        self.emit(&format!("    add rsp, {}", SLOTS));
+    }
+
     /// Exchange two values, which sema has checked are the same type class.
     ///
     /// Both are read before either is written, so `SWAP A(I), A(J)` is correct
@@ -2317,6 +2383,19 @@ impl CodeGen {
         }
     }
 
+    /// Copy the string in `rax`/`rdx` onto the heap.
+    ///
+    /// String assignment copies, so that mutating one variable is not visible
+    /// through another, and so that a string constant's shared `.data` literal
+    /// can never be written through.
+    fn emit_string_copy(&mut self) {
+        self.emit("    mov r10, rax");
+        self.emit("    mov r11, rdx");
+        self.emit_arg_reg(0, "r10");
+        self.emit_arg_reg(1, "r11");
+        self.emit("    call _rt_strdup");
+    }
+
     /// Store a freshly produced value into an assignment target.
     ///
     /// The value is expected where `gen_expr` leaves it: `rax`/`rdx` for a
@@ -2325,6 +2404,9 @@ impl CodeGen {
     /// the value is parked on the stack across the address calculation.
     fn gen_store_lvalue(&mut self, target: &LValue) {
         let is_string = is_string_var(&target.name);
+        if is_string {
+            self.emit_string_copy();
+        }
 
         let Some(indices) = &target.indices else {
             let loc = self.get_var_loc(&target.name);
@@ -3183,6 +3265,9 @@ impl CodeGen {
         self.emit("    mov QWORD PTR [rsp], rax");
 
         let val_type = self.gen_expr(value);
+        if val_type == DataType::String {
+            self.emit_string_copy();
+        }
 
         self.emit("    mov rcx, QWORD PTR [rsp]");
         self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
@@ -3207,6 +3292,7 @@ impl CodeGen {
 
     fn gen_string_assign(&mut self, name: &str, value: &Expr) {
         self.gen_expr(value);
+        self.emit_string_copy();
         // Both words were reserved when the variable was first seen, so this no
         // longer has to scavenge a slot per assignment.
         let loc = self.get_var_loc(name);
