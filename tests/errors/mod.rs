@@ -600,7 +600,6 @@ fn test_file_number_out_of_range_at_runtime() {
 /// `reject_record_value`, so `PRINT #1, Q` compiled and wrote garbage while
 /// `PRINT Q` was correctly refused.
 #[test]
-#[ignore = "unified in phase 2"]
 fn test_whole_record_is_not_a_value_to_a_file() {
     let ty = "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\n";
     expect_rejected(

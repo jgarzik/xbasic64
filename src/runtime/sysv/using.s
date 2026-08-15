@@ -293,7 +293,7 @@ _rt_print_using_num:
 .Luse_num_write:
     lea rdi, [rip + _using_out]
     mov rsi, r9
-    call _rt_print_string
+    call _rt_con_string
 
     add rsp, 24
     pop r15
@@ -356,13 +356,13 @@ _rt_print_using_str:
 .Luse_str_copied:
     lea rdi, [rip + _using_out]
     mov rsi, r13
-    call _rt_print_string
+    call _rt_con_string
     jmp .Luse_str_done
 
 .Luse_str_whole:
     mov rdi, rbx
     mov rsi, r12
-    call _rt_print_string
+    call _rt_con_string
 
 .Luse_str_done:
     add rsp, 8

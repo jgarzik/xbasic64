@@ -61,8 +61,10 @@ const WIN64: Runtime = Runtime {
 /// Concatenate one runtime tree into a single assembly unit.
 ///
 /// `libc_prefix` is what `{libc}` becomes: macOS decorates C symbols with a
-/// leading underscore, Linux and Windows do not.
-fn emit(rt: &Runtime, libc_prefix: &str) -> String {
+/// leading underscore, Linux and Windows do not. `stdout_sym` is what
+/// `{stdout}` becomes: the standard output stream is a plain `stdout` on
+/// Linux but `__stdoutp` on macOS, so the prefix alone would not spell it.
+fn emit(rt: &Runtime, libc_prefix: &str, stdout_sym: &str) -> String {
     let mut output = String::new();
 
     output.push_str("# BASIC Runtime Library\n");
@@ -73,7 +75,11 @@ fn emit(rt: &Runtime, libc_prefix: &str) -> String {
     output.push_str("\n.text\n\n");
 
     for part in rt.parts {
-        output.push_str(&part.replace("{libc}", libc_prefix));
+        output.push_str(
+            &part
+                .replace("{libc}", libc_prefix)
+                .replace("{stdout}", stdout_sym),
+        );
         output.push('\n');
     }
 
@@ -84,16 +90,16 @@ pub fn generate_runtime() -> String {
     // On macOS, C library functions need underscore prefix
     // On Linux and Windows, no prefix
     #[cfg(target_os = "macos")]
-    let libc_prefix = "_";
+    let (libc_prefix, stdout_sym) = ("_", "___stdoutp");
     #[cfg(not(target_os = "macos"))]
-    let libc_prefix = "";
+    let (libc_prefix, stdout_sym) = ("", "stdout");
 
     #[cfg(windows)]
     let rt = &WIN64;
     #[cfg(not(windows))]
     let rt = &SYSV;
 
-    emit(rt, libc_prefix)
+    emit(rt, libc_prefix, stdout_sym)
 }
 
 #[cfg(test)]
@@ -129,18 +135,19 @@ mod tests {
     fn test_both_runtimes_assemble() {
         // Every (tree, symbol prefix) pair the compiler can emit.
         let variants = [
-            ("sysv", &SYSV, ""),
-            ("sysv-macos", &SYSV, "_"),
-            ("win64-native", &WIN64, ""),
+            ("sysv", &SYSV, "", "stdout"),
+            ("sysv-macos", &SYSV, "_", "___stdoutp"),
+            ("win64-native", &WIN64, "", "stdout"),
         ];
 
-        for (name, rt, libc_prefix) in variants {
+        for (name, rt, libc_prefix, stdout_sym) in variants {
             let dir = std::env::temp_dir().join(format!("xbasic64-asm-{name}"));
             std::fs::create_dir_all(&dir).expect("writable temp directory");
             let asm = dir.join("runtime.s");
             let obj = dir.join("runtime.o");
 
-            std::fs::write(&asm, emit(rt, libc_prefix)).expect("writable assembly file");
+            std::fs::write(&asm, emit(rt, libc_prefix, stdout_sym))
+                .expect("writable assembly file");
 
             let output = Command::new("as")
                 .arg("-o")

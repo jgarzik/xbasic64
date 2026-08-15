@@ -33,7 +33,7 @@ _bytes_read: .quad 0             # For ReadFile output parameter
 # ------------------------------------------------------------------------------
 # _rt_init_input - Initialize stdin handle (call once at startup)
 # ------------------------------------------------------------------------------
-.globl _rt_init_input
+# Internal: _rt_platform_init calls this; it is not a codegen entry point.
 _rt_init_input:
     push rbp
     mov rbp, rsp
@@ -180,7 +180,7 @@ _rt_input_number:
 .Linput_num_redo:
     lea rcx, [rip + _redo_msg]
     mov rdx, _redo_msg_len
-    call _rt_print_string
+    call _rt_con_string
     jmp .Linput_num_try
 
 .Linput_num_eof:

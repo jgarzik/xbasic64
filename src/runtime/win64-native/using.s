@@ -286,7 +286,7 @@ _rt_print_using_num:
 .Luse_num_write:
     lea rcx, [rip + _using_out]
     mov rdx, r9
-    call _rt_print_string
+    call _rt_con_string
 
     add rsp, 56
     pop r15
@@ -350,13 +350,13 @@ _rt_print_using_str:
 .Luse_str_copied:
     lea rcx, [rip + _using_out]
     mov rdx, r13
-    call _rt_print_string
+    call _rt_con_string
     jmp .Luse_str_done
 
 .Luse_str_whole:
     mov rcx, rbx
     mov rdx, r12
-    call _rt_print_string
+    call _rt_con_string
 
 .Luse_str_done:
     add rsp, 40

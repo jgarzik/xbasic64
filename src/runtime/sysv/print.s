@@ -2,104 +2,32 @@
 # BASIC Runtime: Print Functions
 # ==============================================================================
 #
-# Output functions for the BASIC PRINT statement. All functions use libc printf
-# for actual output, which handles buffering and platform differences.
-#
-# Format strings are defined in data_defs.s:
-#   _fmt_str     = "%.*s"    - precision-limited string (ptr, len)
-#   _fmt_int     = "%ld"     - long integer
-#   _fmt_float   = "%g"      - floating point (compact representation)
-#   _fmt_char    = "%c"      - single character
-#   _fmt_newline = "\n"      - newline
+# Number formatting and program termination. The printing itself lives in
+# file.s: the console is file handle 0, so PRINT and PRINT # are the same
+# helpers with a different handle, and neither can drift from the other.
 #
 # All functions follow System V AMD64 ABI:
 #   - Callee-saved: rbx, rbp, r12-r15
 #   - Caller-saved: rax, rcx, rdx, rsi, rdi, r8-r11, xmm0-xmm15
 #   - Return values: rax (int), xmm0 (float)
 #
-# The {libc} placeholder is replaced with "_" on macOS, "" on Linux.
+# The {libc} placeholder is replaced with "_" on macOS, "" on Linux, and
+# {stdout} with the libc symbol holding the standard output stream.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# _rt_print_string - Print a string with explicit length
+# _rt_platform_init - Prepare the console for output
 # ------------------------------------------------------------------------------
-# BASIC strings are (ptr, len) pairs, not null-terminated. We use printf's
-# precision specifier "%.*s" which takes the length as an argument.
+# The console is file handle 0, so every print helper reaches it the same way
+# it reaches an OPENed file. Seeding the slot is all that takes here; Windows
+# has to ask the OS for its handles instead.
 #
-# Arguments:
-#   rdi = pointer to string data (char*)
-#   rsi = string length (size_t)
-#
-# Returns: nothing
-#
-# printf call: printf("%.*s", length, pointer)
-#   rdi = format string
-#   rsi = precision (string length)
-#   rdx = string pointer
+# Arguments: none      Returns: nothing
 # ------------------------------------------------------------------------------
-.globl _rt_print_string
-_rt_print_string:
-    push rbp
-    mov rbp, rsp
-    sub rsp, 16
-    mov QWORD PTR [rbp - 8], rsi    # remember the length for the column tracker
-    # An unassigned string variable is (NULL, 0): .bss and the frame-zeroing
-    # prologue both leave it that way. Printing nothing is the correct result,
-    # and returning early avoids passing NULL to printf, which is undefined.
-    test rsi, rsi
-    jz .Lprint_str_done
-    # Rearrange arguments for printf("%.*s", len, ptr)
-    mov rdx, rdi        # ptr → rdx (3rd arg to printf)
-    # rsi already has len (2nd arg to printf, as precision)
-    lea rdi, [rip + _fmt_str]   # format string → rdi (1st arg)
-    xor eax, eax        # no vector registers used (required for varargs)
-    call {libc}printf
-    # Advance the column tracker by the number of characters written.
-    mov rax, QWORD PTR [rbp - 8]
-    add QWORD PTR [rip + _print_col], rax
-.Lprint_str_done:
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_char - Print a single ASCII character
-# ------------------------------------------------------------------------------
-# Used by PRINT with semicolon/comma separators and CHR$() output.
-#
-# Arguments:
-#   rdi = character code (int, 0-255)
-#
-# Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_char
-_rt_print_char:
-    push rbp
-    mov rbp, rsp
-    mov rsi, rdi        # char → rsi (2nd arg)
-    lea rdi, [rip + _fmt_char]  # format → rdi (1st arg)
-    xor eax, eax        # no vector registers
-    call {libc}printf
-    inc QWORD PTR [rip + _print_col]
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_newline - Print a newline character
-# ------------------------------------------------------------------------------
-# Called at end of PRINT statement unless suppressed with ; or ,
-#
-# Arguments: none
-# Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_newline
-_rt_print_newline:
-    push rbp
-    mov rbp, rsp
-    lea rdi, [rip + _fmt_newline]
-    xor eax, eax
-    call {libc}printf
-    mov QWORD PTR [rip + _print_col], 0
-    leave
+.globl _rt_platform_init
+_rt_platform_init:
+    mov rax, QWORD PTR [rip + {stdout}]
+    mov QWORD PTR [rip + _file_handles], rax
     ret
 
 # ------------------------------------------------------------------------------
@@ -191,50 +119,6 @@ _rt_fmt_double:
     ret
 
 # ------------------------------------------------------------------------------
-# _rt_print_float - Print a DOUBLE (or an untyped numeric value)
-# ------------------------------------------------------------------------------
-# Arguments: xmm0 = value        Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_float
-_rt_print_float:
-    push rbp
-    mov rbp, rsp
-    lea rdi, [rip + _fmt_g_table]
-    xor esi, esi
-    call _rt_fmt_double
-    lea rdi, [rip + _fmt_str]   # "%.*s"
-    mov rsi, rax                # length
-    lea rdx, [rip + _num_buf]
-    xor eax, eax
-    call {libc}printf
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_single - Print a SINGLE
-# ------------------------------------------------------------------------------
-# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
-# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
-# print as 3.1415901184082: at 15 digits even a float's value round-trips.
-#
-# Arguments: xmm0 = value, already widened to double     Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_single
-_rt_print_single:
-    push rbp
-    mov rbp, rsp
-    lea rdi, [rip + _fmt_g_single_table]
-    mov esi, 1
-    call _rt_fmt_double
-    lea rdi, [rip + _fmt_str]
-    mov rsi, rax
-    lea rdx, [rip + _num_buf]
-    xor eax, eax
-    call {libc}printf
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
 # _rt_end - Terminate the program normally (END / STOP)
 # ------------------------------------------------------------------------------
 # Valid from any frame, including inside a SUB or FUNCTION. Emitting a plain
@@ -253,65 +137,3 @@ _rt_end:
     mov rbp, rsp
     xor edi, edi            # exit code 0
     call {libc}exit
-
-# ------------------------------------------------------------------------------
-# _rt_print_spc - SPC(n): print n spaces
-# ------------------------------------------------------------------------------
-# Arguments: rdi = count      Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_spc
-_rt_print_spc:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    sub rsp, 8
-    mov rbx, rdi
-.Lspc_loop:
-    cmp rbx, 0
-    jle .Lspc_done
-    mov edi, ' '
-    call _rt_print_char
-    dec rbx
-    jmp .Lspc_loop
-.Lspc_done:
-    add rsp, 8
-    pop rbx
-    leave
-    ret
-
-# ------------------------------------------------------------------------------
-# _rt_print_tab - TAB(n): advance to column n
-# ------------------------------------------------------------------------------
-# Columns are 1-based, as in GW-BASIC. If output is already at or past the
-# requested column, a newline is emitted first and the tab applies to the new
-# line.
-#
-# Arguments: rdi = target column      Returns: nothing
-# ------------------------------------------------------------------------------
-.globl _rt_print_tab
-_rt_print_tab:
-    push rbp
-    mov rbp, rsp
-    push rbx
-    sub rsp, 8
-
-    mov rbx, rdi
-    cmp rbx, 1
-    jge .Ltab_have_target
-    mov rbx, 1
-.Ltab_have_target:
-    dec rbx                 # 1-based column -> count of characters before it
-
-    cmp rbx, QWORD PTR [rip + _print_col]
-    jge .Ltab_pad
-    call _rt_print_newline
-
-.Ltab_pad:
-    mov rdi, rbx
-    sub rdi, QWORD PTR [rip + _print_col]
-    call _rt_print_spc
-
-    add rsp, 8
-    pop rbx
-    leave
-    ret

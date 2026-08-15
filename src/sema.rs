@@ -27,16 +27,16 @@
 use crate::parser::*;
 use std::collections::{HashMap, HashSet};
 
-/// Builtin functions, with the argument counts they accept.
-///
-/// Kept here rather than in codegen so that "is this name known?" has a single
-/// answer. Codegen still owns *how* each one is emitted.
 /// Highest BASIC file number the runtime's handle table has a slot for.
 ///
 /// The table is 16 pointers wide and slot 0 is the console, so a program may
 /// use 1 through 15.
 pub const MAX_FILE_NUM: i64 = 15;
 
+/// Builtin functions, with the argument counts they accept.
+///
+/// Kept here rather than in codegen so that "is this name known?" has a single
+/// answer. Codegen still owns *how* each one is emitted.
 const BUILTINS: &[(&str, usize, usize)] = &[
     // name, min args, max args
     ("ABS", 1, 1),
@@ -594,25 +594,20 @@ impl Analyzer {
             StmtKind::Call { name, args } => {
                 self.check_call(name, args, scope, line, true);
             }
-            StmtKind::Print { items, using, .. } => {
-                self.check_using(using.as_ref(), line);
-                for item in items {
-                    if let PrintItem::Expr(e) = item {
-                        self.check_expr(e, scope, line);
-                        self.reject_record_value(e, scope, line);
-                    }
-                }
-            }
-            StmtKind::PrintFile {
+            StmtKind::Print {
                 file_num,
                 items,
                 using,
                 ..
             } => {
-                if using.is_some() {
-                    self.error(line, "PRINT # USING is not supported");
+                if let Some(file_num) = file_num {
+                    if using.is_some() {
+                        self.error(line, "PRINT # USING is not supported");
+                    }
+                    self.check_file_num(file_num, scope, line);
+                } else {
+                    self.check_using(using.as_ref(), line);
                 }
-                self.check_file_num(file_num, scope, line);
                 for item in items {
                     if let PrintItem::Expr(e) = item {
                         self.check_expr(e, scope, line);
@@ -620,7 +615,10 @@ impl Analyzer {
                     }
                 }
             }
-            StmtKind::InputFile { file_num, .. } => {
+            StmtKind::Input {
+                file_num: Some(file_num),
+                ..
+            } => {
                 self.check_file_num(file_num, scope, line);
             }
             StmtKind::LineInput {

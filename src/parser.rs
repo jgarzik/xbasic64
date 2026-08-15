@@ -71,6 +71,9 @@ pub enum StmtKind {
         value: Expr,
     },
     Print {
+        /// `PRINT #n` writes to a file; `None` is the console, which the
+        /// runtime reaches as file handle 0.
+        file_num: Option<Expr>,
         items: Vec<PrintItem>,
         newline: bool,
         /// PRINT USING format string, when one was given.
@@ -81,6 +84,8 @@ pub enum StmtKind {
     Input {
         prompt: Option<String>,
         vars: Vec<LValue>,
+        /// `INPUT #n` reads from a file; `None` is the console.
+        file_num: Option<Expr>,
     },
     LineInput {
         prompt: Option<String>,
@@ -196,19 +201,6 @@ pub enum StmtKind {
     /// `CLOSE #n`, or bare `CLOSE` to close every open file.
     Close {
         file_num: Option<Expr>,
-    },
-    PrintFile {
-        file_num: Expr,
-        items: Vec<PrintItem>,
-        newline: bool,
-        /// PRINT USING format string, when one was given.
-        using: Option<Expr>,
-        /// True for WRITE #: values are comma-separated and strings quoted.
-        write: bool,
-    },
-    InputFile {
-        file_num: Expr,
-        vars: Vec<LValue>,
     },
 }
 
@@ -915,22 +907,13 @@ impl Parser {
         // suppress the newline the way it does for PRINT.
         let newline = newline || write;
 
-        if let Some(file_num) = file_num {
-            Ok(StmtKind::PrintFile {
-                file_num,
-                items,
-                newline,
-                using,
-                write,
-            })
-        } else {
-            Ok(StmtKind::Print {
-                items,
-                newline,
-                using,
-                write,
-            })
-        }
+        Ok(StmtKind::Print {
+            file_num,
+            items,
+            newline,
+            using,
+            write,
+        })
     }
 
     /// `SWAP a, b`
@@ -1047,7 +1030,11 @@ impl Parser {
                 }
             }
 
-            return Ok(StmtKind::InputFile { file_num, vars });
+            return Ok(StmtKind::Input {
+                prompt: None,
+                vars,
+                file_num: Some(file_num),
+            });
         }
 
         let mut prompt = None;
@@ -1073,7 +1060,11 @@ impl Parser {
             }
         }
 
-        Ok(StmtKind::Input { prompt, vars })
+        Ok(StmtKind::Input {
+            prompt,
+            vars,
+            file_num: None,
+        })
     }
 
     fn parse_line_input(&mut self) -> PResult<StmtKind> {

@@ -198,7 +198,7 @@ _rt_file_print_string:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 8              # Align stack to 16 bytes
+    push r12
 
     # An unassigned string is (NULL, 0); writing nothing is correct and avoids
     # passing NULL to fprintf.
@@ -206,6 +206,7 @@ _rt_file_print_string:
     jz .Lfile_print_str_done
 
     mov ebx, edi            # save file number
+    mov r12, rdx            # remember the length for the column tracker
     mov rcx, rsi            # string ptr → 4th arg (for %.*s format)
     mov r8, rdx             # string len → will become 3rd arg
 
@@ -220,8 +221,11 @@ _rt_file_print_string:
     xor eax, eax            # no vector args
     call {libc}fprintf
 
+    lea rax, [rip + _file_col]
+    add QWORD PTR [rax + rbx*8], r12
+
 .Lfile_print_str_done:
-    add rsp, 8
+    pop r12
     pop rbx
     leave
     ret
@@ -229,7 +233,7 @@ _rt_file_print_string:
 # ------------------------------------------------------------------------------
 # _rt_file_print_float - Write number to file (PRINT# with number)
 # ------------------------------------------------------------------------------
-# Like _rt_print_float, prints whole numbers as integers for clean output.
+# Prints whole numbers as integers for clean output.
 #
 # Arguments:
 #   rdi = file number
@@ -246,21 +250,148 @@ _rt_file_print_float:
 
     mov ebx, edi            # save file number
 
-    # Format through the shared helper, so file output matches console output
-    # digit for digit.
+    # Format through the shared helper, so every sink renders a number the
+    # same way.
     lea rdi, [rip + _fmt_g_table]
     xor esi, esi
     call _rt_fmt_double
+    jmp .Lfile_num_emit
 
-    lea rcx, [rip + _file_handles]
-    mov rdi, [rcx + rbx*8]  # FILE*
-    lea rsi, [rip + _file_fmt_str]  # "%.*s"
-    mov rdx, rax            # length
-    lea rcx, [rip + _num_buf]
-    xor eax, eax
-    call {libc}fprintf
+# ------------------------------------------------------------------------------
+# _rt_file_print_single - Write a SINGLE
+# ------------------------------------------------------------------------------
+# A SINGLE carries only ~7 significant digits, so it uses a table starting at a
+# shorter format and compares at 32-bit precision. Otherwise 3.14159! would
+# print as 3.1415901184082: at 15 digits even a float's value round-trips.
+#
+# Shares the emit tail below with _rt_file_print_float, whose prologue is
+# identical.
+#
+# Arguments:
+#   rdi = file number
+#   xmm0 = value, already widened to double
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_file_print_single
+_rt_file_print_single:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, edi            # save file number
+
+    lea rdi, [rip + _fmt_g_single_table]
+    mov esi, 1
+    call _rt_fmt_double
+
+.Lfile_num_emit:
+    # rax = length of the text _rt_fmt_double left in _num_buf.
+    mov rdx, rax
+    lea rsi, [rip + _num_buf]
+    mov edi, ebx
+    call _rt_file_print_string
 
     add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_con_string - Write a string to the console
+# ------------------------------------------------------------------------------
+# The console is file handle 0. This exists for the runtime's own messages and
+# for PRINT USING, which has no file form; generated code passes a handle like
+# any other caller.
+#
+# Arguments:
+#   rdi = string pointer
+#   rsi = string length
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_con_string
+_rt_con_string:
+    mov rdx, rsi            # length  -> 3rd arg
+    mov rsi, rdi            # pointer -> 2nd arg
+    xor edi, edi            # console -> 1st arg
+    jmp _rt_file_print_string
+
+# ------------------------------------------------------------------------------
+# _rt_file_print_spc - SPC(n): write n spaces
+# ------------------------------------------------------------------------------
+# Arguments:
+#   rdi = file number
+#   rsi = count
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_file_print_spc
+_rt_file_print_spc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    mov ebx, edi            # file number
+    mov r12, rsi            # count remaining
+.Lfile_spc_loop:
+    cmp r12, 0
+    jle .Lfile_spc_done
+    mov edi, ebx
+    mov esi, ' '
+    call _rt_file_print_char
+    dec r12
+    jmp .Lfile_spc_loop
+.Lfile_spc_done:
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# ------------------------------------------------------------------------------
+# _rt_file_print_tab - TAB(n): advance to column n
+# ------------------------------------------------------------------------------
+# Columns are 1-based, as in GW-BASIC. If the sink is already at or past the
+# requested column, a newline is written first and the tab applies to the new
+# line.
+#
+# Arguments:
+#   rdi = file number
+#   rsi = target column
+#
+# Returns: nothing
+# ------------------------------------------------------------------------------
+.globl _rt_file_print_tab
+_rt_file_print_tab:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+
+    mov ebx, edi            # file number
+    mov r12, rsi            # target column
+    cmp r12, 1
+    jge .Lfile_tab_have_target
+    mov r12, 1
+.Lfile_tab_have_target:
+    dec r12                 # 1-based column -> count of characters before it
+
+    lea rax, [rip + _file_col]
+    cmp r12, QWORD PTR [rax + rbx*8]
+    jge .Lfile_tab_pad
+    mov edi, ebx
+    call _rt_file_print_newline
+
+.Lfile_tab_pad:
+    lea rax, [rip + _file_col]
+    mov rsi, r12
+    sub rsi, QWORD PTR [rax + rbx*8]
+    mov edi, ebx
+    call _rt_file_print_spc
+
+    pop r12
     pop rbx
     leave
     ret
@@ -291,6 +422,9 @@ _rt_file_print_char:
     xor eax, eax
     call {libc}fprintf
 
+    lea rax, [rip + _file_col]
+    inc QWORD PTR [rax + rbx*8]
+
     pop r12
     pop rbx
     leave
@@ -320,6 +454,9 @@ _rt_file_print_newline:
     mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
     mov edi, 10             # '\n' → edi (1st arg)
     call {libc}fputc
+
+    lea rax, [rip + _file_col]
+    mov QWORD PTR [rax + rbx*8], 0
 
     add rsp, 8
     pop rbx
