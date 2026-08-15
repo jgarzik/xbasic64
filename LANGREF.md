@@ -42,6 +42,24 @@ Line numbers are optional and appear at the start of a line:
 
 Line numbers serve as labels for `GOTO` and `GOSUB` targets.
 
+### Labels
+
+A name followed by a colon is a label, and marks a target the same way a line
+number does:
+
+```basic
+GOTO Finish
+PRINT "skipped"
+Finish:
+PRINT "done"
+```
+
+A label definition must be the first thing on its line, though a statement may
+follow it there (`Finish: PRINT "done"`). Labels are case-insensitive, like
+every other name, and are accepted wherever a line number is: `GOTO`, `GOSUB`,
+`ON...GOTO` and `RESTORE`. A name already declared as a `SUB` is read as a call
+to it rather than as a label definition.
+
 ### Statement Separators
 
 Multiple statements can appear on one line separated by colons:
@@ -49,6 +67,21 @@ Multiple statements can appear on one line separated by colons:
 ```basic
 A = 1 : B = 2 : PRINT A + B
 ```
+
+### Block Terminators
+
+Each multi-line block may be closed with either the two-word form or a single
+word; the two are interchangeable:
+
+| Two words      | One word       |
+|----------------|----------------|
+| `END IF`       | `ENDIF`        |
+| `END SUB`      | `ENDSUB`       |
+| `END FUNCTION` | `ENDFUNCTION`  |
+| `END SELECT`   | `ENDSELECT`    |
+| `END TYPE`     | `ENDTYPE`      |
+
+The examples in this reference use the two-word form throughout.
 
 ### Identifiers
 
@@ -955,8 +988,21 @@ line it happened on to standard error, and exits with status 1:
 
 Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
-run, division by zero for `/`, `\` and `MOD`, `SQR` of a negative number,
-`LOG` of a non-positive number, and allocation failure.
+run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
+overflows, `SQR` of a negative number, `LOG` of a non-positive number,
+`GOSUB` nested deeper than the return stack holds, and allocation failure.
+
+The message names the fault:
+
+| Message                  | Cause                                            |
+|--------------------------|--------------------------------------------------|
+| `Subscript out of range` | A subscript outside a dimension's bounds         |
+| `Array used before DIM`  | An array reached before its `DIM` ran            |
+| `Division by zero`       | A zero divisor in `/`, `\` or `MOD`              |
+| `Overflow`               | A `\` or `MOD` whose quotient does not fit       |
+| `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive     |
+| `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth     |
+| `Out of memory`          | A string or array allocation that failed         |
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:
