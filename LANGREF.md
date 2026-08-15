@@ -272,6 +272,20 @@ DIM Arr(10)
 Arr(5) = 42
 ```
 
+`LET` is accepted before any assignment, including record fields and
+`MID$`:
+
+```basic
+TYPE Person
+    Name AS STRING * 20
+END TYPE
+DIM P AS Person
+
+LET P.Name = "Ada"
+S$ = "xxllo"
+LET MID$(S$, 1, 2) = "HE"       ' S$ is now "HEllo"
+```
+
 ### PRINT
 
 Output to console:
@@ -324,6 +338,9 @@ String fields:
 `_` emits the next character literally. A value too wide for its field is
 printed in full, preceded by `%`. If values remain after the format is
 exhausted, the format restarts.
+
+A field is at most 255 characters wide with at most 40 fractional digits;
+a format asking for more is clamped to those.
 
 ### INPUT
 
@@ -546,6 +563,9 @@ WRITE "Alice", 30       ' "Alice",30
 WRITE #1, A$, N         ' the same, to a file
 ```
 
+`WRITE` always ends its line, and what it writes is exactly what
+`INPUT #` reads back.
+
 ### EXIT
 
 Leave the innermost matching loop, or return early from a procedure:
@@ -645,6 +665,20 @@ END SUB
 FUNCTION Total AS DOUBLE
     Total = 1.5
 END FUNCTION
+
+FUNCTION Half(X) AS INTEGER
+    Half = X / 2        ' Half(7) is 3, not 3.5
+END FUNCTION
+```
+
+A declared result type must not contradict a type suffix on the name, and
+a `SUB` -- having no result -- cannot be declared `AS` anything.
+
+One `DIM` may mix declarators freely:
+
+```basic
+DIM I AS INTEGER, Grid(9, 9) AS INTEGER, Names$(20)
+
 ```
 
 ### END / STOP
@@ -736,12 +770,17 @@ MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 | Function      | Description                                    |
 |---------------|------------------------------------------------|
 | `TIMER`       | Seconds since midnight (Double)                |
-| `LBOUND(a)`   | Lowest subscript of an array                   |
+| `LBOUND(a[,d])` | Lowest subscript of an array, of dimension d |
 | `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
 | `EOF(n)`      | True once file n has been read to the end      |
 | `LOF(n)`      | Length of file n in bytes                      |
 | `TAB(n)`      | In PRINT: advance to column n                  |
 | `SPC(n)`      | In PRINT: emit n spaces                        |
+
+`LBOUND` and `UBOUND` take an array *name*, of any element type. The
+dimension may be any numeric expression; asking for one the array does
+not have is an error, reported at compile time when it is a constant and
+at run time otherwise.
 
 ---
 
@@ -786,6 +825,11 @@ INPUT #1, X           ' Read value
 INPUT #1, A$, B$      ' Read multiple values
 LINE INPUT #1, Text$  ' Read entire line
 ```
+
+`INPUT #` reads one comma-delimited field per variable, skipping leading
+blanks and line breaks, so several fields may come from one line and one
+field may span several. A field wrapped in quotes may contain commas.
+`LINE INPUT #` takes a whole line, commas and all.
 
 `EOF()` gives the usual read-until-the-end loop:
 
@@ -952,4 +996,6 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 3. **Boolean true is -1** - Comparisons return -1 (true) or 0 (false)
 4. **Array indices start at 0** - `DIM A(10)` creates 11 elements (0-10)
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
-6. **Parameters are by-value only** - No `BYREF` support
+6. **Parameters are by-value only** - No `BYREF` support, records included:
+   a record argument is passed as the address of the caller's copy, which the
+   callee copies into a local, so changes to it do not escape
