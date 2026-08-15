@@ -321,31 +321,6 @@ impl Analyzer {
                     }
                     self.symbols.records.insert(upper, info);
                 }
-                StmtKind::DimTyped {
-                    name,
-                    ty,
-                    dimensions,
-                } => {
-                    if let TypeRef::Record(r) = ty {
-                        if !self.symbols.records.contains_key(&r.to_uppercase()) {
-                            self.error(stmt.line, format!("undefined TYPE '{}'", r));
-                        }
-                    }
-                    let key = (scope.clone(), name.to_uppercase());
-                    if self.symbols.typed_vars.contains_key(&key) {
-                        self.error(stmt.line, format!("'{}' is already declared", name));
-                    }
-                    self.symbols.typed_vars.insert(key.clone(), ty.clone());
-                    if let Some(dims) = dimensions {
-                        self.symbols.arrays.insert(
-                            key,
-                            ArrayInfo {
-                                rank: dims.len(),
-                                line: stmt.line,
-                            },
-                        );
-                    }
-                }
                 StmtKind::OptionBase(n) => {
                     if self.seen_option_base {
                         self.error(stmt.line, "OPTION BASE may appear only once");
@@ -371,28 +346,47 @@ impl Analyzer {
                     }
                 }
                 // REDIM may also introduce an array, so both are collected.
-                StmtKind::Dim { arrays } | StmtKind::Redim { arrays, .. } => {
+                StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
                     let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
-                    for arr in arrays {
-                        if arr.dimensions.is_empty() {
+                    for decl in decls {
+                        let key = (scope.clone(), decl.name.to_uppercase());
+
+                        if let Some(ty) = &decl.ty {
+                            if let TypeRef::Record(r) = ty {
+                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                    self.error(stmt.line, format!("undefined TYPE '{}'", r));
+                                }
+                            }
+                            if self.symbols.typed_vars.contains_key(&key) && !is_redim {
+                                self.error(
+                                    stmt.line,
+                                    format!("'{}' is already declared", decl.name),
+                                );
+                            }
+                            self.symbols.typed_vars.insert(key.clone(), ty.clone());
+                        }
+
+                        let Some(dims) = &decl.dimensions else {
+                            continue;
+                        };
+                        if dims.is_empty() {
                             self.error(
                                 stmt.line,
-                                format!("array '{}' needs at least one dimension", arr.name),
+                                format!("array '{}' needs at least one dimension", decl.name),
                             );
                         }
-                        let key = (scope.clone(), arr.name.clone());
                         if let Some(prev) = self.symbols.arrays.get(&key) {
                             if !is_redim {
                                 self.error(
                                     stmt.line,
-                                    format!("array '{}' is already declared", arr.name),
+                                    format!("array '{}' is already declared", decl.name),
                                 );
-                            } else if prev.rank != arr.dimensions.len() {
+                            } else if prev.rank != dims.len() {
                                 self.error(
                                     stmt.line,
                                     format!(
                                         "REDIM of '{}' must keep its {} dimension(s)",
-                                        arr.name, prev.rank
+                                        decl.name, prev.rank
                                     ),
                                 );
                             }
@@ -400,7 +394,7 @@ impl Analyzer {
                         self.symbols.arrays.insert(
                             key,
                             ArrayInfo {
-                                rank: arr.dimensions.len(),
+                                rank: dims.len(),
                                 line: stmt.line,
                             },
                         );
@@ -635,27 +629,28 @@ impl Analyzer {
                 }
             }
             StmtKind::Restore(Some(target)) => self.check_target(target, line, "RESTORE"),
-            StmtKind::Dim { arrays } => {
-                for arr in arrays {
-                    for d in &arr.dimensions {
+            StmtKind::Dim { decls } => {
+                for decl in decls {
+                    for d in decl.dimensions.iter().flatten() {
                         self.check_expr(d, scope, line);
                     }
                 }
             }
-            StmtKind::Redim { arrays, preserve } => {
-                for arr in arrays {
-                    for d in &arr.dimensions {
+            StmtKind::Redim { decls, preserve } => {
+                for decl in decls {
+                    let dims = decl.dimensions.as_deref().unwrap_or(&[]);
+                    for d in dims {
                         self.check_expr(d, scope, line);
                     }
                     // Only the last dimension may change under PRESERVE, which
                     // is QuickBASIC's own rule: any other change would need the
                     // elements remapped rather than the block simply grown.
-                    if *preserve && arr.dimensions.len() > 1 {
+                    if *preserve && dims.len() > 1 {
                         self.error(
                             line,
                             format!(
                                 "REDIM PRESERVE of '{}' may only change its last dimension",
-                                arr.name
+                                decl.name
                             ),
                         );
                     }

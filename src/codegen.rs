@@ -1845,9 +1845,9 @@ impl CodeGen {
                 }
             }
 
-            StmtKind::Dim { arrays } => {
-                for arr in arrays {
-                    self.gen_dim_array(arr);
+            StmtKind::Dim { decls } => {
+                for decl in decls {
+                    self.gen_declarator(decl, false);
                 }
             }
 
@@ -1910,34 +1910,9 @@ impl CodeGen {
                 }
             }
 
-            StmtKind::DimTyped {
-                name,
-                ty,
-                dimensions,
-            } => {
-                match dimensions {
-                    // An array of records: element size comes from the type.
-                    Some(dims) => {
-                        let decl = ArrayDecl {
-                            name: name.clone(),
-                            dimensions: dims.clone(),
-                        };
-                        let words = self.symbols.type_words(ty);
-                        self.record_elem_words.insert(name.to_uppercase(), words);
-                        self.gen_array_alloc(&decl, false);
-                    }
-                    // A scalar: allocating its storage is all that is needed,
-                    // since .bss and the frame prologue already zero it.
-                    None => {
-                        let ty = ty.clone();
-                        self.get_record_loc(name, &ty);
-                    }
-                }
-            }
-
-            StmtKind::Redim { arrays, preserve } => {
-                for arr in arrays {
-                    self.gen_array_alloc(arr, *preserve);
+            StmtKind::Redim { decls, preserve } => {
+                for decl in decls {
+                    self.gen_declarator(decl, *preserve);
                 }
             }
 
@@ -2629,12 +2604,15 @@ impl CodeGen {
             self.emit(&format!("    mov {}, QWORD PTR [rsp + 40]", regs[5]));
             self.emit("    call _rt_mid_assign");
         } else {
-            // Win64: the 5th and 6th arguments go above the shadow space.
+            // Win64: the 5th and 6th arguments sit just above the 32-byte
+            // shadow space, at [rsp+32] and [rsp+40] as seen by the caller.
+            // The callee reads them at [rsp+40] and [rsp+48], since `call`
+            // pushes a return address in between.
             self.emit("    mov r10, QWORD PTR [rsp + 32]");
             self.emit("    mov r11, QWORD PTR [rsp + 40]");
             self.emit("    sub rsp, 64");
-            self.emit("    mov QWORD PTR [rsp + 40], r10");
-            self.emit("    mov QWORD PTR [rsp + 48], r11");
+            self.emit("    mov QWORD PTR [rsp + 32], r10");
+            self.emit("    mov QWORD PTR [rsp + 40], r11");
             self.emit("    call _rt_mid_assign");
             self.emit("    add rsp, 64");
         }
@@ -3909,6 +3887,44 @@ impl CodeGen {
 
         self.emit(&format!("    call _proc_{}", mangled));
         self.emit(&format!("    add rsp, {}", stack_bytes + temp_bytes));
+    }
+
+    /// Emit storage for one DIM/REDIM declarator.
+    ///
+    /// A declarator is an array, a typed scalar, or a typed array, and one
+    /// statement may mix them.
+    fn gen_declarator(&mut self, decl: &Declarator, preserve: bool) {
+        match (&decl.dimensions, &decl.ty) {
+            // An array of records: element size comes from the type.
+            (Some(dims), Some(ty)) => {
+                let arr = ArrayDecl {
+                    name: decl.name.clone(),
+                    dimensions: dims.clone(),
+                };
+                let words = self.symbols.type_words(ty);
+                self.record_elem_words
+                    .insert(decl.name.to_uppercase(), words);
+                self.gen_array_alloc(&arr, preserve);
+            }
+            (Some(dims), None) => {
+                let arr = ArrayDecl {
+                    name: decl.name.clone(),
+                    dimensions: dims.clone(),
+                };
+                if preserve {
+                    self.gen_array_alloc(&arr, true);
+                } else {
+                    self.gen_dim_array(&arr);
+                }
+            }
+            // A typed scalar: allocating its storage is all that is needed,
+            // since .bss and the frame prologue already zero it.
+            (None, Some(ty)) => {
+                let ty = ty.clone();
+                self.get_record_loc(&decl.name, &ty);
+            }
+            (None, None) => unreachable!("the parser rejects a bare declarator"),
+        }
     }
 
     fn gen_dim_array(&mut self, arr: &ArrayDecl) {

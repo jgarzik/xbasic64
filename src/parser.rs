@@ -118,11 +118,11 @@ pub enum StmtKind {
         targets: Vec<GotoTarget>,
     },
     Dim {
-        arrays: Vec<ArrayDecl>,
+        decls: Vec<Declarator>,
     },
     /// `REDIM [PRESERVE] A(bounds)` -- resize an existing array.
     Redim {
-        arrays: Vec<ArrayDecl>,
+        decls: Vec<Declarator>,
         /// Keep the existing contents (only the last dimension may change).
         preserve: bool,
     },
@@ -171,13 +171,6 @@ pub enum StmtKind {
     FieldAssign {
         target: LValue,
         value: Expr,
-    },
-    /// `DIM v AS T` -- declare a variable of a user-defined or built-in type.
-    DimTyped {
-        name: String,
-        ty: TypeRef,
-        /// Array bounds, when declaring an array of this type.
-        dimensions: Option<Vec<Expr>>,
     },
     Data(Vec<Literal>),
     Read(Vec<LValue>),
@@ -252,6 +245,20 @@ pub enum CaseClause {
     Range(Expr, Expr),
     /// `CASE IS > 100`
     Compare(BinaryOp, Expr),
+}
+
+/// One declarator in a `DIM` or `REDIM` list.
+///
+/// A single statement may mix forms -- `DIM A(3), B AS INTEGER` -- so the
+/// list is heterogeneous rather than the parser bailing out to a different
+/// statement the moment it sees `AS`.
+#[derive(Debug, Clone)]
+pub struct Declarator {
+    pub name: String,
+    /// Array bounds, when this declares an array.
+    pub dimensions: Option<Vec<Expr>>,
+    /// Declared type from an `AS` clause.
+    pub ty: Option<TypeRef>,
 }
 
 /// One procedure parameter.
@@ -1640,53 +1647,57 @@ impl Parser {
 
     fn parse_dim(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DIM
-        self.parse_dim_list()
+        Ok(StmtKind::Dim {
+            decls: self.parse_dim_list()?,
+        })
     }
 
     /// Parse the `name(bounds), name(bounds), ...` part shared by DIM and REDIM.
-    fn parse_dim_list(&mut self) -> PResult<StmtKind> {
-        let mut arrays = Vec::new();
+    /// Parse the declarator list shared by DIM and REDIM.
+    ///
+    /// Each declarator is `name`, `name(bounds)`, or either of those followed
+    /// by `AS type`, and they may be mixed in one statement.
+    fn parse_dim_list(&mut self) -> PResult<Vec<Declarator>> {
+        let mut decls = Vec::new();
 
         loop {
             let name = if let Token::Ident(n) = self.advance() {
                 n
             } else {
-                return err("Expected an array name");
+                return err("Expected a variable or array name");
             };
 
-            // `DIM v AS T` and `DIM v(bounds) AS T` declare a typed variable
-            // rather than an untyped array.
-            if matches!(self.peek(), Token::As) {
+            let dimensions = if matches!(self.peek(), Token::LParen) {
                 self.advance();
-                let ty = self.parse_type_ref()?;
-                return Ok(StmtKind::DimTyped {
-                    name,
-                    ty,
-                    dimensions: None,
-                });
-            }
-
-            self.expect(Token::LParen)?;
-            let dimensions = self.parse_expr_list()?;
-            self.expect(Token::RParen)?;
-
-            if matches!(self.peek(), Token::As) {
-                self.advance();
-                let ty = self.parse_type_ref()?;
-                // Register it so that `name(i)` parses as an array access
+                let dims = self.parse_expr_list()?;
+                self.expect(Token::RParen)?;
+                // Track the name so that `name(i)` parses as an array access
                 // rather than a function call.
                 self.declared_arrays.insert(name.to_uppercase());
-                return Ok(StmtKind::DimTyped {
-                    name,
-                    ty,
-                    dimensions: Some(dimensions),
-                });
+                Some(dims)
+            } else {
+                None
+            };
+
+            let ty = if matches!(self.peek(), Token::As) {
+                self.advance();
+                Some(self.parse_type_ref()?)
+            } else {
+                None
+            };
+
+            if dimensions.is_none() && ty.is_none() {
+                return err(format!(
+                    "'{}' needs either array bounds or an AS clause",
+                    name
+                ));
             }
 
-            // Track this array name for later use in parse_primary
-            self.declared_arrays.insert(name.to_uppercase());
-
-            arrays.push(ArrayDecl { name, dimensions });
+            decls.push(Declarator {
+                name,
+                dimensions,
+                ty,
+            });
 
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
@@ -1695,7 +1706,7 @@ impl Parser {
             }
         }
 
-        Ok(StmtKind::Dim { arrays })
+        Ok(decls)
     }
 
     /// `REDIM [PRESERVE] A(bounds), B(bounds), ...`
@@ -1707,10 +1718,8 @@ impl Parser {
         } else {
             false
         };
-        let StmtKind::Dim { arrays } = self.parse_dim_list()? else {
-            unreachable!("parse_dim_list yields a Dim")
-        };
-        Ok(StmtKind::Redim { arrays, preserve })
+        let decls = self.parse_dim_list()?;
+        Ok(StmtKind::Redim { decls, preserve })
     }
 
     /// Parse a type name in an `AS` clause.
@@ -2734,10 +2743,10 @@ mod tests {
     fn test_dim_single() {
         let prog = parse("DIM A(10)").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
-            assert_eq!(arrays.len(), 1);
-            assert_eq!(arrays[0].name, "A");
-            assert_eq!(arrays[0].dimensions.len(), 1);
+        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+            assert_eq!(decls.len(), 1);
+            assert_eq!(decls[0].name, "A");
+            assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 1);
         } else {
             panic!("Expected Dim");
         }
@@ -2746,11 +2755,11 @@ mod tests {
     #[test]
     fn test_dim_multiple() {
         let prog = parse("DIM A(10), B$(100), C(50)").unwrap();
-        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
-            assert_eq!(arrays.len(), 3);
-            assert_eq!(arrays[0].name, "A");
-            assert_eq!(arrays[1].name, "B$");
-            assert_eq!(arrays[2].name, "C");
+        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+            assert_eq!(decls.len(), 3);
+            assert_eq!(decls[0].name, "A");
+            assert_eq!(decls[1].name, "B$");
+            assert_eq!(decls[2].name, "C");
         } else {
             panic!("Expected Dim");
         }
@@ -2759,10 +2768,10 @@ mod tests {
     #[test]
     fn test_dim_2d() {
         let prog = parse("DIM A(10, 20)").unwrap();
-        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
-            assert_eq!(arrays.len(), 1);
-            assert_eq!(arrays[0].name, "A");
-            assert_eq!(arrays[0].dimensions.len(), 2);
+        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+            assert_eq!(decls.len(), 1);
+            assert_eq!(decls[0].name, "A");
+            assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 2);
         } else {
             panic!("Expected Dim");
         }
@@ -2771,13 +2780,41 @@ mod tests {
     #[test]
     fn test_dim_3d() {
         let prog = parse("DIM Matrix(5, 10, 15)").unwrap();
-        if let StmtKind::Dim { arrays } = &prog.statements[0].kind {
-            assert_eq!(arrays.len(), 1);
-            assert_eq!(arrays[0].name, "MATRIX");
-            assert_eq!(arrays[0].dimensions.len(), 3);
+        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+            assert_eq!(decls.len(), 1);
+            assert_eq!(decls[0].name, "MATRIX");
+            assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 3);
         } else {
             panic!("Expected Dim");
         }
+    }
+
+    #[test]
+    fn test_dim_mixed_declarators() {
+        let prog = parse("DIM A(3), B AS INTEGER, C(2) AS LONG").unwrap();
+        let StmtKind::Dim { decls } = &prog.statements[0].kind else {
+            panic!("Expected Dim");
+        };
+        assert_eq!(decls.len(), 3);
+        assert_eq!(decls[0].name, "A");
+        assert!(decls[0].ty.is_none());
+        assert_eq!(decls[1].name, "B");
+        assert!(decls[1].dimensions.is_none());
+        assert!(decls[1].ty.is_some());
+        assert_eq!(decls[2].dimensions.as_ref().unwrap().len(), 1);
+        assert!(decls[2].ty.is_some());
+    }
+
+    #[test]
+    fn test_redim_with_as_type() {
+        let prog = parse("REDIM PRESERVE A(5) AS INTEGER").unwrap();
+        let StmtKind::Redim { decls, preserve } = &prog.statements[0].kind else {
+            panic!("Expected Redim");
+        };
+        assert!(preserve);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "A");
+        assert!(decls[0].ty.is_some());
     }
 
     #[test]
