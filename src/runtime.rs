@@ -28,6 +28,7 @@ mod runtime_files {
     pub const MATH_FUNCS: &str = include_str!("runtime/sysv/math.s");
     pub const DATA_FUNCS: &str = include_str!("runtime/sysv/data.s");
     pub const FILE_FUNCS: &str = include_str!("runtime/sysv/file.s");
+    pub const ERROR_FUNCS: &str = include_str!("runtime/sysv/error.s");
 }
 
 // Windows x64 Native runtime (pure Win32 API, no MinGW)
@@ -40,6 +41,7 @@ mod runtime_files {
     pub const MATH_FUNCS: &str = include_str!("runtime/win64-native/math.s");
     pub const DATA_FUNCS: &str = include_str!("runtime/win64-native/data.s");
     pub const FILE_FUNCS: &str = include_str!("runtime/win64-native/file.s");
+    pub const ERROR_FUNCS: &str = include_str!("runtime/win64-native/error.s");
 }
 
 use runtime_files::*;
@@ -75,6 +77,8 @@ pub fn generate_runtime() -> String {
     output.push_str(&DATA_FUNCS.replace("{libc}", libc_prefix));
     output.push('\n');
     output.push_str(&FILE_FUNCS.replace("{libc}", libc_prefix));
+    output.push('\n');
+    output.push_str(&ERROR_FUNCS.replace("{libc}", libc_prefix));
     output.push('\n');
 
     output

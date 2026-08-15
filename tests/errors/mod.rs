@@ -321,3 +321,139 @@ fn test_diagnostics_report_source_line() {
         e.stderr
     );
 }
+
+/// Helper: a program must run, produce `stdout_lines`, then abort with the
+/// given message on stderr and a nonzero exit code.
+fn expect_runtime_error(source: &str, stdout_lines: &[&str], message: &str) {
+    let run = compile_and_run_raw(source, "").expect("should compile");
+    assert_eq!(run.lines(), stdout_lines, "output before the abort");
+    assert!(
+        run.stderr.contains(message),
+        "expected {message:?} on stderr, got {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(1),
+        "a runtime error exits 1; stderr was {:?}",
+        run.stderr
+    );
+}
+
+/// An out-of-range subscript used to corrupt memory or segfault.
+#[test]
+fn test_array_bounds_are_checked() {
+    expect_runtime_error(
+        "DIM A(5)\nPRINT \"before\"\nA(99) = 1\nPRINT \"after\"\n",
+        &["before"],
+        "Subscript out of range",
+    );
+    // A negative index is caught by the same unsigned compare.
+    expect_runtime_error(
+        "DIM A(5)\nI = -1\nPRINT A(I)\n",
+        &[],
+        "Subscript out of range",
+    );
+    expect_runtime_error(
+        "DIM M(2,2)\nPRINT \"before\"\nPRINT M(1,9)\n",
+        &["before"],
+        "Subscript out of range",
+    );
+}
+
+/// Indexing right at the declared bound is legal: DIM A(5) has 6 elements.
+#[test]
+fn test_array_bounds_allow_the_declared_bound() {
+    let run = compile_and_run_raw("DIM A(5)\nA(5) = 42\nA(0) = 1\nPRINT A(5)\n", "")
+        .expect("should compile");
+    assert_eq!(run.lines(), vec!["42"]);
+    assert_eq!(run.exit_code, Some(0));
+}
+
+/// Integer division and MOD by zero used to raise SIGFPE; float division
+/// yielded infinity and carried on.
+#[test]
+fn test_division_by_zero_is_checked() {
+    expect_runtime_error(
+        "PRINT \"before\"\nPRINT 1 \\ 0\n",
+        &["before"],
+        "Division by zero",
+    );
+    expect_runtime_error(
+        "PRINT \"before\"\nPRINT 1 MOD 0\n",
+        &["before"],
+        "Division by zero",
+    );
+    expect_runtime_error(
+        "PRINT \"before\"\nPRINT 1 / 0\n",
+        &["before"],
+        "Division by zero",
+    );
+    expect_runtime_error("Z = 0\nPRINT 5 / Z\n", &[], "Division by zero");
+}
+
+/// SQR of a negative and LOG of a non-positive argument used to yield NaN or
+/// -inf, which printed as a meaningless huge integer.
+#[test]
+fn test_math_domain_is_checked() {
+    expect_runtime_error("PRINT SQR(-1)\n", &[], "Illegal function call");
+    expect_runtime_error("PRINT LOG(0)\n", &[], "Illegal function call");
+    expect_runtime_error("PRINT LOG(-1)\n", &[], "Illegal function call");
+}
+
+/// An array whose DIM has not executed yet has a null element pointer.
+#[test]
+fn test_use_before_dim_is_checked() {
+    expect_runtime_error(
+        "SUB T\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n",
+        &[],
+        "Array used before DIM",
+    );
+}
+
+/// The diagnostic names the BASIC line the fault occurred on.
+#[test]
+fn test_runtime_error_reports_line() {
+    let run = compile_and_run_raw("DIM A(2)\nPRINT \"x\"\nA(9) = 1\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 3"),
+        "expected the failing line in the message, got {:?}",
+        run.stderr
+    );
+}
+
+/// Runtime diagnostics go to stderr, leaving the program's own output clean.
+#[test]
+fn test_runtime_errors_go_to_stderr() {
+    let run =
+        compile_and_run_raw("DIM A(2)\nPRINT \"out\"\nA(9) = 1\n", "").expect("should compile");
+    assert_eq!(run.lines(), vec!["out"], "stdout has only program output");
+    assert!(run.stderr.contains("Subscript out of range"));
+}
+
+/// Correct programs are unaffected by the checks.
+#[test]
+fn test_checks_do_not_disturb_correct_programs() {
+    let run = compile_and_run_raw(
+        r#"
+DIM A(9)
+FOR I = 0 TO 9
+A(I) = I * 2
+NEXT I
+S = 0
+FOR I = 0 TO 9
+S = S + A(I)
+NEXT I
+PRINT S
+PRINT 10 / 4
+PRINT 10 \ 4
+PRINT 10 MOD 4
+PRINT SQR(16)
+PRINT LOG(1)
+"#,
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.lines(), vec!["90", "2.5", "2", "2", "4", "0"]);
+    assert_eq!(run.exit_code, Some(0));
+}

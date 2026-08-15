@@ -179,7 +179,7 @@
 use crate::abi::{Abi, PlatformAbi};
 use crate::parser::*;
 use crate::sema::Symbols;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
 
 /// Simple math functions: BASIC name -> libc function name
@@ -294,6 +294,61 @@ impl Loc {
     }
 }
 
+/// A runtime error the generated code can raise.
+///
+/// Each variant names a message constant in the runtime. The BASIC line number
+/// is passed separately at the call site, so the set of messages stays small no
+/// matter how many check sites exist.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum RtError {
+    Subscript,
+    DivideByZero,
+    Domain,
+    Overflow,
+    Undim,
+    OutOfMemory,
+}
+
+impl RtError {
+    /// Assembler symbol holding the message text.
+    fn symbol(self) -> &'static str {
+        match self {
+            RtError::Subscript => "_err_subscript",
+            RtError::DivideByZero => "_err_div0",
+            RtError::Domain => "_err_domain",
+            RtError::Overflow => "_err_overflow",
+            RtError::Undim => "_err_undim",
+            RtError::OutOfMemory => "_err_memory",
+        }
+    }
+
+    /// Short tag used to build a unique trampoline label.
+    fn tag(self) -> &'static str {
+        match self {
+            RtError::Subscript => "sub",
+            RtError::DivideByZero => "div0",
+            RtError::Domain => "dom",
+            RtError::Overflow => "ovf",
+            RtError::Undim => "undim",
+            RtError::OutOfMemory => "mem",
+        }
+    }
+}
+
+/// Code generation options.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Emit runtime safety checks (array bounds, division by zero, ...).
+    pub checks: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        // Checks are on unless the user explicitly opts out.
+        Options { checks: true }
+    }
+}
+
 /// One 8-byte physical argument slot in the private `_proc_*` convention.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Slot {
@@ -344,6 +399,13 @@ pub struct CodeGen {
     /// Names resolved by semantic analysis; codegen consults this instead of
     /// guessing from an identifier's spelling.
     symbols: Symbols,
+    /// Code generation options (currently just whether checks are emitted).
+    opts: Options,
+    /// BASIC line of the statement being compiled, for runtime diagnostics.
+    current_line: u32,
+    /// Error trampolines needed so far, keyed by (error, line) so that sites
+    /// sharing both share one trampoline. Ordered for reproducible output.
+    error_sites: BTreeMap<(RtError, u32), String>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -755,8 +817,9 @@ impl CodeGen {
         }
     }
 
-    pub fn generate(&mut self, program: &Program, symbols: Symbols) -> String {
+    pub fn generate(&mut self, program: &Program, symbols: Symbols, opts: Options) -> String {
         self.symbols = symbols;
+        self.opts = opts;
         // First pass: collect DATA statements and check for GOSUB
         for stmt in &program.statements {
             self.preprocess(stmt);
@@ -795,6 +858,10 @@ impl CodeGen {
         }
 
         self.output.push_str(&main_asm);
+
+        // Error trampolines, past every function body so the checked fast path
+        // is only a compare and a never-taken branch.
+        self.emit_error_trampolines();
 
         // Emit data section
         self.emit_data_section();
@@ -874,6 +941,75 @@ impl CodeGen {
             for s in body {
                 self.preprocess(s);
             }
+        }
+    }
+
+    /// Guard a math function whose argument must be in range: compare the
+    /// value in `xmm0` against zero and raise "Illegal function call" when
+    /// `cond` holds (`jb` for "negative", `jbe` for "not positive").
+    fn emit_domain_check(&mut self, cond: &str) {
+        if !self.opts.checks {
+            return;
+        }
+        self.emit("    xorpd xmm1, xmm1");
+        self.emit("    ucomisd xmm0, xmm1");
+        self.emit_check(cond, RtError::Domain);
+    }
+
+    /// Guard an integer divide: `idiv` raises #DE (a SIGFPE crash) both when
+    /// the divisor is zero and for INT_MIN / -1, which overflows the quotient.
+    /// The divisor is expected in `ecx`.
+    fn emit_integer_divide_checks(&mut self) {
+        if !self.opts.checks {
+            return;
+        }
+        self.emit("    test ecx, ecx");
+        self.emit_check("je", RtError::DivideByZero);
+        // INT_MIN / -1 overflows; both operands must match for it to trap.
+        self.emit("    cmp ecx, -1");
+        let skip = self.new_label("nodivovf");
+        self.emit(&format!("    jne {}", skip));
+        self.emit("    cmp eax, -2147483648");
+        self.emit_check("je", RtError::Overflow);
+        self.emit_label(&skip);
+    }
+
+    /// Label of the trampoline that raises `kind` at the current line,
+    /// creating it if this is the first site to need it.
+    fn error_label(&mut self, kind: RtError) -> String {
+        let line = self.current_line;
+        self.error_sites
+            .entry((kind, line))
+            .or_insert_with(|| format!(".Lerr_{}_{}", kind.tag(), line))
+            .clone()
+    }
+
+    /// Emit a check: branch to the error trampoline when `cond` holds.
+    ///
+    /// The fast path costs only the caller's compare plus this never-taken
+    /// branch; everything else lives in the cold trampoline.
+    fn emit_check(&mut self, cond: &str, kind: RtError) {
+        if !self.opts.checks {
+            return;
+        }
+        let label = self.error_label(kind);
+        self.emit(&format!("    {} {}", cond, label));
+    }
+
+    /// Emit every error trampoline collected during code generation.
+    fn emit_error_trampolines(&mut self) {
+        let sites = std::mem::take(&mut self.error_sites);
+        if sites.is_empty() {
+            return;
+        }
+        self.emit("");
+        self.emit("# Runtime error trampolines (cold; never fall through)");
+        for ((kind, line), label) in sites {
+            self.emit_label(&label);
+            let sym = kind.symbol();
+            self.emit(&format!("    lea {}, [rip + {}]", Self::arg_reg(0), sym));
+            self.emit(&format!("    mov {}, {}", Self::arg_reg(1), line));
+            self.emit("    call _rt_error");
         }
     }
 
@@ -1055,6 +1191,9 @@ impl CodeGen {
     }
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
+        if stmt.line != 0 {
+            self.current_line = stmt.line;
+        }
         match &stmt.kind {
             StmtKind::Label(n) => {
                 self.emit_label(&format!("_line_{}", n));
@@ -1899,15 +2038,26 @@ impl CodeGen {
             ),
             BinaryOp::Div => {
                 self.emit_cvt_to_double(work_type);
+                if self.opts.checks {
+                    // Test the bit pattern rather than comparing with ucomisd:
+                    // doubling drops the sign bit, so the result is zero for
+                    // both +0.0 and -0.0, and there is no unordered case to
+                    // worry about.
+                    self.emit("    movq r11, xmm1");
+                    self.emit("    add r11, r11");
+                    self.emit_check("jz", RtError::DivideByZero);
+                }
                 self.emit("    divsd xmm0, xmm1");
             }
             BinaryOp::IntDiv => {
                 self.emit_cvt_float_to_int(work_type);
+                self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
             }
             BinaryOp::Mod => {
                 self.emit_cvt_float_to_int(work_type);
+                self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
                 self.emit("    mov eax, edx");
@@ -2019,6 +2169,11 @@ impl CodeGen {
         if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
             let arg_type = self.gen_expr(&args[0]);
             self.gen_coercion(arg_type, DataType::Double);
+            // LOG is undefined at and below zero; libc would quietly return
+            // -inf or NaN.
+            if upper_name == "LOG" {
+                self.emit_domain_check("jbe");
+            }
             self.emit_call_libc(libc_fn);
             return;
         }
@@ -2027,6 +2182,11 @@ impl CodeGen {
         if let Some(instr) = INLINE_MATH_FNS.get(upper_name.as_str()) {
             let arg_type = self.gen_expr(&args[0]);
             self.gen_coercion(arg_type, DataType::Double);
+            // sqrtsd of a negative operand yields NaN, which then printed as a
+            // huge meaningless integer.
+            if upper_name == "SQR" {
+                self.emit_domain_check("jb");
+            }
             self.emit(&format!("    {}", instr));
             return;
         }
@@ -2411,6 +2571,12 @@ impl CodeGen {
         let arg0 = Self::arg_reg(0);
         self.emit(&format!("    imul {}, rax, {}", arg0, elem_size));
         self.emit_call_libc("malloc");
+        if self.opts.checks {
+            // A null result would otherwise be written into the descriptor and
+            // dereferenced on first use.
+            self.emit("    test rax, rax");
+            self.emit_check("jz", RtError::OutOfMemory);
+        }
 
         // Store array pointer
         self.emit(&format!("    mov {}, rax", loc.q(0)));
@@ -2424,10 +2590,23 @@ impl CodeGen {
         }
     }
 
-    fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
+    /// Compute the address of an array element, leaving it in `rax`.
+    ///
+    /// Shared by loads and stores so the index arithmetic -- and the bounds
+    /// checks guarding it -- exist in exactly one place.
+    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
         let arr_info = self.lookup_array(name).expect("Array not declared");
         let loc = arr_info.loc.clone();
         let elem_size = Self::elem_size(name);
+
+        // A module-level array's descriptor lives in .bss, so its element
+        // pointer is null until the DIM executes. Catching that is what turns
+        // "used before DIM at run time" into a diagnosable abort rather than a
+        // null dereference.
+        if self.opts.checks {
+            self.emit(&format!("    cmp {}, 0", loc.q(0)));
+            self.emit_check("je", RtError::Undim);
+        }
 
         // Calculate linear index using row-major order:
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
@@ -2438,6 +2617,13 @@ impl CodeGen {
             self.emit("    movsxd rax, eax");
         } else {
             self.emit("    cvttsd2si rax, xmm0");
+        }
+        // One unsigned compare catches both a negative index and one past the
+        // end, since a negative value wraps to a huge unsigned one. The stored
+        // bound is already the element count (declared bound + 1).
+        if self.opts.checks {
+            self.emit(&format!("    cmp rax, {}", loc.q(1)));
+            self.emit_check("jae", RtError::Subscript);
         }
 
         // For each subsequent index, multiply by dimension bound and add
@@ -2452,6 +2638,10 @@ impl CodeGen {
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
+            if self.opts.checks {
+                self.emit(&format!("    cmp rcx, {}", loc.q(1 + i as i32)));
+                self.emit_check("jae", RtError::Subscript);
+            }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
@@ -2462,6 +2652,10 @@ impl CodeGen {
         // Multiply by element size and add to base pointer
         self.emit(&format!("    imul rax, {}", elem_size));
         self.emit(&format!("    add rax, {}", loc.q(0)));
+    }
+
+    fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
+        self.gen_array_addr(name, indices);
 
         // Load value from computed address
         match DataType::from_suffix(name) {
@@ -2478,46 +2672,17 @@ impl CodeGen {
     }
 
     fn gen_array_store(&mut self, name: &str, indices: &[Expr], value: &Expr) {
-        let arr_info = self.lookup_array(name).expect("Array not declared");
-        let loc = arr_info.loc.clone();
-        let elem_size = Self::elem_size(name);
+        self.gen_array_addr(name, indices);
 
-        // Calculate linear index using row-major order (same as gen_array_load)
-        let idx_type = self.gen_expr(&indices[0]);
-        if idx_type.is_integer() {
-            self.emit("    movsxd rax, eax");
-        } else {
-            self.emit("    cvttsd2si rax, xmm0");
-        }
-
-        for (i, idx_expr) in indices.iter().enumerate().skip(1) {
-            // Save current accumulated index - use 16 bytes for alignment
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-            self.emit("    mov QWORD PTR [rsp], rax");
-            let idx_type = self.gen_expr(idx_expr);
-            if idx_type.is_integer() {
-                self.emit("    movsxd rcx, eax");
-            } else {
-                self.emit("    cvttsd2si rcx, xmm0");
-            }
-            self.emit("    mov rax, QWORD PTR [rsp]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
-            self.emit("    add rax, rcx");
-        }
-
-        // Compute final address and save it - use 16 bytes for alignment
-        self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, {}", loc.q(0)));
+        // Save the address while the value is evaluated - 16 bytes for alignment
         self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-        self.emit("    mov QWORD PTR [rsp], rax"); // save address
+        self.emit("    mov QWORD PTR [rsp], rax");
 
-        // Evaluate value
         let val_type = self.gen_expr(value);
 
-        // Store value at computed address
         self.emit("    mov rcx, QWORD PTR [rsp]");
         self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+
         let elem_type = DataType::from_suffix(name);
         if elem_type == DataType::String {
             self.emit("    mov QWORD PTR [rcx], rax");

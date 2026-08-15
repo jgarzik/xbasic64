@@ -34,6 +34,12 @@ struct Args {
     /// Emit assembly only (don't assemble or link)
     #[arg(short = 'S')]
     asm_only: bool,
+
+    /// Disable runtime safety checks (array bounds, division by zero)
+    ///
+    /// Named `no_checks` because `unsafe` is a Rust keyword.
+    #[arg(long = "unsafe")]
+    no_checks: bool,
 }
 
 /// Format a diagnostic position as `file:line`, or just `file` when the line is
@@ -98,7 +104,10 @@ fn main() {
 
     // Generate code
     let mut codegen = codegen::CodeGen::default();
-    let asm = codegen.generate(&program, symbols);
+    let opts = codegen::Options {
+        checks: !args.no_checks,
+    };
+    let asm = codegen.generate(&program, symbols, opts);
 
     // Add runtime
     let runtime_asm = runtime::generate_runtime();
