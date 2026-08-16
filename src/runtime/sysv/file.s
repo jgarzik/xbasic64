@@ -212,6 +212,8 @@ _rt_file_print_string:
     # Get FILE* from handle table
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE* → 1st arg
+    test rdi, rdi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # fprintf(file, "%.*s", len, ptr)
     lea rsi, [rip + _file_fmt_str]  # format → 2nd arg
@@ -398,6 +400,8 @@ _rt_file_print_char:
 
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE*
+    test rdi, rdi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     lea rsi, [rip + _file_fmt_char]
     mov rdx, r12            # char
     xor eax, eax
@@ -430,6 +434,8 @@ _rt_file_print_newline:
     # Use fputc('\n', file) - simpler than fprintf
     lea rax, [rip + _file_handles]
     mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
+    test rsi, rsi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     mov edi, 10             # '\n' → edi (1st arg)
     call fputc
 
@@ -638,6 +644,8 @@ _rt_file_line_input:
     mov rsi, 1023                        # max chars (leave room for null)
     lea rax, [rip + _file_handles]
     mov rdx, [rax + rbx*8]              # FILE*
+    test rdx, rdx
+    jz .Lfile_not_open                  # a number nobody OPENed is NULL here
     call fgets
 
     # Check for EOF/error (fgets returns NULL)
@@ -1546,3 +1554,15 @@ _rt_file_lof:
     pop rbx
     leave
     ret
+
+# Shared tail for a file number that was never OPENed.
+#
+# PRINT # and LINE INPUT # used to load the NULL handle and hand it straight to
+# fprintf/fgets, so `PRINT #3, "x"` on an unopened number died with SIGSEGV --
+# no message, exit 139. _rt_file_getc and _rt_file_eof already guarded; these
+# did not. The line number is unknown here (these helpers are not given one),
+# and _rt_error prints a bare message for 0.
+.Lfile_not_open:
+    lea rdi, [rip + _err_badfile]
+    xor esi, esi
+    call _rt_error

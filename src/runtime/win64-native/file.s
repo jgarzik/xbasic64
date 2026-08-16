@@ -232,6 +232,8 @@ _rt_file_print_string:
     # Get HANDLE from table
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped)
     mov rdx, rdi            # lpBuffer = string ptr
@@ -429,6 +431,8 @@ _rt_file_print_char:
     # Get HANDLE
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, buffer, 1, &bytesWritten, NULL)
     lea rdx, [rip + _file_output_buf]
@@ -462,6 +466,8 @@ _rt_file_print_newline:
     # Get HANDLE
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, "\r\n", CRLF_LEN, &bytesWritten, NULL)
     lea rdx, [rip + _file_newline]
@@ -691,6 +697,8 @@ _rt_file_line_input:
     # ReadFile(hFile, &buffer[pos], 1, &bytesRead, NULL)
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     lea rdx, [rip + _file_input_buf]
     add rdx, r12            # &buffer[pos]
     mov r8, SINGLE_BYTE
@@ -1606,3 +1614,15 @@ _rt_file_lof:
     pop rbx
     leave
     ret
+
+# Shared tail for a file number that was never OPENed.
+#
+# PRINT # and LINE INPUT # used to hand the NULL handle straight to WriteFile
+# and ReadFile. The System V build died with SIGSEGV on the same programs;
+# _rt_file_getc and _rt_file_eof already guarded and these did not. The line
+# number is unknown here (these helpers are not given one), and _rt_error
+# prints a bare message for 0.
+.Lfile_not_open:
+    lea rcx, [rip + _err_badfile]
+    xor edx, edx
+    call _rt_error

@@ -616,3 +616,34 @@ CLOSE #1
     assert_eq!(output.trim(), "[new]");
     assert_eq!(fs::read(tmp.path().join("s.dat")).unwrap(), b"original");
 }
+
+/// Writing to or reading from a file number that was never OPENed is a
+/// diagnosed abort, not a crash.
+///
+/// `_rt_file_print_string`, `_rt_file_print_char`, `_rt_file_print_newline` and
+/// `_rt_file_line_input` all loaded the handle-table slot and passed it
+/// straight to fprintf or fgets, so a NULL took the process down with SIGSEGV
+/// and exit 139 -- outside anything the harness can interpret.
+/// `_rt_file_getc` and `_rt_file_eof` had guarded all along; these four had not.
+#[test]
+fn test_unopened_file_number_is_diagnosed_not_fatal() {
+    for source in [
+        "PRINT #3, \"x\"\n",
+        "PRINT #3, 5\n",
+        "PRINT #3,\n",
+        "LINE INPUT #3, A$\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(
+            run.exit_code,
+            Some(1),
+            "{source:?} should abort cleanly, not crash; stderr: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("Bad file number"),
+            "{source:?} should say why: {}",
+            run.stderr
+        );
+    }
+}
