@@ -913,6 +913,49 @@ NEXT I
     assert_eq!(lines, &["two", "x"], "only the matching iteration prints");
 }
 
+/// A bare line number after THEN or ELSE is an implied GOTO.
+///
+/// This is how GW-BASIC spells the commonest branch of all, and the form
+/// appears throughout published listings. It was rejected outright with
+/// "Unexpected token: Integer(30)", since a statement cannot otherwise begin
+/// with a number.
+#[test]
+fn test_if_then_line_number_is_an_implied_goto() {
+    let output = compile_and_run(
+        r#"
+10 IF 1 = 1 THEN 30
+20 PRINT "skipped"
+30 PRINT "target"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "target", "THEN <linenum> branches");
+}
+
+/// The same after ELSE, and mixed with an ordinary statement.
+#[test]
+fn test_if_then_else_line_numbers() {
+    let output = compile_and_run(
+        r#"
+10 X = 0
+20 IF X = 1 THEN 40 ELSE 60
+40 PRINT "then"
+50 GOTO 70
+60 PRINT "else"
+70 IF X = 0 THEN 90 ELSE PRINT "no"
+80 PRINT "unreachable"
+90 PRINT "done"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["else", "done"],
+        "both branches accept a line number"
+    );
+}
+
 /// `ELSE` ends the THEN branch and opens its own colon-separated list.
 ///
 /// This form did not merely misbehave, it failed to compile: the second

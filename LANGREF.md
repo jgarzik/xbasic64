@@ -402,6 +402,23 @@ IF X > 0 THEN PRINT "Positive"
 IF X > 0 THEN Y = 1 ELSE Y = 0
 ```
 
+Both branches take a list of statements separated by colons. Everything after
+`THEN` up to `ELSE` or the end of the line is conditional, and everything after
+`ELSE` is too:
+
+```basic
+IF X > 0 THEN Y = 1 : PRINT "Positive" ELSE Y = 0 : PRINT "Not positive"
+```
+
+A bare line number after `THEN` or `ELSE` is an implied `GOTO`:
+
+```basic
+10 IF X < 0 THEN 90
+20 IF X = 0 THEN 90 ELSE 80
+80 PRINT "Positive"
+90 PRINT "Done"
+```
+
 **Block form:**
 ```basic
 IF X > 0 THEN

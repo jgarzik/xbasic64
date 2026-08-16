@@ -1423,15 +1423,33 @@ impl Parser {
     /// newline, so without it `IF C THEN PRINT "x" :` would swallow the
     /// statement below it.
     fn parse_single_line_branch(&mut self) -> PResult<Vec<Stmt>> {
-        let mut body = vec![self.parse_statement()?];
+        let mut body = vec![self.parse_branch_statement()?];
         while matches!(self.peek(), Token::Colon) {
             self.advance();
             if matches!(self.peek(), Token::Else | Token::Newline | Token::Eof) {
                 break;
             }
-            body.push(self.parse_statement()?);
+            body.push(self.parse_branch_statement()?);
         }
         Ok(body)
+    }
+
+    /// One statement of a single-line IF branch, where a bare line number is
+    /// an implied GOTO.
+    ///
+    /// `IF X < 0 THEN 900` is how GW-BASIC spells its commonest branch, and it
+    /// is unambiguous: no other statement may begin with a number, so this used
+    /// to be rejected as "Unexpected token: Integer(900)".
+    fn parse_branch_statement(&mut self) -> PResult<Stmt> {
+        let line = self.cur_line();
+        if let Token::Integer(_) | Token::LineNumber(_) = self.peek() {
+            let target = self.parse_goto_target()?;
+            return Ok(Stmt {
+                line,
+                kind: StmtKind::Goto(target),
+            });
+        }
+        self.parse_statement()
     }
 
     /// Parse the body of an IF block, returning (then_branch, else_branch)
