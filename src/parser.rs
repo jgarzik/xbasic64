@@ -195,11 +195,52 @@ pub enum StmtKind {
         filename: Expr,
         mode: FileMode,
         file_num: Expr,
+        /// `LEN = n` on a `FOR RANDOM` open; the record length in bytes.
+        /// `None` takes GW-BASIC's default of 128.
+        reclen: Option<Expr>,
     },
     /// `CLOSE #n`, or bare `CLOSE` to close every open file.
     Close {
         file_num: Option<Expr>,
     },
+    /// `FIELD #n, w AS v$, ...` -- name slices of a random file's record buffer.
+    ///
+    /// Each target is bound to (buffer + offset, width) rather than to a copy,
+    /// so `GET` refreshes every field variable at once and `LSET`/`RSET` write
+    /// straight into the buffer that `PUT` will emit.
+    Field {
+        file_num: Expr,
+        fields: Vec<FieldSlice>,
+    },
+    /// `LSET v$ = expr` / `RSET v$ = expr` -- overwrite a field in place,
+    /// padding with spaces to the field's width.
+    SetField {
+        target: LValue,
+        value: Expr,
+        /// `RSET` right-justifies; `LSET` left-justifies.
+        right: bool,
+    },
+    /// `GET #n[, rec]` / `PUT #n[, rec]` -- move one record between the file
+    /// and its buffer. Without a record number the next one is used.
+    GetPut {
+        file_num: Expr,
+        record: Option<Expr>,
+        is_put: bool,
+    },
+    /// `LOCK`/`UNLOCK #n[, start [TO end]]` -- advisory record locking.
+    Lock {
+        file_num: Expr,
+        /// `None` locks the whole file.
+        range: Option<(Expr, Option<Expr>)>,
+        is_unlock: bool,
+    },
+}
+
+/// One `w AS v$` clause of a FIELD statement.
+#[derive(Debug, Clone)]
+pub struct FieldSlice {
+    pub width: Expr,
+    pub target: LValue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -207,6 +248,7 @@ pub enum FileMode {
     Input,
     Output,
     Append,
+    Random,
 }
 
 #[derive(Debug, Clone)]
@@ -600,6 +642,19 @@ impl Parser {
         self.tokens.get(self.pos + n).unwrap_or(&Token::Eof)
     }
 
+    /// True if the token after the current one is `tok`.
+    ///
+    /// Used to tell the random-access statements apart from ordinary names:
+    /// `FIELD` is only the statement when a `#` follows it.
+    fn next_is(&self, tok: Token) -> bool {
+        *self.peek_at(1) == tok
+    }
+
+    /// True if the token after the current one is any identifier.
+    fn next_is_ident(&self) -> bool {
+        matches!(self.peek_at(1), Token::Ident(_))
+    }
+
     /// Source line of the current token, or 0 when unknown (no line map).
     fn cur_line(&self) -> u32 {
         self.lines.get(self.pos).copied().unwrap_or(0)
@@ -839,7 +894,23 @@ impl Parser {
             // `parse_select_case` consumes CASE itself, so a CASE reaching here
             // is always outside any SELECT CASE.
             Token::Case => err("CASE without matching SELECT CASE"),
-            Token::Ident(_) => self.parse_assignment_or_call(),
+            Token::Ident(ref n) => {
+                // The random-access statements lead with a name rather than a
+                // reserved word. Each is recognised only in a shape that an
+                // assignment or a call could not take -- `FIELD #`, `LSET v =`
+                // -- so programs may still use these names for their own
+                // variables and procedures.
+                match n.to_uppercase().as_str() {
+                    "FIELD" if self.next_is(Token::Hash) => self.parse_field(),
+                    "GET" if self.next_is(Token::Hash) => self.parse_get_put(false),
+                    "PUT" if self.next_is(Token::Hash) => self.parse_get_put(true),
+                    "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
+                    "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
+                    "LSET" if self.next_is_ident() => self.parse_set_field(false),
+                    "RSET" if self.next_is_ident() => self.parse_set_field(true),
+                    _ => self.parse_assignment_or_call(),
+                }
+            }
             Token::Newline => {
                 self.advance();
                 self.parse_statement_kind()
@@ -1980,7 +2051,7 @@ impl Parser {
         // Expect FOR
         self.expect(Token::For)?;
 
-        // Parse mode (INPUT, OUTPUT, APPEND)
+        // Parse mode (INPUT, OUTPUT, APPEND, RANDOM)
         let mode = match self.peek() {
             Token::Input => {
                 self.advance();
@@ -1994,7 +2065,18 @@ impl Parser {
                 self.advance();
                 FileMode::Append
             }
-            tok => return err(format!("Expected INPUT, OUTPUT, or APPEND, got {:?}", tok)),
+            // RANDOM is not a reserved word: only this position gives it a
+            // meaning, so a program may still use the name elsewhere.
+            Token::Ident(n) if n.eq_ignore_ascii_case("RANDOM") => {
+                self.advance();
+                FileMode::Random
+            }
+            tok => {
+                return err(format!(
+                    "Expected INPUT, OUTPUT, APPEND or RANDOM, got {:?}",
+                    tok
+                ));
+            }
         };
 
         // Expect AS
@@ -2002,10 +2084,109 @@ impl Parser {
 
         let file_num = self.parse_file_number()?;
 
+        // `LEN = n` sets the record length. LEN is the string function's name
+        // everywhere else, so it is matched here as an identifier rather than
+        // reserved.
+        let reclen = match self.peek() {
+            Token::Ident(n) if n.eq_ignore_ascii_case("LEN") => {
+                self.advance();
+                self.expect(Token::Eq)?;
+                Some(self.parse_expression()?)
+            }
+            _ => None,
+        };
+
+        if reclen.is_some() && mode != FileMode::Random {
+            return err("LEN = applies only to OPEN ... FOR RANDOM");
+        }
+
         Ok(StmtKind::Open {
             filename,
             mode,
             file_num,
+            reclen,
+        })
+    }
+
+    /// `FIELD #n, width AS var$ [, width AS var$]...`
+    fn parse_field(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume FIELD
+        let file_num = self.parse_file_number()?;
+        self.expect(Token::Comma)?;
+
+        let mut fields = Vec::new();
+        loop {
+            let width = self.parse_expression()?;
+            self.expect(Token::As)?;
+            let target = self.parse_lvalue()?;
+            fields.push(FieldSlice { width, target });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(StmtKind::Field { file_num, fields })
+    }
+
+    /// `LSET v$ = expr` / `RSET v$ = expr`
+    fn parse_set_field(&mut self, right: bool) -> PResult<StmtKind> {
+        self.advance(); // consume LSET or RSET
+        let target = self.parse_lvalue()?;
+        self.expect(Token::Eq)?;
+        let value = self.parse_expression()?;
+        Ok(StmtKind::SetField {
+            target,
+            value,
+            right,
+        })
+    }
+
+    /// `GET #n[, record]` / `PUT #n[, record]`
+    fn parse_get_put(&mut self, is_put: bool) -> PResult<StmtKind> {
+        self.advance(); // consume GET or PUT
+        let file_num = self.parse_file_number()?;
+        let record = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            // `GET #1,` with nothing after it means "the next record", the same
+            // as leaving the comma off.
+            if matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+                None
+            } else {
+                Some(self.parse_expression()?)
+            }
+        } else {
+            None
+        };
+        Ok(StmtKind::GetPut {
+            file_num,
+            record,
+            is_put,
+        })
+    }
+
+    /// `LOCK #n[, start [TO end]]` / `UNLOCK #n[, start [TO end]]`
+    fn parse_lock(&mut self, is_unlock: bool) -> PResult<StmtKind> {
+        self.advance(); // consume LOCK or UNLOCK
+        let file_num = self.parse_file_number()?;
+        let range = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            let start = self.parse_expression()?;
+            let end = if matches!(self.peek(), Token::To) {
+                self.advance();
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            Some((start, end))
+        } else {
+            None
+        };
+        Ok(StmtKind::Lock {
+            file_num,
+            range,
+            is_unlock,
         })
     }
 

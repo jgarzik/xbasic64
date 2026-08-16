@@ -48,6 +48,10 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("CLNG", 1, 1),
     ("COS", 1, 1),
     ("CSNG", 1, 1),
+    ("CVD", 1, 1),
+    ("CVI", 1, 1),
+    ("CVL", 1, 1),
+    ("CVS", 1, 1),
     ("EOF", 1, 1),
     ("EXP", 1, 1),
     ("FIX", 1, 1),
@@ -58,10 +62,15 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("LCASE$", 1, 1),
     ("LEFT$", 2, 2),
     ("LEN", 1, 1),
+    ("LOC", 1, 1),
     ("LOF", 1, 1),
     ("LTRIM$", 1, 1),
     ("LOG", 1, 1),
     ("MID$", 2, 3),
+    ("MKD$", 1, 1),
+    ("MKI$", 1, 1),
+    ("MKL$", 1, 1),
+    ("MKS$", 1, 1),
     ("OCT$", 1, 1),
     ("RIGHT$", 2, 2),
     ("RTRIM$", 1, 1),
@@ -945,6 +954,68 @@ impl Analyzer {
             } => {
                 self.check_file_num(file_num, scope, line);
             }
+            StmtKind::Field { file_num, fields } => {
+                self.check_file_num(file_num, scope, line);
+                for f in fields {
+                    self.check_expr(&f.width, scope, line);
+                    // A field names a slice of the record buffer, so only a
+                    // string variable can hold one.
+                    if !f.target.name.ends_with('$') {
+                        self.error(
+                            line,
+                            format!("FIELD target '{}' must be a string variable", f.target.name),
+                        );
+                    }
+                    if let Some(indices) = &f.target.indices {
+                        self.check_array_use(&f.target.name, indices.len(), scope, line);
+                        for e in indices {
+                            self.check_expr(e, scope, line);
+                        }
+                    }
+                }
+            }
+            StmtKind::SetField {
+                target,
+                value,
+                right,
+            } => {
+                self.check_expr(value, scope, line);
+                let word = if *right { "RSET" } else { "LSET" };
+                if !target.name.ends_with('$') {
+                    self.error(
+                        line,
+                        format!("{} needs a string variable, not '{}'", word, target.name),
+                    );
+                }
+                if self.expr_is_string(value, scope) == Some(false) {
+                    self.error(line, format!("{} needs a string value", word));
+                }
+                if let Some(indices) = &target.indices {
+                    self.check_array_use(&target.name, indices.len(), scope, line);
+                    for e in indices {
+                        self.check_expr(e, scope, line);
+                    }
+                }
+            }
+            StmtKind::GetPut {
+                file_num, record, ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+                if let Some(r) = record {
+                    self.check_expr(r, scope, line);
+                }
+            }
+            StmtKind::Lock {
+                file_num, range, ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+                if let Some((start, end)) = range {
+                    self.check_expr(start, scope, line);
+                    if let Some(e) = end {
+                        self.check_expr(e, scope, line);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1039,6 +1110,8 @@ impl Analyzer {
         let string_args: &[usize] = match name {
             "LEN" | "ASC" | "VAL" | "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => &[0],
             "LEFT$" | "RIGHT$" | "MID$" => &[0],
+            // The CV* family decodes the bytes MK*$ produced.
+            "CVI" | "CVL" | "CVS" | "CVD" => &[0],
             // INSTR is either (haystack, needle) or (start, haystack, needle).
             "INSTR" if args.len() == 2 => &[0, 1],
             "INSTR" => &[1, 2],
@@ -1063,6 +1136,10 @@ impl Analyzer {
                 | "STRING$"
                 | "LBOUND"
                 | "UBOUND"
+                | "CVI"
+                | "CVL"
+                | "CVS"
+                | "CVD"
         );
 
         for (i, arg) in args.iter().enumerate() {

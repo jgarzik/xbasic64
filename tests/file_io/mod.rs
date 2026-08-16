@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run_with_files;
+use crate::common::{compile_and_run_raw, compile_and_run_with_files};
 use std::fs;
 
 #[test]
@@ -323,4 +323,296 @@ fn test_crlf_numeric_fields() {
     .unwrap()
     .0;
     assert_eq!(output.trim(), "10/20/30");
+}
+
+// ---------------------------------------------------------------------------
+// Random-access files
+//
+// The property that matters throughout is that a FIELD variable is a *window*
+// onto the record buffer, not a copy of it: GET must change what every field
+// variable reads, and LSET must change what the next PUT writes.
+
+/// The round trip the feature exists for: write records, read them back by
+/// number, and get the same values.
+#[test]
+fn test_random_record_round_trip() {
+    let source = r#"
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 32
+FIELD #1, 20 AS NM$, 4 AS AG$, 8 AS PAY$
+LSET NM$ = "Alice"
+LSET AG$ = MKI$(30)
+LSET PAY$ = MKD$(50000.5)
+PUT #1, 1
+LSET NM$ = "Bob"
+LSET AG$ = MKI$(45)
+LSET PAY$ = MKD$(61234.25)
+PUT #1, 2
+GET #1, 1
+PRINT RTRIM$(NM$); "/"; CVI(AG$); "/"; CVD(PAY$)
+GET #1, 2
+PRINT RTRIM$(NM$); "/"; CVI(AG$); "/"; CVD(PAY$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["Alice/30/50000.5", "Bob/45/61234.25"]
+    );
+}
+
+/// Records are fixed-length, so the file is exactly records x record length
+/// however short the data written into them was.
+#[test]
+fn test_random_records_are_fixed_length() {
+    let source = r#"
+OPEN "f.dat" FOR RANDOM AS #1 LEN = 16
+FIELD #1, 16 AS S$
+LSET S$ = "a"
+PUT #1, 1
+LSET S$ = "bb"
+PUT #1, 3
+PRINT LOF(1)
+CLOSE #1
+"#;
+    let (output, tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "48", "three 16-byte records");
+    let bytes = fs::read(tmp.path().join("f.dat")).unwrap();
+    assert_eq!(bytes.len(), 48);
+    assert_eq!(&bytes[0..16], b"a               ", "LSET pads with spaces");
+    // Record 2 was never written, so it is whatever the file system supplies
+    // for a hole; only its length is guaranteed.
+    assert_eq!(&bytes[32..48], b"bb              ");
+}
+
+/// LSET is left-justified and RSET right-justified, and both truncate on the
+/// right when the value is too wide for the field.
+#[test]
+fn test_lset_and_rset_justification() {
+    let source = r#"
+OPEN "j.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS S$
+LSET S$ = "ab"
+PRINT "["; S$; "]"
+RSET S$ = "ab"
+PRINT "["; S$; "]"
+LSET S$ = "0123456789"
+PRINT "["; S$; "]"
+RSET S$ = "0123456789"
+PRINT "["; S$; "]"
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["[ab      ]", "[      ab]", "[01234567]", "[01234567]"]
+    );
+}
+
+/// A FIELD variable keeps its width no matter what is written through it, and
+/// the widths partition the record.
+#[test]
+fn test_field_widths_are_fixed() {
+    let source = r#"
+OPEN "w.dat" FOR RANDOM AS #1 LEN = 20
+FIELD #1, 5 AS A$, 15 AS B$
+PRINT LEN(A$); LEN(B$)
+LSET A$ = "x"
+PRINT LEN(A$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.lines().collect::<Vec<_>>(), vec!["515", "5"]);
+}
+
+/// GET refreshes every field variable at once, because they all point into the
+/// one buffer it overwrites.
+#[test]
+fn test_get_refreshes_all_fields() {
+    let source = r#"
+OPEN "g.dat" FOR RANDOM AS #1 LEN = 10
+FIELD #1, 5 AS A$, 5 AS B$
+LSET A$ = "one"
+LSET B$ = "two"
+PUT #1, 1
+LSET A$ = "three"
+LSET B$ = "four"
+PUT #1, 2
+GET #1, 1
+PRINT RTRIM$(A$); "-"; RTRIM$(B$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "one-two");
+}
+
+/// Rewriting one field of a record leaves the others as they were on disk,
+/// which only works if GET loaded them into the buffer PUT writes back.
+#[test]
+fn test_record_update_preserves_other_fields() {
+    let source = r#"
+OPEN "u.dat" FOR RANDOM AS #1 LEN = 24
+FIELD #1, 20 AS NM$, 4 AS AG$
+LSET NM$ = "Alice"
+LSET AG$ = MKI$(30)
+PUT #1, 1
+GET #1, 1
+LSET NM$ = "Alicia"
+PUT #1, 1
+GET #1, 1
+PRINT RTRIM$(NM$); "/"; CVI(AG$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "Alicia/30");
+}
+
+/// GET and PUT without a record number walk forward one record at a time.
+#[test]
+fn test_get_put_default_to_the_next_record() {
+    let source = r#"
+OPEN "n.dat" FOR RANDOM AS #1 LEN = 4
+FIELD #1, 4 AS S$
+LSET S$ = "aa"
+PUT #1, 1
+LSET S$ = "bb"
+PUT #1
+LSET S$ = "cc"
+PUT #1
+GET #1, 1
+PRINT RTRIM$(S$); LOC(1)
+GET #1
+PRINT RTRIM$(S$); LOC(1)
+GET #1
+PRINT RTRIM$(S$); LOC(1)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["aa1", "bb2", "cc3"]
+    );
+}
+
+/// The MK*$ / CV* pair must round-trip every type at its own width, including
+/// the extremes that distinguish a signed 16-bit value from a wider one.
+#[test]
+fn test_mk_cv_round_trips() {
+    let source = r#"
+PRINT LEN(MKI$(1)); LEN(MKL$(1)); LEN(MKS$(1)); LEN(MKD$(1))
+PRINT CVI(MKI$(32767)); CVI(MKI$(-32768)); CVI(MKI$(0))
+PRINT CVL(MKL$(2147483647)); CVL(MKL$(-2147483647))
+PRINT CVS(MKS$(3.5)); CVD(MKD$(2.25))
+"#;
+    let output = crate::common::compile_and_run(source).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["2448", "32767-327680", "2147483647-2147483647", "3.52.25"]
+    );
+}
+
+/// A string too short for the conversion is an error, not a value.
+///
+/// Zero-padding would be the tempting thing to do and the wrong one: two
+/// characters read as a DOUBLE give a denormal near 1e-319, a number plausible
+/// enough that nobody would ever spot it. GW-BASIC rejects the call, and so
+/// does this.
+#[test]
+fn test_cv_of_a_short_string_is_rejected() {
+    let run = compile_and_run_raw("PRINT CVD(\"ab\")\n", "").unwrap();
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "stderr was: {}",
+        run.stderr
+    );
+}
+
+/// Reading past the end of the file yields a zero-filled record, not the
+/// previous one.
+#[test]
+fn test_get_past_end_of_file_is_zero_filled() {
+    let source = r#"
+OPEN "p.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS S$
+LSET S$ = "data"
+PUT #1, 1
+GET #1, 9
+PRINT CVD(S$); LEN(S$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "08");
+}
+
+/// LOCK and UNLOCK are accepted in all their forms and leave the file usable.
+#[test]
+fn test_lock_and_unlock() {
+    let source = r#"
+OPEN "l.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS S$
+LSET S$ = "locked"
+PUT #1, 1
+LOCK #1, 1
+UNLOCK #1, 1
+LOCK #1, 1 TO 4
+UNLOCK #1, 1 TO 4
+LOCK #1
+UNLOCK #1
+GET #1, 1
+PRINT RTRIM$(S$)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "locked");
+}
+
+/// A random file with no LEN clause takes GW-BASIC's default record length.
+#[test]
+fn test_default_record_length_is_128() {
+    let source = r#"
+OPEN "d.dat" FOR RANDOM AS #1
+FIELD #1, 4 AS S$
+LSET S$ = "abcd"
+PUT #1, 1
+PRINT LOF(1)
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "128");
+}
+
+/// A record buffer starts blank, so a field never written is spaces rather
+/// than whatever the allocator last held.
+#[test]
+fn test_unwritten_fields_are_blank() {
+    let source = r#"
+OPEN "b.dat" FOR RANDOM AS #1 LEN = 6
+FIELD #1, 3 AS A$, 3 AS B$
+LSET A$ = "xy"
+PRINT "["; B$; "]"
+CLOSE #1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(output.trim(), "[   ]");
+}
+
+/// Ordinary assignment to a fielded variable rebinds it, which is exactly why
+/// LSET exists; the record buffer is left alone.
+#[test]
+fn test_plain_assignment_severs_the_field_binding() {
+    let source = r#"
+OPEN "s.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS S$
+LSET S$ = "original"
+S$ = "new"
+PUT #1, 1
+GET #1, 1
+PRINT "["; S$; "]"
+CLOSE #1
+"#;
+    let (output, tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    // After the plain assignment S$ is an ordinary string, so GET no longer
+    // reaches it -- and the record still holds what LSET put there.
+    assert_eq!(output.trim(), "[new]");
+    assert_eq!(fs::read(tmp.path().join("s.dat")).unwrap(), b"original");
 }
