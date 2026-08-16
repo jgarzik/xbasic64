@@ -16,7 +16,12 @@
 _rng_state: .quad 0x12345678DEADBEEF
 _cls_seq: .ascii "\033[2J\033[H"
 .equ _cls_seq_len, . - _cls_seq
-_cls_bytes_written: .quad 0
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows.
+.bss
+.p2align 3
+_cls_bytes_written: .skip 8
 
 .text
 

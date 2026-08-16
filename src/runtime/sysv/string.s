@@ -535,6 +535,10 @@ _rt_ucase:
 .globl _rt_lcase
 _rt_lcase:
     xor r8b, r8b
+    # An explicit jump, not a fall-through: each helper is emitted into its
+    # own section so the linker can discard the ones a program never calls,
+    # and sections are not laid out in source order.
+    jmp _rt_case_convert
 
 _rt_case_convert:
     push rbp

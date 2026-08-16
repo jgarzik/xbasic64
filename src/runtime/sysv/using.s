@@ -31,6 +31,9 @@ _using_fmt_e:   .asciz "%.*E"
 .equ USING_MAX_WIDTH, 255       # must match using::MAX_WIDTH
 .equ USING_MAX_DEC,   40        # must match using::MAX_DECIMALS
 
+# 3.5K of zeros, which is why these are .bss -- see data_defs.s.
+.bss
+.p2align 3
 _using_raw:     .skip 512       # sprintf target
 _using_work:    .skip 1024      # after comma insertion
 _using_out:     .skip 2048      # after sign/currency, padded to the width

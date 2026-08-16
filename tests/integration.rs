@@ -7,6 +7,7 @@ mod common;
 
 mod arithmetic;
 mod arrays;
+mod codegen;
 mod control;
 mod data;
 mod docs;

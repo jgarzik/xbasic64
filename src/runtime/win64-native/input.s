@@ -20,10 +20,13 @@
 .equ INPUT_BUF_SIZE, 1024
 .equ MAX_INPUT_LEN, 1023            # INPUT_BUF_SIZE - 1 (for null terminator)
 
-.data
-_stdin_handle: .quad 0
+# All zero-filled, so .bss rather than .data -- see data_defs.s. The .text
+# below restores the section for the code that follows.
+.bss
+.p2align 3
+_stdin_handle: .skip 8
 _input_buf: .skip 1024           # Buffer for string input
-_bytes_read: .quad 0             # For ReadFile output parameter
+_bytes_read: .skip 8             # For ReadFile output parameter
 
 .text
 

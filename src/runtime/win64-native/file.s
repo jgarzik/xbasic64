@@ -43,21 +43,29 @@
 .equ CRLF_LEN,              2
 
 .data
+_file_fmt_int:     .asciz "%lld"
+_file_fmt_float:   .asciz "%g"
+_file_newline:     .ascii "\r\n"
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows; a .bss left
+# open at the end of this file would swallow the next runtime part.
+.bss
+# The handle table and the column table are both indexed as quadwords, so
+# they need stated alignment: in .data they inherited whatever offset the
+# preceding strings happened to leave, which is not something to rely on.
+.p2align 3
 _file_handles: .skip 128        # 16 * 8 bytes = 16 HANDLEs
 # Current output column per file number, so TAB(n) knows how far to advance.
 # Updated by the print helpers and reset by a newline. Slot 0 is the console,
 # which is file handle 0.
-.p2align 3
 _file_col: .skip 128
 _file_name_buf: .skip 1024      # Buffer for null-terminated filename
 _file_output_buf: .skip 256     # Buffer for formatted output
-_file_bytes_written: .quad 0    # For WriteFile output
-_file_bytes_read: .quad 0       # For ReadFile output
+_file_bytes_written: .skip 8    # For WriteFile output
+_file_bytes_read: .skip 8       # For ReadFile output
 _file_input_buf: .skip 1024     # Buffer for file input
 _file_getc_buf:  .skip 8        # One byte at a time, for _rt_file_getc
-_file_fmt_int:     .asciz "%lld"
-_file_fmt_float:   .asciz "%g"
-_file_newline:     .ascii "\r\n"
 
 .text
 
@@ -810,7 +818,16 @@ _rt_file_eof:
 #
 # Only the mechanics differ here: Win32 handles instead of FILE*, ReadFile and
 # WriteFile instead of fread and fwrite, and LockFileEx instead of fcntl.
-.data
+.equ MAX_RECLEN, 32767
+.equ FILE_BEGIN,   0
+.equ FILE_CURRENT, 1
+.equ LOCKFILE_FAIL_IMMEDIATELY, 1
+.equ LOCKFILE_EXCLUSIVE_LOCK,   2
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s.
+.bss
+# All four tables are indexed as quadwords, and each is a multiple of 8, so
+# aligning the first aligns them all.
 .p2align 3
 _file_recbuf:   .skip 128       # record buffer per file number (malloc'd)
 _file_reclen:   .skip 128       # record length per file number
@@ -818,17 +835,13 @@ _file_recnum:   .skip 128       # last record read or written, 1-based; 0 = none
 _file_fieldoff: .skip 128       # bytes of the buffer FIELD has assigned so far
 
 # MKI$/MKL$/MKS$/MKD$ assemble their bytes here, then return a heap copy; the
-# buffer itself is never handed out.
+# buffer itself is never handed out. Written a quadword at a time, so it is
+# aligned deliberately rather than by accident of what precedes it.
+.p2align 3
 _mk_buf: .skip 16
 
 # Scratch for the file-pointer position SetFilePointerEx reports back.
-_file_pos: .quad 0
-
-.equ MAX_RECLEN, 32767
-.equ FILE_BEGIN,   0
-.equ FILE_CURRENT, 1
-.equ LOCKFILE_FAIL_IMMEDIATELY, 1
-.equ LOCKFILE_EXCLUSIVE_LOCK,   2
+_file_pos: .skip 8
 
 .text
 

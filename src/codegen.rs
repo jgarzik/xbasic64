@@ -457,6 +457,83 @@ struct VarInfo {
     data_type: DataType,
 }
 
+/// A FOR loop's limit or step, held wherever it is cheapest to reach.
+///
+/// A constant is written into the compare and the add themselves; anything
+/// else is evaluated once, before the loop, into a frame slot.
+enum ForOperand {
+    /// An integer constant, as an instruction immediate.
+    Imm(i32),
+    /// A Double constant, named in the constant pool.
+    Pool(String),
+    /// A frame slot, at the control type's own width.
+    Slot(i32),
+}
+
+impl ForOperand {
+    /// The operand as it is written in an instruction.
+    fn text(&self, ct: DataType) -> String {
+        match self {
+            ForOperand::Imm(n) => n.to_string(),
+            ForOperand::Pool(sym) => sym.clone(),
+            ForOperand::Slot(off) => {
+                format!("{} [rbp + {}]", CodeGen::for_ptr(ct), off)
+            }
+        }
+    }
+}
+
+/// A variable a loop is holding in a register rather than in its storage.
+///
+/// Both a FOR control variable and an accumulator the body assigns to: the
+/// difference is only where the register's initial value comes from, and both
+/// are written back at the loop's single exit.
+#[derive(Clone)]
+struct Promoted {
+    /// The name as the AST spells it, which is how a reference is matched.
+    name: String,
+    reg: String,
+    ty: DataType,
+    /// The variable's storage, for the write-back.
+    loc: Loc,
+}
+
+/// An array whose descriptor a loop is holding in registers.
+///
+/// The element pointer and the per-dimension element counts do not change
+/// while the loop runs -- DIM and REDIM are outside the allowlist that makes a
+/// loop promotable -- but every subscript re-read them: two loads for the
+/// pointer, since the null check and the address each fetched it, and one per
+/// bound compare.
+#[derive(Clone)]
+struct HoistedArray {
+    /// The name as the AST spells it, which is how a subscript is matched.
+    name: String,
+    /// Register holding the element pointer, if one was free.
+    base: Option<String>,
+    /// Register per dimension holding its element count, where one was free.
+    bounds: Vec<Option<String>>,
+}
+
+/// Registers this compiler never allocates for anything else, so a loop may
+/// keep a variable in one for its whole duration.
+///
+/// The integer ones belong to the calling function and are saved around the
+/// loop. The XMM ones do not need saving -- System V has no callee-saved XMM
+/// register at all, which is the same fact that stops a promoted loop from
+/// containing a call.
+const PROMO_GPRS: [&str; 4] = ["r12", "r13", "r14", "r15"];
+const PROMO_XMMS: [&str; 8] = [
+    "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+];
+
+/// How many variables besides the control variable one loop may promote.
+///
+/// Past a handful the registers are gone and each further one is a save and a
+/// restore for a diminishing return; a loop with more accumulators than this
+/// simply keeps the rest in memory.
+const MAX_PROMOTED_ACCUMULATORS: usize = 3;
+
 /// Metadata for array storage
 #[derive(Clone)]
 struct ArrayInfo {
@@ -474,9 +551,14 @@ pub struct CodeGen {
     stack_offset: i32,              // current stack offset
     label_counter: u32,             // for generating unique labels
     string_literals: Vec<String>,   // string constants
-    data_items: Vec<Literal>,       // DATA values
-    current_proc: Option<String>,   // current SUB/FUNCTION name
-    proc_vars: HashMap<String, VarInfo>, // local variables for current proc
+    /// Double constants, as bit patterns, in emission order. Deduplicated
+    /// through `f64_index`; keyed on the bits rather than the value so that
+    /// 0.0 and -0.0 stay distinct, as do NaNs with different payloads.
+    f64_pool: Vec<u64>,
+    f64_index: HashMap<u64, usize>,
+    data_items: Vec<Literal>,                // DATA values
+    current_proc: Option<String>,            // current SUB/FUNCTION name
+    proc_vars: HashMap<String, VarInfo>,     // local variables for current proc
     proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
     /// Names resolved by semantic analysis; codegen consults this instead of
     /// guessing from an identifier's spelling.
@@ -513,6 +595,12 @@ pub struct CodeGen {
     data_line_index: HashMap<u32, usize>,
     /// The same for named labels.
     data_label_index: HashMap<String, usize>,
+    /// Variables currently held in a register instead of in their storage,
+    /// innermost loop last. A read or a write of one of these names has to go
+    /// to the register: the storage is stale until the loop ends.
+    promoted: Vec<Promoted>,
+    /// Array descriptors currently held in registers, innermost loop last.
+    hoisted_arrays: Vec<HoistedArray>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -521,6 +609,19 @@ impl CodeGen {
     fn emit(&mut self, s: &str) {
         self.output.push_str(s);
         self.output.push('\n');
+    }
+
+    /// Whether the instruction just emitted begins with `prefix`.
+    ///
+    /// A peephole over the text, which is all there is to look at without an
+    /// IR. It is deliberately literal: anything at all between -- a label, a
+    /// comment, a branch target -- means no match, so the caller keeps
+    /// whatever it was about to elide.
+    fn last_emitted_is(&self, prefix: &str) -> bool {
+        self.output
+            .rsplit('\n')
+            .nth(1)
+            .is_some_and(|line| line.trim_start().starts_with(prefix))
     }
 
     /// Get the integer argument register for a given argument position (0-based)
@@ -538,10 +639,37 @@ impl CodeGen {
         }
     }
 
+    /// The 32-bit name of an integer register, for [`emit_arg_imm`].
+    ///
+    /// [`emit_arg_imm`]: Self::emit_arg_imm
+    fn reg32(reg: &str) -> &'static str {
+        match reg {
+            "rax" => "eax",
+            "rbx" => "ebx",
+            "rcx" => "ecx",
+            "rdx" => "edx",
+            "rsi" => "esi",
+            "rdi" => "edi",
+            "r8" => "r8d",
+            "r9" => "r9d",
+            other => panic!("no 32-bit name recorded for {}", other),
+        }
+    }
+
     /// Emit a mov instruction to set up an integer argument from an immediate
+    ///
+    /// Writing a 32-bit register zeroes the upper half, so for a value that
+    /// fits unsigned in 32 bits the narrow form is equivalent and two bytes
+    /// shorter -- `mov edi, 1` rather than `mov rdi, 1`. Every caller today
+    /// passes a small non-negative constant, so this is the form that is
+    /// actually emitted; the wide form remains for anything that needs it.
     fn emit_arg_imm(&mut self, arg_n: usize, value: i64) {
         let dst = Self::arg_reg(arg_n);
-        self.emit(&format!("    mov {}, {}", dst, value));
+        if (0..=u32::MAX as i64).contains(&value) {
+            self.emit(&format!("    mov {}, {}", Self::reg32(dst), value));
+        } else {
+            self.emit(&format!("    mov {}, {}", dst, value));
+        }
     }
 
     /// Emit a lea instruction to set up an integer argument from a memory reference
@@ -659,6 +787,118 @@ impl CodeGen {
         let idx = self.string_literals.len();
         self.string_literals.push(s.to_string());
         idx
+    }
+
+    /// A memory operand naming `value` in the Double constant pool.
+    ///
+    /// Materializing a double as an immediate costs `mov rax, <imm64>` plus
+    /// `movq xmm0, rax`: fifteen bytes, a scratch register, and a register
+    /// round trip. Naming it in memory costs eight bytes and no register, and
+    /// every SSE instruction that wants a second operand will take it from
+    /// memory directly, which is what makes the literal fast paths below
+    /// possible at all.
+    fn f64_operand(&mut self, value: f64) -> String {
+        let bits = value.to_bits();
+        let next = self.f64_pool.len();
+        let idx = *self.f64_index.entry(bits).or_insert(next);
+        if idx == next {
+            self.f64_pool.push(bits);
+        }
+        format!("QWORD PTR [rip + _f64_{}]", idx)
+    }
+
+    /// Load a Double constant into xmm0.
+    fn gen_double_const(&mut self, value: f64) {
+        // Positive zero is the one value with a shorter encoding still: three
+        // bytes, no memory reference, and it breaks rather than creates a
+        // dependency on xmm0's previous contents. Negative zero is a different
+        // bit pattern and does not qualify.
+        if value == 0.0 && value.is_sign_positive() {
+            self.emit("    xorpd xmm0, xmm0");
+            return;
+        }
+        let operand = self.f64_operand(value);
+        self.emit(&format!("    movsd xmm0, {}", operand));
+    }
+
+    /// The constant value of a numeric literal, for the fast paths that need
+    /// to know one at compile time. `None` for anything else, including
+    /// strings.
+    ///
+    /// A `CONST` name counts: sema has already folded it to a literal, and
+    /// `gen_expr` substitutes it, so leaving it out here would mean `X * 2`
+    /// took the fast path while `X * TWO` did not.
+    ///
+    /// So does a negated one. The parser gives `-1` as a negation applied to
+    /// the literal 1 rather than as a literal, and without this `STEP -1` --
+    /// the commonest negative step there is -- would count as unknown.
+    fn const_double(&self, expr: &Expr) -> Option<f64> {
+        let lit = match expr {
+            Expr::Literal(lit) => lit,
+            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => return self.const_double(operand).map(|v| -v),
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => Some(*n as f64),
+            Literal::Float(f) => Some(*f),
+            Literal::String(_) => None,
+        }
+    }
+
+    /// The value of an integer constant that fits an instruction's imm32.
+    ///
+    /// Read from the literal rather than through [`Self::const_double`]: past
+    /// 2^53 an f64 no longer holds every integer, and the point of this is to
+    /// be exact.
+    fn const_i32(&self, expr: &Expr) -> Option<i32> {
+        let lit = match expr {
+            Expr::Literal(lit) => lit,
+            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            // `checked_neg` rather than `-`: negating i32::MIN is not an i32,
+            // and the general path handles it correctly.
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => return self.const_i32(operand).and_then(i32::checked_neg),
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => i32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    /// Evaluate `expr` into xmm0 as a Double.
+    ///
+    /// A numeric constant is loaded straight from the pool. Going through
+    /// `gen_expr` would put an integer literal in eax and then pay a
+    /// `cvtsi2sd` to widen it -- an instruction whose destination register is
+    /// also an input, so it carries a dependency on whatever xmm0 last held.
+    fn gen_expr_to_double(&mut self, expr: &Expr) {
+        if let Some(value) = self.const_double(expr) {
+            self.gen_double_const(value);
+            return;
+        }
+        let ty = self.gen_expr(expr);
+        self.gen_coercion(ty, DataType::Double);
+    }
+
+    /// Evaluate `expr` into the working register for `ct`, coerced.
+    ///
+    /// Routes a Double target through the pooled path and everything else
+    /// through the ordinary one, so a caller working in a type it only knows
+    /// at compile time does not have to choose.
+    fn gen_expr_coerced(&mut self, expr: &Expr, ct: DataType) {
+        if ct == DataType::Double {
+            self.gen_expr_to_double(expr);
+            return;
+        }
+        let ty = self.gen_expr(expr);
+        self.gen_coercion(ty, ct);
     }
 
     /// Get variable info, allocating if necessary
@@ -986,8 +1226,20 @@ impl CodeGen {
 
         match (from, to) {
             // Integer to Long (sign extension, but both in eax so just use movsxd conceptually)
+            //
+            // Skipped when eax was just loaded by a word-sized `movsx`, which
+            // has already sign-extended it -- the common case, since that is
+            // how every INTEGER variable, array element and record field is
+            // read. It cannot be skipped on the strength of the static type
+            // alone: Integer is also what `promote_types` returns for
+            // INTEGER+INTEGER, whose 32-bit `add` genuinely has to be
+            // truncated back to 16 bits here, and `gen_coercion(Long,
+            // Integer)` is a no-op that leaves an untruncated 32-bit value
+            // behind a value typed Integer.
             (DataType::Integer, DataType::Long) => {
-                self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
+                if !self.last_emitted_is("movsx eax, WORD PTR") {
+                    self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
+                }
             }
             // Long to Integer (truncation - just use lower 16 bits)
             (DataType::Long, DataType::Integer) => {
@@ -1264,6 +1516,735 @@ impl CodeGen {
         match lit {
             Literal::Integer(n) => i32::try_from(n).ok(),
             _ => None,
+        }
+    }
+
+    /// Whether an expression can be evaluated without calling anything.
+    ///
+    /// A call is what makes a promoted counter unsafe: System V has no
+    /// callee-saved XMM register at all, so a Double counter would not survive
+    /// one, and a called procedure can reach a module-level counter through
+    /// its own name. Strings are rejected wholesale -- every string operation
+    /// goes through the runtime -- as is `^`, which calls libc's pow.
+    fn expr_is_call_free(&self, expr: &Expr) -> bool {
+        if self.expr_type(expr) == DataType::String {
+            return false;
+        }
+        match expr {
+            Expr::Literal(_) => true,
+            // A bare name is not always a variable: a parameterless FUNCTION
+            // and a zero-argument builtin are both spelled this way, and both
+            // compile to a call.
+            Expr::Variable(name) => {
+                let upper = name.to_uppercase();
+                !crate::sema::is_zero_arg_builtin(&upper)
+                    && !self.symbols.procs.contains_key(&upper)
+            }
+            Expr::ArrayAccess { name, indices } => {
+                self.array_elem_type(name).is_none()
+                    && indices.iter().all(|i| self.expr_is_call_free(i))
+            }
+            Expr::Unary { operand, .. } => self.expr_is_call_free(operand),
+            Expr::Binary { op, left, right } => {
+                *op != BinaryOp::Pow
+                    && self.expr_is_call_free(left)
+                    && self.expr_is_call_free(right)
+            }
+            Expr::FnCall { .. } | Expr::Field { .. } => false,
+        }
+    }
+
+    /// Whether a statement can run with `counter` held only in a register.
+    ///
+    /// An allowlist, not a denylist: the set of statements that neither call,
+    /// nor leave the loop by a route that skips its exit, nor write the
+    /// counter behind the register's back. Everything else -- PRINT, INPUT,
+    /// CALL, GOSUB, GOTO, READ, SWAP, file I/O -- says no, which costs those
+    /// loops nothing they had before.
+    fn stmt_allows_register_counter(&self, counter: &str, stmt: &Stmt) -> bool {
+        let all = |s: &[Stmt]| {
+            s.iter()
+                .all(|s| self.stmt_allows_register_counter(counter, s))
+        };
+        match &stmt.kind {
+            StmtKind::Let {
+                name,
+                indices,
+                value,
+            } => {
+                name != counter
+                    && !is_string_var(name)
+                    && self.typed_var(name).is_none()
+                    && indices
+                        .as_ref()
+                        .is_none_or(|ix| ix.iter().all(|e| self.expr_is_call_free(e)))
+                    && self.expr_is_call_free(value)
+            }
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr_is_call_free(condition)
+                    && all(then_branch)
+                    && else_branch.as_ref().is_none_or(|b| all(b))
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                var != counter
+                    && self.expr_is_call_free(start)
+                    && self.expr_is_call_free(end)
+                    && step.as_ref().is_none_or(|s| self.expr_is_call_free(s))
+                    && all(body)
+            }
+            StmtKind::While { condition, body } => self.expr_is_call_free(condition) && all(body),
+            StmtKind::DoLoop {
+                condition, body, ..
+            } => condition.as_ref().is_none_or(|c| self.expr_is_call_free(c)) && all(body),
+            // Leaves by way of a loop's own exit label, which is where the
+            // register is written back.
+            StmtKind::ExitLoop { .. } => true,
+            StmtKind::Const { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Whether this whole loop can run with its counter in a register.
+    ///
+    /// The bounds are checked as well as the body: they are evaluated before
+    /// the register is loaded, so a call in them would be harmless -- but a
+    /// bound that is not call-free is a sign the loop is not the kind this
+    /// helps, and checking them keeps the rule one sentence long.
+    fn body_allows_register_counter(
+        &self,
+        counter: &str,
+        body: &[Stmt],
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+    ) -> bool {
+        self.expr_is_call_free(start)
+            && self.expr_is_call_free(end)
+            && step.is_none_or(|s| self.expr_is_call_free(s))
+            && body
+                .iter()
+                .all(|s| self.stmt_allows_register_counter(counter, s))
+    }
+
+    /// A register of the right class that no enclosing loop is already using.
+    ///
+    /// Nested loops promote too, so the pool is checked against what is live
+    /// rather than indexed by depth; when it runs out the variable simply
+    /// stays in memory.
+    fn free_promotion_register(&self, ty: DataType) -> Option<&'static str> {
+        let pool: &[&'static str] = if ty.is_integer() {
+            &PROMO_GPRS
+        } else {
+            &PROMO_XMMS
+        };
+        pool.iter().copied().find(|r| !self.register_in_use(r))
+    }
+
+    /// Whether an enclosing loop is already holding something in `reg`.
+    fn register_in_use(&self, reg: &str) -> bool {
+        self.promoted.iter().any(|p| p.reg == reg)
+            || self.hoisted_arrays.iter().any(|h| {
+                h.base.as_deref() == Some(reg) || h.bounds.iter().any(|b| b.as_deref() == Some(reg))
+            })
+    }
+
+    /// The register holding `name`'s element pointer, if a loop hoisted it.
+    fn hoisted_base(&self, name: &str) -> Option<String> {
+        self.hoisted_arrays
+            .iter()
+            .rev()
+            .find(|h| h.name == name)
+            .and_then(|h| h.base.clone())
+    }
+
+    /// The register holding dimension `dim`'s element count, if hoisted.
+    fn hoisted_bound(&self, name: &str, dim: usize) -> Option<String> {
+        self.hoisted_arrays
+            .iter()
+            .rev()
+            .find(|h| h.name == name)
+            .and_then(|h| h.bounds.get(dim).cloned().flatten())
+    }
+
+    /// The operand naming an array's element pointer.
+    fn array_base_operand(&self, name: &str, loc: &Loc) -> String {
+        self.hoisted_base(name).unwrap_or_else(|| loc.q(0))
+    }
+
+    /// Pick registers to hold the descriptors of the arrays `body` subscripts.
+    ///
+    /// Element pointers first, then bounds: a pointer is read twice per
+    /// subscript and a bound once, so it is worth more per register. Whatever
+    /// is left over keeps reading memory, which is what it did before.
+    fn hoist_array_descriptors(&mut self, body: &[Stmt], claimed: &[String]) -> Vec<HoistedArray> {
+        let names = Self::arrays_used_in(body);
+        let mut taken: Vec<String> = claimed.to_vec();
+        let mut out: Vec<HoistedArray> = Vec::new();
+
+        for name in &names {
+            let Some(info) = self.lookup_array(name) else {
+                continue;
+            };
+            let ndims = info.ndims;
+            let base = self.free_gpr(&taken);
+            if let Some(reg) = &base {
+                taken.push(reg.clone());
+            }
+            out.push(HoistedArray {
+                name: name.clone(),
+                base,
+                bounds: vec![None; ndims],
+            });
+        }
+
+        for h in out.iter_mut() {
+            for slot in h.bounds.iter_mut() {
+                match self.free_gpr(&taken) {
+                    Some(reg) => {
+                        taken.push(reg.clone());
+                        *slot = Some(reg);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        out.retain(|h| h.base.is_some() || h.bounds.iter().any(|b| b.is_some()));
+        out
+    }
+
+    /// A callee-saved register neither an enclosing loop nor `taken` is using.
+    fn free_gpr(&self, taken: &[String]) -> Option<String> {
+        PROMO_GPRS
+            .iter()
+            .find(|r| !self.register_in_use(r) && !taken.iter().any(|t| t == *r))
+            .map(|r| r.to_string())
+    }
+
+    /// Save the registers a hoist claimed and load the descriptor into them.
+    fn emit_hoist_loads(&mut self, h: &HoistedArray) {
+        let Some(info) = self.lookup_array(&h.name) else {
+            return;
+        };
+        let loc = info.loc.clone();
+        let mut regs: Vec<(String, String)> = Vec::new();
+        if let Some(reg) = &h.base {
+            regs.push((reg.clone(), loc.q(0)));
+        }
+        for (i, slot) in h.bounds.iter().enumerate() {
+            if let Some(reg) = slot {
+                regs.push((reg.clone(), loc.q(1 + i as i32)));
+            }
+        }
+        for (reg, mem) in regs {
+            self.emit("    sub rsp, 16        # save a descriptor register");
+            self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
+            self.emit(&format!("    mov {}, {}", reg, mem));
+        }
+    }
+
+    /// Give those registers back, in the order that unwinds the saves.
+    fn emit_hoist_restores(&mut self, h: &HoistedArray) {
+        let mut regs: Vec<String> = Vec::new();
+        if let Some(reg) = &h.base {
+            regs.push(reg.clone());
+        }
+        for reg in h.bounds.iter().flatten() {
+            regs.push(reg.clone());
+        }
+        for reg in regs.into_iter().rev() {
+            self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+            self.emit("    add rsp, 16");
+        }
+    }
+
+    /// An array's element pointer in a register, ready for a scaled index.
+    ///
+    /// Free when a loop has hoisted it; otherwise loaded into r10 here, after
+    /// the last subscript has been evaluated -- evaluating one runs arbitrary
+    /// code, which is free to clobber r10.
+    fn array_base_into_register(&mut self, name: &str, loc: &Loc) -> String {
+        if let Some(reg) = self.hoisted_base(name) {
+            return reg;
+        }
+        self.emit(&format!("    mov r10, {}", loc.q(0)));
+        "r10".to_string()
+    }
+
+    /// The operand naming dimension `dim`'s element count.
+    fn array_bound_operand(&self, name: &str, loc: &Loc, dim: usize) -> String {
+        self.hoisted_bound(name, dim)
+            .unwrap_or_else(|| loc.q(1 + dim as i32))
+    }
+
+    /// Every array subscripted anywhere in `body`, in first-use order.
+    fn arrays_used_in(body: &[Stmt]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        Self::walk_body(body, &mut |stmt| match &stmt.kind {
+            StmtKind::Let {
+                name,
+                indices,
+                value,
+            } => {
+                if let Some(ix) = indices {
+                    if !names.iter().any(|n| n == name) {
+                        names.push(name.clone());
+                    }
+                    for e in ix {
+                        Self::walk_array_uses(e, &mut names);
+                    }
+                }
+                Self::walk_array_uses(value, &mut names);
+            }
+            StmtKind::If { condition, .. } | StmtKind::While { condition, .. } => {
+                Self::walk_array_uses(condition, &mut names)
+            }
+            StmtKind::DoLoop {
+                condition: Some(c), ..
+            } => Self::walk_array_uses(c, &mut names),
+            StmtKind::For {
+                start, end, step, ..
+            } => {
+                Self::walk_array_uses(start, &mut names);
+                Self::walk_array_uses(end, &mut names);
+                if let Some(st) = step {
+                    Self::walk_array_uses(st, &mut names);
+                }
+            }
+            _ => {}
+        });
+        names
+    }
+
+    /// Collect array names subscripted anywhere in `expr`.
+    fn walk_array_uses(expr: &Expr, names: &mut Vec<String>) {
+        match expr {
+            Expr::ArrayAccess { name, indices } => {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.clone());
+                }
+                for i in indices {
+                    Self::walk_array_uses(i, names);
+                }
+            }
+            Expr::Unary { operand, .. } => Self::walk_array_uses(operand, names),
+            Expr::Binary { left, right, .. } => {
+                Self::walk_array_uses(left, names);
+                Self::walk_array_uses(right, names);
+            }
+            Expr::FnCall { args, .. } => {
+                for a in args {
+                    Self::walk_array_uses(a, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The scalars a loop body assigns to, in first-assignment order.
+    ///
+    /// These are the ones worth a register: an accumulator's store and the
+    /// next iteration's load of the same address are the loop-carried
+    /// dependency, and removing it is worth far more than the instructions.
+    /// A variable the body only reads costs a load per read and carries no
+    /// dependency, so it is left alone and its register given to an
+    /// accumulator instead.
+    ///
+    /// Only plain numeric scalars. A string would need its two words and its
+    /// ownership rules; an `AS`-typed variable lives in different storage and
+    /// is written through a different path; an array is not a scalar at all.
+    fn promotable_accumulators(&self, counter: &str, body: &[Stmt]) -> Vec<String> {
+        // A nested loop's control variable is written by that loop's own
+        // machinery, which reads and writes its storage directly. Holding it
+        // here as well would mean this loop's write-back put a stale value
+        // over whatever the inner loop had left there.
+        let mut inner_counters: Vec<String> = Vec::new();
+        Self::walk_nested_counters(body, &mut |name| inner_counters.push(name.to_string()));
+
+        let mut found: Vec<String> = Vec::new();
+        Self::walk_assigned_scalars(body, &mut |name| {
+            if name == counter
+                || is_string_var(name)
+                || found.iter().any(|n| n == name)
+                || inner_counters.iter().any(|n| n == name)
+                // Already held by an enclosing loop, which will write it back.
+                || self.promoted.iter().any(|p| p.name == name)
+            {
+                return;
+            }
+            if self.typed_var(name).is_some() || self.lookup_array(name).is_some() {
+                return;
+            }
+            // A name that is really a procedure, or a FUNCTION's own result
+            // variable, is not an ordinary scalar.
+            let upper = name.to_uppercase();
+            if self.symbols.procs.contains_key(&upper) {
+                return;
+            }
+            found.push(name.to_string());
+        });
+        found
+    }
+
+    /// Call `visit` with every scalar name assigned by a `LET` in `body`.
+    fn walk_assigned_scalars(body: &[Stmt], visit: &mut impl FnMut(&str)) {
+        Self::walk_body(body, &mut |stmt| {
+            if let StmtKind::Let {
+                name,
+                indices: None,
+                ..
+            } = &stmt.kind
+            {
+                visit(name);
+            }
+        });
+    }
+
+    /// Call `visit` with the control variable of every loop nested in `body`.
+    fn walk_nested_counters(body: &[Stmt], visit: &mut impl FnMut(&str)) {
+        Self::walk_body(body, &mut |stmt| {
+            if let StmtKind::For { var, .. } = &stmt.kind {
+                visit(var);
+            }
+        });
+    }
+
+    /// Visit every statement in `body`, including nested ones.
+    ///
+    /// Only the statement kinds that can appear in a promotable loop are
+    /// descended into; everything else is outside the allowlist that makes
+    /// the loop promotable at all, so it cannot be there.
+    fn walk_body(body: &[Stmt], visit: &mut impl FnMut(&Stmt)) {
+        for stmt in body {
+            visit(stmt);
+            match &stmt.kind {
+                StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    Self::walk_body(then_branch, visit);
+                    if let Some(eb) = else_branch {
+                        Self::walk_body(eb, visit);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::While { body, .. }
+                | StmtKind::DoLoop { body, .. } => Self::walk_body(body, visit),
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether `name` is held in a register by some enclosing loop.
+    fn promotion_of(&self, name: &str) -> Option<Promoted> {
+        self.promoted.iter().rev().find(|p| p.name == name).cloned()
+    }
+
+    /// Where a FOR control variable lives, and the type it counts in.
+    ///
+    /// Resolved the same way a read of the name resolves, so that the loop
+    /// writes where every other reference looks: a `DIM I AS INTEGER` counter
+    /// lives in typed storage, and allocating a plain slot for it instead
+    /// would leave the loop counting somewhere nothing reads.
+    fn for_control_var(&mut self, name: &str) -> (Loc, DataType) {
+        if let Some((loc, ty)) = self.typed_storage(name) {
+            return (loc, DataType::from_type_ref(&ty));
+        }
+        let info = self.get_var_info(name);
+        (info.loc, info.data_type)
+    }
+
+    /// The operand size a FOR control value is held at.
+    fn for_ptr(ct: DataType) -> &'static str {
+        match ct {
+            DataType::Integer => "WORD PTR",
+            DataType::Long | DataType::Single => "DWORD PTR",
+            _ => "QWORD PTR",
+        }
+    }
+
+    /// Load a FOR control value from `mem` into the working register.
+    fn emit_for_load(&mut self, ct: DataType, mem: &str, second: bool) {
+        match ct {
+            DataType::Integer => {
+                let r = if second { "ecx" } else { "eax" };
+                self.emit(&format!("    movsx {}, {}", r, mem));
+            }
+            DataType::Long => {
+                let r = if second { "ecx" } else { "eax" };
+                self.emit(&format!("    mov {}, {}", r, mem));
+            }
+            DataType::Single => {
+                let r = if second { "xmm1" } else { "xmm0" };
+                self.emit(&format!("    movss {}, {}", r, mem));
+            }
+            _ => {
+                let r = if second { "xmm1" } else { "xmm0" };
+                self.emit(&format!("    movsd {}, {}", r, mem));
+            }
+        }
+    }
+
+    /// Store the primary working register into a FOR control value's slot.
+    ///
+    /// The narrow store is what gives an INTEGER counter its wraparound, the
+    /// same as every other INTEGER assignment in the language.
+    fn emit_for_store(&mut self, ct: DataType, mem: &str) {
+        match ct {
+            DataType::Integer => self.emit(&format!("    mov {}, ax", mem)),
+            DataType::Long => self.emit(&format!("    mov {}, eax", mem)),
+            DataType::Single => self.emit(&format!("    movss {}, xmm0", mem)),
+            _ => self.emit(&format!("    movsd {}, xmm0", mem)),
+        }
+    }
+
+    /// Evaluate a FOR limit or step into something usable every iteration.
+    ///
+    /// `None` is the implicit `STEP 1`. A constant costs no frame slot and no
+    /// setup instruction; anything else is evaluated once into a slot, since
+    /// re-evaluating it per iteration would be both slower and wrong.
+    fn gen_for_bound(&mut self, expr: Option<&Expr>, ct: DataType) -> ForOperand {
+        let constant = match expr {
+            None => Some(1.0),
+            Some(e) => self.const_double(e),
+        };
+
+        if let Some(value) = constant {
+            match ct {
+                // Narrowed to the counter's own type first, so a limit too
+                // wide to hold behaves the way assigning it would.
+                DataType::Integer => return ForOperand::Imm(i32::from(value as i32 as i16)),
+                DataType::Long => return ForOperand::Imm(value as i32),
+                DataType::Double => return ForOperand::Pool(self.f64_operand(value)),
+                // SINGLE is the exception: the pool holds doubles and `movss`
+                // cannot read one, so it takes a slot like anything else.
+                _ => {}
+            }
+        }
+
+        self.stack_offset -= 8;
+        let offset = self.stack_offset;
+        match expr {
+            Some(e) => self.gen_expr_coerced(e, ct),
+            None => {
+                self.gen_double_const(1.0);
+                self.gen_coercion(DataType::Double, ct);
+            }
+        }
+        let mem = format!("{} [rbp + {}]", Self::for_ptr(ct), offset);
+        self.emit_for_store(ct, &mem);
+        ForOperand::Slot(offset)
+    }
+
+    /// Compare the counter in the primary register against `operand`.
+    fn emit_for_compare(&mut self, ct: DataType, operand: &ForOperand) {
+        match (ct, operand) {
+            (DataType::Integer, ForOperand::Slot(off)) => {
+                // The slot holds sixteen bits; the counter in eax is already
+                // sign-extended, so the limit has to be too before they meet.
+                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
+                self.emit("    cmp eax, ecx");
+            }
+            (DataType::Integer | DataType::Long, _) => {
+                self.emit(&format!("    cmp eax, {}", operand.text(ct)));
+            }
+            (DataType::Single, _) => {
+                self.emit(&format!("    ucomiss xmm0, {}", operand.text(ct)));
+            }
+            _ => self.emit(&format!("    ucomisd xmm0, {}", operand.text(ct))),
+        }
+    }
+
+    /// Add `operand` to the counter in the primary register.
+    ///
+    /// The add is done at the counter's own width, so that a step past the
+    /// type's range sets the overflow flag. Without that check the counter
+    /// simply wraps and never passes its limit: `FOR I% = 32760 TO 32767`
+    /// would run forever rather than reporting the Overflow that GW-BASIC
+    /// reports. `--unsafe` drops the check and takes the wraparound.
+    fn emit_for_add(&mut self, ct: DataType, operand: &ForOperand) {
+        match ct {
+            DataType::Integer => {
+                self.emit(&format!("    add ax, {}", operand.text(ct)));
+                self.emit_check("jo", RtError::Overflow);
+            }
+            DataType::Long => {
+                self.emit(&format!("    add eax, {}", operand.text(ct)));
+                self.emit_check("jo", RtError::Overflow);
+            }
+            DataType::Single => {
+                self.emit(&format!("    addss xmm0, {}", operand.text(ct)));
+            }
+            _ => self.emit(&format!("    addsd xmm0, {}", operand.text(ct))),
+        }
+    }
+
+    /// The 32-bit name of a promoted counter's register.
+    fn counter_reg32(reg: &str) -> String {
+        format!("{}d", reg)
+    }
+
+    /// Move the freshly computed start value into the counter's register.
+    fn emit_counter_init(&mut self, ct: DataType, reg: &str) {
+        match ct {
+            // Narrowed on the way in, exactly as the store to a 16-bit slot
+            // would have narrowed it.
+            DataType::Integer => self.emit(&format!("    movsx {}, ax", Self::counter_reg32(reg))),
+            DataType::Long => self.emit(&format!("    mov {}, eax", Self::counter_reg32(reg))),
+            // movaps rather than movss: a register-to-register movss merges
+            // into the destination, so it would depend on what was there.
+            DataType::Single => self.emit(&format!("    movaps {}, xmm0", reg)),
+            _ => self.emit(&format!("    movapd {}, xmm0", reg)),
+        }
+    }
+
+    /// Write a promoted counter back to the variable's storage.
+    fn emit_counter_writeback(&mut self, ct: DataType, reg: &str, mem: &str) {
+        match ct {
+            DataType::Integer => self.emit(&format!("    mov {}, {}w", mem, reg)),
+            DataType::Long => self.emit(&format!("    mov {}, {}", mem, Self::counter_reg32(reg))),
+            DataType::Single => self.emit(&format!("    movss {}, {}", mem, reg)),
+            _ => self.emit(&format!("    movsd {}, {}", mem, reg)),
+        }
+    }
+
+    /// Compare a promoted counter against `operand`.
+    fn emit_counter_compare(&mut self, ct: DataType, reg: &str, operand: &ForOperand) {
+        match (ct, operand) {
+            (DataType::Integer, ForOperand::Slot(off)) => {
+                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
+                self.emit(&format!("    cmp {}, ecx", Self::counter_reg32(reg)));
+            }
+            (DataType::Integer | DataType::Long, _) => {
+                let text = operand.text(ct);
+                self.emit(&format!("    cmp {}, {}", Self::counter_reg32(reg), text));
+            }
+            (DataType::Single, _) => {
+                let text = operand.text(ct);
+                self.emit(&format!("    ucomiss {}, {}", reg, text));
+            }
+            _ => {
+                let text = operand.text(ct);
+                self.emit(&format!("    ucomisd {}, {}", reg, text));
+            }
+        }
+    }
+
+    /// Step a promoted counter. See [`Self::emit_for_add`] on the width.
+    fn emit_counter_add(&mut self, ct: DataType, reg: &str, operand: &ForOperand) {
+        let r32 = Self::counter_reg32(reg);
+        let text = operand.text(ct);
+        match ct {
+            DataType::Integer => {
+                self.emit(&format!("    add {}w, {}", reg, text));
+                self.emit_check("jo", RtError::Overflow);
+                // The narrowing store used to keep an INTEGER counter within
+                // sixteen bits for free; in a register it has to be said.
+                self.emit(&format!("    movsx {}, {}w", r32, reg));
+            }
+            DataType::Long => {
+                self.emit(&format!("    add {}, {}", r32, text));
+                self.emit_check("jo", RtError::Overflow);
+            }
+            DataType::Single => self.emit(&format!("    addss {}, {}", reg, text)),
+            _ => self.emit(&format!("    addsd {}, {}", reg, text)),
+        }
+    }
+
+    /// Load a promoted variable's storage into its register, entering a loop.
+    fn emit_promotion_load(&mut self, p: &Promoted) {
+        match p.ty {
+            DataType::Integer => self.emit(&format!(
+                "    movsx {}, {}",
+                Self::counter_reg32(&p.reg),
+                p.loc.at("WORD PTR", 0)
+            )),
+            DataType::Long => self.emit(&format!(
+                "    mov {}, {}",
+                Self::counter_reg32(&p.reg),
+                p.loc.at("DWORD PTR", 0)
+            )),
+            DataType::Single => self.emit(&format!(
+                "    movss {}, {}",
+                p.reg,
+                p.loc.at("DWORD PTR", 0)
+            )),
+            _ => self.emit(&format!("    movsd {}, {}", p.reg, p.loc.q(0))),
+        }
+    }
+
+    /// Write a promoted variable's register back to its storage, leaving.
+    fn emit_promotion_store(&mut self, p: &Promoted) {
+        let mem = p.loc.at(Self::for_ptr(p.ty), 0);
+        self.emit_counter_writeback(p.ty, &p.reg.clone(), &mem);
+    }
+
+    /// Move a freshly computed value from the working register into a
+    /// promoted variable's register.
+    fn emit_promotion_assign(&mut self, p: &Promoted) {
+        // Narrowed on the way in, exactly as the store to its slot would have
+        // narrowed it, so an INTEGER still wraps at sixteen bits.
+        self.emit_counter_init(p.ty, &p.reg.clone());
+    }
+
+    /// Read a promoted counter into the register an expression expects.
+    fn emit_counter_read(&mut self, ct: DataType, reg: &str) {
+        match ct {
+            DataType::Integer | DataType::Long => {
+                self.emit(&format!("    mov eax, {}", Self::counter_reg32(reg)))
+            }
+            DataType::Single => self.emit(&format!("    movaps xmm0, {}", reg)),
+            _ => self.emit(&format!("    movapd xmm0, {}", reg)),
+        }
+    }
+
+    /// Branch to `target` when a step held only at run time is negative.
+    ///
+    /// Only reached for a step that is not a constant, which is also the only
+    /// case where `operand` is a slot. Clobbers the secondary registers, so
+    /// the counter already loaded in the primary one survives.
+    fn emit_for_test_step_sign(&mut self, ct: DataType, operand: &ForOperand, target: &str) {
+        let mem = operand.text(ct);
+        match ct {
+            DataType::Integer | DataType::Long => {
+                self.emit(&format!("    cmp {}, 0", mem));
+                self.emit(&format!("    jl {}", target));
+            }
+            DataType::Single => {
+                self.emit(&format!("    movss xmm1, {}", mem));
+                self.emit("    xorps xmm2, xmm2");
+                self.emit("    ucomiss xmm1, xmm2");
+                self.emit(&format!("    jb {}", target));
+            }
+            _ => {
+                self.emit(&format!("    movsd xmm1, {}", mem));
+                self.emit("    xorpd xmm2, xmm2");
+                self.emit("    ucomisd xmm1, xmm2");
+                self.emit(&format!("    jb {}", target));
+            }
+        }
+    }
+
+    /// The branch that leaves the loop: past the limit going up, or below it
+    /// going down. Integers compare signed; ucomis* reports through CF and ZF,
+    /// so a floating counter reads unsigned.
+    fn for_exit_branch(ct: DataType, ascending: bool) -> &'static str {
+        match (ct.is_integer(), ascending) {
+            (true, true) => "jg",
+            (true, false) => "jl",
+            (false, true) => "ja",
+            (false, false) => "jb",
         }
     }
 
@@ -1604,12 +2585,29 @@ impl CodeGen {
                 } else if is_string_var(name) {
                     self.gen_string_assign(name, value);
                 } else {
-                    // Evaluate expression and get its type
-                    let expr_type = self.gen_expr(value);
+                    // Evaluate expression and get its type. A Double target is
+                    // worth knowing about first: `X# = 2` is common, and going
+                    // through gen_expr would put 2 in eax only to widen it.
+                    let target_type = self.get_var_info(name).data_type;
+                    let expr_type = if target_type == DataType::Double {
+                        self.gen_expr_to_double(value);
+                        DataType::Double
+                    } else {
+                        self.gen_expr(value)
+                    };
                     let var_info = self.get_var_info(name);
 
                     // Coerce to target type
                     self.gen_coercion(expr_type, var_info.data_type);
+
+                    // An enclosing loop may be holding this name in a
+                    // register. Writing its storage instead would be lost:
+                    // the register is where every read of it now looks, and
+                    // it is what gets written back when the loop ends.
+                    if let Some(p) = self.promotion_of(name) {
+                        self.emit_promotion_assign(&p);
+                        return;
+                    }
 
                     // Store based on target type
                     let loc = &var_info.loc;
@@ -1748,16 +2746,7 @@ impl CodeGen {
                 let else_label = self.new_label("else");
                 let end_label = self.new_label("endif");
 
-                let cond_type = self.gen_expr(condition);
-                // Compare with 0 - conditions typically return Long (integer) now
-                if cond_type.is_integer() {
-                    self.emit("    test eax, eax");
-                    self.emit(&format!("    je {}", else_label));
-                } else {
-                    self.emit("    xorpd xmm1, xmm1");
-                    self.emit("    ucomisd xmm0, xmm1");
-                    self.emit(&format!("    je {}", else_label));
-                }
+                self.gen_condition(condition, &else_label, false);
 
                 for s in then_branch {
                     self.gen_stmt(s);
@@ -1783,78 +2772,250 @@ impl CodeGen {
             } => {
                 let start_label = self.new_label("for");
                 let end_label = self.new_label("endfor");
-                let var_loc = self.get_var_loc(var);
+                // The control variable counts in its own declared type, and is
+                // read back through that type's own load by everything else in
+                // the program -- so it has to be written through the matching
+                // store. Counting in Double regardless, as this used to, meant
+                // `FOR I% = 1 TO 3` wrote the bit pattern of 1.0 and every read
+                // of I% took the low sixteen bits of it, which are zero.
+                let (var_loc, ct) = self.for_control_var(var);
+                let var_mem = var_loc.at(Self::for_ptr(ct), 0);
 
-                // Initialize loop variable - coerce to double
-                let start_type = self.gen_expr(start);
-                self.gen_coercion(start_type, DataType::Double);
-                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
-
-                // Store end value - coerce to double
-                self.stack_offset -= 8;
-                let end_offset = self.stack_offset;
-                let end_type = self.gen_expr(end);
-                self.gen_coercion(end_type, DataType::Double);
-                self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", end_offset));
-
-                // Store step value - coerce to double
-                self.stack_offset -= 8;
-                let step_offset = self.stack_offset;
-                if let Some(s) = step {
-                    let step_type = self.gen_expr(s);
-                    self.gen_coercion(step_type, DataType::Double);
+                // A counter kept in memory makes the loop-carried dependency a
+                // store followed by the next iteration's load of the same
+                // address -- around ten cycles of store-to-load forwarding that
+                // nothing else in the loop can hide. Held in a register it is
+                // one add. Only loops that call nothing qualify, since System V
+                // has no callee-saved XMM register for a Double counter to
+                // survive a call in, and a called procedure could reach a
+                // module-level counter by name.
+                let promotable =
+                    self.body_allows_register_counter(var, body, start, end, step.as_ref());
+                let counter_reg = if promotable {
+                    self.free_promotion_register(ct).map(str::to_string)
                 } else {
-                    self.emit("    mov rax, 0x3FF0000000000000  # 1.0");
-                    self.emit("    movq xmm0, rax");
+                    None
+                };
+
+                // r12-r15 belong to this function's caller, so they are saved
+                // across the loop. Sixteen bytes rather than eight because a
+                // bounds check inside the loop can still reach a trampoline
+                // that calls the runtime, and it must find rsp aligned.
+                if let Some(reg) = &counter_reg {
+                    if ct.is_integer() {
+                        self.emit("    sub rsp, 16        # save a counter register");
+                        self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
+                    }
                 }
-                self.emit(&format!(
-                    "    movsd QWORD PTR [rbp + {}], xmm0",
-                    step_offset
-                ));
+
+                // Initialize the control variable.
+                self.gen_expr_coerced(start, ct);
+                match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        self.emit_counter_init(ct, &reg)
+                    }
+                    None => self.emit_for_store(ct, &var_mem),
+                }
+
+                // The limit and the step are evaluated once. A constant one
+                // needs no slot at all: it becomes the compare's or the add's
+                // own operand.
+                let end_operand = self.gen_for_bound(Some(end), ct);
+                let step_operand = self.gen_for_bound(step.as_ref(), ct);
+
+                // The same argument that puts the counter in a register puts
+                // the body's accumulators there: `T = T + ...` has exactly the
+                // same store-then-reload dependency, and usually a longer one,
+                // since the add is on the critical path too.
+                //
+                // Loaded after the bounds, which are evaluated in memory, and
+                // before the loop label, so a variable the loop never reaches
+                // is still written back unchanged.
+                let mut accumulators: Vec<Promoted> = Vec::new();
+                if promotable {
+                    for name in self.promotable_accumulators(var, body) {
+                        if accumulators.len() == MAX_PROMOTED_ACCUMULATORS {
+                            break;
+                        }
+                        let info = self.get_var_info(&name);
+                        // Ask with the counter already accounted for, so the
+                        // two cannot be given the same register.
+                        let taken: Vec<String> = counter_reg.iter().cloned().collect();
+                        let reg = {
+                            let pool: &[&'static str] = if info.data_type.is_integer() {
+                                &PROMO_GPRS
+                            } else {
+                                &PROMO_XMMS
+                            };
+                            pool.iter().copied().find(|r| {
+                                !taken.iter().any(|t| t == r)
+                                    && !accumulators.iter().any(|a| a.reg == *r)
+                                    && !self.promoted.iter().any(|p| p.reg == *r)
+                            })
+                        };
+                        let Some(reg) = reg else { break };
+                        accumulators.push(Promoted {
+                            name,
+                            reg: reg.to_string(),
+                            ty: info.data_type,
+                            loc: info.loc,
+                        });
+                    }
+                }
+                for p in &accumulators.clone() {
+                    if p.ty.is_integer() {
+                        self.emit("    sub rsp, 16        # save an accumulator register");
+                        self.emit(&format!("    mov QWORD PTR [rsp], {}", p.reg));
+                    }
+                    self.emit_promotion_load(p);
+                }
+
+                // An array's element pointer and bounds cannot change while
+                // the loop runs -- DIM and REDIM are outside the allowlist --
+                // yet every subscript re-read them: two loads for the pointer,
+                // since the null check and the address each fetched it, and
+                // one per bound compare. Hoisting those was worth 1.45x on a
+                // loop doing four subscripts, which is most of what the bounds
+                // checking costs in the first place.
+                let hoisted = if promotable {
+                    // The counter and the accumulators have registers but are
+                    // not on the promoted stack yet -- that happens as the
+                    // body is entered -- so they are named explicitly here.
+                    let mut claimed: Vec<String> = counter_reg.iter().cloned().collect();
+                    claimed.extend(accumulators.iter().map(|a| a.reg.clone()));
+                    self.hoist_array_descriptors(body, &claimed)
+                } else {
+                    Vec::new()
+                };
+                for h in &hoisted.clone() {
+                    self.emit_hoist_loads(h);
+                }
+
+                // Which way the loop runs is a property of the step's sign. It
+                // is almost always written into the program, so it is almost
+                // always decided here rather than re-tested on every iteration.
+                let direction = match step {
+                    None => Some(true),
+                    Some(s) => self.const_double(s).map(|v| v >= 0.0),
+                };
 
                 self.emit_label(&start_label);
+                let compare = |s: &mut Self| match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        s.emit_counter_compare(ct, &reg, &end_operand)
+                    }
+                    None => {
+                        s.emit_for_load(ct, &var_mem, false);
+                        s.emit_for_compare(ct, &end_operand);
+                    }
+                };
 
-                // Check condition (var > end for positive step, var < end for negative)
-                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
-                self.emit(&format!("    movsd xmm1, QWORD PTR [rbp + {}]", end_offset));
-                self.emit(&format!(
-                    "    movsd xmm2, QWORD PTR [rbp + {}]",
-                    step_offset
-                ));
-                self.emit("    xorpd xmm3, xmm3");
-                self.emit("    ucomisd xmm2, xmm3");
-                self.emit(&format!("    jb .Lfor_neg_{}", self.label_counter));
+                match direction {
+                    Some(ascending) => {
+                        compare(self);
+                        self.emit(&format!(
+                            "    {} {}",
+                            Self::for_exit_branch(ct, ascending),
+                            end_label
+                        ));
+                    }
+                    None => {
+                        // Step known only at run time, so both directions have
+                        // to be present. Only this shape pays for the test.
+                        let neg = format!(".Lfor_neg_{}", self.label_counter);
+                        let body_label = format!(".Lfor_body_{}", self.label_counter);
+                        self.label_counter += 1;
 
-                // Positive step: exit if var > end
-                self.emit("    ucomisd xmm0, xmm1");
-                self.emit(&format!("    ja {}", end_label));
-                self.emit(&format!("    jmp .Lfor_body_{}", self.label_counter));
+                        self.emit_for_test_step_sign(ct, &step_operand, &neg);
+                        compare(self);
+                        self.emit(&format!(
+                            "    {} {}",
+                            Self::for_exit_branch(ct, true),
+                            end_label
+                        ));
+                        self.emit(&format!("    jmp {}", body_label));
 
-                // Negative step: exit if var < end
-                self.emit_label(&format!(".Lfor_neg_{}", self.label_counter));
-                self.emit("    ucomisd xmm0, xmm1");
-                self.emit(&format!("    jb {}", end_label));
+                        self.emit_label(&neg);
+                        compare(self);
+                        self.emit(&format!(
+                            "    {} {}",
+                            Self::for_exit_branch(ct, false),
+                            end_label
+                        ));
+                        self.emit_label(&body_label);
+                    }
+                }
 
-                self.emit_label(&format!(".Lfor_body_{}", self.label_counter));
-                self.label_counter += 1;
-
-                // Body
+                // Body. While it runs, a read or a write of any promoted name
+                // resolves to its register rather than to its storage.
+                let promoted_here = accumulators.len() + usize::from(counter_reg.is_some());
+                let hoisted_here = hoisted.len();
+                for h in &hoisted {
+                    self.hoisted_arrays.push(h.clone());
+                }
+                if let Some(reg) = &counter_reg {
+                    self.promoted.push(Promoted {
+                        name: var.clone(),
+                        reg: reg.clone(),
+                        ty: ct,
+                        loc: var_loc.clone(),
+                    });
+                }
+                for p in &accumulators {
+                    self.promoted.push(p.clone());
+                }
                 self.loop_stack.push((true, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
                 self.loop_stack.pop();
+                self.promoted.truncate(self.promoted.len() - promoted_here);
+                self.hoisted_arrays
+                    .truncate(self.hoisted_arrays.len() - hoisted_here);
 
-                // Increment
-                self.emit(&format!("    movsd xmm0, {}", var_loc.q(0)));
-                self.emit(&format!(
-                    "    addsd xmm0, QWORD PTR [rbp + {}]",
-                    step_offset
-                ));
-                self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
+                // Increment. When the counter is in memory it is reloaded
+                // rather than carried over from the compare above, because the
+                // body is allowed to assign to it and BASIC programs do -- the
+                // register form is only reached for bodies that provably do not.
+                match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        self.emit_counter_add(ct, &reg, &step_operand);
+                    }
+                    None => {
+                        self.emit_for_load(ct, &var_mem, false);
+                        self.emit_for_add(ct, &step_operand);
+                        self.emit_for_store(ct, &var_mem);
+                    }
+                }
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
+
+                // Every route out of the loop passes here, EXIT FOR included,
+                // so this is where the variables become visible again. In
+                // reverse order, so the saved registers come off the stack in
+                // the order they went on.
+                for h in hoisted.iter().rev() {
+                    self.emit_hoist_restores(h);
+                }
+                for p in accumulators.iter().rev() {
+                    self.emit_promotion_store(p);
+                    if p.ty.is_integer() {
+                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", p.reg));
+                        self.emit("    add rsp, 16");
+                    }
+                }
+                if let Some(reg) = &counter_reg {
+                    let reg = reg.clone();
+                    self.emit_counter_writeback(ct, &reg, &var_mem);
+                    if ct.is_integer() {
+                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+                        self.emit("    add rsp, 16");
+                    }
+                }
             }
 
             StmtKind::While { condition, body } => {
@@ -1862,15 +3023,7 @@ impl CodeGen {
                 let end_label = self.new_label("endwhile");
 
                 self.emit_label(&start_label);
-                let cond_type = self.gen_expr(condition);
-                if cond_type.is_integer() {
-                    self.emit("    test eax, eax");
-                    self.emit(&format!("    je {}", end_label));
-                } else {
-                    self.emit("    xorpd xmm1, xmm1");
-                    self.emit("    ucomisd xmm0, xmm1");
-                    self.emit(&format!("    je {}", end_label));
-                }
+                self.gen_condition(condition, &end_label, false);
 
                 // WHILE is a DO-family loop for EXIT DO purposes.
                 self.loop_stack.push((false, end_label.clone()));
@@ -1896,23 +3049,9 @@ impl CodeGen {
 
                 if *cond_at_start {
                     if let Some(cond) = condition {
-                        let cond_type = self.gen_expr(cond);
-                        if cond_type.is_integer() {
-                            self.emit("    test eax, eax");
-                            if *is_until {
-                                self.emit(&format!("    jne {}", end_label));
-                            } else {
-                                self.emit(&format!("    je {}", end_label));
-                            }
-                        } else {
-                            self.emit("    xorpd xmm1, xmm1");
-                            self.emit("    ucomisd xmm0, xmm1");
-                            if *is_until {
-                                self.emit(&format!("    jne {}", end_label));
-                            } else {
-                                self.emit(&format!("    je {}", end_label));
-                            }
-                        }
+                        // DO WHILE leaves when the condition is false;
+                        // DO UNTIL leaves when it is true.
+                        self.gen_condition(cond, &end_label, *is_until);
                     }
                 }
 
@@ -1924,23 +3063,11 @@ impl CodeGen {
 
                 if !*cond_at_start {
                     if let Some(cond) = condition {
-                        let cond_type = self.gen_expr(cond);
-                        if cond_type.is_integer() {
-                            self.emit("    test eax, eax");
-                            if *is_until {
-                                self.emit(&format!("    je {}", start_label));
-                            } else {
-                                self.emit(&format!("    jne {}", start_label));
-                            }
-                        } else {
-                            self.emit("    xorpd xmm1, xmm1");
-                            self.emit("    ucomisd xmm0, xmm1");
-                            if *is_until {
-                                self.emit(&format!("    je {}", start_label));
-                            } else {
-                                self.emit(&format!("    jne {}", start_label));
-                            }
-                        }
+                        // The senses invert against the pre-test form: this
+                        // branch goes back into the loop rather than out of
+                        // it. LOOP WHILE repeats while true, LOOP UNTIL
+                        // repeats while false.
+                        self.gen_condition(cond, &start_label, !*is_until);
                     } else {
                         self.emit(&format!("    jmp {}", start_label));
                     }
@@ -2407,23 +3534,21 @@ impl CodeGen {
                     // -1530494975. The lexer widens such literals already; this
                     // also covers values arriving from DATA.
                     Err(_) => {
-                        let bits = (*n as f64).to_bits();
-                        self.emit(&format!("    mov rax, 0x{:X}", bits));
-                        self.emit("    movq xmm0, rax");
+                        self.gen_double_const(*n as f64);
                         DataType::Double
                     }
                 },
                 Literal::Float(f) => {
                     // Load as double into xmm0
-                    let bits = f.to_bits();
-                    self.emit(&format!("    mov rax, 0x{:X}", bits));
-                    self.emit("    movq xmm0, rax");
+                    self.gen_double_const(*f);
                     DataType::Double
                 }
                 Literal::String(s) => {
                     let idx = self.add_string_literal(s);
                     self.emit(&format!("    lea rax, [rip + _str_{}]", idx));
-                    self.emit(&format!("    mov rdx, {}", s.len()));
+                    // A literal's length cannot approach 2^32, and writing edx
+                    // zeroes the upper half, so the narrow form is equivalent.
+                    self.emit(&format!("    mov edx, {}", s.len()));
                     DataType::String
                 }
             },
@@ -2432,6 +3557,15 @@ impl CodeGen {
                 // A CONST is substituted with its folded value.
                 if let Some(lit) = self.symbols.consts.get(&name.to_uppercase()).cloned() {
                     return self.gen_expr(&Expr::Literal(lit));
+                }
+
+                // An enclosing FOR may be holding this name in a register
+                // instead of in its storage, in which case that register is
+                // where its current value is. Checked before anything else,
+                // because the storage is stale until the loop ends.
+                if let Some(p) = self.promotion_of(name) {
+                    self.emit_counter_read(p.ty, &p.reg);
+                    return p.ty;
                 }
 
                 // A variable declared with `AS` lives in typed storage, which
@@ -2506,8 +3640,16 @@ impl CodeGen {
                                 self.emit("    movd xmm1, eax");
                                 self.emit("    xorps xmm0, xmm1");
                             } else {
-                                self.emit("    mov rax, 0x8000000000000000");
-                                self.emit("    movq xmm1, rax");
+                                // The mask comes from the pool rather than a
+                                // 64-bit immediate, so rax is left alone.
+                                //
+                                // It is loaded into a register rather than
+                                // named as xorpd's operand: the memory form of
+                                // a packed SSE instruction reads sixteen bytes
+                                // and requires them aligned, and pool entries
+                                // are eight bytes on an eight-byte boundary.
+                                let mask = self.f64_operand(-0.0);
+                                self.emit(&format!("    movsd xmm1, {}", mask));
                                 self.emit("    xorpd xmm0, xmm1");
                             }
                             operand_type
@@ -2624,24 +3766,7 @@ impl CodeGen {
             && self.expr_type(left) == DataType::String
             && self.expr_type(right) == DataType::String
         {
-            // Evaluate left string (ptr in rax, len in rdx)
-            self.gen_expr(left);
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-            self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
-            self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
-
-            // Evaluate right string (ptr in rax, len in rdx)
-            self.gen_expr(right);
-            self.emit("    mov r8, rax"); // right ptr
-            self.emit("    mov r9, rdx"); // right len
-            self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
-            self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-            self.emit_arg_reg(0, "rax");
-            self.emit_arg_reg(1, "rdx");
-            self.emit_arg_reg(2, "r8");
-            self.emit_arg_reg(3, "r9");
-            self.emit("    call _rt_strcmp");
+            self.gen_string_compare(left, right);
 
             // _rt_strcmp returns <0, 0 or >0 in eax, like memcmp. Turn that
             // into BASIC's -1 / 0 by testing it against zero with the signed
@@ -2655,7 +3780,6 @@ impl CodeGen {
                 BinaryOp::Ge => "setge",
                 _ => unreachable!("guarded by is_comparison"),
             };
-            self.emit("    test eax, eax");
             self.emit(&format!("    {} al", setcc));
             self.emit("    movzx eax, al");
             self.emit("    neg eax"); // BASIC true is -1
@@ -2681,37 +3805,15 @@ impl CodeGen {
             result_type
         };
 
-        // Evaluate left operand and coerce to work type
-        let left_type = self.gen_expr(left);
-        self.gen_coercion(left_type, work_type);
-
-        // Save left result - use 16 bytes to maintain 16-byte stack alignment
-        // This ensures any function calls while evaluating right operand have aligned stack
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-        if work_type.is_integer() {
-            self.emit("    mov QWORD PTR [rsp], rax");
-        } else if work_type == DataType::Single {
-            self.emit("    movss DWORD PTR [rsp], xmm0");
-        } else {
-            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        // A constant on the right needs no register of its own, and evaluating
+        // it cannot disturb the left operand, so the spill below is pure
+        // overhead for what is far and away the commonest shape in BASIC.
+        if self.gen_binary_const_rhs(op, left, right, work_type) {
+            self.expr_depth -= 1;
+            return result_type;
         }
 
-        // Evaluate right operand and coerce to work type
-        let right_type = self.gen_expr(right);
-        self.gen_coercion(right_type, work_type);
-
-        // Move right to secondary register/location and restore left
-        if work_type.is_integer() {
-            self.emit("    mov ecx, eax"); // right in ecx
-            self.emit("    mov rax, QWORD PTR [rsp]"); // left in rax
-        } else if work_type == DataType::Single {
-            self.emit("    movss xmm1, xmm0"); // right in xmm1
-            self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
-        } else {
-            self.emit("    movsd xmm1, xmm0"); // right in xmm1
-            self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
-        }
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_binary_operands(left, right, work_type);
 
         // Generate operation
         match op {
@@ -2808,6 +3910,338 @@ impl CodeGen {
 
         self.expr_depth -= 1;
         result_type
+    }
+
+    /// Branch to `target` on the truth of `cond`.
+    ///
+    /// A comparison already sets exactly the flags a conditional jump reads,
+    /// so when one is used *as* a condition -- which is nearly always -- there
+    /// is no reason to turn the flags into a -1/0 word only to test that word
+    /// against zero. This turns
+    ///
+    /// ```text
+    ///     ucomisd xmm0, xmm1 / setb al / movzx eax, al / neg eax
+    ///     test eax, eax / je .Lelse
+    /// ```
+    ///
+    /// into `ucomisd xmm0, xmm1 / jae .Lelse`.
+    ///
+    /// It has to be requested per site rather than done inside
+    /// `gen_binary_expr`, because a comparison is an ordinary Long-valued
+    /// expression everywhere else: `X = (A > B)` stores it, `PRINT (A > B)`
+    /// prints it, and `A > B AND C > D` needs both halves as -1/0 words,
+    /// since BASIC's AND is bitwise.
+    ///
+    /// Anything that is not a comparison falls back to evaluating the
+    /// condition as a value and testing it, exactly as before.
+    fn gen_condition(&mut self, cond: &Expr, target: &str, jump_if_true: bool) {
+        // Complement rather than negate the mnemonic by hand: jae is exactly
+        // not-jb, jle is not-jg, and so on, including for the unordered case
+        // that ucomisd signals through CF -- so inverting the operator and
+        // inverting the branch agree on NaN, as they must to preserve what the
+        // setcc form did.
+        let effective = |op: BinaryOp| -> BinaryOp {
+            if jump_if_true {
+                op
+            } else {
+                match op {
+                    BinaryOp::Eq => BinaryOp::Ne,
+                    BinaryOp::Ne => BinaryOp::Eq,
+                    BinaryOp::Lt => BinaryOp::Ge,
+                    BinaryOp::Ge => BinaryOp::Lt,
+                    BinaryOp::Gt => BinaryOp::Le,
+                    BinaryOp::Le => BinaryOp::Gt,
+                    other => other,
+                }
+            }
+        };
+
+        // Integers and memcmp results read signed; ucomis* reports through CF
+        // and ZF, so a float comparison reads unsigned.
+        let jcc = |op: BinaryOp, signed: bool| -> &'static str {
+            match (op, signed) {
+                (BinaryOp::Eq, _) => "je",
+                (BinaryOp::Ne, _) => "jne",
+                (BinaryOp::Lt, true) => "jl",
+                (BinaryOp::Lt, false) => "jb",
+                (BinaryOp::Gt, true) => "jg",
+                (BinaryOp::Gt, false) => "ja",
+                (BinaryOp::Le, true) => "jle",
+                (BinaryOp::Le, false) => "jbe",
+                (BinaryOp::Ge, true) => "jge",
+                (BinaryOp::Ge, false) => "jae",
+                _ => unreachable!("guarded by is_comparison"),
+            }
+        };
+
+        if let Expr::Binary { op, left, right } = cond {
+            if Self::is_comparison(*op) {
+                let left_type = self.expr_type(left);
+                let right_type = self.expr_type(right);
+
+                if left_type == DataType::String && right_type == DataType::String {
+                    self.gen_string_compare(left, right);
+                    self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                    return;
+                }
+
+                if left_type != DataType::String && right_type != DataType::String {
+                    let work_type = self.promote_types(left_type, right_type, BinaryOp::Add);
+                    let signed = work_type.is_integer();
+
+                    // Same constant-operand shortcut the value form takes.
+                    if signed {
+                        if let Some(n) = self.const_i32(right) {
+                            let ty = self.gen_expr(left);
+                            self.gen_coercion(ty, work_type);
+                            self.emit(&format!("    cmp eax, {}", n));
+                            self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                            return;
+                        }
+                    } else if work_type == DataType::Double {
+                        if let Some(value) = self.const_double(right) {
+                            self.gen_expr_to_double(left);
+                            let operand = self.f64_operand(value);
+                            self.emit(&format!("    ucomisd xmm0, {}", operand));
+                            self.emit(&format!("    {} {}", jcc(effective(*op), false), target));
+                            return;
+                        }
+                    }
+
+                    self.gen_binary_operands(left, right, work_type);
+                    self.emit_typed(
+                        work_type,
+                        "    cmp eax, ecx",
+                        "    ucomiss xmm0, xmm1",
+                        "    ucomisd xmm0, xmm1",
+                    );
+                    self.emit(&format!("    {} {}", jcc(effective(*op), signed), target));
+                    return;
+                }
+            }
+        }
+
+        // Not a comparison: evaluate it as a value and test that.
+        let cond_type = self.gen_expr(cond);
+        if cond_type.is_integer() {
+            self.emit("    test eax, eax");
+        } else {
+            self.emit("    xorpd xmm1, xmm1");
+            self.emit("    ucomisd xmm0, xmm1");
+        }
+        self.emit(&format!(
+            "    {} {}",
+            if jump_if_true { "jne" } else { "je" },
+            target
+        ));
+    }
+
+    /// Compare two strings, leaving memcmp-style flags set.
+    ///
+    /// `_rt_strcmp` returns a negative, zero or positive int in eax like
+    /// memcmp, and the `test` at the end sets the flags a *signed* condition
+    /// reads -- so both the value form and the branch form below can just pick
+    /// a mnemonic.
+    fn gen_string_compare(&mut self, left: &Expr, right: &Expr) {
+        // Evaluate left string (ptr in rax, len in rdx)
+        self.gen_expr(left);
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
+        self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
+
+        // Evaluate right string (ptr in rax, len in rdx)
+        self.gen_expr(right);
+        self.emit("    mov r8, rax"); // right ptr
+        self.emit("    mov r9, rdx"); // right len
+        self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
+        self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.emit_arg_reg(0, "rax");
+        self.emit_arg_reg(1, "rdx");
+        self.emit_arg_reg(2, "r8");
+        self.emit_arg_reg(3, "r9");
+        self.emit("    call _rt_strcmp");
+        self.emit("    test eax, eax");
+    }
+
+    /// Evaluate both operands of a numeric binary operator into the registers
+    /// the operator instruction expects: left in eax/xmm0, right in ecx/xmm1.
+    ///
+    /// The left operand is parked on the stack while the right is evaluated,
+    /// because evaluating the right can call a function and clobber every
+    /// scratch register. Sixteen bytes rather than eight so that such a call
+    /// still finds rsp aligned.
+    fn gen_binary_operands(&mut self, left: &Expr, right: &Expr, work_type: DataType) {
+        let left_type = self.gen_expr(left);
+        self.gen_coercion(left_type, work_type);
+
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if work_type.is_integer() {
+            self.emit("    mov QWORD PTR [rsp], rax");
+        } else if work_type == DataType::Single {
+            self.emit("    movss DWORD PTR [rsp], xmm0");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        let right_type = self.gen_expr(right);
+        self.gen_coercion(right_type, work_type);
+
+        // Move right to secondary register/location and restore left
+        if work_type.is_integer() {
+            self.emit("    mov ecx, eax"); // right in ecx
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left in rax
+        } else if work_type == DataType::Single {
+            self.emit("    movss xmm1, xmm0"); // right in xmm1
+            self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
+        } else {
+            self.emit("    movsd xmm1, xmm0"); // right in xmm1
+            self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
+        }
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+    }
+
+    /// Apply `op` with a compile-time constant on the right, or report that it
+    /// could not be done and leave nothing emitted.
+    ///
+    /// The general path spills the left operand to the stack while the right
+    /// one is evaluated, because evaluating the right operand can call a
+    /// function and clobber every scratch register. A constant cannot: it has
+    /// no side effects, needs no registers, and every instruction here takes
+    /// it as an immediate or straight out of the constant pool. That removes
+    /// four instructions and a store-to-load round trip from what is the
+    /// commonest shape in BASIC arithmetic.
+    ///
+    /// `Single` is left to the general path -- it would want a pool of its own
+    /// and there is very little SINGLE arithmetic to reward one.
+    fn gen_binary_const_rhs(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        work_type: DataType,
+    ) -> bool {
+        // (signed, unsigned): integers compare signed, but ucomisd reports
+        // through CF and ZF, so a float comparison reads as unsigned.
+        let setcc = |op: BinaryOp, signed: bool| -> &'static str {
+            match (op, signed) {
+                (BinaryOp::Eq, _) => "sete",
+                (BinaryOp::Ne, _) => "setne",
+                (BinaryOp::Lt, true) => "setl",
+                (BinaryOp::Lt, false) => "setb",
+                (BinaryOp::Gt, true) => "setg",
+                (BinaryOp::Gt, false) => "seta",
+                (BinaryOp::Le, true) => "setle",
+                (BinaryOp::Le, false) => "setbe",
+                (BinaryOp::Ge, true) => "setge",
+                (BinaryOp::Ge, false) => "setae",
+                _ => unreachable!("guarded by is_comparison"),
+            }
+        };
+
+        match work_type {
+            DataType::Integer | DataType::Long => {
+                let Some(n) = self.const_i32(right) else {
+                    return false;
+                };
+                // Div and Pow always promote to Double, so they never reach
+                // the integer arm; anything else unexpected declines.
+                let arith = match op {
+                    BinaryOp::Add => Some("add"),
+                    BinaryOp::Sub => Some("sub"),
+                    BinaryOp::Mul => Some("imul"),
+                    BinaryOp::And => Some("and"),
+                    BinaryOp::Or => Some("or"),
+                    BinaryOp::Xor => Some("xor"),
+                    _ => None,
+                };
+                if arith.is_none()
+                    && !Self::is_comparison(op)
+                    && !matches!(op, BinaryOp::IntDiv | BinaryOp::Mod)
+                {
+                    return false;
+                }
+
+                let left_type = self.gen_expr(left);
+                self.gen_coercion(left_type, work_type);
+
+                if let Some(instr) = arith {
+                    self.emit(&format!("    {} eax, {}", instr, n));
+                } else if Self::is_comparison(op) {
+                    self.emit(&format!("    cmp eax, {}", n));
+                    self.emit(&format!("    {} al", setcc(op, true)));
+                    self.emit("    movzx eax, al");
+                    self.emit("    neg eax"); // BASIC true is -1
+                } else {
+                    // idiv has no immediate form, so the divisor still has to
+                    // reach ecx -- but it gets there without the spill, and
+                    // the existing checks apply to it unchanged.
+                    self.emit(&format!("    mov ecx, {}", n));
+                    self.emit_integer_divide_checks();
+                    self.emit("    cdq");
+                    self.emit("    idiv ecx");
+                    if op == BinaryOp::Mod {
+                        self.emit("    mov eax, edx");
+                    }
+                }
+                true
+            }
+
+            DataType::Double => {
+                let Some(value) = self.const_double(right) else {
+                    return false;
+                };
+                // IntDiv and Mod promote to Long, so they are handled above
+                // and never arrive here; decline rather than assume it.
+                if matches!(op, BinaryOp::IntDiv | BinaryOp::Mod) {
+                    return false;
+                }
+                self.gen_expr_to_double(left);
+                let operand = self.f64_operand(value);
+
+                match op {
+                    BinaryOp::Add => self.emit(&format!("    addsd xmm0, {}", operand)),
+                    BinaryOp::Sub => self.emit(&format!("    subsd xmm0, {}", operand)),
+                    BinaryOp::Mul => self.emit(&format!("    mulsd xmm0, {}", operand)),
+                    BinaryOp::Div => {
+                        // The divisor is known here, so the check is decided
+                        // here too rather than being re-tested at run time.
+                        // `value == 0.0` is true of -0.0 as well, which is
+                        // exactly the set the runtime test catches.
+                        if value == 0.0 {
+                            self.emit_check("jmp", RtError::DivideByZero);
+                        }
+                        self.emit(&format!("    divsd xmm0, {}", operand));
+                    }
+                    BinaryOp::Pow => {
+                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        self.emit_call_libc("pow");
+                    }
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                        // Truncation to integer is left to the same conversion
+                        // the general path uses, so an out-of-range constant
+                        // behaves identically to one held in a register.
+                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        self.emit_cvt_float_to_int(work_type);
+                        let instr = match op {
+                            BinaryOp::And => "and",
+                            BinaryOp::Or => "or",
+                            _ => "xor",
+                        };
+                        self.emit(&format!("    {} eax, ecx", instr));
+                    }
+                    _ => {
+                        self.emit(&format!("    ucomisd xmm0, {}", operand));
+                        self.emit(&format!("    {} al", setcc(op, false)));
+                        self.emit("    movzx eax, al");
+                        self.emit("    neg eax");
+                    }
+                }
+                true
+            }
+
+            _ => false,
+        }
     }
 
     /// Evaluate a file-number expression ahead of a runtime call.
@@ -2968,7 +4402,9 @@ impl CodeGen {
                 self.emit("    movsxd rax, eax");
             }
             // No length given: replace as much as the value provides.
-            None => self.emit("    mov rax, 0x7FFFFFFF"),
+            // `mov eax` zeroes the upper half, so this is the same positive
+            // value in rax, in five bytes rather than seven.
+            None => self.emit("    mov eax, 0x7FFFFFFF"),
         }
         self.emit("    mov QWORD PTR [rsp + 24], rax");
 
@@ -3076,6 +4512,62 @@ impl CodeGen {
     /// String assignment copies, so that mutating one variable is not visible
     /// through another, and so that a string constant's shared `.data` literal
     /// can never be written through.
+    /// Whether evaluating `expr` leaves a string in memory nothing else holds.
+    ///
+    /// Assignment copies a string because most expressions hand back a pointer
+    /// into something that outlives the statement: a variable's own buffer,
+    /// a slice of one -- `LEFT$`, `MID$`, `LTRIM$` all just narrow (ptr, len)
+    /// -- or a `FIELD` window into a file's record buffer. Without the copy
+    /// two variables would share bytes and `MID$(a$, ...) =` would edit both.
+    ///
+    /// These, though, have already allocated. Copying one is a second malloc
+    /// and a second memcpy of bytes no one else can reach, and it leaks the
+    /// first block, since nothing in this runtime frees. `S$ = S$ + "ab"` paid
+    /// for two of everything.
+    ///
+    /// Kept as a list of names rather than a property of the call, because it
+    /// is a fact about each helper's implementation: `_rt_strcat`, `_rt_space`,
+    /// `_rt_string_n` and `_rt_case_convert` call malloc, and `_rt_str`,
+    /// `_rt_chr`, `_rt_hex`, `_rt_oct` and `_rt_mk` end in `_rt_strdup`. A
+    /// helper that stops allocating has to come off this list.
+    fn expr_owns_its_string(&self, expr: &Expr) -> bool {
+        match expr {
+            // Concatenation. Guarded on the type, since `+` is also numeric.
+            Expr::Binary {
+                op: BinaryOp::Add, ..
+            } => self.expr_type(expr) == DataType::String,
+            Expr::FnCall { name, .. } => {
+                let upper = name.to_uppercase();
+                // A user procedure may not shadow one of these, but checking
+                // costs nothing and the answer would be wrong if it could.
+                !self.symbols.procs.contains_key(&upper)
+                    && matches!(
+                        upper.as_str(),
+                        "STR$"
+                            | "CHR$"
+                            | "HEX$"
+                            | "OCT$"
+                            | "SPACE$"
+                            | "STRING$"
+                            | "UCASE$"
+                            | "LCASE$"
+                            | "MKI$"
+                            | "MKL$"
+                            | "MKS$"
+                            | "MKD$"
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Copy a string unless `value` has already allocated one of its own.
+    fn emit_string_copy_of(&mut self, value: &Expr) {
+        if !self.expr_owns_its_string(value) {
+            self.emit_string_copy();
+        }
+    }
+
     fn emit_string_copy(&mut self) {
         self.emit("    mov r10, rax");
         self.emit("    mov r11, rdx");
@@ -3286,7 +4778,7 @@ impl CodeGen {
                 // the address clobbers the value registers.
                 let vt = self.gen_expr(v);
                 if DataType::from_type_ref(&ty) == DataType::String {
-                    self.emit_string_copy();
+                    self.emit_string_copy_of(v);
                     self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
                     self.emit("    mov QWORD PTR [rsp], rax");
                     self.emit("    mov QWORD PTR [rsp + 8], rdx");
@@ -3674,8 +5166,7 @@ impl CodeGen {
                         }
                         let value = values[next];
                         next += 1;
-                        let ty = self.gen_expr(value);
-                        self.gen_coercion(ty, DataType::Double);
+                        self.gen_expr_to_double(value);
                         self.emit_arg_imm(0, *width as i64);
                         self.emit_arg_imm(1, *decimals as i64);
                         self.emit_arg_imm(2, *flags);
@@ -3735,8 +5226,7 @@ impl CodeGen {
         let sel = format!("QWORD PTR [rbp + {}]", temp_offset);
         match clause {
             CaseClause::Value(e) => {
-                let t = self.gen_expr(e);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(e);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    je {}", body_label));
@@ -3745,21 +5235,18 @@ impl CodeGen {
                 // Inclusive at both ends. The low bound is tested first, and a
                 // failure skips the high test.
                 let skip = self.new_label("caseskip");
-                let t = self.gen_expr(lo);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(lo);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    jb {}", skip));
-                let t = self.gen_expr(hi);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(hi);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    jbe {}", body_label));
                 self.emit_label(&skip);
             }
             CaseClause::Compare(op, e) => {
-                let t = self.gen_expr(e);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(e);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 // Unsigned conditions, since ucomisd sets the carry flag.
@@ -3873,8 +5360,8 @@ impl CodeGen {
             // A Single is printed via its own helper, which round-trips
             // against 32-bit precision: widening 3.14159! to a double and
             // printing every digit that survives would show 3.141590118408203.
-            let expr_type = self.gen_expr(expr);
-            self.gen_coercion(expr_type, DataType::Double);
+            let expr_type = self.expr_type(expr);
+            self.gen_expr_to_double(expr);
             self.emit_arg_file_num(0, sink);
             if expr_type == DataType::Single {
                 self.emit("    call _rt_file_print_single");
@@ -3904,8 +5391,7 @@ impl CodeGen {
 
         // Table-driven: libc math functions (SIN, COS, TAN, ATN, EXP, LOG)
         if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
-            let arg_type = self.gen_expr(&args[0]);
-            self.gen_coercion(arg_type, DataType::Double);
+            self.gen_expr_to_double(&args[0]);
             // LOG is undefined at and below zero; libc would quietly return
             // -inf or NaN.
             if upper_name == "LOG" {
@@ -3917,8 +5403,7 @@ impl CodeGen {
 
         // Table-driven: inline math functions (SQR, INT, FIX)
         if let Some(instr) = INLINE_MATH_FNS.get(upper_name.as_str()) {
-            let arg_type = self.gen_expr(&args[0]);
-            self.gen_coercion(arg_type, DataType::Double);
+            self.gen_expr_to_double(&args[0]);
             // sqrtsd of a negative operand yields NaN, which then printed as a
             // huge meaningless integer.
             if upper_name == "SQR" {
@@ -3959,18 +5444,20 @@ impl CodeGen {
         // Complex built-in functions
         match upper_name.as_str() {
             "ABS" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
-                self.emit("    movq xmm1, rax");
+                let arg_type = self.expr_type(&args[0]);
+                self.gen_expr_to_double(&args[0]);
+                // Everything-but-the-sign-bit, from the pool rather than a
+                // 64-bit immediate, and via a register because the memory form
+                // of andpd wants sixteen aligned bytes. See UnaryOp::Neg.
+                let mask = self.f64_operand(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
+                self.emit(&format!("    movsd xmm1, {}", mask));
                 self.emit("    andpd xmm0, xmm1");
                 // ABS preserves its argument's type: narrow back so the value
                 // matches what call_return_type promises.
                 self.gen_coercion(DataType::Double, Self::abs_result_type(arg_type));
             }
             "SGN" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(&args[0]);
                 self.emit("    xorpd xmm1, xmm1");
                 self.emit("    ucomisd xmm0, xmm1");
                 self.emit("    seta al");
@@ -3982,8 +5469,7 @@ impl CodeGen {
             }
             "RND" => {
                 if !args.is_empty() {
-                    let arg_type = self.gen_expr(&args[0]);
-                    self.gen_coercion(arg_type, DataType::Double);
+                    self.gen_expr_to_double(&args[0]);
                 }
                 self.emit("    call _rt_rnd");
             }
@@ -4087,7 +5573,7 @@ impl CodeGen {
                         self.emit("    cvttsd2si rbx, xmm0");
                     }
                 } else {
-                    self.emit("    mov rbx, 1");
+                    self.emit("    mov ebx, 1");
                 }
 
                 // Evaluate haystack and save
@@ -4227,8 +5713,7 @@ impl CodeGen {
                 // SINGLE already widens it to a double, so asking afterwards
                 // would never see one.
                 let single = self.expr_type(&args[0]) == DataType::Single;
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(&args[0]);
                 if single {
                     self.emit("    call _rt_str_single");
                 } else {
@@ -4359,8 +5844,8 @@ impl CodeGen {
                     continue;
                 }
             }
-            let arg_type = self.gen_expr(arg);
             if *ty == DataType::String {
+                self.gen_expr(arg);
                 self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
                 self.emit(&format!("    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8));
                 temp_of.push(w * 8);
@@ -4368,7 +5853,7 @@ impl CodeGen {
             } else {
                 // Numeric arguments travel as f64 bit patterns in integer
                 // slots; the callee narrows to the declared type.
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(arg);
                 self.emit(&format!("    movsd QWORD PTR [rsp + {}], xmm0", w * 8));
                 temp_of.push(w * 8);
                 w += 1;
@@ -4582,7 +6067,23 @@ impl CodeGen {
     ///
     /// Shared by loads and stores so the index arithmetic -- and the bounds
     /// checks guarding it -- exist in exactly one place.
-    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
+    /// Element sizes x86-64 can scale an index by in an addressing mode.
+    ///
+    /// Which is every scalar element type -- INTEGER 2, LONG and SINGLE 4,
+    /// DOUBLE 8. A string element is sixteen bytes and a record element is
+    /// eight times its word count, and neither is a legal scale, so those keep
+    /// the multiply.
+    fn is_sib_scale(elem_size: i32) -> bool {
+        matches!(elem_size, 1 | 2 | 4 | 8)
+    }
+
+    /// Compute an array element's linear index into `rax`, bounds-checked.
+    ///
+    /// Stops one step short of the address, returning the descriptor and the
+    /// element size so the caller can choose between building a flat pointer
+    /// and folding the scale into whatever addressing mode it was going to
+    /// use anyway.
+    fn gen_array_index(&mut self, name: &str, indices: &[Expr]) -> (Loc, i32) {
         // Descriptors for every declared array are reserved before any code is
         // emitted, and sema has already rejected undeclared ones, so this
         // cannot fail for a program that reached code generation.
@@ -4596,8 +6097,12 @@ impl CodeGen {
         // pointer is null until the DIM executes. Catching that is what turns
         // "used before DIM at run time" into a diagnosable abort rather than a
         // null dereference.
+        //
+        // Kept per access rather than hoisted with the pointer: a loop whose
+        // body never runs must not report an array it never touched.
         if self.opts.checks {
-            self.emit(&format!("    cmp {}, 0", loc.q(0)));
+            let base = self.array_base_operand(name, &loc);
+            self.emit(&format!("    cmp {}, 0", base));
             self.emit_check("je", RtError::Undim);
         }
 
@@ -4615,7 +6120,8 @@ impl CodeGen {
         // end, since a negative value wraps to a huge unsigned one. The stored
         // bound is already the element count (declared bound + 1).
         if self.opts.checks {
-            self.emit(&format!("    cmp rax, {}", loc.q(1)));
+            let bound = self.array_bound_operand(name, &loc, 0);
+            self.emit(&format!("    cmp rax, {}", bound));
             self.emit_check("jae", RtError::Subscript);
             self.emit_lower_bound_check("rax");
         }
@@ -4632,28 +6138,65 @@ impl CodeGen {
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
+            let bound = self.array_bound_operand(name, &loc, i);
             if self.opts.checks {
-                self.emit(&format!("    cmp rcx, {}", loc.q(1 + i as i32)));
+                self.emit(&format!("    cmp rcx, {}", bound));
                 self.emit_check("jae", RtError::Subscript);
                 self.emit_lower_bound_check("rcx");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
-            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+            self.emit(&format!("    imul rax, {}", bound));
             self.emit("    add rax, rcx");
         }
 
-        // Multiply by element size and add to base pointer
-        self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, {}", loc.q(0)));
+        (loc, elem_size)
+    }
+
+    /// The address of an array element, in `rax`.
+    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
+        let (loc, elem_size) = self.gen_array_index(name, indices);
+
+        // `lea` with a scaled index does the multiply and the add at once, and
+        // does the multiply as part of the address rather than as a `imul`.
+        // The base is loaded here rather than earlier because evaluating an
+        // index runs arbitrary code, which is free to clobber r10.
+        if Self::is_sib_scale(elem_size) {
+            let base = self.array_base_into_register(name, &loc);
+            self.emit(&format!("    lea rax, [{} + rax*{}]", base, elem_size));
+        } else {
+            self.emit(&format!("    imul rax, {}", elem_size));
+            let base = self.array_base_operand(name, &loc);
+            self.emit(&format!("    add rax, {}", base));
+        }
     }
 
     fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
-        self.gen_array_addr(name, indices);
+        let elem_type = DataType::from_suffix(name);
+        let (loc, elem_size) = self.gen_array_index(name, indices);
 
-        // Load value from computed address
-        match DataType::from_suffix(name) {
+        // A scalar element needs no address of its own: the same scaled index
+        // that would have gone into a `lea` goes into the load instead, so the
+        // read costs one instruction rather than three.
+        if Self::is_sib_scale(elem_size) && elem_type != DataType::String {
+            let base = self.array_base_into_register(name, &loc);
+            let at = format!("[{} + rax*{}]", base, elem_size);
+            match elem_type {
+                DataType::Integer => self.emit(&format!("    movsx eax, WORD PTR {}", at)),
+                DataType::Long => self.emit(&format!("    mov eax, DWORD PTR {}", at)),
+                DataType::Single => self.emit(&format!("    movss xmm0, DWORD PTR {}", at)),
+                DataType::Double => self.emit(&format!("    movsd xmm0, QWORD PTR {}", at)),
+                DataType::String => unreachable!("excluded above"),
+            }
+            return;
+        }
+
+        // Otherwise build the address and read through it.
+        self.emit(&format!("    imul rax, {}", elem_size));
+        let base = self.array_base_operand(name, &loc);
+        self.emit(&format!("    add rax, {}", base));
+        match elem_type {
             DataType::String => {
                 self.emit("    mov rcx, rax");
                 self.emit("    mov rax, QWORD PTR [rcx]");
@@ -4675,7 +6218,7 @@ impl CodeGen {
 
         let val_type = self.gen_expr(value);
         if val_type == DataType::String {
-            self.emit_string_copy();
+            self.emit_string_copy_of(value);
         }
 
         self.emit("    mov rcx, QWORD PTR [rsp]");
@@ -4701,7 +6244,7 @@ impl CodeGen {
 
     fn gen_string_assign(&mut self, name: &str, value: &Expr) {
         self.gen_expr(value);
-        self.emit_string_copy();
+        self.emit_string_copy_of(value);
         // Both words were reserved when the variable was first seen, so this no
         // longer has to scavenge a slot per assignment.
         let loc = self.get_var_loc(name);
@@ -4743,6 +6286,23 @@ impl CodeGen {
             // to everything that uses the (ptr, len) representation.
             self.output
                 .push_str(&format!("    .asciz \"{}\"\n", escaped));
+        }
+
+        // Double constant pool. Emitted after the strings, which are packed
+        // bytes with no alignment of their own, so it states its own; the
+        // DATA table below is protected by the `.p2align 3` already there.
+        //
+        // `.data` rather than a read-only section: nothing here is ever
+        // written, but `emit_data_section` has no `.section` machinery and the
+        // second assembler this has to please is clang targeting COFF. The
+        // size saved is the same either way.
+        if !self.f64_pool.is_empty() {
+            self.output.push_str(".p2align 3\n");
+            let pool = std::mem::take(&mut self.f64_pool);
+            for (i, bits) in pool.iter().enumerate() {
+                self.output
+                    .push_str(&format!("_f64_{}: .quad 0x{:016X}\n", i, bits));
+            }
         }
 
         // DATA table - always define it (even if empty) to avoid linker errors

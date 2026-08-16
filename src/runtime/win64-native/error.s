@@ -17,10 +17,8 @@
 .equ STD_ERROR_HANDLE, -12
 
 .data
-_err_buf: .skip 128
 _err_fmt_line: .asciz "?%s in %lld\r\n"
 _err_fmt_bare: .asciz "?%s\r\n"
-_err_bytes_written: .quad 0
 
 _err_subscript: .asciz "Subscript out of range"
 _err_div0:      .asciz "Division by zero"
@@ -33,6 +31,13 @@ _err_badfile:   .asciz "Bad file number"
 _err_badmode:   .asciz "Bad file mode"
 _err_fieldovf:  .asciz "FIELD overflow"
 _err_permission: .asciz "Permission denied"
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows.
+.bss
+.p2align 3
+_err_buf: .skip 128
+_err_bytes_written: .skip 8
 
 .text
 

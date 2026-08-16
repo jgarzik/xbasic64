@@ -33,17 +33,10 @@
 
 # Data Section: File handle table and buffers
 .data
-# File handle table: FILE* pointers indexed by BASIC file number (1-15)
-# Index 0 unused, indices 1-15 for BASIC files #1-#15
-_file_handles: .skip 128        # 16 * 8 bytes = 16 FILE* pointers
-
 # Mode strings for fopen()
 _mode_read:   .asciz "r"        # FOR INPUT
 _mode_write:  .asciz "w"        # FOR OUTPUT
 _mode_append: .asciz "a"        # FOR APPEND
-
-# Temp buffer for null-terminated filename (BASIC strings aren't null-terminated)
-_file_name_buf: .skip 1024
 
 # Format strings for fprintf/fscanf (same as console I/O)
 _file_fmt_str:     .asciz "%.*s"    # String with precision (ptr, len)
@@ -55,6 +48,21 @@ _file_fmt_input:   .asciz "%lf"     # Read double
 
 # Longest INPUT # field kept, leaving room for the NUL in _file_input_buf.
 .equ MAX_FIELD_LEN, 1023
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows; a .bss left
+# open at the end of this file would swallow the next runtime part.
+.bss
+# The handle table is indexed as quadwords (`[rcx + rbx*8]`), so it needs
+# stated alignment: in .data it inherited whatever offset the preceding
+# strings happened to leave, which is not something to rely on.
+.p2align 3
+# File handle table: FILE* pointers indexed by BASIC file number (1-15)
+# Index 0 unused, indices 1-15 for BASIC files #1-#15
+_file_handles: .skip 128        # 16 * 8 bytes = 16 FILE* pointers
+
+# Temp buffer for null-terminated filename (BASIC strings aren't null-terminated)
+_file_name_buf: .skip 1024
 
 # Buffer for string input from files
 _file_input_buf: .skip 1024
@@ -772,21 +780,26 @@ _rt_file_eof:
 # Strings are never freed in this runtime, so a variable outliving its file is
 # a dangling read at worst, never a double free.
 .data
+_mode_update: .asciz "r+b"      # open an existing file for reading and writing
+_mode_create: .asciz "w+b"      # ... or create it when it does not exist
+
+# Largest record GW-BASIC allows.
+.equ MAX_RECLEN, 32767
+
+.bss
+# All four tables are indexed as quadwords, and each is a multiple of 8, so
+# aligning the first aligns them all.
 .p2align 3
 _file_recbuf:   .skip 128       # record buffer per file number (malloc'd)
 _file_reclen:   .skip 128       # record length per file number
 _file_recnum:   .skip 128       # last record read or written, 1-based; 0 = none
 _file_fieldoff: .skip 128       # bytes of the buffer FIELD has assigned so far
 
-_mode_update: .asciz "r+b"      # open an existing file for reading and writing
-_mode_create: .asciz "w+b"      # ... or create it when it does not exist
-
 # MKI$/MKL$/MKS$/MKD$ assemble their bytes here, then return a heap copy; the
-# buffer itself is never handed out.
+# buffer itself is never handed out. Written a quadword at a time, so it is
+# aligned deliberately rather than by accident of what precedes it.
+.p2align 3
 _mk_buf: .skip 16
-
-# Largest record GW-BASIC allows.
-.equ MAX_RECLEN, 32767
 
 .text
 

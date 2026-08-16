@@ -1,1 +1,9 @@
 /target
+
+# Files the megatest writes beside itself. Running tests/megatest/mega.bas by
+# hand from the repository root leaves these behind; under `cargo test` it runs
+# in a temporary directory and they never appear. Three of them reached a
+# commit once.
+/seq.txt
+/byvar.txt
+/people.dat
