@@ -616,6 +616,96 @@ impl std::fmt::Display for LocatedParseError {
     }
 }
 
+/// How a token is written in BASIC source, for diagnostics.
+///
+/// Every fixed token has a spelling, so a diagnostic can quote what the
+/// programmer would have typed. Errors used to fall back to `{:?}` and show
+/// Rust variant names instead -- "Expected To, got Integer(2)" rather than
+/// "expected TO, got 2", and `EndSelect`, `LParen` and `Ne` at people who had
+/// written `END SELECT`, `(` and `<>`.
+fn token_spelling(tok: &Token) -> Option<&'static str> {
+    Some(match tok {
+        Token::Print => "PRINT",
+        Token::Input => "INPUT",
+        Token::Line => "LINE",
+        Token::Let => "LET",
+        Token::Dim => "DIM",
+        Token::If => "IF",
+        Token::Then => "THEN",
+        Token::Else => "ELSE",
+        Token::ElseIf => "ELSEIF",
+        Token::EndIf => "ENDIF",
+        Token::For => "FOR",
+        Token::To => "TO",
+        Token::Step => "STEP",
+        Token::Next => "NEXT",
+        Token::While => "WHILE",
+        Token::Wend => "WEND",
+        Token::Do => "DO",
+        Token::Loop => "LOOP",
+        Token::Until => "UNTIL",
+        Token::Goto => "GOTO",
+        Token::Gosub => "GOSUB",
+        Token::Return => "RETURN",
+        Token::On => "ON",
+        Token::Sub => "SUB",
+        Token::EndSub => "ENDSUB",
+        Token::Function => "FUNCTION",
+        Token::EndFunction => "ENDFUNCTION",
+        Token::Select => "SELECT",
+        Token::Case => "CASE",
+        Token::EndSelect => "ENDSELECT",
+        Token::End => "END",
+        Token::Stop => "STOP",
+        Token::Data => "DATA",
+        Token::Read => "READ",
+        Token::Restore => "RESTORE",
+        Token::Cls => "CLS",
+        Token::Open => "OPEN",
+        Token::Close => "CLOSE",
+        Token::As => "AS",
+        Token::Output => "OUTPUT",
+        Token::Append => "APPEND",
+        Token::And => "AND",
+        Token::Or => "OR",
+        Token::Not => "NOT",
+        Token::Xor => "XOR",
+        Token::Mod => "MOD",
+        Token::Using => "USING",
+        Token::Swap => "SWAP",
+        Token::Const => "CONST",
+        Token::Write => "WRITE",
+        Token::Exit => "EXIT",
+        Token::Def => "DEF",
+        Token::Option => "OPTION",
+        Token::Base => "BASE",
+        Token::Redim => "REDIM",
+        Token::Preserve => "PRESERVE",
+        Token::Type => "TYPE",
+        Token::EndType => "ENDTYPE",
+        Token::Plus => "+",
+        Token::Minus => "-",
+        Token::Star => "*",
+        Token::Slash => "/",
+        Token::Backslash => "\\",
+        Token::Caret => "^",
+        Token::Eq => "=",
+        Token::Ne => "<>",
+        Token::Lt => "<",
+        Token::Gt => ">",
+        Token::Le => "<=",
+        Token::Ge => ">=",
+        Token::LParen => "(",
+        Token::RParen => ")",
+        Token::Comma => ",",
+        Token::Semicolon => ";",
+        Token::Colon => ":",
+        Token::Hash => "#",
+        Token::Dot => ".",
+        _ => return None,
+    })
+}
+
 /// Human-readable name for a token, for diagnostics.
 fn describe_token(tok: &Token) -> String {
     match tok {
@@ -625,7 +715,10 @@ fn describe_token(tok: &Token) -> String {
         Token::String(s) => format!("string \"{}\"", s),
         Token::Newline => "end of line".to_string(),
         Token::Eof => "end of file".to_string(),
-        other => format!("{:?}", other),
+        Token::LineNumber(n) => format!("line number {}", n),
+        other => token_spelling(other)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:?}", other)),
     }
 }
 
@@ -755,12 +848,21 @@ impl Parser {
         tok
     }
 
+    /// Consume the next token, which must be `expected`.
+    ///
+    /// Matching is by variant, so a payload would be ignored -- every caller
+    /// passes a payload-free token, and `token_spelling` returning `Some` for
+    /// exactly those is what keeps that honest: a payload-carrying token has no
+    /// fixed spelling to name in the diagnostic, and is refused here.
     fn expect(&mut self, expected: Token) -> PResult<()> {
+        let Some(wanted) = token_spelling(&expected) else {
+            unreachable!("expect takes a token with a fixed spelling")
+        };
         let tok = self.advance();
         if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) {
             Ok(())
         } else {
-            err(format!("Expected {:?}, got {:?}", expected, tok))
+            err(format!("expected {}, got {}", wanted, describe_token(&tok)))
         }
     }
 
@@ -992,7 +1094,10 @@ impl Parser {
             }
             // Newline and Colon are consumed by the skip loop above, so
             // reaching here means the statement itself is unrecognised.
-            _ => err(format!("Unexpected token: {:?}", self.peek())),
+            _ => err(format!(
+                "unexpected {} at the start of a statement",
+                describe_token(self.peek())
+            )),
         }?;
         Ok(Parsed::Item(kind))
     }
@@ -1875,7 +1980,10 @@ impl Parser {
             Token::Integer(n) => Ok(GotoTarget::Line(n as u32)),
             Token::LineNumber(n) => Ok(GotoTarget::Line(n)),
             Token::Ident(name) => Ok(GotoTarget::Label(name)),
-            tok => err(format!("Expected line number or label, got {:?}", tok)),
+            tok => err(format!(
+                "expected a line number or label, got {}",
+                describe_token(&tok)
+            )),
         }
     }
 
@@ -2270,9 +2378,10 @@ impl Parser {
                 FileMode::Random
             }
             tok => {
+                let tok = tok.clone();
                 return err(format!(
-                    "Expected INPUT, OUTPUT, APPEND or RANDOM, got {:?}",
-                    tok
+                    "expected INPUT, OUTPUT, APPEND or RANDOM, got {}",
+                    describe_token(&tok)
                 ));
             }
         };
@@ -2538,7 +2647,10 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
-            tok => err(format!("Unexpected token in expression: {:?}", tok)),
+            tok => err(format!(
+                "unexpected {} in an expression",
+                describe_token(&tok)
+            )),
         }
     }
 

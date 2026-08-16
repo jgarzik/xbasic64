@@ -933,6 +933,65 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// Diagnostics quote BASIC, not Rust.
+///
+/// Errors fell back to `{:?}` on the token, so they showed the lexer's variant
+/// names: "Expected To, got Integer(2)" for a missing TO, and `EndSelect`,
+/// `LParen` and `Ne` at programmers who had written `END SELECT`, `(` and `<>`.
+/// Every fixed token now carries the spelling it was written with.
+#[test]
+fn test_diagnostics_quote_source_spelling() {
+    let cases = [
+        ("FOR I = 1 2 3\nNEXT\n", "expected TO, got 2"),
+        ("IF THEN\n", "unexpected THEN in an expression"),
+        ("GOTO +\n", "expected a line number or label, got +"),
+        ("X = )\n", "unexpected ) in an expression"),
+        (
+            "OPEN \"f\" FOR BOGUS AS #1\n",
+            "expected INPUT, OUTPUT, APPEND or RANDOM, got identifier 'BOGUS'",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+    }
+}
+
+/// No diagnostic may leak a Rust variant name.
+///
+/// A cheap guard over the whole set: these are the spellings `{:?}` produced,
+/// and none of them is a thing anyone can type in BASIC.
+#[test]
+fn test_diagnostics_never_show_rust_variant_names() {
+    let sources = [
+        "FOR I = 1 2 3\nNEXT\n",
+        "X = )\n",
+        "IF THEN\n",
+        "GOTO +\n",
+        "X = 1 <> \n",
+        "SELECT CASE\n",
+    ];
+    for source in sources {
+        let Err(e) = compile_only(source) else {
+            continue;
+        };
+        for leaked in [
+            "EndSelect",
+            "LParen",
+            "RParen",
+            "Integer(",
+            "Ident(",
+            "Newline",
+            "ElseIf",
+        ] {
+            assert!(
+                !e.stderr.contains(leaked),
+                "{source:?} leaked the Rust name {leaked:?}: {}",
+                e.stderr
+            );
+        }
+    }
+}
+
 /// An unclosed block names the construct and the line that opened it.
 ///
 /// None of the seven hand-written body loops checked for end of file. They
