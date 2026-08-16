@@ -709,6 +709,22 @@ impl Analyzer {
                         let key = (scope.clone(), decl.name.to_uppercase());
 
                         if let Some(ty) = &decl.ty {
+                            // A declared type and a type suffix must agree, or
+                            // there is no telling which the program meant. The
+                            // same check has always guarded a FUNCTION's result
+                            // type; DIM accepted the contradiction silently.
+                            if decl.name.ends_with(|c| "%&!#$".contains(c))
+                                && !matches!(ty, TypeRef::Record(_))
+                                && DataType::from_type_ref(ty) != DataType::from_suffix(&decl.name)
+                            {
+                                self.error(
+                                    stmt.line,
+                                    format!(
+                                        "'{}' is declared AS a different type than its name's suffix",
+                                        decl.name
+                                    ),
+                                );
+                            }
                             if let TypeRef::Record(r) = ty {
                                 if !self.symbols.records.contains_key(normalized(r)) {
                                     self.error(stmt.line, format!("undefined TYPE '{}'", r));

@@ -1534,3 +1534,64 @@ PRINT 0 ^ 0
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, &["-8", "4", "2", "0.25", "1"]);
 }
+
+/// CHR$, SPACE$ and STRING$ refuse counts and codes they cannot represent.
+///
+/// CHR$ kept only the low byte, so CHR$(256) was CHR$(0) and CHR$(-1) was
+/// CHR$(255). SPACE$ and STRING$ clamped a negative count to zero and returned
+/// the empty string. GW-BASIC calls all four an illegal function call.
+#[test]
+fn test_character_and_count_arguments_are_range_checked() {
+    for (source, what) in [
+        ("PRINT CHR$(256)\n", "CHR$ above 255"),
+        ("PRINT CHR$(-1)\n", "CHR$ below 0"),
+        ("PRINT SPACE$(-1)\n", "SPACE$ negative"),
+        ("PRINT STRING$(-1, \"x\")\n", "STRING$ negative"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+    }
+}
+
+/// The whole legal range still works, both ends included.
+#[test]
+fn test_character_and_count_legal_arguments() {
+    let output = compile_and_run(
+        r#"
+PRINT ASC(CHR$(0))
+PRINT ASC(CHR$(255))
+PRINT ASC(CHR$(65))
+PRINT "["; SPACE$(0); "]"
+PRINT "["; SPACE$(3); "]"
+PRINT "["; STRING$(0, "x"); "]"
+PRINT "["; STRING$(3, "x"); "]"
+PRINT HEX$(255)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["0", "255", "65", "[]", "[   ]", "[]", "[xxx]", "FF"]
+    );
+}
+
+/// A `DIM ... AS` type must agree with any suffix on the name.
+///
+/// The identical check has always existed for a FUNCTION's declared result
+/// type, and LANGREF states the rule -- but DIM accepted the contradiction
+/// silently, leaving no way to tell which of the two the program meant.
+#[test]
+fn test_dim_suffix_must_agree_with_its_as_clause() {
+    expect_rejected("DIM X$ AS INTEGER\n", "different type");
+    expect_rejected("DIM X% AS DOUBLE\nX% = 1\n", "different type");
+    expect_rejected("DIM A%(3) AS STRING * 4\n", "different type");
+    // Agreeing, and unsuffixed, are both fine.
+    compile_only("DIM X% AS INTEGER\nDIM Y AS DOUBLE\nDIM S$ AS STRING * 4\nDIM N AS LONG\n")
+        .expect("a suffix that agrees, or none at all, is legal");
+}

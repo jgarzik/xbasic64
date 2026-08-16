@@ -1523,11 +1523,33 @@ impl CodeGen {
     /// length *unsigned*, so a negative one reads as enormous, clamps to the
     /// length and returns the whole string rather than failing.
     fn emit_arg_min_check(&mut self, reg: &str, min: i64) {
+        self.emit_arg_range_check(reg, min, None);
+    }
+
+    /// The same, with an upper bound as well.
+    fn emit_arg_range_check(&mut self, reg: &str, min: i64, max: Option<i64>) {
         if !self.opts.checks {
             return;
         }
         emit!(self, "    cmp {}, {}", reg, min);
         self.emit_check("jl", RtError::Domain);
+        if let Some(max) = max {
+            emit!(self, "    cmp {}, {}", reg, max);
+            self.emit_check("jg", RtError::Domain);
+        }
+    }
+
+    /// The range a table-driven `CallLong` builtin accepts, if it is narrower
+    /// than a Long. HEX$ and OCT$ take any value; the others do not.
+    fn long_arg_range(name: &str) -> Option<(i64, Option<i64>)> {
+        match name {
+            // A character code, not a byte: CHR$ used to keep only the low one,
+            // so CHR$(256) was CHR$(0) and CHR$(-1) was CHR$(255).
+            "CHR$" => Some((0, Some(255))),
+            // A count of spaces. Negative used to clamp to the empty string.
+            "SPACE$" => Some((0, None)),
+            _ => None,
+        }
     }
 
     /// Guard an integer divide: `idiv` raises #DE (a SIGFPE crash) both when
@@ -5539,6 +5561,9 @@ impl CodeGen {
                     let arg_type = self.gen_expr(&args[0]);
                     self.gen_coercion(arg_type, DataType::Long);
                     self.emit("    movsxd rax, eax");
+                    if let Some((min, max)) = Self::long_arg_range(&upper_name) {
+                        self.emit_arg_range_check("rax", min, max);
+                    }
                     self.emit_arg_reg(0, "rax");
                     emit!(self, "    call {}", sym);
                 }
@@ -5745,6 +5770,8 @@ impl CodeGen {
                 let t = self.gen_expr(&args[0]);
                 self.gen_coercion(t, DataType::Long);
                 self.emit("    movsxd rax, eax");
+                // A negative count used to clamp to the empty string.
+                self.emit_arg_min_check("rax", 0);
                 self.emit("    push rax");
                 self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
                 let ct = self.gen_expr(&args[1]);
