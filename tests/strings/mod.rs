@@ -5,6 +5,105 @@
 
 use crate::common::compile_and_run;
 
+/// Assignment must not leave two variables sharing bytes.
+///
+/// A string assignment copies its value, because most string expressions hand
+/// back a pointer into something that outlives the statement. Expressions that
+/// have already allocated skip that copy -- and this is the property that has
+/// to survive the skip: whatever `MID$ =` edits, it edits alone.
+#[test]
+fn test_string_assignment_never_aliases() {
+    let output = compile_and_run(
+        r#"
+A$ = "hello"
+B$ = A$
+MID$(B$, 1, 1) = "J"
+PRINT A$
+PRINT B$
+C$ = LEFT$(A$, 3)
+MID$(C$, 1, 1) = "Z"
+PRINT A$
+PRINT C$
+G$ = MID$(A$, 2, 3)
+MID$(G$, 1, 1) = "X"
+PRINT A$
+PRINT G$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "hello", "the source of a plain assignment");
+    assert_eq!(lines[1], "Jello");
+    assert_eq!(lines[2], "hello", "the source of a LEFT$ slice");
+    assert_eq!(lines[3], "Zel");
+    assert_eq!(lines[4], "hello", "the source of a MID$ slice");
+    assert_eq!(lines[5], "Xll");
+}
+
+/// ...including for the expressions that own their result and are not copied.
+///
+/// A concatenation or a UCASE$ has already allocated, so assigning it does not
+/// copy again. The variable still owns the buffer alone, so assigning *from*
+/// it copies as usual.
+#[test]
+fn test_allocating_expressions_still_own_their_result() {
+    let output = compile_and_run(
+        r#"
+A$ = "hello"
+D$ = A$ + "!"
+E$ = D$
+MID$(E$, 1, 1) = "Q"
+PRINT D$
+PRINT E$
+F$ = UCASE$(A$)
+MID$(F$, 1, 1) = "j"
+PRINT A$
+PRINT F$
+H$ = SPACE$(3) + "x"
+PRINT LEN(H$)
+K$ = STRING$(2, 65) + CHR$(66)
+PRINT K$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "hello!", "a concatenation is not aliased by E$");
+    assert_eq!(lines[1], "Qello!");
+    assert_eq!(
+        lines[2], "hello",
+        "UCASE$ did not write through to its source"
+    );
+    assert_eq!(lines[3], "jELLO");
+    assert_eq!(lines[4], "4");
+    assert_eq!(lines[5], "AAB");
+}
+
+/// The same for array elements and for a string built in a loop.
+#[test]
+fn test_string_arrays_and_accumulation_do_not_alias() {
+    let output = compile_and_run(
+        r#"
+DIM A$(3)
+S$ = ""
+FOR I = 1 TO 3
+  S$ = S$ + "ab"
+  A$(I) = S$
+NEXT I
+MID$(S$, 1, 1) = "Z"
+PRINT S$
+PRINT A$(1)
+PRINT A$(2)
+PRINT A$(3)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "Zbabab", "the accumulator, first byte edited");
+    assert_eq!(lines[1], "ab");
+    assert_eq!(lines[2], "abab");
+    assert_eq!(lines[3], "ababab", "unaffected by the edit to S$");
+}
+
 #[test]
 fn test_string_functions() {
     // Test LEN, LEFT$, RIGHT$, MID$, CHR$, ASC, VAL, STR$, INSTR

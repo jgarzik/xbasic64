@@ -4027,6 +4027,62 @@ impl CodeGen {
     /// String assignment copies, so that mutating one variable is not visible
     /// through another, and so that a string constant's shared `.data` literal
     /// can never be written through.
+    /// Whether evaluating `expr` leaves a string in memory nothing else holds.
+    ///
+    /// Assignment copies a string because most expressions hand back a pointer
+    /// into something that outlives the statement: a variable's own buffer,
+    /// a slice of one -- `LEFT$`, `MID$`, `LTRIM$` all just narrow (ptr, len)
+    /// -- or a `FIELD` window into a file's record buffer. Without the copy
+    /// two variables would share bytes and `MID$(a$, ...) =` would edit both.
+    ///
+    /// These, though, have already allocated. Copying one is a second malloc
+    /// and a second memcpy of bytes no one else can reach, and it leaks the
+    /// first block, since nothing in this runtime frees. `S$ = S$ + "ab"` paid
+    /// for two of everything.
+    ///
+    /// Kept as a list of names rather than a property of the call, because it
+    /// is a fact about each helper's implementation: `_rt_strcat`, `_rt_space`,
+    /// `_rt_string_n` and `_rt_case_convert` call malloc, and `_rt_str`,
+    /// `_rt_chr`, `_rt_hex`, `_rt_oct` and `_rt_mk` end in `_rt_strdup`. A
+    /// helper that stops allocating has to come off this list.
+    fn expr_owns_its_string(&self, expr: &Expr) -> bool {
+        match expr {
+            // Concatenation. Guarded on the type, since `+` is also numeric.
+            Expr::Binary {
+                op: BinaryOp::Add, ..
+            } => self.expr_type(expr) == DataType::String,
+            Expr::FnCall { name, .. } => {
+                let upper = name.to_uppercase();
+                // A user procedure may not shadow one of these, but checking
+                // costs nothing and the answer would be wrong if it could.
+                !self.symbols.procs.contains_key(&upper)
+                    && matches!(
+                        upper.as_str(),
+                        "STR$"
+                            | "CHR$"
+                            | "HEX$"
+                            | "OCT$"
+                            | "SPACE$"
+                            | "STRING$"
+                            | "UCASE$"
+                            | "LCASE$"
+                            | "MKI$"
+                            | "MKL$"
+                            | "MKS$"
+                            | "MKD$"
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Copy a string unless `value` has already allocated one of its own.
+    fn emit_string_copy_of(&mut self, value: &Expr) {
+        if !self.expr_owns_its_string(value) {
+            self.emit_string_copy();
+        }
+    }
+
     fn emit_string_copy(&mut self) {
         self.emit("    mov r10, rax");
         self.emit("    mov r11, rdx");
@@ -4237,7 +4293,7 @@ impl CodeGen {
                 // the address clobbers the value registers.
                 let vt = self.gen_expr(v);
                 if DataType::from_type_ref(&ty) == DataType::String {
-                    self.emit_string_copy();
+                    self.emit_string_copy_of(v);
                     self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
                     self.emit("    mov QWORD PTR [rsp], rax");
                     self.emit("    mov QWORD PTR [rsp + 8], rdx");
@@ -5669,7 +5725,7 @@ impl CodeGen {
 
         let val_type = self.gen_expr(value);
         if val_type == DataType::String {
-            self.emit_string_copy();
+            self.emit_string_copy_of(value);
         }
 
         self.emit("    mov rcx, QWORD PTR [rsp]");
@@ -5695,7 +5751,7 @@ impl CodeGen {
 
     fn gen_string_assign(&mut self, name: &str, value: &Expr) {
         self.gen_expr(value);
-        self.emit_string_copy();
+        self.emit_string_copy_of(value);
         // Both words were reserved when the variable was first seen, so this no
         // longer has to scavenge a slot per assignment.
         let loc = self.get_var_loc(name);
