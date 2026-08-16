@@ -213,3 +213,49 @@ PRINT A + B
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["after", "3"]);
 }
+
+/// A DATA item may be READ as either type, whichever way its tag points.
+///
+/// `_rt_read_number` has always parsed a string entry with strtod, but
+/// `_rt_read_string` ignored the tag entirely and passed the entry's second
+/// word to strlen whatever it held -- so `DATA 42` followed by `READ A$`
+/// measured a string at address 42 and the program died with SIGSEGV. Nothing
+/// in sema caught it, and nothing could: pairing a READ with the item it will
+/// consume needs the execution path, which RESTORE and branching hide.
+#[test]
+fn test_numeric_data_read_into_a_string() {
+    let output = compile_and_run(
+        r#"
+DATA 42, 3.5, -7, text
+READ A$, B$, C$, D$
+PRINT A$
+PRINT B$
+PRINT C$
+PRINT D$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["42", "3.5", "-7", "text"],
+        "rendered as PRINT would"
+    );
+}
+
+/// And the mirror image, which already worked: a string item read as a number.
+#[test]
+fn test_string_data_read_as_a_number() {
+    let output = compile_and_run(
+        r#"
+DATA "12", "3.5", "notanumber"
+READ A, B, C
+PRINT A
+PRINT B
+PRINT C
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["12", "3.5", "0"]);
+}
