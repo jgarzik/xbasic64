@@ -48,13 +48,17 @@ _rt_val:
     ret
 
 # _rt_str - Convert number to string (STR$ function)
-# Formats a number as a string using %g format (compact representation).
+#
+# Renders exactly what PRINT would render, by going through the same helper.
+# This used to be its own sprintf("%g"), which stops at six significant digits:
+# STR$(123456789.125) came back as "1.23457e+08" and VAL(STR$(X)) was not X.
+# GW-BASIC's STR$ is defined as the text PRINT produces, and now so is this.
 #
 # Arguments:
 #   xmm0 = number to convert (double)
 #
 # Returns:
-#   rax = pointer to string (_str_buf)
+#   rax = pointer to string (_num_buf)
 #   rdx = length of string
 #
 # Note: Uses static buffer - result only valid until next STR$() call.
@@ -62,26 +66,33 @@ _rt_val:
 _rt_str:
     push rbp
     mov rbp, rsp
-    sub rsp, 16                     # Stack alignment
-    # sprintf(buffer, "%g", value)
-    lea rdi, [rip + _str_buf]       # destination buffer (1st arg)
-    lea rsi, [rip + _fmt_float]     # format string (2nd arg)
-    mov eax, 1                      # 1 vector register arg (xmm0)
-    call sprintf
-    # Calculate result length
-    lea rax, [rip + _str_buf]
-    mov rdx, rax                    # save ptr
-    xor rcx, rcx                    # length counter
-.Lstr_len:
-    cmp BYTE PTR [rax + rcx], 0
-    je .Lstr_done
-    inc rcx
-    jmp .Lstr_len
-.Lstr_done:
-    mov rax, rdx                    # restore ptr
-    mov rdx, rcx                    # length
+    lea rdi, [rip + _fmt_g_table]
+    xor esi, esi
+    call _rt_fmt_double
+    lea rdi, [rip + _num_buf]
+    mov rsi, rax                    # length
     leave
-    ret
+    jmp _rt_strdup                  # the caller may hold another such result
+
+# _rt_str_single - STR$ of a SINGLE
+#
+# A SINGLE carries only ~7 significant digits, so it uses the shorter table for
+# the same reason PRINT does: rendered at full double precision, 3.14159! would
+# come back as "3.141590118408203".
+#
+# Arguments: xmm0 = value, already widened to double
+# Returns:   rax = pointer, rdx = length
+.globl _rt_str_single
+_rt_str_single:
+    push rbp
+    mov rbp, rsp
+    lea rdi, [rip + _fmt_g_single_table]
+    mov esi, 1
+    call _rt_fmt_double
+    lea rdi, [rip + _num_buf]
+    mov rsi, rax
+    leave
+    jmp _rt_strdup
 
 # _rt_chr - Convert ASCII code to single character (CHR$ function)
 # Creates a 1-character string from an ASCII code.
@@ -101,9 +112,10 @@ _rt_chr:
     lea rax, [rip + _chr_buf]
     mov BYTE PTR [rax], dil         # store character (low byte of rdi)
     mov BYTE PTR [rax + 1], 0       # null terminate (for safety)
-    mov rdx, 1                      # length = 1
+    mov rdi, rax
+    mov esi, 1                      # length = 1
     leave
-    ret
+    jmp _rt_strdup
 
 # _rt_left - Extract leftmost characters (LEFT$ function)
 # Returns the first N characters of a string. If N > string length, returns
@@ -585,10 +597,10 @@ _rt_hex:
     lea rsi, [rip + _fmt_hex]
     xor eax, eax
     call sprintf
-    mov rdx, rax
-    lea rax, [rip + _str_buf]
+    lea rdi, [rip + _str_buf]
+    mov rsi, rax
     leave
-    ret
+    jmp _rt_strdup
 
 .globl _rt_oct
 _rt_oct:
@@ -600,10 +612,10 @@ _rt_oct:
     lea rsi, [rip + _fmt_oct]
     xor eax, eax
     call sprintf
-    mov rdx, rax
-    lea rax, [rip + _str_buf]
+    lea rdi, [rip + _str_buf]
+    mov rsi, rax
     leave
-    ret
+    jmp _rt_strdup
 
 # _rt_strdup - Copy a string onto the heap
 # String assignment copies, so that mutating one variable cannot be seen

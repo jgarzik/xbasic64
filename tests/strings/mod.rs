@@ -255,3 +255,56 @@ fn test_mid_assignment_into_array() {
             .unwrap();
     assert_eq!(output.trim(), "Jello");
 }
+
+/// Two calls to the same string builtin in one expression must not alias.
+///
+/// STR$, CHR$, HEX$ and OCT$ each formatted into a buffer they owned outright,
+/// and nothing copied the result until it was assigned. Two of them in one
+/// expression therefore returned the same pointer, and the first value was
+/// gone by the time the expression finished: `STR$(2) + STR$(1)` produced
+/// "11", and `STR$(A) = STR$(B)` was true for every A and B.
+#[test]
+fn test_string_builtins_do_not_share_a_buffer() {
+    let source = r#"
+A = 2
+B = 1
+PRINT STR$(A) + STR$(B)
+PRINT CHR$(65) + CHR$(66)
+PRINT HEX$(10) + HEX$(11)
+PRINT OCT$(8) + OCT$(9)
+PRINT STR$(A) = STR$(B)
+PRINT STR$(A) = STR$(A)
+"#;
+    let output = compile_and_run(source).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["21", "AB", "AB", "1011", "0", "-1"]
+    );
+}
+
+/// STR$ renders what PRINT renders, so it neither loses digits nor stops
+/// round-tripping through VAL. It used to be its own sprintf("%g"), which cuts
+/// off at six significant digits.
+#[test]
+fn test_str_matches_print_and_round_trips() {
+    let source = r#"
+PRINT STR$(123456789.125)
+PRINT STR$(1 / 3)
+PRINT VAL(STR$(1 / 3)) = 1 / 3
+PRINT STR$(0.1 + 0.2)
+X! = 3.14159
+PRINT STR$(X!)
+"#;
+    let output = compile_and_run(source).unwrap();
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec![
+            "123456789.125",
+            "0.3333333333333333",
+            "-1",
+            "0.30000000000000004",
+            // A SINGLE carries ~7 digits, and STR$ respects that as PRINT does.
+            "3.14159",
+        ]
+    );
+}

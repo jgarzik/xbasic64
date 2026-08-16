@@ -242,7 +242,6 @@ enum Builtin {
     /// One string argument, passed as (pointer, length).
     CallStr(&'static str),
     /// One numeric argument, widened to Double in xmm0.
-    CallDouble(&'static str),
     /// One numeric argument, narrowed to Long and sign-extended.
     CallLong(&'static str),
     /// No helper at all: the conversion *is* the coercion.
@@ -257,7 +256,9 @@ static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| 
         ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
         ("UCASE$", Builtin::CallStr("_rt_ucase")),
         ("LCASE$", Builtin::CallStr("_rt_lcase")),
-        ("STR$", Builtin::CallDouble("_rt_str")),
+        // STR$ is not here: it picks its formatter from the argument's static
+        // type, which this table has no way to express. It was the only user of
+        // a "coerce to double and call" form, which is why none remains.
         ("CHR$", Builtin::CallLong("_rt_chr")),
         ("SPACE$", Builtin::CallLong("_rt_space")),
         ("HEX$", Builtin::CallLong("_rt_hex")),
@@ -3685,11 +3686,6 @@ impl CodeGen {
                     self.emit_arg_reg(0, "rax");
                     self.emit(&format!("    call {}", sym));
                 }
-                Builtin::CallDouble(sym) => {
-                    let arg_type = self.gen_expr(&args[0]);
-                    self.gen_coercion(arg_type, DataType::Double);
-                    self.emit(&format!("    call {}", sym));
-                }
                 Builtin::CallLong(sym) => {
                     let arg_type = self.gen_expr(&args[0]);
                     self.gen_coercion(arg_type, DataType::Long);
@@ -3966,6 +3962,23 @@ impl CodeGen {
                     "_rt_file_lof"
                 };
                 self.emit(&format!("    call {}", rt));
+            }
+            // STR$ renders what PRINT would, which means picking the same
+            // table PRINT would: a SINGLE carries ~7 digits, and rendering it
+            // at full double precision would turn 3.14159! into
+            // "3.141590118408203".
+            "STR$" => {
+                // The *static* type, not what gen_expr reports: loading a
+                // SINGLE already widens it to a double, so asking afterwards
+                // would never see one.
+                let single = self.expr_type(&args[0]) == DataType::Single;
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
+                if single {
+                    self.emit("    call _rt_str_single");
+                } else {
+                    self.emit("    call _rt_str");
+                }
             }
             // Print positioning. These emit output rather than yielding a
             // value, so they are only meaningful inside PRINT.
