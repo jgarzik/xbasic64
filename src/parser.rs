@@ -746,6 +746,9 @@ pub struct Parser {
     /// How deep the recursive descent currently is, so that pathological input
     /// is refused rather than overflowing the stack. See [`MAX_DEPTH`].
     depth: u32,
+    /// Errors found so far. Parsing continues past each one, so a program with
+    /// several mistakes reports them all rather than one per compile.
+    errors: Vec<LocatedParseError>,
 }
 
 impl Parser {
@@ -872,13 +875,54 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> Result<Program, LocatedParseError> {
-        self.parse_program().map_err(|error| LocatedParseError {
-            // An error that names its own line keeps it; otherwise `pos` is
-            // left at the token that stopped the parse.
-            line: error.line().unwrap_or_else(|| self.cur_line()),
-            error,
-        })
+    /// Parse the whole program, reporting every syntax error it contains.
+    ///
+    /// Sema has always returned a `Vec<Diagnostic>`, so a program with five
+    /// undefined names is told about all five. The parser stopped at the first
+    /// error, so five typos meant five compiles. It now recovers in the same
+    /// way and reports the same way.
+    pub fn parse(&mut self) -> Result<Program, Vec<LocatedParseError>> {
+        let program = match self.parse_program() {
+            Ok(p) => p,
+            // A hard error -- one recovery could not get past, such as an
+            // unterminated block -- ends the parse, but whatever was already
+            // collected is still worth reporting alongside it.
+            Err(error) => {
+                self.record(error);
+                return Err(std::mem::take(&mut self.errors));
+            }
+        };
+        if self.errors.is_empty() {
+            Ok(program)
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
+    }
+
+    /// Note an error, giving it a line if it does not name one of its own.
+    fn record(&mut self, error: ParseError) {
+        let line = error.line().unwrap_or_else(|| self.cur_line());
+        self.errors.push(LocatedParseError { line, error });
+    }
+
+    /// Skip to the next place a statement could begin.
+    ///
+    /// Panic-mode recovery. BASIC is line-oriented, which makes this unusually
+    /// reliable: a newline or a colon ends a statement no matter what went
+    /// wrong before it, so the parser can pick up with the next one instead of
+    /// abandoning the file. Stopping *before* the boundary rather than past it
+    /// leaves any block terminator on that line to be read normally, so one bad
+    /// statement inside a SUB does not also cost the END SUB.
+    fn synchronize(&mut self) {
+        let start = self.pos;
+        while !matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            self.advance();
+        }
+        // If the error was already at a boundary, step over it: the caller's
+        // loop would otherwise see the same token again and spin.
+        if self.pos == start && !matches!(self.peek(), Token::Eof) {
+            self.advance();
+        }
     }
 
     fn parse_program(&mut self) -> PResult<Program> {
@@ -886,16 +930,22 @@ impl Parser {
         self.skip_newlines();
 
         while !matches!(self.peek(), Token::Eof) {
-            match self.parse_statement()? {
-                Parsed::Item(stmt) => statements.push(stmt),
+            match self.parse_statement() {
+                Ok(Parsed::Item(stmt)) => statements.push(stmt),
                 // A terminator here closed nothing: there is no enclosing block
                 // for it to belong to.
-                Parsed::End(end) => {
-                    return err(format!(
+                Ok(Parsed::End(end)) => {
+                    let e = ParseError::Error(format!(
                         "{} without matching {}",
                         end.keyword(),
                         end.opener()
                     ));
+                    self.record(e);
+                    self.synchronize();
+                }
+                Err(e) => {
+                    self.record(e);
+                    self.synchronize();
                 }
             }
             self.skip_newlines();
@@ -926,9 +976,18 @@ impl Parser {
                     format!("{} is missing its {}", opener, closer),
                 ));
             }
-            match self.parse_statement()? {
-                Parsed::Item(stmt) => body.push(stmt),
-                Parsed::End(end) => return Ok((body, end)),
+            match self.parse_statement() {
+                Ok(Parsed::Item(stmt)) => body.push(stmt),
+                Ok(Parsed::End(end)) => return Ok((body, end)),
+                // Recover here as well as at the top level, so a mistake inside
+                // a block costs that statement rather than the whole block --
+                // otherwise the error would propagate out, the block's own
+                // terminator would be left stranded, and the reader would get a
+                // cascade of complaints about a SUB that was perfectly closed.
+                Err(e) => {
+                    self.record(e);
+                    self.synchronize();
+                }
             }
             self.skip_newlines();
         }
@@ -2673,12 +2732,20 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
 
+    /// Parse, joining any errors so these tests keep their `Result<_, String>`
+    /// shape now that the parser reports every error it finds rather than one.
     fn parse(input: &str) -> Result<Program, String> {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
         let lines = lexer.line_map().to_vec();
         let mut parser = Parser::new(tokens, lines);
-        parser.parse().map_err(|e| e.to_string())
+        parser.parse().map_err(|errors| {
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
     }
 
     // Label Tests

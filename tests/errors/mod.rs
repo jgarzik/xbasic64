@@ -933,6 +933,78 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// Every syntax error in a program is reported, not just the first.
+///
+/// Sema has always returned a Vec<Diagnostic>, so five undefined names cost one
+/// compile. The parser stopped at the first error, so five typos cost five.
+#[test]
+fn test_parser_reports_every_error() {
+    let e = compile_only("X = )\nGOTO +\nY = *\nPRINT \"ok\"\n")
+        .expect_err("three bad statements must be refused");
+    for expected in [
+        "unexpected ) in an expression",
+        "expected a line number or label, got +",
+        "unexpected * in an expression",
+    ] {
+        assert!(
+            e.contains(expected),
+            "expected {expected:?} among the diagnostics: {}",
+            e.stderr
+        );
+    }
+    assert!(
+        e.contains("3 errors"),
+        "the tally should say 3: {}",
+        e.stderr
+    );
+}
+
+/// One error is "1 error", not "1 errors".
+#[test]
+fn test_single_error_tally_is_singular() {
+    let e = compile_only("X = )\n").expect_err("must be refused");
+    assert!(e.contains("1 error\n") || e.stderr.trim_end().ends_with("1 error"));
+}
+
+/// Recovery happens inside blocks too, so one bad statement costs that
+/// statement and not the block around it.
+///
+/// Recovering only at the top level would let the error escape the SUB, strand
+/// its END SUB, and produce a cascade of complaints about a SUB that was
+/// perfectly well closed.
+#[test]
+fn test_recovery_inside_a_block_does_not_cascade() {
+    let e = compile_only("SUB Foo\nX = )\nPRINT 1\nEND SUB\nPRINT 2\n")
+        .expect_err("the bad statement must be refused");
+    assert!(
+        e.contains("1 error"),
+        "only the bad statement should be reported: {}",
+        e.stderr
+    );
+    assert!(
+        !e.contains("without matching") && !e.contains("missing its"),
+        "the SUB was closed correctly and must not be blamed: {}",
+        e.stderr
+    );
+}
+
+/// Errors found before a block that never closes are kept, not discarded.
+#[test]
+fn test_hard_error_keeps_the_errors_found_before_it() {
+    let e = compile_only("X = )\nFOR I = 1 TO 10\nPRINT I\n")
+        .expect_err("an unclosed FOR must be refused");
+    assert!(
+        e.contains("unexpected ) in an expression"),
+        "the earlier error must survive: {}",
+        e.stderr
+    );
+    assert!(
+        e.contains("FOR is missing its NEXT"),
+        "the unclosed block must be reported: {}",
+        e.stderr
+    );
+}
+
 /// Diagnostics quote BASIC, not Rust.
 ///
 /// Errors fell back to `{:?}` on the token, so they showed the lexer's variant
