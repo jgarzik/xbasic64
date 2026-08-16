@@ -260,12 +260,20 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `XOR`    | Bitwise/logical XOR   |
 | `NOT`    | Bitwise/logical NOT   |
 
-These operate bitwise on integers, allowing both logical tests and bit manipulation:
+These operate bitwise on integers, allowing both logical tests and bit
+manipulation. Their operands are converted to integers first, and the result is
+an integer:
 
 ```basic
 IF A > 0 AND B > 0 THEN PRINT "Both positive"
 Flags% = Flags% OR &H01    ' Set bit 0
+Mask% = NOT &H00FF         ' -256: every bit flipped
 ```
+
+`NOT` complements every bit, so `NOT 1` is `-2`, which is non-zero and therefore
+*true*. This matters only when testing a value that is not already a truth
+value: comparisons yield -1 or 0, and `NOT` maps those to each other, so
+`IF NOT (A > 0)` behaves as expected while `IF NOT 1` does not.
 
 ### String Concatenation
 

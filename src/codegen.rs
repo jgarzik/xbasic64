@@ -1118,6 +1118,11 @@ impl CodeGen {
             Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
             Expr::FnCall { name, args } => self.call_return_type(name, args),
             Expr::Field { .. } => self.field_expr_type(expr),
+            // Unary minus keeps its operand's type; NOT is a bitwise operator
+            // and yields an integer, exactly as AND, OR and XOR do.
+            Expr::Unary {
+                op: UnaryOp::Not, ..
+            } => DataType::Long,
             Expr::Unary { operand, .. } => self.expr_type(operand),
             Expr::Binary { left, right, op } => {
                 let lt = self.expr_type(left);
@@ -1212,6 +1217,19 @@ impl CodeGen {
 
         // MOD produces integer type
         if op == BinaryOp::Mod {
+            return DataType::Long;
+        }
+
+        // The bitwise operators convert both operands to integers and produce
+        // an integer, exactly as `\` and MOD above do.
+        //
+        // Without this they fell through to ordinary numeric promotion and came
+        // out Double whenever either operand was -- which is what an unsuffixed
+        // variable is. Codegen still emitted `and eax, ecx`, so the answer sat
+        // in EAX while every consumer read xmm0 and found the *left operand*
+        // still there: `A = 12 : B = 10 : PRINT A AND B` printed 12. Literal
+        // operands are folded before reaching here, which is why it hid.
+        if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor) {
             return DataType::Long;
         }
 
@@ -3669,19 +3687,27 @@ impl CodeGen {
                         }
                     }
                     UnaryOp::Not => {
-                        // NOT: if 0 then -1, else 0 - result is always Long
-                        if operand_type.is_integer() {
-                            self.emit("    test eax, eax");
-                        } else if operand_type == DataType::Single {
-                            self.emit("    xorps xmm1, xmm1");
-                            self.emit("    ucomiss xmm0, xmm1");
-                        } else {
-                            self.emit("    xorpd xmm1, xmm1");
-                            self.emit("    ucomisd xmm0, xmm1");
+                        // NOT is a bitwise complement, like AND, OR and XOR
+                        // beside it: `NOT 12` is -13, not 0.
+                        //
+                        // It used to emit `sete al / movzx / neg`, i.e. "0 gives
+                        // -1, anything else gives 0" -- a *logical* not. That
+                        // agrees with the bitwise answer only when the operand
+                        // is already 0 or -1, which every test used, so the
+                        // difference stayed invisible while `12 AND 10` was
+                        // correctly bitwise and `NOT 12` was not.
+                        //
+                        // GW-BASIC complements a 16-bit two's-complement
+                        // integer; we use 32-bit, as the other three do.
+                        if !operand_type.is_integer() {
+                            self.emit_typed(
+                                operand_type,
+                                "",
+                                "    cvttss2si eax, xmm0",
+                                "    cvttsd2si eax, xmm0",
+                            );
                         }
-                        self.emit("    sete al");
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
+                        self.emit("    not eax");
                         DataType::Long
                     }
                 }
