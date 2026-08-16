@@ -40,6 +40,18 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
 /// Precedence of `^`, the tightest-binding binary operator.
 const POWER_PREC: u8 = 7;
 
+/// How deeply expressions and blocks may nest before the parser gives up.
+///
+/// This is a recursive-descent parser, so nesting costs stack. Without a bound
+/// it did not refuse deep input, it *died* on it: 50,000 nested parentheses --
+/// or the same number of unary minuses or `NOT`s, which descend through the
+/// same path -- aborted the process with "fatal runtime error: stack overflow"
+/// and exit code 134, which is outside anything a caller can interpret.
+///
+/// The limit is far above what a person writes and far below what the stack
+/// can take, so the only programs it rejects are ones that were going to crash.
+const MAX_DEPTH: u32 = 256;
+
 // AST Definitions
 
 #[derive(Debug, Clone)]
@@ -610,6 +622,9 @@ pub struct Parser {
     /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
     /// start of a line is not mistaken for a label definition.
     declared_procs: HashSet<String>,
+    /// How deep the recursive descent currently is, so that pathological input
+    /// is refused rather than overflowing the stack. See [`MAX_DEPTH`].
+    depth: u32,
 }
 
 impl Parser {
@@ -759,6 +774,26 @@ impl Parser {
     }
 
     fn parse_statement_kind(&mut self) -> PResult<StmtKind> {
+        self.depth += 1;
+        let r = self.parse_statement_kind_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_statement_kind_inner(&mut self) -> PResult<StmtKind> {
+        if self.depth > MAX_DEPTH {
+            return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
+        }
+
+        // Skip any run of separators and blank lines before the statement
+        // proper. Each of these used to recurse. That is a tail call, so a
+        // release build optimized it away and only a debug build overflowed on
+        // a long run of colons -- the worst way to hold a bug, since CI runs
+        // `cargo test --release`. A loop costs no stack in any profile.
+        while matches!(self.peek(), Token::Colon | Token::Newline) {
+            self.advance();
+        }
+
         // Handle line numbers as labels
         if let Token::LineNumber(n) = self.peek().clone() {
             self.advance();
@@ -772,12 +807,6 @@ impl Parser {
             };
             self.advance(); // consume ':'
             return Ok(StmtKind::LabelName(name));
-        }
-
-        // Handle colon as statement separator
-        if matches!(self.peek(), Token::Colon) {
-            self.advance();
-            return self.parse_statement_kind();
         }
 
         match self.peek().clone() {
@@ -920,10 +949,8 @@ impl Parser {
                     _ => self.parse_assignment_or_call(),
                 }
             }
-            Token::Newline => {
-                self.advance();
-                self.parse_statement_kind()
-            }
+            // Newline and Colon are consumed by the skip loop above, so
+            // reaching here means the statement itself is unrecognised.
             _ => err(format!("Unexpected token: {:?}", self.peek())),
         }
     }
@@ -2308,7 +2335,21 @@ impl Parser {
         Ok(base)
     }
 
+    /// Every descent into an expression passes through here, so this is the one
+    /// place the depth has to be counted: parentheses re-enter via
+    /// `parse_primary`, and unary `-`, `+` and `NOT` re-enter directly.
     fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
+        self.depth += 1;
+        let r = self.parse_prec_inner(min_prec);
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_prec_inner(&mut self, min_prec: u8) -> PResult<Expr> {
+        if self.depth > MAX_DEPTH {
+            return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
+        }
+
         // Handle NOT prefix operator (binds tighter than binary ops)
         let mut left = if matches!(self.peek(), Token::Not) {
             self.advance();

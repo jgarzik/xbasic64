@@ -7,7 +7,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run_flags, compile_and_run_raw, compile_only};
+use crate::common::{compile_and_run, compile_and_run_flags, compile_and_run_raw, compile_only};
 
 /// The harness itself must be able to tell a rejected program from an accepted one.
 #[test]
@@ -931,6 +931,53 @@ fn test_unsupported_diagnostics_explain_themselves() {
         "a planned feature should say so: {}",
         err.stderr
     );
+}
+
+/// Pathological nesting is diagnosed, not fatal.
+///
+/// The expression parser recursed without a bound, so 50,000 nested parens --
+/// or 50,000 unary minuses, which descend through the same path -- aborted the
+/// process with "fatal runtime error: stack overflow" and exit code 134. A
+/// compiler may refuse its input; it may not die on it, and 134 is outside the
+/// contract `is_clean_rejection` describes.
+#[test]
+fn test_deeply_nested_expressions_are_diagnosed_not_fatal() {
+    let n = 50_000;
+    expect_rejected(
+        &format!("X = {}1{}\n", "(".repeat(n), ")".repeat(n)),
+        "nesting is too deep",
+    );
+    expect_rejected(&format!("X = {}1\n", "-".repeat(n)), "nesting is too deep");
+    expect_rejected(
+        &format!("X = {}1\n", "NOT ".repeat(n)),
+        "nesting is too deep",
+    );
+}
+
+/// Deeply nested blocks descend through the same statement path.
+#[test]
+fn test_deeply_nested_blocks_are_diagnosed_not_fatal() {
+    let n = 50_000;
+    let source = format!(
+        "{}PRINT 1\n{}",
+        "IF 1 = 1 THEN\n".repeat(n),
+        "END IF\n".repeat(n)
+    );
+    expect_rejected(&source, "nesting is too deep");
+}
+
+/// A long run of statement separators must not consume stack either.
+///
+/// `parse_statement_kind` recursed once per separator to skip it. That is a
+/// tail call, so a release build optimized it away and only a debug build
+/// overflowed on 200,000 colons -- which is the worst way to hold a bug, since
+/// CI runs `cargo test --release`. Skipping them in a loop costs no stack in
+/// any profile. A separator run is legal, so this is accepted, not diagnosed.
+#[test]
+fn test_a_long_run_of_separators_costs_no_stack() {
+    let source = format!("X = 1 {}\nPRINT X\n", ":".repeat(200_000));
+    let run = compile_and_run(&source).expect("a run of separators is legal, if pointless");
+    assert_eq!(run.trim(), "1");
 }
 
 /// A line number too large to represent is an error, not a silent zero.
