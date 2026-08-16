@@ -208,6 +208,11 @@ fn main() {
             &format!("/OUT:{}", exe_file),
             &obj_file,
             "/SUBSYSTEM:CONSOLE",
+            // Discard the runtime helpers this program never calls. Each is
+            // emitted into a COMDAT section of its own for exactly this;
+            // /OPT:REF is the default for a non-/DEBUG link, but the whole
+            // point is lost if that ever stops being true.
+            "/OPT:REF",
             "/DEFAULTLIB:msvcrt.lib",
             "/DEFAULTLIB:ucrt.lib",
             "/DEFAULTLIB:kernel32.lib",

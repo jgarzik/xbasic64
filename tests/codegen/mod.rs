@@ -705,8 +705,17 @@ PRINT Y
 /// Each runtime helper is emitted into a section of its own.
 ///
 /// A linker discards an unreferenced *section*, never an unreferenced label,
-/// so this is what lets `--gc-sections` drop the helpers a program does not
-/// call. Without it all 69 went into every binary.
+/// so this is what lets the linker drop the helpers a program does not call.
+/// Without it all 69 went into every binary.
+///
+/// Counted against the exported helpers, not against every label: a COMDAT
+/// section is identified by a symbol and that symbol has to be external, so
+/// the handful of helpers that are not `.globl` deliberately ride in the
+/// section of whichever helper precedes them.
+///
+/// The two object formats spell the directive differently -- ELF names the
+/// section after the helper, COFF repeats `.text` and names the helper as the
+/// COMDAT symbol -- so the match is on what they have in common.
 #[test]
 fn test_runtime_helpers_get_their_own_sections() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -722,15 +731,19 @@ fn test_runtime_helpers_get_their_own_sections() {
     assert!(out.status.success());
     let asm = std::fs::read_to_string(tmp.path().join("t.s")).expect("read asm");
 
-    let sections = asm.matches(".section .text._rt_").count();
-    let labels = asm
+    let exported = asm.lines().filter(|l| l.starts_with(".globl _rt_")).count();
+    let sections = asm
         .lines()
-        .filter(|l| l.starts_with("_rt_") && l.ends_with(':'))
+        .filter(|l| l.starts_with(".section .text") && l.contains("_rt_"))
         .count();
-    assert!(labels > 50, "expected the whole runtime, saw {}", labels);
+    assert!(
+        exported > 50,
+        "expected the whole runtime, saw {} exported helpers",
+        exported
+    );
     assert_eq!(
-        sections, labels,
-        "every helper label needs a section directive of its own"
+        sections, exported,
+        "every exported helper needs a section of its own"
     );
 }
 

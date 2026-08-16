@@ -75,11 +75,14 @@ const WIN64: Runtime = Runtime {
     ],
     // COFF has no equivalent note, and clang rejects the ELF spelling.
     trailer: "",
-    // Left alone deliberately: the ELF flag spelling is not COFF's, and there
-    // is no COFF assembler on the machine this was developed on -- not clang,
-    // not llvm-mc, not mingw -- so the directive could not be checked even for
-    // syntax. Windows keeps the whole runtime; correctness is not affected.
-    function_section: "",
+    // COFF's spelling of the same idea. The section name repeats -- COMDAT
+    // sections are told apart by their symbol, not their name -- and the
+    // fourth field names that symbol. `discard` is IMAGE_COMDAT_SELECT_ANY:
+    // there is only ever one definition here, so the selection rule does not
+    // matter, and the tolerant one is the better bet for something that
+    // cannot be assembled on a Linux host. link.exe discards unreferenced
+    // COMDATs under /OPT:REF, which main.rs passes explicitly.
+    function_section: ".section .text,\"xr\",discard,{}\n",
 };
 
 /// Put each `_rt_*` helper in `part` into a section of its own.
@@ -88,19 +91,33 @@ const WIN64: Runtime = Runtime {
 /// is covered without anyone remembering to, and so the two trees cannot
 /// drift apart on it.
 ///
-/// Only the exported entry points are split. A helper's internal `.L` labels
-/// stay with it, and a private label that is *not* an entry point -- like
-/// `_rt_case_convert`, which `_rt_ucase` and `_rt_lcase` both jump to -- gets
-/// its own section too and is kept alive by those references.
+/// Only exported entry points are split, for COFF's sake: a COMDAT section is
+/// identified by a symbol, and that symbol has to be external. The three
+/// helpers that are not `.globl` -- `_rt_case_convert` and, on Win64,
+/// `_rt_init_input` -- therefore ride in the section of whichever helper
+/// precedes them, which costs nothing: a jump into one keeps that section,
+/// and `_rt_ucase` and `_rt_lcase` both jump to `_rt_case_convert`.
 ///
 /// This is only sound because no helper falls through into the next one:
 /// sections are not laid out in source order, so a fall-through would land
 /// somewhere else entirely. `_rt_lcase` used to, and now jumps explicitly.
 fn split_helpers(part: &str, template: &str) -> String {
+    let exported: Vec<&str> = part
+        .lines()
+        .filter_map(|l| l.strip_prefix(".globl "))
+        .map(str::trim)
+        .collect();
+
+    // Emitted ahead of the `.globl`, not between it and the label, because
+    // that is the order LLVM itself writes a COFF COMDAT in and there is no
+    // way to check the alternative from here. Every `.globl _rt_x` in both
+    // trees is immediately followed by `_rt_x:`, which a test enforces.
     let mut output = String::with_capacity(part.len() + part.len() / 8);
     for line in part.lines() {
-        if let Some(name) = helper_label(line) {
-            output.push_str(&template.replace("{}", name));
+        if let Some(name) = line.strip_prefix(".globl ").map(str::trim) {
+            if exported.contains(&name) && name.starts_with("_rt_") {
+                output.push_str(&template.replace("{}", name));
+            }
         }
         output.push_str(line);
         output.push('\n');
@@ -109,6 +126,10 @@ fn split_helpers(part: &str, template: &str) -> String {
 }
 
 /// The helper name on a line that is exactly a `_rt_*` label definition.
+///
+/// Used to pair a `.globl` with the label that must follow it, which is an
+/// invariant `split_helpers` depends on and only a test checks.
+#[cfg(test)]
 fn helper_label(line: &str) -> Option<&str> {
     let name = line.strip_prefix("_rt_")?.strip_suffix(':')?;
     // A label and nothing else: `_rt_foo:` yes, `_rt_foo: .quad 0` no.
@@ -175,13 +196,67 @@ mod tests {
     /// Windows CI ever sees it. The reverse is not needed -- a System V
     /// mistake fails the Linux job outright -- and Windows builds its own tree
     /// on every compile a test performs.
+    ///
+    /// What it does *not* cover, since GNU `as` targets ELF: the Win64 tree's
+    /// per-function section directives, whose flags and COMDAT selector are
+    /// COFF spellings that this assembler rejects outright. They are stripped
+    /// here so the hand-written code underneath still gets checked, which is
+    /// what this test was ever for. Only Windows CI can say whether the
+    /// directive itself is right.
+    /// Every exported helper's `.globl` is immediately followed by its label.
+    ///
+    /// `split_helpers` puts the section directive ahead of the `.globl`, so a
+    /// `.globl` that drifted away from its label would open a section around
+    /// the wrong code -- and on ELF, where the flags are accepted, it would do
+    /// so silently.
+    #[test]
+    fn test_globl_precedes_its_label() {
+        for rt in [&SYSV, &WIN64] {
+            for part in rt.parts {
+                let lines: Vec<&str> = part.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let Some(name) = line.strip_prefix(".globl ").map(str::trim) else {
+                        continue;
+                    };
+                    if !name.starts_with("_rt_") {
+                        continue;
+                    }
+                    let next = lines.get(i + 1).copied().unwrap_or("");
+                    assert_eq!(
+                        helper_label(next),
+                        Some(name),
+                        "`.globl {}` must be followed by its label, not {:?}",
+                        name,
+                        next
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg_attr(windows, ignore = "GNU as assembles every tree; Windows uses clang")]
     fn test_both_runtimes_assemble() {
-        // Every tree the compiler can emit.
-        let variants = [("sysv", &SYSV), ("win64-native", &WIN64)];
+        // Every tree the compiler can emit, with the section directives taken
+        // off: this host's assembler has no opinion worth hearing about them.
+        let variants = [
+            (
+                "sysv",
+                Runtime {
+                    function_section: "",
+                    ..SYSV
+                },
+            ),
+            (
+                "win64-native",
+                Runtime {
+                    function_section: "",
+                    ..WIN64
+                },
+            ),
+        ];
 
-        for (name, rt) in variants {
+        for (name, rt) in &variants {
             let dir = std::env::temp_dir().join(format!("xbasic64-asm-{name}"));
             std::fs::create_dir_all(&dir).expect("writable temp directory");
             let asm = dir.join("runtime.s");
