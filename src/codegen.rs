@@ -210,7 +210,23 @@ use crate::parser::*;
 use crate::sema::{Scope as SemaScope, Symbols};
 use crate::using;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::sync::LazyLock;
+
+/// Emit one formatted instruction straight into the output buffer.
+///
+/// The spelling this replaces was `self.emit(&format!(...))`, which built a
+/// throwaway `String` for every instruction only to copy it into `output` and
+/// drop it. A 200k-line BASIC program assembles to five million lines, so that
+/// was five million allocations spent handing text to `push_str`.
+///
+/// `writeln!` into a `String` cannot fail -- `fmt::Write` for `String` is
+/// infallible -- so the result is discarded rather than unwrapped.
+macro_rules! emit {
+    ($self:expr, $($arg:tt)*) => {{
+        let _ = writeln!($self.output, $($arg)*);
+    }};
+}
 
 /// Simple math functions: BASIC name -> libc function name
 static LIBC_MATH_FNS: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
@@ -636,7 +652,7 @@ impl CodeGen {
     fn emit_arg_reg(&mut self, arg_n: usize, src_reg: &str) {
         let dst = Self::arg_reg(arg_n);
         if dst != src_reg {
-            self.emit(&format!("    mov {}, {}", dst, src_reg));
+            emit!(self, "    mov {}, {}", dst, src_reg);
         }
     }
 
@@ -667,16 +683,16 @@ impl CodeGen {
     fn emit_arg_imm(&mut self, arg_n: usize, value: i64) {
         let dst = Self::arg_reg(arg_n);
         if (0..=u32::MAX as i64).contains(&value) {
-            self.emit(&format!("    mov {}, {}", Self::reg32(dst), value));
+            emit!(self, "    mov {}, {}", Self::reg32(dst), value);
         } else {
-            self.emit(&format!("    mov {}, {}", dst, value));
+            emit!(self, "    mov {}, {}", dst, value);
         }
     }
 
     /// Emit a lea instruction to set up an integer argument from a memory reference
     fn emit_arg_lea(&mut self, arg_n: usize, mem: &str) {
         let dst = Self::arg_reg(arg_n);
-        self.emit(&format!("    lea {}, {}", dst, mem));
+        emit!(self, "    lea {}, {}", dst, mem);
     }
 
     /// Call a libc function, whose arguments are already in place.
@@ -705,23 +721,23 @@ impl CodeGen {
             bytes => (bytes + 15) / 16 * 16,
         };
         if reserve > 0 {
-            self.emit(&format!("    sub rsp, {}", reserve));
+            emit!(self, "    sub rsp, {}", reserve);
         }
 
         for (i, src) in srcs.iter().enumerate().rev() {
             match regs.get(i) {
                 Some(reg) if reg == src => {} // already there
-                Some(reg) => self.emit(&format!("    mov {}, {}", reg, src)),
+                Some(reg) => emit!(self, "    mov {}, {}", reg, src),
                 None => {
                     let off = shadow + (i - regs.len()) as i32 * 8;
-                    self.emit(&format!("    mov QWORD PTR [rsp + {}], {}", off, src));
+                    emit!(self, "    mov QWORD PTR [rsp + {}], {}", off, src);
                 }
             }
         }
 
-        self.emit(&format!("    call {}", sym));
+        emit!(self, "    call {}", sym);
         if reserve > 0 {
-            self.emit(&format!("    add rsp, {}", reserve));
+            emit!(self, "    add rsp, {}", reserve);
         }
     }
 
@@ -819,7 +835,7 @@ impl CodeGen {
             return;
         }
         let operand = self.f64_operand(value);
-        self.emit(&format!("    movsd xmm0, {}", operand));
+        emit!(self, "    movsd xmm0, {}", operand);
     }
 
     /// The constant value of a numeric literal, for the fast paths that need
@@ -1330,7 +1346,10 @@ impl CodeGen {
         // Emit data section
         self.emit_data_section();
 
-        self.output.clone()
+        // Handed over rather than cloned. The buffer is the whole program's
+        // assembly -- 145 MB for a 200k-line source -- so copying it to return
+        // it doubled the compiler's peak memory for nothing.
+        std::mem::take(&mut self.output)
     }
 
     /// Reserve descriptors for every array declared in `scope`.
@@ -1381,10 +1400,11 @@ impl CodeGen {
         // Initialize GOSUB return stack if needed
         if self.gosub_used {
             self.emit("    # Initialize GOSUB return stack");
-            self.emit(&format!(
+            emit!(
+                self,
                 "    lea rax, [rip + _gosub_stack + {}]",
                 GOSUB_STACK_SIZE
-            )); // Point to end (stack grows down)
+            ); // Point to end (stack grows down)
             self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
@@ -1475,7 +1495,7 @@ impl CodeGen {
         // INT_MIN / -1 overflows; both operands must match for it to trap.
         self.emit("    cmp ecx, -1");
         let skip = self.new_label("nodivovf");
-        self.emit(&format!("    jne {}", skip));
+        emit!(self, "    jne {}", skip);
         self.emit("    cmp eax, -2147483648");
         self.emit_check("je", RtError::Overflow);
         self.emit_label(&skip);
@@ -1500,7 +1520,7 @@ impl CodeGen {
         if self.symbols.option_base == 0 {
             return;
         }
-        self.emit(&format!("    cmp {}, {}", reg, self.symbols.option_base));
+        emit!(self, "    cmp {}, {}", reg, self.symbols.option_base);
         self.emit_check("jb", RtError::Subscript);
     }
 
@@ -1749,8 +1769,8 @@ impl CodeGen {
         }
         for (reg, mem) in regs {
             self.emit("    sub rsp, 16        # save a descriptor register");
-            self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
-            self.emit(&format!("    mov {}, {}", reg, mem));
+            emit!(self, "    mov QWORD PTR [rsp], {}", reg);
+            emit!(self, "    mov {}, {}", reg, mem);
         }
     }
 
@@ -1764,7 +1784,7 @@ impl CodeGen {
             regs.push(reg.clone());
         }
         for reg in regs.into_iter().rev() {
-            self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+            emit!(self, "    mov {}, QWORD PTR [rsp]", reg);
             self.emit("    add rsp, 16");
         }
     }
@@ -1778,7 +1798,7 @@ impl CodeGen {
         if let Some(reg) = self.hoisted_base(name) {
             return reg;
         }
-        self.emit(&format!("    mov r10, {}", loc.q(0)));
+        emit!(self, "    mov r10, {}", loc.q(0));
         "r10".to_string()
     }
 
@@ -1980,19 +2000,19 @@ impl CodeGen {
         match ct {
             DataType::Integer => {
                 let r = if second { "ecx" } else { "eax" };
-                self.emit(&format!("    movsx {}, {}", r, mem));
+                emit!(self, "    movsx {}, {}", r, mem);
             }
             DataType::Long => {
                 let r = if second { "ecx" } else { "eax" };
-                self.emit(&format!("    mov {}, {}", r, mem));
+                emit!(self, "    mov {}, {}", r, mem);
             }
             DataType::Single => {
                 let r = if second { "xmm1" } else { "xmm0" };
-                self.emit(&format!("    movss {}, {}", r, mem));
+                emit!(self, "    movss {}, {}", r, mem);
             }
             _ => {
                 let r = if second { "xmm1" } else { "xmm0" };
-                self.emit(&format!("    movsd {}, {}", r, mem));
+                emit!(self, "    movsd {}, {}", r, mem);
             }
         }
     }
@@ -2003,10 +2023,10 @@ impl CodeGen {
     /// same as every other INTEGER assignment in the language.
     fn emit_for_store(&mut self, ct: DataType, mem: &str) {
         match ct {
-            DataType::Integer => self.emit(&format!("    mov {}, ax", mem)),
-            DataType::Long => self.emit(&format!("    mov {}, eax", mem)),
-            DataType::Single => self.emit(&format!("    movss {}, xmm0", mem)),
-            _ => self.emit(&format!("    movsd {}, xmm0", mem)),
+            DataType::Integer => emit!(self, "    mov {}, ax", mem),
+            DataType::Long => emit!(self, "    mov {}, eax", mem),
+            DataType::Single => emit!(self, "    movss {}, xmm0", mem),
+            _ => emit!(self, "    movsd {}, xmm0", mem),
         }
     }
 
@@ -2054,16 +2074,16 @@ impl CodeGen {
             (DataType::Integer, ForOperand::Slot(off)) => {
                 // The slot holds sixteen bits; the counter in eax is already
                 // sign-extended, so the limit has to be too before they meet.
-                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
+                emit!(self, "    movsx ecx, WORD PTR [rbp + {}]", off);
                 self.emit("    cmp eax, ecx");
             }
             (DataType::Integer | DataType::Long, _) => {
-                self.emit(&format!("    cmp eax, {}", operand.text(ct)));
+                emit!(self, "    cmp eax, {}", operand.text(ct));
             }
             (DataType::Single, _) => {
-                self.emit(&format!("    ucomiss xmm0, {}", operand.text(ct)));
+                emit!(self, "    ucomiss xmm0, {}", operand.text(ct));
             }
-            _ => self.emit(&format!("    ucomisd xmm0, {}", operand.text(ct))),
+            _ => emit!(self, "    ucomisd xmm0, {}", operand.text(ct)),
         }
     }
 
@@ -2077,17 +2097,17 @@ impl CodeGen {
     fn emit_for_add(&mut self, ct: DataType, operand: &ForOperand) {
         match ct {
             DataType::Integer => {
-                self.emit(&format!("    add ax, {}", operand.text(ct)));
+                emit!(self, "    add ax, {}", operand.text(ct));
                 self.emit_check("jo", RtError::Overflow);
             }
             DataType::Long => {
-                self.emit(&format!("    add eax, {}", operand.text(ct)));
+                emit!(self, "    add eax, {}", operand.text(ct));
                 self.emit_check("jo", RtError::Overflow);
             }
             DataType::Single => {
-                self.emit(&format!("    addss xmm0, {}", operand.text(ct)));
+                emit!(self, "    addss xmm0, {}", operand.text(ct));
             }
-            _ => self.emit(&format!("    addsd xmm0, {}", operand.text(ct))),
+            _ => emit!(self, "    addsd xmm0, {}", operand.text(ct)),
         }
     }
 
@@ -2101,22 +2121,22 @@ impl CodeGen {
         match ct {
             // Narrowed on the way in, exactly as the store to a 16-bit slot
             // would have narrowed it.
-            DataType::Integer => self.emit(&format!("    movsx {}, ax", Self::counter_reg32(reg))),
-            DataType::Long => self.emit(&format!("    mov {}, eax", Self::counter_reg32(reg))),
+            DataType::Integer => emit!(self, "    movsx {}, ax", Self::counter_reg32(reg)),
+            DataType::Long => emit!(self, "    mov {}, eax", Self::counter_reg32(reg)),
             // movaps rather than movss: a register-to-register movss merges
             // into the destination, so it would depend on what was there.
-            DataType::Single => self.emit(&format!("    movaps {}, xmm0", reg)),
-            _ => self.emit(&format!("    movapd {}, xmm0", reg)),
+            DataType::Single => emit!(self, "    movaps {}, xmm0", reg),
+            _ => emit!(self, "    movapd {}, xmm0", reg),
         }
     }
 
     /// Write a promoted counter back to the variable's storage.
     fn emit_counter_writeback(&mut self, ct: DataType, reg: &str, mem: &str) {
         match ct {
-            DataType::Integer => self.emit(&format!("    mov {}, {}w", mem, reg)),
-            DataType::Long => self.emit(&format!("    mov {}, {}", mem, Self::counter_reg32(reg))),
-            DataType::Single => self.emit(&format!("    movss {}, {}", mem, reg)),
-            _ => self.emit(&format!("    movsd {}, {}", mem, reg)),
+            DataType::Integer => emit!(self, "    mov {}, {}w", mem, reg),
+            DataType::Long => emit!(self, "    mov {}, {}", mem, Self::counter_reg32(reg)),
+            DataType::Single => emit!(self, "    movss {}, {}", mem, reg),
+            _ => emit!(self, "    movsd {}, {}", mem, reg),
         }
     }
 
@@ -2124,20 +2144,20 @@ impl CodeGen {
     fn emit_counter_compare(&mut self, ct: DataType, reg: &str, operand: &ForOperand) {
         match (ct, operand) {
             (DataType::Integer, ForOperand::Slot(off)) => {
-                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
-                self.emit(&format!("    cmp {}, ecx", Self::counter_reg32(reg)));
+                emit!(self, "    movsx ecx, WORD PTR [rbp + {}]", off);
+                emit!(self, "    cmp {}, ecx", Self::counter_reg32(reg));
             }
             (DataType::Integer | DataType::Long, _) => {
                 let text = operand.text(ct);
-                self.emit(&format!("    cmp {}, {}", Self::counter_reg32(reg), text));
+                emit!(self, "    cmp {}, {}", Self::counter_reg32(reg), text);
             }
             (DataType::Single, _) => {
                 let text = operand.text(ct);
-                self.emit(&format!("    ucomiss {}, {}", reg, text));
+                emit!(self, "    ucomiss {}, {}", reg, text);
             }
             _ => {
                 let text = operand.text(ct);
-                self.emit(&format!("    ucomisd {}, {}", reg, text));
+                emit!(self, "    ucomisd {}, {}", reg, text);
             }
         }
     }
@@ -2148,40 +2168,38 @@ impl CodeGen {
         let text = operand.text(ct);
         match ct {
             DataType::Integer => {
-                self.emit(&format!("    add {}w, {}", reg, text));
+                emit!(self, "    add {}w, {}", reg, text);
                 self.emit_check("jo", RtError::Overflow);
                 // The narrowing store used to keep an INTEGER counter within
                 // sixteen bits for free; in a register it has to be said.
-                self.emit(&format!("    movsx {}, {}w", r32, reg));
+                emit!(self, "    movsx {}, {}w", r32, reg);
             }
             DataType::Long => {
-                self.emit(&format!("    add {}, {}", r32, text));
+                emit!(self, "    add {}, {}", r32, text);
                 self.emit_check("jo", RtError::Overflow);
             }
-            DataType::Single => self.emit(&format!("    addss {}, {}", reg, text)),
-            _ => self.emit(&format!("    addsd {}, {}", reg, text)),
+            DataType::Single => emit!(self, "    addss {}, {}", reg, text),
+            _ => emit!(self, "    addsd {}, {}", reg, text),
         }
     }
 
     /// Load a promoted variable's storage into its register, entering a loop.
     fn emit_promotion_load(&mut self, p: &Promoted) {
         match p.ty {
-            DataType::Integer => self.emit(&format!(
+            DataType::Integer => emit!(
+                self,
                 "    movsx {}, {}",
                 Self::counter_reg32(&p.reg),
                 p.loc.at("WORD PTR", 0)
-            )),
-            DataType::Long => self.emit(&format!(
+            ),
+            DataType::Long => emit!(
+                self,
                 "    mov {}, {}",
                 Self::counter_reg32(&p.reg),
                 p.loc.at("DWORD PTR", 0)
-            )),
-            DataType::Single => self.emit(&format!(
-                "    movss {}, {}",
-                p.reg,
-                p.loc.at("DWORD PTR", 0)
-            )),
-            _ => self.emit(&format!("    movsd {}, {}", p.reg, p.loc.q(0))),
+            ),
+            DataType::Single => emit!(self, "    movss {}, {}", p.reg, p.loc.at("DWORD PTR", 0)),
+            _ => emit!(self, "    movsd {}, {}", p.reg, p.loc.q(0)),
         }
     }
 
@@ -2203,10 +2221,10 @@ impl CodeGen {
     fn emit_counter_read(&mut self, ct: DataType, reg: &str) {
         match ct {
             DataType::Integer | DataType::Long => {
-                self.emit(&format!("    mov eax, {}", Self::counter_reg32(reg)))
+                emit!(self, "    mov eax, {}", Self::counter_reg32(reg))
             }
-            DataType::Single => self.emit(&format!("    movaps xmm0, {}", reg)),
-            _ => self.emit(&format!("    movapd xmm0, {}", reg)),
+            DataType::Single => emit!(self, "    movaps xmm0, {}", reg),
+            _ => emit!(self, "    movapd xmm0, {}", reg),
         }
     }
 
@@ -2219,20 +2237,20 @@ impl CodeGen {
         let mem = operand.text(ct);
         match ct {
             DataType::Integer | DataType::Long => {
-                self.emit(&format!("    cmp {}, 0", mem));
-                self.emit(&format!("    jl {}", target));
+                emit!(self, "    cmp {}, 0", mem);
+                emit!(self, "    jl {}", target);
             }
             DataType::Single => {
-                self.emit(&format!("    movss xmm1, {}", mem));
+                emit!(self, "    movss xmm1, {}", mem);
                 self.emit("    xorps xmm2, xmm2");
                 self.emit("    ucomiss xmm1, xmm2");
-                self.emit(&format!("    jb {}", target));
+                emit!(self, "    jb {}", target);
             }
             _ => {
-                self.emit(&format!("    movsd xmm1, {}", mem));
+                emit!(self, "    movsd xmm1, {}", mem);
                 self.emit("    xorpd xmm2, xmm2");
                 self.emit("    ucomisd xmm1, xmm2");
-                self.emit(&format!("    jb {}", target));
+                emit!(self, "    jb {}", target);
             }
         }
     }
@@ -2258,7 +2276,7 @@ impl CodeGen {
         self.gen_coercion(ty, DataType::Long);
         self.emit("    movsxd rax, eax");
         self.emit("    dec rax");
-        self.emit(&format!("    cmp rax, {}", rank));
+        emit!(self, "    cmp rax, {}", rank);
         self.emit_check("jae", RtError::Subscript);
         self.emit("    inc rax");
     }
@@ -2280,7 +2298,7 @@ impl CodeGen {
             return;
         }
         let label = self.error_label(kind);
-        self.emit(&format!("    {} {}", cond, label));
+        emit!(self, "    {} {}", cond, label);
     }
 
     /// Emit every error trampoline collected during code generation.
@@ -2294,8 +2312,8 @@ impl CodeGen {
         for ((kind, line), label) in sites {
             self.emit_label(&label);
             let sym = kind.symbol();
-            self.emit(&format!("    lea {}, [rip + {}]", Self::arg_reg(0), sym));
-            self.emit(&format!("    mov {}, {}", Self::arg_reg(1), line));
+            emit!(self, "    lea {}, [rip + {}]", Self::arg_reg(0), sym);
+            emit!(self, "    mov {}, {}", Self::arg_reg(1), line);
             self.emit("    call _rt_error");
         }
     }
@@ -2317,13 +2335,13 @@ impl CodeGen {
         self.emit("    # zero locals: [rsp, rbp)");
         self.emit("    mov r11, rsp");
         self.emit("    mov r10, rbp");
-        self.emit(&format!("    jmp {}", check));
+        emit!(self, "    jmp {}", check);
         self.emit_label(&body);
         self.emit("    mov QWORD PTR [r11], 0");
         self.emit("    add r11, 8");
         self.emit_label(&check);
         self.emit("    cmp r11, r10");
-        self.emit(&format!("    jb {}", body));
+        emit!(self, "    jb {}", body);
     }
 
     fn gen_procedure(&mut self, name: &str, params: &[Param], body: &[Stmt], is_function: bool) {
@@ -2373,17 +2391,14 @@ impl CodeGen {
                 let src = match place.ptr {
                     Slot::Reg(i) => int_regs[i].to_string(),
                     Slot::Stk(i) => {
-                        self.emit(&format!(
-                            "    mov r11, QWORD PTR [rbp + {}]",
-                            16 + 8 * i as i32
-                        ));
+                        emit!(self, "    mov r11, QWORD PTR [rbp + {}]", 16 + 8 * i as i32);
                         "r11".to_string()
                     }
                 };
-                self.emit(&format!("    mov r10, {}", src));
+                emit!(self, "    mov r10, {}", src);
                 for w in 0..words {
-                    self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
-                    self.emit(&format!("    mov {}, rax", loc.q(w)));
+                    emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
+                    emit!(self, "    mov {}, rax", loc.q(w));
                 }
                 self.proc_record_vars.insert(param.clone(), loc);
                 self.proc_types.insert(param.clone(), ty);
@@ -2419,33 +2434,33 @@ impl CodeGen {
             match place.ty {
                 DataType::String => {
                     let p = fetch(self, place.ptr);
-                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                    emit!(self, "    mov {}, {}", loc.q(0), p);
                     let l = fetch(self, place.len.expect("string parameter has a length slot"));
-                    self.emit(&format!("    mov {}, {}", loc.q(1), l));
+                    emit!(self, "    mov {}, {}", loc.q(1), l);
                 }
                 DataType::Double => {
                     let p = fetch(self, place.ptr);
-                    self.emit(&format!("    mov {}, {}", loc.q(0), p));
+                    emit!(self, "    mov {}, {}", loc.q(0), p);
                 }
                 // Numeric arguments arrive as f64 bit patterns; narrow to the
                 // declared type. rax/xmm0 are safe scratch: neither is an
                 // argument register on either ABI.
                 DataType::Single => {
                     let p = fetch(self, place.ptr);
-                    self.emit(&format!("    movq xmm0, {}", p));
+                    emit!(self, "    movq xmm0, {}", p);
                     self.emit("    cvtsd2ss xmm0, xmm0");
-                    self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+                    emit!(self, "    movss {}, xmm0", loc.at("DWORD PTR", 0));
                 }
                 DataType::Integer | DataType::Long => {
                     let p = fetch(self, place.ptr);
-                    self.emit(&format!("    movq xmm0, {}", p));
+                    emit!(self, "    movq xmm0, {}", p);
                     self.emit("    cvttsd2si eax, xmm0");
                     let (size, reg) = if place.ty == DataType::Integer {
                         ("WORD PTR", "ax")
                     } else {
                         ("DWORD PTR", "eax")
                     };
-                    self.emit(&format!("    mov {}, {}", loc.at(size, 0), reg));
+                    emit!(self, "    mov {}, {}", loc.at(size, 0), reg);
                 }
             }
         }
@@ -2481,21 +2496,21 @@ impl CodeGen {
             let data_type = ret_info.data_type;
             match data_type {
                 DataType::Integer => {
-                    self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
+                    emit!(self, "    movsx eax, {}", loc.at("WORD PTR", 0));
                 }
                 DataType::Long => {
-                    self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
+                    emit!(self, "    mov eax, {}", loc.at("DWORD PTR", 0));
                 }
                 DataType::Single => {
-                    self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
+                    emit!(self, "    movss xmm0, {}", loc.at("DWORD PTR", 0));
                 }
                 DataType::Double => {
-                    self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
+                    emit!(self, "    movsd xmm0, {}", loc.q(0));
                 }
                 DataType::String => {
                     // Load string (ptr, len) into rax, rdx
-                    self.emit(&format!("    mov rax, {}", loc.q(0)));
-                    self.emit(&format!("    mov rdx, {}", loc.q(1)));
+                    emit!(self, "    mov rax, {}", loc.q(0));
+                    emit!(self, "    mov rdx, {}", loc.q(1));
                 }
             }
         }
@@ -2548,8 +2563,8 @@ impl CodeGen {
                             let src_ty = self.typed_var(src).expect("sema checked the source");
                             let src_loc = self.get_record_loc(src, &src_ty);
                             for w in 0..words {
-                                self.emit(&format!("    mov rax, {}", src_loc.q(w)));
-                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                                emit!(self, "    mov rax, {}", src_loc.q(w));
+                                emit!(self, "    mov {}, rax", loc.q(w));
                             }
                             return;
                         }
@@ -2563,8 +2578,8 @@ impl CodeGen {
                             self.gen_array_addr(name, &indices);
                             self.emit("    mov r10, rax");
                             for w in 0..words {
-                                self.emit(&format!("    mov rax, QWORD PTR [r10 + {}]", w * 8));
-                                self.emit(&format!("    mov {}, rax", loc.q(w)));
+                                emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
+                                emit!(self, "    mov {}, rax", loc.q(w));
                             }
                             return;
                         }
@@ -2614,16 +2629,16 @@ impl CodeGen {
                     let loc = &var_info.loc;
                     match var_info.data_type {
                         DataType::Integer => {
-                            self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
+                            emit!(self, "    mov {}, ax", loc.at("WORD PTR", 0));
                         }
                         DataType::Long => {
-                            self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+                            emit!(self, "    mov {}, eax", loc.at("DWORD PTR", 0));
                         }
                         DataType::Single => {
-                            self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+                            emit!(self, "    movss {}, xmm0", loc.at("DWORD PTR", 0));
                         }
                         DataType::Double => {
-                            self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+                            emit!(self, "    movsd {}, xmm0", loc.q(0));
                         }
                         DataType::String => {
                             // Should be handled by gen_string_assign above
@@ -2713,7 +2728,7 @@ impl CodeGen {
                         (None, true) => "_rt_input_string",
                         (None, false) => "_rt_input_number",
                     };
-                    self.emit(&format!("    call {}", rt));
+                    emit!(self, "    call {}", rt);
                     self.gen_store_lvalue(var);
                 }
             }
@@ -2752,7 +2767,7 @@ impl CodeGen {
                 for s in then_branch {
                     self.gen_stmt(s);
                 }
-                self.emit(&format!("    jmp {}", end_label));
+                emit!(self, "    jmp {}", end_label);
 
                 self.emit_label(&else_label);
                 if let Some(eb) = else_branch {
@@ -2805,7 +2820,7 @@ impl CodeGen {
                 if let Some(reg) = &counter_reg {
                     if ct.is_integer() {
                         self.emit("    sub rsp, 16        # save a counter register");
-                        self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
+                        emit!(self, "    mov QWORD PTR [rsp], {}", reg);
                     }
                 }
 
@@ -2867,7 +2882,7 @@ impl CodeGen {
                 for p in &accumulators.clone() {
                     if p.ty.is_integer() {
                         self.emit("    sub rsp, 16        # save an accumulator register");
-                        self.emit(&format!("    mov QWORD PTR [rsp], {}", p.reg));
+                        emit!(self, "    mov QWORD PTR [rsp], {}", p.reg);
                     }
                     self.emit_promotion_load(p);
                 }
@@ -2916,11 +2931,12 @@ impl CodeGen {
                 match direction {
                     Some(ascending) => {
                         compare(self);
-                        self.emit(&format!(
+                        emit!(
+                            self,
                             "    {} {}",
                             Self::for_exit_branch(ct, ascending),
                             end_label
-                        ));
+                        );
                     }
                     None => {
                         // Step known only at run time, so both directions have
@@ -2931,20 +2947,22 @@ impl CodeGen {
 
                         self.emit_for_test_step_sign(ct, &step_operand, &neg);
                         compare(self);
-                        self.emit(&format!(
+                        emit!(
+                            self,
                             "    {} {}",
                             Self::for_exit_branch(ct, true),
                             end_label
-                        ));
-                        self.emit(&format!("    jmp {}", body_label));
+                        );
+                        emit!(self, "    jmp {}", body_label);
 
                         self.emit_label(&neg);
                         compare(self);
-                        self.emit(&format!(
+                        emit!(
+                            self,
                             "    {} {}",
                             Self::for_exit_branch(ct, false),
                             end_label
-                        ));
+                        );
                         self.emit_label(&body_label);
                     }
                 }
@@ -2991,7 +3009,7 @@ impl CodeGen {
                         self.emit_for_store(ct, &var_mem);
                     }
                 }
-                self.emit(&format!("    jmp {}", start_label));
+                emit!(self, "    jmp {}", start_label);
 
                 self.emit_label(&end_label);
 
@@ -3005,7 +3023,7 @@ impl CodeGen {
                 for p in accumulators.iter().rev() {
                     self.emit_promotion_store(p);
                     if p.ty.is_integer() {
-                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", p.reg));
+                        emit!(self, "    mov {}, QWORD PTR [rsp]", p.reg);
                         self.emit("    add rsp, 16");
                     }
                 }
@@ -3013,7 +3031,7 @@ impl CodeGen {
                     let reg = reg.clone();
                     self.emit_counter_writeback(ct, &reg, &var_mem);
                     if ct.is_integer() {
-                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+                        emit!(self, "    mov {}, QWORD PTR [rsp]", reg);
                         self.emit("    add rsp, 16");
                     }
                 }
@@ -3032,7 +3050,7 @@ impl CodeGen {
                     self.gen_stmt(s);
                 }
                 self.loop_stack.pop();
-                self.emit(&format!("    jmp {}", start_label));
+                emit!(self, "    jmp {}", start_label);
 
                 self.emit_label(&end_label);
             }
@@ -3070,10 +3088,10 @@ impl CodeGen {
                         // repeats while false.
                         self.gen_condition(cond, &start_label, !*is_until);
                     } else {
-                        self.emit(&format!("    jmp {}", start_label));
+                        emit!(self, "    jmp {}", start_label);
                     }
                 } else {
-                    self.emit(&format!("    jmp {}", start_label));
+                    emit!(self, "    jmp {}", start_label);
                 }
 
                 self.emit_label(&end_label);
@@ -3084,7 +3102,7 @@ impl CodeGen {
                     GotoTarget::Line(n) => format!("_line_{}", n),
                     GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                 };
-                self.emit(&format!("    jmp {}", label));
+                emit!(self, "    jmp {}", label);
             }
 
             StmtKind::Gosub(target) => {
@@ -3100,10 +3118,10 @@ impl CodeGen {
                 self.emit("    cmp rcx, rax");
                 self.emit_check("jb", RtError::GosubOverflow);
                 // Push return address to GOSUB stack
-                self.emit(&format!("    lea rax, [rip + {}]", ret_label));
+                emit!(self, "    lea rax, [rip + {}]", ret_label);
                 self.emit("    mov QWORD PTR [rcx], rax");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
-                self.emit(&format!("    jmp {}", label));
+                emit!(self, "    jmp {}", label);
                 self.emit_label(&ret_label);
             }
 
@@ -3130,8 +3148,8 @@ impl CodeGen {
                         GotoTarget::Line(n) => format!("_line_{}", n),
                         GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                     };
-                    self.emit(&format!("    cmp rax, {}", i + 1));
-                    self.emit(&format!("    je {}", label));
+                    emit!(self, "    cmp rax, {}", i + 1);
+                    emit!(self, "    je {}", label);
                 }
             }
 
@@ -3159,16 +3177,16 @@ impl CodeGen {
 
                 let after = self.new_label("on_gosub_ret");
                 self.emit("    cmp r8, 1");
-                self.emit(&format!("    jl {}", after));
-                self.emit(&format!("    cmp r8, {}", targets.len()));
-                self.emit(&format!("    jg {}", after));
+                emit!(self, "    jl {}", after);
+                emit!(self, "    cmp r8, {}", targets.len());
+                emit!(self, "    jg {}", after);
 
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
                 self.emit("    sub rcx, 8");
                 self.emit("    lea rax, [rip + _gosub_stack]");
                 self.emit("    cmp rcx, rax");
                 self.emit_check("jb", RtError::GosubOverflow);
-                self.emit(&format!("    lea rax, [rip + {}]", after));
+                emit!(self, "    lea rax, [rip + {}]", after);
                 self.emit("    mov QWORD PTR [rcx], rax");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
 
@@ -3177,8 +3195,8 @@ impl CodeGen {
                         GotoTarget::Line(n) => format!("_line_{}", n),
                         GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
                     };
-                    self.emit(&format!("    cmp r8, {}", i + 1));
-                    self.emit(&format!("    je {}", label));
+                    emit!(self, "    cmp r8, {}", i + 1);
+                    emit!(self, "    je {}", label);
                 }
                 self.emit_label(&after);
             }
@@ -3276,13 +3294,13 @@ impl CodeGen {
                     .find(|(f, _)| f == is_for)
                     .map(|(_, label)| label.clone());
                 if let Some(label) = target {
-                    self.emit(&format!("    jmp {}", label));
+                    emit!(self, "    jmp {}", label);
                 }
             }
 
             StmtKind::ExitProc => {
                 if let Some(label) = self.proc_exit_label.clone() {
-                    self.emit(&format!("    jmp {}", label));
+                    emit!(self, "    jmp {}", label);
                 }
             }
 
@@ -3301,19 +3319,13 @@ impl CodeGen {
                 if is_string {
                     self.stack_offset -= 16;
                     temp_offset = self.stack_offset;
-                    self.emit(&format!("    mov QWORD PTR [rbp + {}], rax", temp_offset));
-                    self.emit(&format!(
-                        "    mov QWORD PTR [rbp + {}], rdx",
-                        temp_offset + 8
-                    ));
+                    emit!(self, "    mov QWORD PTR [rbp + {}], rax", temp_offset);
+                    emit!(self, "    mov QWORD PTR [rbp + {}], rdx", temp_offset + 8);
                 } else {
                     self.gen_coercion(expr_type, DataType::Double);
                     self.stack_offset -= 8;
                     temp_offset = self.stack_offset;
-                    self.emit(&format!(
-                        "    movsd QWORD PTR [rbp + {}], xmm0",
-                        temp_offset
-                    ));
+                    emit!(self, "    movsd QWORD PTR [rbp + {}], xmm0", temp_offset);
                 }
 
                 // Generate code for each case
@@ -3331,7 +3343,7 @@ impl CodeGen {
                         for clause in clauses {
                             self.gen_case_clause(clause, temp_offset, is_string, &body_label);
                         }
-                        self.emit(&format!("    jmp {}", next_case_label));
+                        emit!(self, "    jmp {}", next_case_label);
                         self.emit_label(&body_label);
                     }
                     // CASE ELSE (None) falls through without comparison
@@ -3343,7 +3355,7 @@ impl CodeGen {
 
                     // Jump to end (skip remaining cases)
                     if i + 1 < cases.len() {
-                        self.emit(&format!("    jmp {}", end_label));
+                        emit!(self, "    jmp {}", end_label);
                         self.emit_label(&next_case_label);
                     }
                 }
@@ -3431,7 +3443,7 @@ impl CodeGen {
                 // field's existing pointer, so the target keeps its address and
                 // width while the bytes underneath change.
                 self.gen_expr(value);
-                self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
                 self.emit("    mov QWORD PTR [rsp], rax");
                 self.emit("    mov QWORD PTR [rsp + 8], rdx");
                 self.gen_load_lvalue_string(target);
@@ -3443,9 +3455,9 @@ impl CodeGen {
                 // length that argument 3 has yet to read.
                 let src_ptr = Self::arg_reg(2);
                 let src_len = Self::arg_reg(3);
-                self.emit(&format!("    mov {}, QWORD PTR [rsp]", src_ptr));
-                self.emit(&format!("    mov {}, QWORD PTR [rsp + 8]", src_len));
-                self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+                emit!(self, "    mov {}, QWORD PTR [rsp]", src_ptr);
+                emit!(self, "    mov {}, QWORD PTR [rsp + 8]", src_len);
+                emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
                 if *right {
                     self.emit("    call _rt_rset");
                 } else {
@@ -3527,7 +3539,7 @@ impl CodeGen {
                 Literal::Integer(n) => match i32::try_from(*n) {
                     Ok(v) => {
                         // Load as integer into eax
-                        self.emit(&format!("    mov eax, {}", v));
+                        emit!(self, "    mov eax, {}", v);
                         DataType::Long
                     }
                     // Wider than LONG: emit as a Double rather than truncating
@@ -3546,10 +3558,10 @@ impl CodeGen {
                 }
                 Literal::String(s) => {
                     let idx = self.add_string_literal(s);
-                    self.emit(&format!("    lea rax, [rip + _str_{}]", idx));
+                    emit!(self, "    lea rax, [rip + _str_{}]", idx);
                     // A literal's length cannot approach 2^32, and writing edx
                     // zeroes the upper half, so the narrow form is equivalent.
-                    self.emit(&format!("    mov edx, {}", s.len()));
+                    emit!(self, "    mov edx, {}", s.len());
                     DataType::String
                 }
             },
@@ -3603,20 +3615,20 @@ impl CodeGen {
                 let loc = &info.loc;
                 match info.data_type {
                     DataType::Integer => {
-                        self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
+                        emit!(self, "    movsx eax, {}", loc.at("WORD PTR", 0));
                     }
                     DataType::Long => {
-                        self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
+                        emit!(self, "    mov eax, {}", loc.at("DWORD PTR", 0));
                     }
                     DataType::Single => {
-                        self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
+                        emit!(self, "    movss xmm0, {}", loc.at("DWORD PTR", 0));
                     }
                     DataType::Double => {
-                        self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
+                        emit!(self, "    movsd xmm0, {}", loc.q(0));
                     }
                     DataType::String => {
-                        self.emit(&format!("    mov rax, {}", loc.q(0)));
-                        self.emit(&format!("    mov rdx, {}", loc.q(1)));
+                        emit!(self, "    mov rax, {}", loc.q(0));
+                        emit!(self, "    mov rdx, {}", loc.q(1));
                     }
                 }
                 info.data_type
@@ -3650,7 +3662,7 @@ impl CodeGen {
                                 // and requires them aligned, and pool entries
                                 // are eight bytes on an eight-byte boundary.
                                 let mask = self.f64_operand(-0.0);
-                                self.emit(&format!("    movsd xmm1, {}", mask));
+                                emit!(self, "    movsd xmm1, {}", mask);
                                 self.emit("    xorpd xmm0, xmm1");
                             }
                             operand_type
@@ -3728,7 +3740,7 @@ impl CodeGen {
             // Evaluate left string (ptr in rax, len in rdx)
             self.gen_expr(left);
             // Save left string on stack using consistent sub rsp pattern (16-byte aligned)
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
             self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
 
@@ -3743,7 +3755,7 @@ impl CodeGen {
             // Restore left string from stack
             self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
             self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             self.emit_arg_reg(0, "rax"); // left ptr
             self.emit_arg_reg(1, "rdx"); // left len
             self.emit_arg_reg(2, "r8"); // right ptr
@@ -3781,7 +3793,7 @@ impl CodeGen {
                 BinaryOp::Ge => "setge",
                 _ => unreachable!("guarded by is_comparison"),
             };
-            self.emit(&format!("    {} al", setcc));
+            emit!(self, "    {} al", setcc);
             self.emit("    movzx eax, al");
             self.emit("    neg eax"); // BASIC true is -1
             self.expr_depth -= 1;
@@ -3893,7 +3905,7 @@ impl CodeGen {
                 } else {
                     unsigned
                 };
-                self.emit(&format!("    {} al", setcc));
+                emit!(self, "    {} al", setcc);
                 self.emit("    movzx eax, al");
                 self.emit("    neg eax");
             }
@@ -3905,7 +3917,7 @@ impl CodeGen {
                     BinaryOp::Xor => "xor",
                     _ => unreachable!(),
                 };
-                self.emit(&format!("    {} eax, ecx", instr));
+                emit!(self, "    {} eax, ecx", instr);
             }
         }
 
@@ -3982,7 +3994,7 @@ impl CodeGen {
 
                 if left_type == DataType::String && right_type == DataType::String {
                     self.gen_string_compare(left, right);
-                    self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                    emit!(self, "    {} {}", jcc(effective(*op), true), target);
                     return;
                 }
 
@@ -3995,16 +4007,16 @@ impl CodeGen {
                         if let Some(n) = self.const_i32(right) {
                             let ty = self.gen_expr(left);
                             self.gen_coercion(ty, work_type);
-                            self.emit(&format!("    cmp eax, {}", n));
-                            self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                            emit!(self, "    cmp eax, {}", n);
+                            emit!(self, "    {} {}", jcc(effective(*op), true), target);
                             return;
                         }
                     } else if work_type == DataType::Double {
                         if let Some(value) = self.const_double(right) {
                             self.gen_expr_to_double(left);
                             let operand = self.f64_operand(value);
-                            self.emit(&format!("    ucomisd xmm0, {}", operand));
-                            self.emit(&format!("    {} {}", jcc(effective(*op), false), target));
+                            emit!(self, "    ucomisd xmm0, {}", operand);
+                            emit!(self, "    {} {}", jcc(effective(*op), false), target);
                             return;
                         }
                     }
@@ -4016,7 +4028,7 @@ impl CodeGen {
                         "    ucomiss xmm0, xmm1",
                         "    ucomisd xmm0, xmm1",
                     );
-                    self.emit(&format!("    {} {}", jcc(effective(*op), signed), target));
+                    emit!(self, "    {} {}", jcc(effective(*op), signed), target);
                     return;
                 }
             }
@@ -4030,11 +4042,12 @@ impl CodeGen {
             self.emit("    xorpd xmm1, xmm1");
             self.emit("    ucomisd xmm0, xmm1");
         }
-        self.emit(&format!(
+        emit!(
+            self,
             "    {} {}",
             if jump_if_true { "jne" } else { "je" },
             target
-        ));
+        );
     }
 
     /// Compare two strings, leaving memcmp-style flags set.
@@ -4046,7 +4059,7 @@ impl CodeGen {
     fn gen_string_compare(&mut self, left: &Expr, right: &Expr) {
         // Evaluate left string (ptr in rax, len in rdx)
         self.gen_expr(left);
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
         self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
         self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
 
@@ -4056,7 +4069,7 @@ impl CodeGen {
         self.emit("    mov r9, rdx"); // right len
         self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
         self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
         self.emit_arg_reg(0, "rax");
         self.emit_arg_reg(1, "rdx");
         self.emit_arg_reg(2, "r8");
@@ -4076,7 +4089,7 @@ impl CodeGen {
         let left_type = self.gen_expr(left);
         self.gen_coercion(left_type, work_type);
 
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
         if work_type.is_integer() {
             self.emit("    mov QWORD PTR [rsp], rax");
         } else if work_type == DataType::Single {
@@ -4099,7 +4112,7 @@ impl CodeGen {
             self.emit("    movsd xmm1, xmm0"); // right in xmm1
             self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
         }
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
     }
 
     /// Apply `op` with a compile-time constant on the right, or report that it
@@ -4167,17 +4180,17 @@ impl CodeGen {
                 self.gen_coercion(left_type, work_type);
 
                 if let Some(instr) = arith {
-                    self.emit(&format!("    {} eax, {}", instr, n));
+                    emit!(self, "    {} eax, {}", instr, n);
                 } else if Self::is_comparison(op) {
-                    self.emit(&format!("    cmp eax, {}", n));
-                    self.emit(&format!("    {} al", setcc(op, true)));
+                    emit!(self, "    cmp eax, {}", n);
+                    emit!(self, "    {} al", setcc(op, true));
                     self.emit("    movzx eax, al");
                     self.emit("    neg eax"); // BASIC true is -1
                 } else {
                     // idiv has no immediate form, so the divisor still has to
                     // reach ecx -- but it gets there without the spill, and
                     // the existing checks apply to it unchanged.
-                    self.emit(&format!("    mov ecx, {}", n));
+                    emit!(self, "    mov ecx, {}", n);
                     self.emit_integer_divide_checks();
                     self.emit("    cdq");
                     self.emit("    idiv ecx");
@@ -4201,9 +4214,9 @@ impl CodeGen {
                 let operand = self.f64_operand(value);
 
                 match op {
-                    BinaryOp::Add => self.emit(&format!("    addsd xmm0, {}", operand)),
-                    BinaryOp::Sub => self.emit(&format!("    subsd xmm0, {}", operand)),
-                    BinaryOp::Mul => self.emit(&format!("    mulsd xmm0, {}", operand)),
+                    BinaryOp::Add => emit!(self, "    addsd xmm0, {}", operand),
+                    BinaryOp::Sub => emit!(self, "    subsd xmm0, {}", operand),
+                    BinaryOp::Mul => emit!(self, "    mulsd xmm0, {}", operand),
                     BinaryOp::Div => {
                         // The divisor is known here, so the check is decided
                         // here too rather than being re-tested at run time.
@@ -4212,28 +4225,28 @@ impl CodeGen {
                         if value == 0.0 {
                             self.emit_check("jmp", RtError::DivideByZero);
                         }
-                        self.emit(&format!("    divsd xmm0, {}", operand));
+                        emit!(self, "    divsd xmm0, {}", operand);
                     }
                     BinaryOp::Pow => {
-                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        emit!(self, "    movsd xmm1, {}", operand);
                         self.emit_call_libc("pow");
                     }
                     BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
                         // Truncation to integer is left to the same conversion
                         // the general path uses, so an out-of-range constant
                         // behaves identically to one held in a register.
-                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        emit!(self, "    movsd xmm1, {}", operand);
                         self.emit_cvt_float_to_int(work_type);
                         let instr = match op {
                             BinaryOp::And => "and",
                             BinaryOp::Or => "or",
                             _ => "xor",
                         };
-                        self.emit(&format!("    {} eax, ecx", instr));
+                        emit!(self, "    {} eax, ecx", instr);
                     }
                     _ => {
-                        self.emit(&format!("    ucomisd xmm0, {}", operand));
-                        self.emit(&format!("    {} al", setcc(op, false)));
+                        emit!(self, "    ucomisd xmm0, {}", operand);
+                        emit!(self, "    {} al", setcc(op, false));
                         self.emit("    movzx eax, al");
                         self.emit("    neg eax");
                     }
@@ -4260,7 +4273,7 @@ impl CodeGen {
         self.emit_file_num_check();
         self.stack_offset -= 8;
         let loc = Loc::Frame(self.stack_offset);
-        self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+        emit!(self, "    mov {}, eax", loc.at("DWORD PTR", 0));
         FileNum::Slot(loc)
     }
 
@@ -4290,7 +4303,7 @@ impl CodeGen {
         self.gen_coercion(ty, DataType::Long);
         self.stack_offset -= 8;
         let loc = Loc::Frame(self.stack_offset);
-        self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+        emit!(self, "    mov {}, eax", loc.at("DWORD PTR", 0));
         FileNum::Slot(loc)
     }
 
@@ -4303,21 +4316,21 @@ impl CodeGen {
     fn gen_bind_alias(&mut self, target: &LValue) {
         if let Some(indices) = &target.indices {
             let indices = indices.clone();
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rsp], rax");
             self.emit("    mov QWORD PTR [rsp + 8], rdx");
             self.gen_array_addr(&target.name, &indices);
             self.emit("    mov rcx, rax");
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit("    mov rdx, QWORD PTR [rsp + 8]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
             return;
         }
         let loc = self.get_var_loc(&target.name);
-        self.emit(&format!("    mov {}, rax", loc.q(0)));
-        self.emit(&format!("    mov {}, rdx", loc.q(1)));
+        emit!(self, "    mov {}, rax", loc.q(0));
+        emit!(self, "    mov {}, rdx", loc.q(1));
     }
 
     /// Load a string lvalue's current (pointer, length) into `rax`/`rdx`.
@@ -4333,8 +4346,8 @@ impl CodeGen {
             return;
         }
         let loc = self.get_var_loc(&target.name);
-        self.emit(&format!("    mov rax, {}", loc.q(0)));
-        self.emit(&format!("    mov rdx, {}", loc.q(1)));
+        emit!(self, "    mov rax, {}", loc.q(0));
+        emit!(self, "    mov rdx, {}", loc.q(1));
     }
 
     /// Resolve where a PRINT writes: a file number, or the console.
@@ -4362,7 +4375,7 @@ impl CodeGen {
     fn emit_file_num_check(&mut self) {
         self.emit("    cmp eax, 1");
         self.emit_check("jl", RtError::BadFileNum);
-        self.emit(&format!("    cmp eax, {}", crate::sema::MAX_FILE_NUM));
+        emit!(self, "    cmp eax, {}", crate::sema::MAX_FILE_NUM);
         self.emit_check("jg", RtError::BadFileNum);
     }
 
@@ -4372,7 +4385,7 @@ impl CodeGen {
             FileNum::Imm(n) => self.emit_arg_imm(idx, *n),
             FileNum::Slot(loc) => {
                 let reg = Self::arg_reg(idx);
-                self.emit(&format!("    movsxd {}, {}", reg, loc.at("DWORD PTR", 0)));
+                emit!(self, "    movsxd {}, {}", reg, loc.at("DWORD PTR", 0));
             }
         }
     }
@@ -4385,7 +4398,7 @@ impl CodeGen {
         // Everything is evaluated into a temp block first, because each
         // evaluation clobbers the value registers.
         const SLOTS: i32 = 96; // 6 values, 16-byte aligned with room to spare
-        self.emit(&format!("    sub rsp, {}", SLOTS));
+        emit!(self, "    sub rsp, {}", SLOTS);
 
         self.gen_read_lvalue(target);
         self.emit("    mov QWORD PTR [rsp], rax"); // target pointer
@@ -4417,12 +4430,12 @@ impl CodeGen {
         let regs = PlatformAbi::INT_ARG_REGS;
         for (i, off) in [0, 8, 16, 24].iter().enumerate() {
             if i < regs.len() {
-                self.emit(&format!("    mov {}, QWORD PTR [rsp + {}]", regs[i], off));
+                emit!(self, "    mov {}, QWORD PTR [rsp + {}]", regs[i], off);
             }
         }
         if regs.len() >= 6 {
-            self.emit(&format!("    mov {}, QWORD PTR [rsp + 32]", regs[4]));
-            self.emit(&format!("    mov {}, QWORD PTR [rsp + 40]", regs[5]));
+            emit!(self, "    mov {}, QWORD PTR [rsp + 32]", regs[4]);
+            emit!(self, "    mov {}, QWORD PTR [rsp + 40]", regs[5]);
             self.emit("    call _rt_mid_assign");
         } else {
             // Win64: the 5th and 6th arguments sit just above the 32-byte
@@ -4438,7 +4451,7 @@ impl CodeGen {
             self.emit("    add rsp, 64");
         }
 
-        self.emit(&format!("    add rsp, {}", SLOTS));
+        emit!(self, "    add rsp, {}", SLOTS);
     }
 
     /// Exchange two values, which sema has checked are the same type class.
@@ -4452,7 +4465,7 @@ impl CodeGen {
 
         // Read A into a temp.
         self.gen_read_lvalue(a);
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
         if is_string {
             self.emit("    mov QWORD PTR [rsp], rax");
             self.emit("    mov QWORD PTR [rsp + 8], rdx");
@@ -4471,7 +4484,7 @@ impl CodeGen {
         } else {
             self.emit("    movsd xmm0, QWORD PTR [rsp]");
         }
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
         self.gen_store_lvalue(b);
     }
 
@@ -4676,8 +4689,8 @@ impl CodeGen {
                 }
                 let loc = self.get_record_loc(name, &ty);
                 match &loc {
-                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
-                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                    Loc::Global(sym) => emit!(self, "    lea rax, [rip + {}]", sym),
+                    Loc::Frame(off) => emit!(self, "    lea rax, [rbp + {}]", off),
                 }
                 true
             }
@@ -4712,7 +4725,7 @@ impl CodeGen {
                     }
                     self.gen_array_addr(&name, &indices);
                     if offset != 0 {
-                        self.emit(&format!("    add rax, {}", offset));
+                        emit!(self, "    add rax, {}", offset);
                     }
                     return true;
                 }
@@ -4727,8 +4740,8 @@ impl CodeGen {
                     return false;
                 }
                 match &loc {
-                    Loc::Global(sym) => self.emit(&format!("    lea rax, [rip + {}]", sym)),
-                    Loc::Frame(off) => self.emit(&format!("    lea rax, [rbp + {}]", off)),
+                    Loc::Global(sym) => emit!(self, "    lea rax, [rip + {}]", sym),
+                    Loc::Frame(off) => emit!(self, "    lea rax, [rbp + {}]", off),
                 }
                 true
             }
@@ -4767,7 +4780,7 @@ impl CodeGen {
                 self.gen_array_addr(&target.name, &indices);
                 let loc = Loc::Frame(0); // placeholder, replaced below
                 let _ = loc;
-                self.emit(&format!("    add rax, {}", byte_offset));
+                emit!(self, "    add rax, {}", byte_offset);
                 self.gen_load_indirect("rax", &ty)
             }
             Some(v) => {
@@ -4776,17 +4789,17 @@ impl CodeGen {
                 let vt = self.gen_expr(v);
                 if DataType::from_type_ref(&ty) == DataType::String {
                     self.emit_string_copy_of(v);
-                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
                     self.emit("    mov QWORD PTR [rsp], rax");
                     self.emit("    mov QWORD PTR [rsp + 8], rdx");
                 } else {
                     self.gen_coercion(vt, DataType::Double);
-                    self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                    emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
                     self.emit("    movsd QWORD PTR [rsp], xmm0");
                 }
 
                 self.gen_array_addr(&target.name, &indices);
-                self.emit(&format!("    add rax, {}", byte_offset));
+                emit!(self, "    add rax, {}", byte_offset);
                 self.emit("    mov rcx, rax");
                 self.emit_store_parked(&ty);
                 DataType::Double
@@ -4802,13 +4815,13 @@ impl CodeGen {
         if DataType::from_type_ref(ty) == DataType::String {
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit("    mov rdx, QWORD PTR [rsp + 8]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
             return;
         }
         self.emit("    movsd xmm0, QWORD PTR [rsp]");
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
         self.gen_coercion(DataType::Double, DataType::from_type_ref(ty));
         match ty {
             TypeRef::Integer => self.emit("    mov WORD PTR [rcx], ax"),
@@ -4822,23 +4835,23 @@ impl CodeGen {
     fn gen_load_indirect(&mut self, reg: &str, ty: &TypeRef) -> DataType {
         match ty {
             TypeRef::Integer => {
-                self.emit(&format!("    movsx eax, WORD PTR [{}]", reg));
+                emit!(self, "    movsx eax, WORD PTR [{}]", reg);
                 DataType::Integer
             }
             TypeRef::Long => {
-                self.emit(&format!("    mov eax, DWORD PTR [{}]", reg));
+                emit!(self, "    mov eax, DWORD PTR [{}]", reg);
                 DataType::Long
             }
             TypeRef::Single => {
-                self.emit(&format!("    movss xmm0, DWORD PTR [{}]", reg));
+                emit!(self, "    movss xmm0, DWORD PTR [{}]", reg);
                 DataType::Single
             }
             TypeRef::Double => {
-                self.emit(&format!("    movsd xmm0, QWORD PTR [{}]", reg));
+                emit!(self, "    movsd xmm0, QWORD PTR [{}]", reg);
                 DataType::Double
             }
             TypeRef::FixedString(_) => {
-                self.emit(&format!("    mov rcx, {}", reg));
+                emit!(self, "    mov rcx, {}", reg);
                 self.emit("    mov rax, QWORD PTR [rcx]");
                 self.emit("    mov rdx, QWORD PTR [rcx + 8]");
                 DataType::String
@@ -4974,24 +4987,24 @@ impl CodeGen {
     fn gen_load_typed(&mut self, loc: &Loc, ty: &TypeRef) -> DataType {
         match ty {
             TypeRef::Integer => {
-                self.emit(&format!("    movsx eax, {}", loc.at("WORD PTR", 0)));
+                emit!(self, "    movsx eax, {}", loc.at("WORD PTR", 0));
                 DataType::Integer
             }
             TypeRef::Long => {
-                self.emit(&format!("    mov eax, {}", loc.at("DWORD PTR", 0)));
+                emit!(self, "    mov eax, {}", loc.at("DWORD PTR", 0));
                 DataType::Long
             }
             TypeRef::Single => {
-                self.emit(&format!("    movss xmm0, {}", loc.at("DWORD PTR", 0)));
+                emit!(self, "    movss xmm0, {}", loc.at("DWORD PTR", 0));
                 DataType::Single
             }
             TypeRef::Double => {
-                self.emit(&format!("    movsd xmm0, {}", loc.q(0)));
+                emit!(self, "    movsd xmm0, {}", loc.q(0));
                 DataType::Double
             }
             TypeRef::FixedString(_) => {
-                self.emit(&format!("    mov rax, {}", loc.q(0)));
-                self.emit(&format!("    mov rdx, {}", loc.q(1)));
+                emit!(self, "    mov rax, {}", loc.q(0));
+                emit!(self, "    mov rdx, {}", loc.q(1));
                 DataType::String
             }
             // A whole record has no scalar value; sema rejects using one here.
@@ -5004,24 +5017,24 @@ impl CodeGen {
         match ty {
             TypeRef::Integer => {
                 self.gen_coercion(value_type, DataType::Integer);
-                self.emit(&format!("    mov {}, ax", loc.at("WORD PTR", 0)));
+                emit!(self, "    mov {}, ax", loc.at("WORD PTR", 0));
             }
             TypeRef::Long => {
                 self.gen_coercion(value_type, DataType::Long);
-                self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+                emit!(self, "    mov {}, eax", loc.at("DWORD PTR", 0));
             }
             TypeRef::Single => {
                 self.gen_coercion(value_type, DataType::Single);
-                self.emit(&format!("    movss {}, xmm0", loc.at("DWORD PTR", 0)));
+                emit!(self, "    movss {}, xmm0", loc.at("DWORD PTR", 0));
             }
             TypeRef::Double => {
                 self.gen_coercion(value_type, DataType::Double);
-                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+                emit!(self, "    movsd {}, xmm0", loc.q(0));
             }
             TypeRef::FixedString(_) => {
                 self.emit_string_copy();
-                self.emit(&format!("    mov {}, rax", loc.q(0)));
-                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+                emit!(self, "    mov {}, rax", loc.q(0));
+                emit!(self, "    mov {}, rdx", loc.q(1));
             }
             TypeRef::Record(_) => {}
         }
@@ -5042,7 +5055,7 @@ impl CodeGen {
             if let Some(indices) = target.indices.clone() {
                 if let Some(base) = self.array_elem_type(&target.name) {
                     if let Some((offset, ty)) = self.field_byte_offset(&base, &target.fields) {
-                        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
                         if DataType::from_type_ref(&ty) == DataType::String {
                             self.emit("    mov QWORD PTR [rsp], rax");
                             self.emit("    mov QWORD PTR [rsp + 8], rdx");
@@ -5050,7 +5063,7 @@ impl CodeGen {
                             self.emit("    movsd QWORD PTR [rsp], xmm0");
                         }
                         self.gen_array_addr(&target.name, &indices);
-                        self.emit(&format!("    add rax, {}", offset));
+                        emit!(self, "    add rax, {}", offset);
                         self.emit("    mov rcx, rax");
                         self.emit_store_parked(&ty);
                         return;
@@ -5071,16 +5084,16 @@ impl CodeGen {
         let Some(indices) = &target.indices else {
             let loc = self.get_var_loc(&target.name);
             if is_string {
-                self.emit(&format!("    mov {}, rax", loc.q(0)));
-                self.emit(&format!("    mov {}, rdx", loc.q(1)));
+                emit!(self, "    mov {}, rax", loc.q(0));
+                emit!(self, "    mov {}, rdx", loc.q(1));
             } else {
-                self.emit(&format!("    movsd {}, xmm0", loc.q(0)));
+                emit!(self, "    movsd {}, xmm0", loc.q(0));
             }
             return;
         };
 
         // Park the value, compute the element address, then store.
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
         if is_string {
             self.emit("    mov QWORD PTR [rsp], rax");
             self.emit("    mov QWORD PTR [rsp + 8], rdx");
@@ -5095,12 +5108,12 @@ impl CodeGen {
         if is_string {
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit("    mov rdx, QWORD PTR [rsp + 8]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rcx], rax");
             self.emit("    mov QWORD PTR [rcx + 8], rdx");
         } else {
             self.emit("    movsd xmm0, QWORD PTR [rsp]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             // Narrow to the element's declared type, as a normal store does.
             let elem_type = DataType::from_suffix(&target.name);
             self.gen_coercion(DataType::Double, elem_type);
@@ -5224,27 +5237,27 @@ impl CodeGen {
         match clause {
             CaseClause::Value(e) => {
                 self.gen_expr_to_double(e);
-                self.emit(&format!("    movsd xmm1, {}", sel));
+                emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
-                self.emit(&format!("    je {}", body_label));
+                emit!(self, "    je {}", body_label);
             }
             CaseClause::Range(lo, hi) => {
                 // Inclusive at both ends. The low bound is tested first, and a
                 // failure skips the high test.
                 let skip = self.new_label("caseskip");
                 self.gen_expr_to_double(lo);
-                self.emit(&format!("    movsd xmm1, {}", sel));
+                emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
-                self.emit(&format!("    jb {}", skip));
+                emit!(self, "    jb {}", skip);
                 self.gen_expr_to_double(hi);
-                self.emit(&format!("    movsd xmm1, {}", sel));
+                emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
-                self.emit(&format!("    jbe {}", body_label));
+                emit!(self, "    jbe {}", body_label);
                 self.emit_label(&skip);
             }
             CaseClause::Compare(op, e) => {
                 self.gen_expr_to_double(e);
-                self.emit(&format!("    movsd xmm1, {}", sel));
+                emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
                 // Unsigned conditions, since ucomisd sets the carry flag.
                 let cc = match op {
@@ -5256,7 +5269,7 @@ impl CodeGen {
                     BinaryOp::Ge => "jae",
                     _ => unreachable!("the parser only builds comparisons here"),
                 };
-                self.emit(&format!("    {} {}", cc, body_label));
+                emit!(self, "    {} {}", cc, body_label);
             }
         }
     }
@@ -5286,14 +5299,14 @@ impl CodeGen {
         match clause {
             CaseClause::Value(e) => {
                 compare(self, e);
-                self.emit(&format!("    je {}", body_label));
+                emit!(self, "    je {}", body_label);
             }
             CaseClause::Range(lo, hi) => {
                 let skip = self.new_label("caseskip");
                 compare(self, lo);
-                self.emit(&format!("    jl {}", skip));
+                emit!(self, "    jl {}", skip);
                 compare(self, hi);
-                self.emit(&format!("    jle {}", body_label));
+                emit!(self, "    jle {}", body_label);
                 self.emit_label(&skip);
             }
             CaseClause::Compare(op, e) => {
@@ -5307,7 +5320,7 @@ impl CodeGen {
                     BinaryOp::Ge => "jge",
                     _ => unreachable!("the parser only builds comparisons here"),
                 };
-                self.emit(&format!("    {} {}", cc, body_label));
+                emit!(self, "    {} {}", cc, body_label);
             }
         }
     }
@@ -5380,7 +5393,7 @@ impl CodeGen {
         } else {
             "_rt_file_print_spc"
         };
-        self.emit(&format!("    call {}", rt));
+        emit!(self, "    call {}", rt);
     }
 
     fn gen_fn_call(&mut self, name: &str, args: &[Expr]) {
@@ -5406,14 +5419,14 @@ impl CodeGen {
             if upper_name == "SQR" {
                 self.emit_domain_check("jb");
             }
-            self.emit(&format!("    {}", instr));
+            emit!(self, "    {}", instr);
             return;
         }
 
         // Table-driven: evaluate one argument, coerce it, call the helper.
         if let Some(builtin) = RT_BUILTINS.get(upper_name.as_str()) {
             match builtin {
-                Builtin::Call0(sym) => self.emit(&format!("    call {}", sym)),
+                Builtin::Call0(sym) => emit!(self, "    call {}", sym),
                 Builtin::CallStr(sym) => {
                     // gen_expr leaves a string in rax/rdx. Loading the length
                     // first keeps Win64, where the pointer's register is rdx,
@@ -5421,14 +5434,14 @@ impl CodeGen {
                     self.gen_expr(&args[0]);
                     self.emit_arg_reg(1, "rdx");
                     self.emit_arg_reg(0, "rax");
-                    self.emit(&format!("    call {}", sym));
+                    emit!(self, "    call {}", sym);
                 }
                 Builtin::CallLong(sym) => {
                     let arg_type = self.gen_expr(&args[0]);
                     self.gen_coercion(arg_type, DataType::Long);
                     self.emit("    movsxd rax, eax");
                     self.emit_arg_reg(0, "rax");
-                    self.emit(&format!("    call {}", sym));
+                    emit!(self, "    call {}", sym);
                 }
                 Builtin::Coerce(ty) => {
                     let arg_type = self.gen_expr(&args[0]);
@@ -5447,7 +5460,7 @@ impl CodeGen {
                 // 64-bit immediate, and via a register because the memory form
                 // of andpd wants sixteen aligned bytes. See UnaryOp::Neg.
                 let mask = self.f64_operand(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
-                self.emit(&format!("    movsd xmm1, {}", mask));
+                emit!(self, "    movsd xmm1, {}", mask);
                 self.emit("    andpd xmm0, xmm1");
                 // ABS preserves its argument's type: narrow back so the value
                 // matches what call_return_type promises.
@@ -5486,9 +5499,9 @@ impl CodeGen {
                 let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
-                    self.emit(&format!("    movsxd {}, eax", arg2));
+                    emit!(self, "    movsxd {}, eax", arg2);
                 } else {
-                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
+                    emit!(self, "    cvttsd2si {}, xmm0", arg2);
                 }
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
@@ -5507,9 +5520,9 @@ impl CodeGen {
                 let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
                 if count_type.is_integer() {
-                    self.emit(&format!("    movsxd {}, eax", arg2));
+                    emit!(self, "    movsxd {}, eax", arg2);
                 } else {
-                    self.emit(&format!("    cvttsd2si {}, xmm0", arg2));
+                    emit!(self, "    cvttsd2si {}, xmm0", arg2);
                 }
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
@@ -5536,12 +5549,12 @@ impl CodeGen {
                 if args.len() > 2 {
                     let len_type = self.gen_expr(&args[2]); // count - safe now
                     if len_type.is_integer() {
-                        self.emit(&format!("    movsxd {}, eax", arg3));
+                        emit!(self, "    movsxd {}, eax", arg3);
                     } else {
-                        self.emit(&format!("    cvttsd2si {}, xmm0", arg3));
+                        emit!(self, "    cvttsd2si {}, xmm0", arg3);
                     }
                 } else {
-                    self.emit(&format!("    mov {}, -1", arg3)); // rest of string
+                    emit!(self, "    mov {}, -1", arg3); // rest of string
                 }
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
@@ -5659,7 +5672,7 @@ impl CodeGen {
                             self.gen_dim_index(dim, rank);
                         }
                     }
-                    self.emit(&format!("    mov eax, {}", self.symbols.option_base));
+                    emit!(self, "    mov eax, {}", self.symbols.option_base);
                     return;
                 }
 
@@ -5674,14 +5687,14 @@ impl CodeGen {
                     // to a fixed descriptor slot.
                     None | Some((_, Some(_))) => {
                         let dim = args.get(1).and_then(|d| self.const_dim(d)).unwrap_or(1);
-                        self.emit(&format!("    mov rax, {}", loc.q(dim)));
+                        emit!(self, "    mov rax, {}", loc.q(dim));
                     }
                     // A computed dimension indexes the descriptor at run time.
                     Some((dim, None)) => {
                         self.gen_dim_index(dim, rank);
                         match &loc {
-                            Loc::Global(sym) => self.emit(&format!("    lea rcx, [rip + {}]", sym)),
-                            Loc::Frame(off) => self.emit(&format!("    lea rcx, [rbp + {}]", off)),
+                            Loc::Global(sym) => emit!(self, "    lea rcx, [rip + {}]", sym),
+                            Loc::Frame(off) => emit!(self, "    lea rcx, [rbp + {}]", off),
                         }
                         self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
                     }
@@ -5699,7 +5712,7 @@ impl CodeGen {
                     "LOC" => "_rt_file_loc",
                     _ => "_rt_file_lof",
                 };
-                self.emit(&format!("    call {}", rt));
+                emit!(self, "    call {}", rt);
             }
             // STR$ renders what PRINT would, which means picking the same
             // table PRINT would: a SINGLE carries ~7 digits, and rendering it
@@ -5759,7 +5772,7 @@ impl CodeGen {
                     "CVS" => "_rt_cvs",
                     _ => "_rt_cvd",
                 };
-                self.emit(&format!("    call {}", rt));
+                emit!(self, "    call {}", rt);
             }
             // Print positioning. These emit output rather than yielding a
             // value, so they are only meaningful inside PRINT.
@@ -5800,7 +5813,7 @@ impl CodeGen {
 
         let mangled = mangle(&upper);
         if args.is_empty() {
-            self.emit(&format!("    call _proc_{}", mangled));
+            emit!(self, "    call _proc_{}", mangled);
             return;
         }
 
@@ -5813,7 +5826,7 @@ impl CodeGen {
             .map(|t| Self::words_for(*t) as usize)
             .sum();
         let temp_bytes = ((words * 8 + 15) & !15) as i32;
-        self.emit(&format!("    sub rsp, {}", temp_bytes));
+        emit!(self, "    sub rsp, {}", temp_bytes);
 
         let param_decls: Vec<Param> = self
             .symbols
@@ -5835,7 +5848,7 @@ impl CodeGen {
             }) = param_decls.get(i)
             {
                 if self.gen_record_addr(arg) {
-                    self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
+                    emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
                     temp_of.push(w * 8);
                     w += 1;
                     continue;
@@ -5843,15 +5856,15 @@ impl CodeGen {
             }
             if *ty == DataType::String {
                 self.gen_expr(arg);
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8));
+                emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
+                emit!(self, "    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8);
                 temp_of.push(w * 8);
                 w += 2;
             } else {
                 // Numeric arguments travel as f64 bit patterns in integer
                 // slots; the callee narrows to the declared type.
                 self.gen_expr_to_double(arg);
-                self.emit(&format!("    movsd QWORD PTR [rsp + {}], xmm0", w * 8));
+                emit!(self, "    movsd QWORD PTR [rsp + {}], xmm0", w * 8);
                 temp_of.push(w * 8);
                 w += 1;
             }
@@ -5860,23 +5873,21 @@ impl CodeGen {
         // Phase 2: copy the stack-passed slots into place.
         let stack_bytes = ((stack_slots * 8 + 15) & !15) as i32;
         if stack_slots > 0 {
-            self.emit(&format!("    sub rsp, {}", stack_bytes));
+            emit!(self, "    sub rsp, {}", stack_bytes);
         }
         for (place, off) in places.iter().zip(&temp_of) {
             // r11 is caller-saved and an argument register on neither ABI.
             if let Slot::Stk(i) = place.ptr {
-                self.emit(&format!(
-                    "    mov r11, QWORD PTR [rsp + {}]",
-                    stack_bytes + off
-                ));
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
+                emit!(self, "    mov r11, QWORD PTR [rsp + {}]", stack_bytes + off);
+                emit!(self, "    mov QWORD PTR [rsp + {}], r11", i as i32 * 8);
             }
             if let Some(Slot::Stk(i)) = place.len {
-                self.emit(&format!(
+                emit!(
+                    self,
                     "    mov r11, QWORD PTR [rsp + {}]",
                     stack_bytes + off + 8
-                ));
-                self.emit(&format!("    mov QWORD PTR [rsp + {}], r11", i as i32 * 8));
+                );
+                emit!(self, "    mov QWORD PTR [rsp + {}], r11", i as i32 * 8);
             }
         }
 
@@ -5884,23 +5895,25 @@ impl CodeGen {
         let regs = PlatformAbi::INT_ARG_REGS;
         for (place, off) in places.iter().zip(&temp_of) {
             if let Slot::Reg(i) = place.ptr {
-                self.emit(&format!(
+                emit!(
+                    self,
                     "    mov {}, QWORD PTR [rsp + {}]",
                     regs[i],
                     stack_bytes + off
-                ));
+                );
             }
             if let Some(Slot::Reg(i)) = place.len {
-                self.emit(&format!(
+                emit!(
+                    self,
                     "    mov {}, QWORD PTR [rsp + {}]",
                     regs[i],
                     stack_bytes + off + 8
-                ));
+                );
             }
         }
 
-        self.emit(&format!("    call _proc_{}", mangled));
-        self.emit(&format!("    add rsp, {}", stack_bytes + temp_bytes));
+        emit!(self, "    call _proc_{}", mangled);
+        emit!(self, "    add rsp, {}", stack_bytes + temp_bytes);
     }
 
     /// Emit storage for one DIM/REDIM declarator.
@@ -5977,11 +5990,11 @@ impl CodeGen {
         // With PRESERVE, the old element count is needed to know where the
         // newly added tail begins.
         if preserve {
-            self.emit(&format!("    mov rax, {}", loc.q(1)));
+            emit!(self, "    mov rax, {}", loc.q(1));
             for i in 1..ndims {
-                self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+                emit!(self, "    imul rax, {}", loc.q(1 + i as i32));
             }
-            self.emit(&format!("    imul rax, {}", elem_size));
+            emit!(self, "    imul rax, {}", elem_size);
             self.emit("    push rax"); // old size in bytes
             self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
         }
@@ -5997,22 +6010,22 @@ impl CodeGen {
                 self.emit("    cvttsd2si rax, xmm0");
             }
             self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
-            self.emit(&format!("    mov {}, rax", loc.q(1 + i as i32)));
+            emit!(self, "    mov {}, rax", loc.q(1 + i as i32));
         }
 
         // Calculate total elements: dim0 * dim1 * dim2 * ...
-        self.emit(&format!("    mov rax, {}", loc.q(1)));
+        emit!(self, "    mov rax, {}", loc.q(1));
         for i in 1..ndims {
-            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+            emit!(self, "    imul rax, {}", loc.q(1 + i as i32));
         }
-        self.emit(&format!("    imul rax, {}", elem_size));
+        emit!(self, "    imul rax, {}", elem_size);
 
         if preserve {
             // realloc(old_ptr, new_size)
             self.emit("    mov r10, rax"); // new size in bytes
             self.emit("    push r10");
             self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned across the call
-            self.emit(&format!("    mov {}, {}", Self::arg_reg(0), loc.q(0)));
+            emit!(self, "    mov {}, {}", Self::arg_reg(0), loc.q(0));
             self.emit_arg_reg(1, "r10");
             self.emit_call_libc("realloc");
             self.emit("    add rsp, 8");
@@ -6020,7 +6033,7 @@ impl CodeGen {
         } else {
             // calloc(1, size): BASIC guarantees a fresh array reads as 0 / "",
             // which malloc alone does not.
-            self.emit(&format!("    mov {}, 1", Self::arg_reg(0)));
+            emit!(self, "    mov {}, 1", Self::arg_reg(0));
             self.emit_arg_reg(1, "rax");
             self.emit_call_libc("calloc");
         }
@@ -6033,7 +6046,7 @@ impl CodeGen {
         }
 
         // Store array pointer
-        self.emit(&format!("    mov {}, rax", loc.q(0)));
+        emit!(self, "    mov {}, rax", loc.q(0));
 
         if preserve {
             // Zero the newly added tail, from the old size up to the new one.
@@ -6044,10 +6057,10 @@ impl CodeGen {
             let done_label = self.new_label("preserve_done");
             self.emit_label(&loop_label);
             self.emit("    cmp rcx, r10");
-            self.emit(&format!("    jae {}", done_label));
+            emit!(self, "    jae {}", done_label);
             self.emit("    mov BYTE PTR [rax + rcx], 0");
             self.emit("    inc rcx");
-            self.emit(&format!("    jmp {}", loop_label));
+            emit!(self, "    jmp {}", loop_label);
             self.emit_label(&done_label);
         }
 
@@ -6099,7 +6112,7 @@ impl CodeGen {
         // body never runs must not report an array it never touched.
         if self.opts.checks {
             let base = self.array_base_operand(name, &loc);
-            self.emit(&format!("    cmp {}, 0", base));
+            emit!(self, "    cmp {}, 0", base);
             self.emit_check("je", RtError::Undim);
         }
 
@@ -6118,7 +6131,7 @@ impl CodeGen {
         // bound is already the element count (declared bound + 1).
         if self.opts.checks {
             let bound = self.array_bound_operand(name, &loc, 0);
-            self.emit(&format!("    cmp rax, {}", bound));
+            emit!(self, "    cmp rax, {}", bound);
             self.emit_check("jae", RtError::Subscript);
             self.emit_lower_bound_check("rax");
         }
@@ -6126,7 +6139,7 @@ impl CodeGen {
         // For each subsequent index, multiply by dimension bound and add
         for (i, idx_expr) in indices.iter().enumerate().skip(1) {
             // Save current accumulated index - use 16 bytes for alignment
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
             self.emit("    mov QWORD PTR [rsp], rax");
             // Evaluate next index
             let idx_type = self.gen_expr(idx_expr);
@@ -6137,14 +6150,14 @@ impl CodeGen {
             }
             let bound = self.array_bound_operand(name, &loc, i);
             if self.opts.checks {
-                self.emit(&format!("    cmp rcx, {}", bound));
+                emit!(self, "    cmp rcx, {}", bound);
                 self.emit_check("jae", RtError::Subscript);
                 self.emit_lower_bound_check("rcx");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
             // rax = rax * dim[i] + indices[i]
-            self.emit(&format!("    imul rax, {}", bound));
+            emit!(self, "    imul rax, {}", bound);
             self.emit("    add rax, rcx");
         }
 
@@ -6161,11 +6174,11 @@ impl CodeGen {
         // index runs arbitrary code, which is free to clobber r10.
         if Self::is_sib_scale(elem_size) {
             let base = self.array_base_into_register(name, &loc);
-            self.emit(&format!("    lea rax, [{} + rax*{}]", base, elem_size));
+            emit!(self, "    lea rax, [{} + rax*{}]", base, elem_size);
         } else {
-            self.emit(&format!("    imul rax, {}", elem_size));
+            emit!(self, "    imul rax, {}", elem_size);
             let base = self.array_base_operand(name, &loc);
-            self.emit(&format!("    add rax, {}", base));
+            emit!(self, "    add rax, {}", base);
         }
     }
 
@@ -6180,19 +6193,19 @@ impl CodeGen {
             let base = self.array_base_into_register(name, &loc);
             let at = format!("[{} + rax*{}]", base, elem_size);
             match elem_type {
-                DataType::Integer => self.emit(&format!("    movsx eax, WORD PTR {}", at)),
-                DataType::Long => self.emit(&format!("    mov eax, DWORD PTR {}", at)),
-                DataType::Single => self.emit(&format!("    movss xmm0, DWORD PTR {}", at)),
-                DataType::Double => self.emit(&format!("    movsd xmm0, QWORD PTR {}", at)),
+                DataType::Integer => emit!(self, "    movsx eax, WORD PTR {}", at),
+                DataType::Long => emit!(self, "    mov eax, DWORD PTR {}", at),
+                DataType::Single => emit!(self, "    movss xmm0, DWORD PTR {}", at),
+                DataType::Double => emit!(self, "    movsd xmm0, QWORD PTR {}", at),
                 DataType::String => unreachable!("excluded above"),
             }
             return;
         }
 
         // Otherwise build the address and read through it.
-        self.emit(&format!("    imul rax, {}", elem_size));
+        emit!(self, "    imul rax, {}", elem_size);
         let base = self.array_base_operand(name, &loc);
-        self.emit(&format!("    add rax, {}", base));
+        emit!(self, "    add rax, {}", base);
         match elem_type {
             DataType::String => {
                 self.emit("    mov rcx, rax");
@@ -6210,7 +6223,7 @@ impl CodeGen {
         self.gen_array_addr(name, indices);
 
         // Save the address while the value is evaluated - 16 bytes for alignment
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
         self.emit("    mov QWORD PTR [rsp], rax");
 
         let val_type = self.gen_expr(value);
@@ -6219,7 +6232,7 @@ impl CodeGen {
         }
 
         self.emit("    mov rcx, QWORD PTR [rsp]");
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
 
         let elem_type = DataType::from_suffix(name);
         if elem_type == DataType::String {
@@ -6245,8 +6258,8 @@ impl CodeGen {
         // Both words were reserved when the variable was first seen, so this no
         // longer has to scavenge a slot per assignment.
         let loc = self.get_var_loc(name);
-        self.emit(&format!("    mov {}, rax", loc.q(0)));
-        self.emit(&format!("    mov {}, rdx", loc.q(1)));
+        emit!(self, "    mov {}, rax", loc.q(0));
+        emit!(self, "    mov {}, rdx", loc.q(1));
     }
 
     fn emit_data_section(&mut self) {
@@ -6369,10 +6382,11 @@ impl CodeGen {
 
         // GOSUB stack (if needed)
         if self.gosub_used {
-            self.emit(&format!(
+            emit!(
+                self,
                 "_gosub_stack: .skip {}  # GOSUB return stack (64K entries)",
                 GOSUB_STACK_SIZE
-            ));
+            );
         }
     }
 }

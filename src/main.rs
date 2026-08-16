@@ -137,12 +137,12 @@ fn main() {
     let opts = codegen::Options {
         checks: !args.no_checks,
     };
-    let asm = codegen.generate(&program, symbols, opts);
+    let mut full_asm = codegen.generate(&program, symbols, opts);
 
-    // Add runtime
-    let runtime_asm = runtime::generate_runtime();
-
-    let full_asm = format!("{}\n{}", asm, runtime_asm);
+    // Append the runtime rather than `format!("{}\n{}", ..)`, which would build
+    // a third copy of an assembly text that reaches 145 MB on a large program.
+    full_asm.push('\n');
+    full_asm.push_str(&runtime::generate_runtime());
 
     // Determine output file names - put temp files next to output
     let input_path = Path::new(&input_file);
