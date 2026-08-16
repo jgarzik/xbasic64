@@ -1063,3 +1063,24 @@ fn test_next_list_is_checked() {
         assert!(e.is_clean_rejection(), "stderr: {}", e.stderr);
     }
 }
+
+/// `IF cond THEN` followed by only colons opens a block, not a single-line IF.
+///
+/// The single-line test treated anything other than end-of-line as the start of
+/// a statement, so the colons made this a one-line IF and the END IF below was
+/// then unmatched.
+#[test]
+fn test_if_then_trailing_colon_is_still_a_block() {
+    let output = compile_and_run(
+        r#"
+X = 1
+IF X = 1 THEN :
+PRINT "in"
+END IF
+PRINT "after"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["in", "after"]);
+}

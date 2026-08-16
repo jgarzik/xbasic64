@@ -143,3 +143,24 @@ fn test_let_accepts_every_assignment_form() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["5734", "HEllo"]);
 }
+
+/// A trailing `_` continues a statement on the next line.
+#[test]
+fn test_line_continuation() {
+    let output = compile_and_run(
+        r#"
+X = 1 + _
+    2 + _
+    3
+PRINT X
+Y$ = "a" + _
+     "b"
+PRINT Y$
+IF X = 6 AND _
+   Y$ = "ab" THEN PRINT "both"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["6", "ab", "both"]);
+}

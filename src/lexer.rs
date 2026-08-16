@@ -338,21 +338,32 @@ impl<'a> Lexer<'a> {
         // Replace D with E for parsing
         let s = s.replace(['d', 'D'], "e");
 
+        // `parse::<f64>()` answers `inf` for a literal too large to represent
+        // rather than failing, so an overflow used to slip through as a silent
+        // infinity -- the one numeric form in this lexer that guessed.
+        let finite = |v: f64, text: &str| {
+            if v.is_finite() {
+                Ok(Token::Float(v))
+            } else {
+                Err(format!("number '{}' is too large", text))
+            }
+        };
+
         if is_float {
-            return s
-                .parse::<f64>()
-                .map(Token::Float)
-                .map_err(|_| format!("malformed number '{}'", s));
+            return match s.parse::<f64>() {
+                Ok(v) => finite(v, &s),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            };
         }
 
         match s.parse::<i32>() {
             Ok(n) => Ok(Token::Integer(n as i64)),
             // Outside LONG range: widen to Double, as MS BASIC does, rather
             // than truncating to 32 bits.
-            Err(_) => s
-                .parse::<f64>()
-                .map(Token::Float)
-                .map_err(|_| format!("number '{}' is too large", s)),
+            Err(_) => match s.parse::<f64>() {
+                Ok(v) => finite(v, &s),
+                Err(_) => Err(format!("number '{}' is too large", s)),
+            },
         }
     }
 
@@ -430,6 +441,21 @@ impl<'a> Lexer<'a> {
 
     pub fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
+
+        // A trailing `_` joins this line to the next one. The newline is
+        // swallowed so no Newline token is produced and the statement carries
+        // on, but the line counter still advances so diagnostics keep pointing
+        // at the line the text was written on.
+        while self.peek() == Some('_') {
+            self.advance();
+            self.skip_whitespace();
+            if self.peek() != Some('\n') {
+                return Err("'_' continues a line, so nothing may follow it".to_string());
+            }
+            self.advance();
+            self.line += 1;
+            self.skip_whitespace();
+        }
 
         // Check for line number at start of line
         if self.at_line_start {

@@ -69,6 +69,16 @@ Multiple statements can appear on one line separated by colons:
 A = 1 : B = 2 : PRINT A + B
 ```
 
+### Line Continuation
+
+A trailing underscore joins a statement to the next line. Nothing may follow it
+on the line it ends:
+
+```basic
+Total = Price * Quantity + _
+        Shipping
+```
+
 ### Block Terminators
 
 Each multi-line block may be closed with either the two-word form or a single

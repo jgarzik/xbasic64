@@ -1076,12 +1076,19 @@ impl Parser {
                 // A terminator here closed nothing: there is no enclosing block
                 // for it to belong to.
                 Ok(Parsed::End(end)) => {
-                    let e = ParseError::Error(format!(
-                        "{} without matching {}",
-                        end.keyword(),
-                        end.opener()
-                    ));
-                    self.record(e);
+                    // Once anything has gone wrong, a stray terminator says
+                    // nothing useful: it is usually the perfectly good closer
+                    // of a block whose *header* failed, so reporting it blames
+                    // a FOR that is sitting right there. Suppress after the
+                    // first error, report it in a clean program.
+                    if self.errors.is_empty() {
+                        let e = ParseError::Error(format!(
+                            "{} without matching {}",
+                            end.keyword(),
+                            end.opener()
+                        ));
+                        self.record(e);
+                    }
                     self.synchronize();
                 }
                 Err(e) => {
@@ -1851,6 +1858,20 @@ impl Parser {
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
         self.expect(Token::Then)?;
+
+        // A run of colons after THEN separates no statements, so the line ends
+        // there and this is a block IF. Treating them as the start of a
+        // statement -- as any non-newline token used to be -- made
+        // `IF X = 1 THEN :` a one-line IF whose END IF was then unmatched.
+        let mut ahead = 0;
+        while matches!(self.peek_at(ahead), Token::Colon) {
+            ahead += 1;
+        }
+        if matches!(self.peek_at(ahead), Token::Newline | Token::Eof) {
+            for _ in 0..ahead {
+                self.advance();
+            }
+        }
 
         // Check for single-line IF
         if !matches!(self.peek(), Token::Newline | Token::Eof) {

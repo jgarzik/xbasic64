@@ -1381,3 +1381,43 @@ fn test_front_end_never_panics_on_token_soup() {
         }
     }
 }
+
+/// A number too large to represent is an error, not infinity.
+///
+/// `parse::<f64>()` returns `inf` for an overflowing literal rather than Err,
+/// so the "malformed number" arm never fired and `1e400` compiled to a silent
+/// infinity. Every other numeric form in this lexer refuses to guess.
+#[test]
+fn test_numeric_overflow_is_diagnosed() {
+    expect_rejected("PRINT 1e400\n", "too large");
+    expect_rejected("X# = 1.5D400\n", "too large");
+    // The largest representable double still works.
+    compile_only("PRINT 1.7976931348623157E+308\n").expect("near the maximum is fine");
+}
+
+/// A failed block header must not also blame its own terminator.
+///
+/// `FOR I = 1 2 3` fails, and the NEXT that follows is then orphaned -- so the
+/// reader was told "NEXT without matching FOR" about a FOR sitting one line
+/// above. Once anything has gone wrong, stray terminators say nothing useful.
+#[test]
+fn test_a_failed_block_header_does_not_cascade() {
+    let e = compile_only("FOR I = 1 2 3\nPRINT I\nNEXT\n").expect_err("must be refused");
+    assert!(
+        e.contains("expected TO"),
+        "the real error must survive: {}",
+        e.stderr
+    );
+    assert!(
+        !e.contains("without matching"),
+        "the orphaned NEXT must not be reported: {}",
+        e.stderr
+    );
+    assert!(e.contains("1 error"), "exactly one: {}", e.stderr);
+}
+
+/// A stray terminator in an otherwise clean program is still reported.
+#[test]
+fn test_cascade_suppression_only_applies_after_an_error() {
+    expect_rejected("PRINT 1\nNEXT\n", "NEXT without matching FOR");
+}
