@@ -873,3 +873,61 @@ fn test_on_without_goto_or_gosub_is_diagnosed() {
         err.stderr
     );
 }
+
+/// Every colon-separated statement after `THEN` belongs to the THEN branch.
+///
+/// The parser used to take exactly one statement, so the rest of the line
+/// escaped the conditional and ran unconditionally: with `X = 0`, the program
+/// below printed `B`. Nothing in the suite used the form, so it stayed green.
+#[test]
+fn test_single_line_if_takes_every_statement_after_then() {
+    let output = compile_and_run(
+        r#"
+X = 0
+IF X = 1 THEN PRINT "A" : PRINT "B"
+PRINT "done"
+X = 1
+IF X = 1 THEN PRINT "C" : PRINT "D"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["done", "C", "D"], "the whole tail is conditional");
+}
+
+/// The same, inside a loop, where the leak was loudest.
+///
+/// With the trailing statement unconditional this printed `x two x x` across
+/// three iterations instead of `two x` on the second alone.
+#[test]
+fn test_single_line_if_inside_a_loop() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 3
+IF I = 2 THEN PRINT "two" : PRINT "x"
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["two", "x"], "only the matching iteration prints");
+}
+
+/// `ELSE` ends the THEN branch and opens its own colon-separated list.
+///
+/// This form did not merely misbehave, it failed to compile: the second
+/// statement became a sibling of the IF, so the `ELSE` that followed it
+/// reached the top level and was rejected as "ELSE without matching IF".
+#[test]
+fn test_single_line_if_else_both_take_statement_lists() {
+    let output = compile_and_run(
+        r#"
+X = 9
+IF X = 1 THEN PRINT "a" : PRINT "b" ELSE PRINT "c" : PRINT "d"
+PRINT "end"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["c", "d", "end"], "the ELSE branch takes the tail");
+}

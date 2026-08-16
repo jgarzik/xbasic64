@@ -1381,11 +1381,11 @@ impl Parser {
         // Check for single-line IF
         if !matches!(self.peek(), Token::Newline | Token::Eof) {
             // Single-line IF
-            let then_branch = vec![self.parse_statement()?];
+            let then_branch = self.parse_single_line_branch()?;
 
             let else_branch = if matches!(self.peek(), Token::Else) {
                 self.advance();
-                Some(vec![self.parse_statement()?])
+                Some(self.parse_single_line_branch()?)
             } else {
                 None
             };
@@ -1406,6 +1406,32 @@ impl Parser {
             then_branch,
             else_branch,
         })
+    }
+
+    /// Parse one branch of a single-line IF: a colon-separated statement list.
+    ///
+    /// Everything after `THEN` up to `ELSE` or the end of the line is the THEN
+    /// clause, and everything after `ELSE` is the ELSE clause. Taking only the
+    /// first statement -- as this used to -- let the rest of the line escape
+    /// the conditional and run unconditionally, so `IF X = 1 THEN PRINT "A" :
+    /// PRINT "B"` printed `B` when X was 0. It also broke the ELSE form
+    /// outright: the second statement became a sibling of the IF, leaving the
+    /// `ELSE` to reach the top level as "ELSE without matching IF".
+    ///
+    /// The check for a terminator after the separator is what keeps a trailing
+    /// colon from pulling in the next line: `parse_statement` skips a leading
+    /// newline, so without it `IF C THEN PRINT "x" :` would swallow the
+    /// statement below it.
+    fn parse_single_line_branch(&mut self) -> PResult<Vec<Stmt>> {
+        let mut body = vec![self.parse_statement()?];
+        while matches!(self.peek(), Token::Colon) {
+            self.advance();
+            if matches!(self.peek(), Token::Else | Token::Newline | Token::Eof) {
+                break;
+            }
+            body.push(self.parse_statement()?);
+        }
+        Ok(body)
     }
 
     /// Parse the body of an IF block, returning (then_branch, else_branch)
