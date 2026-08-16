@@ -933,6 +933,19 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// A line number too large to represent is an error, not a silent zero.
+///
+/// The lexer parsed it with `unwrap_or(0)`, so `99999999999 PRINT "hi"`
+/// compiled as a definition of label 0 -- and any GOTO written to reach it
+/// failed separately, because past LONG range the same digits lex as a Double.
+/// Every other numeric form in the lexer already refuses to guess.
+#[test]
+fn test_line_number_out_of_range_is_diagnosed() {
+    expect_rejected("99999999999 PRINT \"hi\"\n", "line number");
+    // The largest representable one still works.
+    compile_only("4294967295 PRINT \"ok\"\n").expect("u32::MAX is a valid line number");
+}
+
 /// A DO loop tests its condition at one end or the other, never both.
 ///
 /// The two conditions used to be merged with `condition.or(end_condition)`, so

@@ -3,75 +3,80 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;
-use std::sync::LazyLock;
 
-/// Keyword lookup table (initialized once on first use)
-static KEYWORDS: LazyLock<HashMap<&'static str, Token>> = LazyLock::new(|| {
-    HashMap::from([
-        ("PRINT", Token::Print),
-        ("INPUT", Token::Input),
-        ("LINE", Token::Line),
-        ("LET", Token::Let),
-        ("DIM", Token::Dim),
-        ("IF", Token::If),
-        ("THEN", Token::Then),
-        ("ELSE", Token::Else),
-        ("ELSEIF", Token::ElseIf),
-        ("ENDIF", Token::EndIf),
-        ("FOR", Token::For),
-        ("TO", Token::To),
-        ("STEP", Token::Step),
-        ("NEXT", Token::Next),
-        ("WHILE", Token::While),
-        ("WEND", Token::Wend),
-        ("DO", Token::Do),
-        ("LOOP", Token::Loop),
-        ("UNTIL", Token::Until),
-        ("GOTO", Token::Goto),
-        ("GOSUB", Token::Gosub),
-        ("RETURN", Token::Return),
-        ("ON", Token::On),
-        ("SUB", Token::Sub),
-        ("ENDSUB", Token::EndSub),
-        ("FUNCTION", Token::Function),
-        ("ENDFUNCTION", Token::EndFunction),
-        ("SELECT", Token::Select),
-        ("CASE", Token::Case),
-        ("ENDSELECT", Token::EndSelect),
-        ("END", Token::End),
-        ("STOP", Token::Stop),
-        ("REM", Token::Rem),
-        ("DATA", Token::Data),
-        ("READ", Token::Read),
-        ("RESTORE", Token::Restore),
-        ("CLS", Token::Cls),
-        ("OPEN", Token::Open),
-        ("CLOSE", Token::Close),
-        ("AS", Token::As),
-        ("OUTPUT", Token::Output),
-        ("APPEND", Token::Append),
-        ("AND", Token::And),
-        ("OR", Token::Or),
-        ("NOT", Token::Not),
-        ("XOR", Token::Xor),
-        ("MOD", Token::Mod),
-        ("USING", Token::Using),
-        ("SWAP", Token::Swap),
-        ("CONST", Token::Const),
-        ("WRITE", Token::Write),
-        ("EXIT", Token::Exit),
-        ("DEF", Token::Def),
-        ("OPTION", Token::Option),
-        ("BASE", Token::Base),
-        ("REDIM", Token::Redim),
-        ("PRESERVE", Token::Preserve),
-        ("TYPE", Token::Type),
-        ("ENDTYPE", Token::EndType),
-    ])
-});
+/// Recognise a keyword.
+///
+/// A `match` on the string rather than a `HashMap`: rustc lowers this to a
+/// switch on length followed by a memcmp chain, so there is no lazy-init check,
+/// no hashing and no clone of the matched token on every identifier scanned.
+///
+/// REM is absent deliberately -- `next_token` intercepts it before this is
+/// reached, because it introduces a comment rather than producing a token.
+fn keyword(s: &str) -> Option<Token> {
+    match s {
+        "PRINT" => Some(Token::Print),
+        "INPUT" => Some(Token::Input),
+        "LINE" => Some(Token::Line),
+        "LET" => Some(Token::Let),
+        "DIM" => Some(Token::Dim),
+        "IF" => Some(Token::If),
+        "THEN" => Some(Token::Then),
+        "ELSE" => Some(Token::Else),
+        "ELSEIF" => Some(Token::ElseIf),
+        "ENDIF" => Some(Token::EndIf),
+        "FOR" => Some(Token::For),
+        "TO" => Some(Token::To),
+        "STEP" => Some(Token::Step),
+        "NEXT" => Some(Token::Next),
+        "WHILE" => Some(Token::While),
+        "WEND" => Some(Token::Wend),
+        "DO" => Some(Token::Do),
+        "LOOP" => Some(Token::Loop),
+        "UNTIL" => Some(Token::Until),
+        "GOTO" => Some(Token::Goto),
+        "GOSUB" => Some(Token::Gosub),
+        "RETURN" => Some(Token::Return),
+        "ON" => Some(Token::On),
+        "SUB" => Some(Token::Sub),
+        "ENDSUB" => Some(Token::EndSub),
+        "FUNCTION" => Some(Token::Function),
+        "ENDFUNCTION" => Some(Token::EndFunction),
+        "SELECT" => Some(Token::Select),
+        "CASE" => Some(Token::Case),
+        "ENDSELECT" => Some(Token::EndSelect),
+        "END" => Some(Token::End),
+        "STOP" => Some(Token::Stop),
+        "DATA" => Some(Token::Data),
+        "READ" => Some(Token::Read),
+        "RESTORE" => Some(Token::Restore),
+        "CLS" => Some(Token::Cls),
+        "OPEN" => Some(Token::Open),
+        "CLOSE" => Some(Token::Close),
+        "AS" => Some(Token::As),
+        "OUTPUT" => Some(Token::Output),
+        "APPEND" => Some(Token::Append),
+        "AND" => Some(Token::And),
+        "OR" => Some(Token::Or),
+        "NOT" => Some(Token::Not),
+        "XOR" => Some(Token::Xor),
+        "MOD" => Some(Token::Mod),
+        "USING" => Some(Token::Using),
+        "SWAP" => Some(Token::Swap),
+        "CONST" => Some(Token::Const),
+        "WRITE" => Some(Token::Write),
+        "EXIT" => Some(Token::Exit),
+        "DEF" => Some(Token::Def),
+        "OPTION" => Some(Token::Option),
+        "BASE" => Some(Token::Base),
+        "REDIM" => Some(Token::Redim),
+        "PRESERVE" => Some(Token::Preserve),
+        "TYPE" => Some(Token::Type),
+        "ENDTYPE" => Some(Token::EndType),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -116,7 +121,6 @@ pub enum Token {
     EndSelect,
     End,
     Stop,
-    Rem,
     Data,
     Read,
     Restore,
@@ -174,9 +178,7 @@ pub enum Token {
 }
 
 pub struct Lexer<'a> {
-    input: &'a str,
     chars: Peekable<Chars<'a>>,
-    pos: usize,
     line: u32,
     at_line_start: bool,
     /// Source line of each token produced by `tokenize`, parallel to its output.
@@ -186,9 +188,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         Lexer {
-            input,
             chars: input.chars().peekable(),
-            pos: 0,
             line: 1,
             at_line_start: true,
             lines: Vec::new(),
@@ -196,11 +196,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn advance(&mut self) -> Option<char> {
-        let c = self.chars.next();
-        if let Some(ch) = c {
-            self.pos += ch.len_utf8();
-        }
-        c
+        self.chars.next()
     }
 
     fn peek(&mut self) -> Option<char> {
@@ -227,9 +223,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Scan a string literal. The opening quote is already consumed.
     fn read_string(&mut self) -> Result<String, String> {
         let mut s = String::new();
-        self.advance(); // consume opening "
         loop {
             match self.advance() {
                 Some('"') => {
@@ -367,10 +363,7 @@ impl<'a> Lexer<'a> {
         if s.ends_with(['%', '&', '!', '#', '$']) {
             return Token::Ident(s.to_string());
         }
-        KEYWORDS
-            .get(s)
-            .cloned()
-            .unwrap_or_else(|| Token::Ident(s.to_string()))
+        keyword(s).unwrap_or_else(|| Token::Ident(s.to_string()))
     }
 
     pub fn next_token(&mut self) -> Result<Token, String> {
@@ -390,7 +383,15 @@ impl<'a> Lexer<'a> {
                     }
                     self.at_line_start = false;
                     self.skip_whitespace();
-                    return Ok(Token::LineNumber(num.parse().unwrap_or(0)));
+                    // A number too large to represent used to become label 0,
+                    // so the program silently defined a label nobody wrote and
+                    // every GOTO to it failed separately -- past LONG range the
+                    // same digits lex as a Double. Every other numeric form in
+                    // this lexer refuses to guess; so does this one.
+                    return match num.parse::<u32>() {
+                        Ok(n) => Ok(Token::LineNumber(n)),
+                        Err(_) => Err(format!("line number '{}' is too large", num)),
+                    };
                 }
             }
         }
@@ -408,12 +409,7 @@ impl<'a> Lexer<'a> {
                 Ok(Token::Newline)
             }
 
-            '"' => {
-                self.pos -= 1; // back up to re-read the quote
-                self.chars = self.input[self.pos..].chars().peekable();
-                let s = self.read_string()?;
-                Ok(Token::String(s))
-            }
+            '"' => Ok(Token::String(self.read_string()?)),
 
             '\'' => {
                 self.skip_comment();
