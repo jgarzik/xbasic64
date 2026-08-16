@@ -204,6 +204,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::abi::{Abi, PlatformAbi};
+use crate::lexer::normalized;
 use crate::parser::TypeRef;
 use crate::parser::*;
 use crate::sema::{Scope as SemaScope, Symbols};
@@ -835,7 +836,7 @@ impl CodeGen {
     fn const_double(&self, expr: &Expr) -> Option<f64> {
         let lit = match expr {
             Expr::Literal(lit) => lit,
-            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            Expr::Variable(name) => self.symbols.consts.get(normalized(name))?,
             Expr::Unary {
                 op: UnaryOp::Neg,
                 operand,
@@ -857,7 +858,7 @@ impl CodeGen {
     fn const_i32(&self, expr: &Expr) -> Option<i32> {
         let lit = match expr {
             Expr::Literal(lit) => lit,
-            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            Expr::Variable(name) => self.symbols.consts.get(normalized(name))?,
             // `checked_neg` rather than `-`: negating i32::MIN is not an i32,
             // and the general path handles it correctly.
             Expr::Unary {
@@ -1081,7 +1082,7 @@ impl CodeGen {
             Expr::Variable(name) if crate::sema::is_zero_arg_builtin(name) => {
                 self.fn_return_type(name)
             }
-            Expr::Variable(name) => match self.symbols.consts.get(&name.to_uppercase()) {
+            Expr::Variable(name) => match self.symbols.consts.get(normalized(name)) {
                 Some(Literal::Integer(_)) => DataType::Long,
                 Some(Literal::Float(_)) => DataType::Double,
                 Some(Literal::String(_)) => DataType::String,
@@ -1138,7 +1139,7 @@ impl CodeGen {
         match self
             .symbols
             .procs
-            .get(&name.to_uppercase())
+            .get(normalized(name))
             .and_then(|p| p.ret_ty.as_ref())
         {
             Some(ty) => DataType::from_type_ref(ty),
@@ -1510,7 +1511,7 @@ impl CodeGen {
     fn const_dim(&self, e: &Expr) -> Option<i32> {
         let lit = match e {
             Expr::Literal(l) => l.clone(),
-            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase())?.clone(),
+            Expr::Variable(n) => self.symbols.consts.get(normalized(n))?.clone(),
             _ => return None,
         };
         match lit {
@@ -3222,7 +3223,7 @@ impl CodeGen {
                     Some(GotoTarget::Line(n)) => self.data_line_index.get(n).copied().unwrap_or(0),
                     Some(GotoTarget::Label(name)) => self
                         .data_label_index
-                        .get(&name.to_uppercase())
+                        .get(normalized(name))
                         .copied()
                         .unwrap_or(0),
                     None => 0,
@@ -3555,7 +3556,7 @@ impl CodeGen {
 
             Expr::Variable(name) => {
                 // A CONST is substituted with its folded value.
-                if let Some(lit) = self.symbols.consts.get(&name.to_uppercase()).cloned() {
+                if let Some(lit) = self.symbols.consts.get(normalized(name)).cloned() {
                     return self.gen_expr(&Expr::Literal(lit));
                 }
 
@@ -4638,7 +4639,7 @@ impl CodeGen {
             let TypeRef::Record(rec) = &ty else {
                 return DataType::Double;
             };
-            let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+            let Some(info) = self.symbols.records.get(normalized(rec)) else {
                 return DataType::Double;
             };
             let Some(f) = info.field(field) else {
@@ -4744,11 +4745,7 @@ impl CodeGen {
             let TypeRef::Record(rec) = &ty else {
                 return None;
             };
-            let f = self
-                .symbols
-                .records
-                .get(&rec.to_uppercase())?
-                .field(field)?;
+            let f = self.symbols.records.get(normalized(rec))?.field(field)?;
             offset += f.word * 8;
             ty = f.ty.clone();
         }
@@ -4906,7 +4903,7 @@ impl CodeGen {
             let TypeRef::Record(rec) = &ty else {
                 return None;
             };
-            let info = self.symbols.records.get(&rec.to_uppercase())?;
+            let info = self.symbols.records.get(normalized(rec))?;
             let f = info.field(field)?;
             loc = loc.offset_words(f.word);
             ty = f.ty.clone();

@@ -24,6 +24,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
+use crate::lexer::normalized;
 use crate::parser::*;
 use std::collections::{HashMap, HashSet};
 
@@ -243,7 +244,7 @@ pub fn unsupported_reason(name: &str) -> Option<&'static str> {
 /// mention of either is a call. Without this they parsed as ordinary variable
 /// reads and quietly returned the zero of a slot nobody ever wrote.
 pub fn is_zero_arg_builtin(name: &str) -> bool {
-    builtin(&name.to_uppercase()).is_some_and(|(_, min, _)| *min == 0)
+    builtin(normalized(name)).is_some_and(|(_, min, _)| *min == 0)
 }
 
 fn builtin(name: &str) -> Option<&'static (&'static str, usize, usize)> {
@@ -338,7 +339,7 @@ impl Symbols {
             TypeRef::FixedString(_) => 2,
             TypeRef::Record(name) => self
                 .records
-                .get(&name.to_uppercase())
+                .get(normalized(name))
                 .map(|r| r.words)
                 .unwrap_or(1),
         }
@@ -698,7 +699,7 @@ impl Analyzer {
 
                         if let Some(ty) = &decl.ty {
                             if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                if !self.symbols.records.contains_key(normalized(r)) {
                                     self.error(stmt.line, format!("undefined TYPE '{}'", r));
                                 }
                             }
@@ -800,7 +801,7 @@ impl Analyzer {
                     for p in params {
                         if let Some(ty) = &p.ty {
                             if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                if !self.symbols.records.contains_key(normalized(r)) {
                                     self.error(
                                         stmt.line,
                                         format!(
@@ -1327,7 +1328,7 @@ impl Analyzer {
     fn const_eval(&self, e: &Expr) -> Option<Literal> {
         match e {
             Expr::Literal(l) => Some(l.clone()),
-            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase()).cloned(),
+            Expr::Variable(n) => self.symbols.consts.get(normalized(n)).cloned(),
             Expr::Unary { op, operand } => {
                 let v = self.const_eval(operand)?;
                 match (op, v) {
@@ -1380,7 +1381,7 @@ impl Analyzer {
             let Expr::Variable(arr) = first else {
                 return Some(format!("argument 1 of '{}' must be an array name", name));
             };
-            let Some(info) = self.symbols.lookup_array(scope, &arr.to_uppercase()) else {
+            let Some(info) = self.symbols.lookup_array(scope, normalized(arr)) else {
                 return Some(format!("'{}' is not a declared array", arr));
             };
             let rank = info.rank;
@@ -1477,7 +1478,7 @@ impl Analyzer {
                     };
                     for f in &fields {
                         let TypeRef::Record(rec) = &ty else { return };
-                        let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                        let Some(info) = self.symbols.records.get(normalized(rec)) else {
                             return;
                         };
                         match info.field(f) {
@@ -1891,7 +1892,7 @@ impl Analyzer {
             ty = self
                 .symbols
                 .records
-                .get(&rec.to_uppercase())?
+                .get(normalized(rec))?
                 .field(field)?
                 .ty
                 .clone();
@@ -1920,12 +1921,12 @@ impl Analyzer {
                 );
                 return None;
             };
-            let info = self.symbols.records.get(&rec.to_uppercase())?;
+            let info = self.symbols.records.get(normalized(rec))?;
             match info.field(field) {
                 Some(f) => ty = f.ty.clone(),
                 None => {
                     let known: Vec<&str> = info.fields.iter().map(|(n, _)| n.as_str()).collect();
-                    match closest(&field.to_uppercase(), &known) {
+                    match closest(normalized(field), &known) {
                         Some(sug) => self.error_with_note(
                             line,
                             format!("TYPE '{}' has no field '{}'", rec, field),
@@ -2010,7 +2011,7 @@ impl Analyzer {
                     let TypeRef::Record(rec) = &ty else {
                         return None;
                     };
-                    let info = self.symbols.records.get(&rec.to_uppercase())?;
+                    let info = self.symbols.records.get(normalized(rec))?;
                     ty = info.field(field)?.ty.clone();
                 }
                 Some(matches!(ty, TypeRef::FixedString(_)))

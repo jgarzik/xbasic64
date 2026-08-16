@@ -6,6 +6,29 @@
 use std::iter::Peekable;
 use std::str::Chars;
 
+/// An identifier, as the lexer already normalized it.
+///
+/// [`Lexer::read_identifier`] uppercases every character of every name, so by
+/// the time one reaches the parser, sema or codegen it is *already* upper case.
+/// Sixty-odd call sites used to write `name.to_uppercase()` to say so, each
+/// allocating a fresh `String` to produce the string it was handed.
+///
+/// This states the invariant in one place and checks it, rather than having
+/// every consumer defensively re-establish it -- and re-establish it slightly
+/// differently, which is how `Symbols::lookup_array` came to uppercase the name
+/// for its module-level lookup but not for its procedure-local one.
+///
+/// The check is `debug_assert`, so it costs nothing in the shipped compiler and
+/// fires during `cargo test` in a debug profile if a name ever arrives raw.
+pub fn normalized(name: &str) -> &str {
+    debug_assert!(
+        !name.chars().any(char::is_lowercase),
+        "identifier '{}' was not uppercased by the lexer",
+        name
+    );
+    name
+}
+
 /// Recognise a keyword.
 ///
 /// A `match` on the string rather than a `HashMap`: rustc lowers this to a
@@ -330,6 +353,13 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Scan an identifier, uppercasing it.
+    ///
+    /// This is where BASIC's case-insensitivity is implemented, and it is the
+    /// only place: every name that reaches the AST has been through here, and
+    /// the entry gate in `next_token` is `is_ascii_alphabetic`, so there is no
+    /// Unicode folding to worry about and the type suffixes (`% & ! # $`) are
+    /// case-invariant. See [`normalized`] for the invariant this establishes.
     fn read_identifier(&mut self, first: char) -> String {
         let mut s = String::new();
         s.push(first.to_ascii_uppercase());
@@ -954,5 +984,31 @@ mod tests {
         let result = lexer.tokenize();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected character"));
+    }
+
+    // The uppercase invariant
+
+    /// Every identifier the lexer produces satisfies `normalized`, whatever
+    /// case it was written in and whatever suffix it carries.
+    #[test]
+    fn test_every_identifier_is_normalized() {
+        let mut lexer = Lexer::new("MyVar counter FOO123 a$ b% c& d! e# under_score");
+        for tok in lexer.tokenize().unwrap() {
+            if let Token::Ident(name) = &tok {
+                assert_eq!(normalized(name), name);
+            }
+        }
+    }
+
+    /// And the guard is real: it fires on a name that skipped the lexer.
+    ///
+    /// Without this the invariant would be documented and unenforced, which is
+    /// how sixty-odd call sites came to re-assert it defensively in the first
+    /// place.
+    #[test]
+    #[should_panic(expected = "was not uppercased")]
+    #[cfg(debug_assertions)]
+    fn test_normalized_rejects_a_raw_name() {
+        normalized("lowercase");
     }
 }
