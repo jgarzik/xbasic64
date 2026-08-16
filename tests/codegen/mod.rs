@@ -1044,3 +1044,94 @@ PRINT T#
     let got: Vec<&str> = out.trim().lines().collect();
     assert_eq!(got, vec!["9", "23", "90"]);
 }
+
+/// Every call in generated code must be made with the stack 16-byte aligned.
+///
+/// `tests/runtime` already checks this for the hand-written runtime; nothing
+/// checked the code the compiler emits. MID$ and INSTR each pushed three
+/// callee-saved registers and never padded, so every call in those sequences
+/// was 8 bytes out. The leaf helpers tolerated it, which is why it went
+/// unnoticed -- until an argument check jumped to an error trampoline, whose
+/// `_rt_error` calls into the C library. On Linux that survived; on Windows it
+/// was an access violation, and the Linux CI could not see it.
+///
+/// The model is a linear scan of `main`'s body, which is sound here because
+/// each program below is straight-line: no loops, no branches of its own. A
+/// conditional jump to an error trampoline is checked too, since the trampoline
+/// touches no stack before calling and so inherits the jump site's alignment.
+#[test]
+fn test_generated_calls_are_stack_aligned() {
+    let programs = [
+        ("MID$ three args", "PRINT MID$(\"abcdef\", 2, 3)\n"),
+        ("MID$ two args", "PRINT MID$(\"abcdef\", 2)\n"),
+        ("INSTR two args", "PRINT INSTR(\"abc\", \"b\")\n"),
+        ("INSTR three args", "PRINT INSTR(2, \"abc\", \"b\")\n"),
+        ("LEFT$", "PRINT LEFT$(\"abc\", 2)\n"),
+        ("RIGHT$", "PRINT RIGHT$(\"abc\", 2)\n"),
+        ("STRING$", "PRINT STRING$(3, \"x\")\n"),
+        ("SPACE$", "PRINT SPACE$(3)\n"),
+        ("CHR$", "PRINT CHR$(65)\n"),
+        ("ASC", "PRINT ASC(\"A\")\n"),
+        (
+            "nested",
+            "PRINT MID$(LEFT$(\"abcdef\", 5), INSTR(\"abc\", \"b\"), 2)\n",
+        ),
+        ("concat", "PRINT MID$(\"abc\", 1, 2) + RIGHT$(\"xyz\", 1)\n"),
+        (
+            "array subscript",
+            "DIM A(3)\nA(1) = 2\nPRINT MID$(\"abcdef\", A(1), 2)\n",
+        ),
+    ];
+
+    let mut problems = Vec::new();
+    for (what, source) in programs {
+        let asm = compile_to_asm(source).expect("must compile");
+        // `offset` is rsp modulo 16 measured from the ABI's state on entry.
+        // After `push rbp` it is 0, and every call must see it at 0.
+        let mut offset: i64 = 8;
+        let mut in_main = false;
+
+        for raw in asm.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line == "main:" {
+                in_main = true;
+                offset = 8;
+                continue;
+            }
+            if !in_main {
+                continue;
+            }
+            // The body ends at the first `ret`; the trampolines past it are
+            // reached by jumps, so a linear scan cannot model them.
+            if line == "ret" {
+                break;
+            }
+
+            if line.starts_with("push ") || line.starts_with("pop ") {
+                offset = (offset + 8) % 16;
+            } else if let Some(n) = line.strip_prefix("sub rsp, ") {
+                offset = (offset - n.trim().parse::<i64>().expect("literal")).rem_euclid(16);
+            } else if let Some(n) = line.strip_prefix("add rsp, ") {
+                offset = (offset + n.trim().parse::<i64>().expect("literal")) % 16;
+            } else if line == "leave" {
+                offset = 8;
+            } else if let Some(target) = line.strip_prefix("call ") {
+                if offset != 0 {
+                    problems.push(format!("{what}: call {target} with rsp % 16 == {offset}"));
+                }
+            } else if line.starts_with('j') && line.contains(".Lerr_") && offset != 0 {
+                problems.push(format!("{what}: {line} with rsp % 16 == {offset}"));
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{} misaligned site(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}

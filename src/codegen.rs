@@ -5662,6 +5662,11 @@ impl CodeGen {
                 self.emit("    push r12");
                 self.emit("    push r13");
                 self.emit("    push r14");
+                // Three pushes leave rsp 8 short of a 16-byte boundary, and
+                // every call made from here -- _rt_mid, and any error
+                // trampoline an argument check jumps to -- must be aligned.
+                // STRING$ below already pairs its odd push with this.
+                self.emit("    sub rsp, 8");
                 self.gen_expr(&args[0]);
                 self.emit("    mov r12, rax"); // save ptr
                 self.emit("    mov r13, rdx"); // save len
@@ -5692,6 +5697,7 @@ impl CodeGen {
                 self.emit_arg_reg(1, "r13"); // len
                 self.emit_arg_reg(2, "r14"); // start
                 self.emit("    call _rt_mid");
+                self.emit("    add rsp, 8");
                 self.emit("    pop r14");
                 self.emit("    pop r13");
                 self.emit("    pop r12");
@@ -5721,6 +5727,10 @@ impl CodeGen {
                 // Evaluate haystack and save
                 self.emit("    push r12");
                 self.emit("    push r13");
+                // Three pushes in all, counting rbx above: pad so that every
+                // call from here is 16-byte aligned, including the error
+                // trampoline _rt_instr's own start check may reach.
+                self.emit("    sub rsp, 8");
                 self.gen_expr(hay_arg);
                 self.emit("    mov r12, rax"); // haystack ptr
                 self.emit("    mov r13, rdx"); // haystack len
@@ -5736,6 +5746,7 @@ impl CodeGen {
                 // V's third argument register.
                 self.emit_call_with_args("_rt_instr", &["r12", "r13", "rax", "rdx", "rbx"]);
 
+                self.emit("    add rsp, 8");
                 self.emit("    pop r13");
                 self.emit("    pop r12");
                 self.emit("    pop rbx");
