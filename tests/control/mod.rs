@@ -974,3 +974,92 @@ PRINT "end"
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, &["c", "d", "end"], "the ELSE branch takes the tail");
 }
+
+/// `NEXT` names the loop it closes, and the name is checked.
+///
+/// The control variable was parsed and thrown away, so crossed NEXTs compiled
+/// into a loop nesting nobody wrote:
+///
+///     FOR I = 1 TO 2
+///       FOR J = 1 TO 2
+///       NEXT I          ' actually closed the J loop
+///     NEXT J            ' actually closed the I loop
+///
+/// GW-BASIC rejects that as "NEXT without FOR".
+#[test]
+fn test_next_variable_must_match_its_for() {
+    for source in [
+        "FOR I = 1 TO 2\nPRINT I\nNEXT J\n",
+        "FOR I = 1 TO 2\nFOR J = 1 TO 2\nPRINT I\nNEXT I\nNEXT J\n",
+    ] {
+        let e = crate::common::compile_only(source)
+            .expect_err(&format!("{source:?} should be refused"));
+        assert!(
+            e.contains("NEXT"),
+            "the diagnostic should name NEXT: {}",
+            e.stderr
+        );
+        assert!(e.is_clean_rejection());
+    }
+}
+
+/// A bare `NEXT` still closes the innermost loop, and a matching name is fine.
+#[test]
+fn test_next_bare_and_matching_still_work() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 2
+  FOR J = 1 TO 2
+    PRINT I; J
+  NEXT J
+NEXT I
+FOR K = 1 TO 2
+  FOR L = 1 TO 2
+  NEXT
+NEXT
+PRINT "done"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["11", "12", "21", "22", "done"]);
+}
+
+/// One `NEXT` may close several loops, innermost name first.
+#[test]
+fn test_next_closes_several_loops() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 2
+  FOR J = 1 TO 2
+    PRINT I; J
+NEXT J, I
+PRINT "done"
+FOR A = 1 TO 2
+  FOR B = 1 TO 2
+    FOR C = 1 TO 2
+      T = T + 1
+NEXT C, B, A
+PRINT T
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["11", "12", "21", "22", "done", "8"]);
+}
+
+/// The names in a multi-loop `NEXT` are checked in order, and a name with no
+/// loop left to close is refused rather than silently dropped.
+#[test]
+fn test_next_list_is_checked() {
+    for source in [
+        // Wrong order: J is the inner loop, so `NEXT I, J` is backwards.
+        "FOR I = 1 TO 2\nFOR J = 1 TO 2\nNEXT I, J\n",
+        // One name too many.
+        "FOR I = 1 TO 2\nNEXT I, J\n",
+    ] {
+        let e = crate::common::compile_only(source)
+            .expect_err(&format!("{source:?} should be refused"));
+        assert!(e.is_clean_rejection(), "stderr: {}", e.stderr);
+    }
+}

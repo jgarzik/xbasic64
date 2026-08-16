@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::Token;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
 ///
@@ -535,7 +535,10 @@ pub enum BlockEnd {
     EndSub,
     EndFunction,
     EndSelect,
-    Next,
+    /// `NEXT [var [, var]...]`. The names are carried rather than discarded so
+    /// that `FOR I ... NEXT J` can be refused and `NEXT J, I` can close both
+    /// loops. Empty means a bare `NEXT`, which closes the innermost loop.
+    Next(Vec<String>),
     Wend,
     Loop,
     LoopWhile(Expr),
@@ -552,7 +555,7 @@ impl BlockEnd {
             BlockEnd::EndSub => "END SUB",
             BlockEnd::EndFunction => "END FUNCTION",
             BlockEnd::EndSelect => "END SELECT",
-            BlockEnd::Next => "NEXT",
+            BlockEnd::Next(_) => "NEXT",
             BlockEnd::Wend => "WEND",
             BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "LOOP",
             BlockEnd::Else => "ELSE",
@@ -567,7 +570,7 @@ impl BlockEnd {
             BlockEnd::EndSub => "SUB",
             BlockEnd::EndFunction => "FUNCTION",
             BlockEnd::EndSelect => "SELECT CASE",
-            BlockEnd::Next => "FOR",
+            BlockEnd::Next(_) => "FOR",
             BlockEnd::Wend => "WHILE",
             BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "DO",
         }
@@ -760,6 +763,13 @@ pub struct Parser {
     /// Errors found so far. Parsing continues past each one, so a program with
     /// several mistakes reports them all rather than one per compile.
     errors: Vec<LocatedParseError>,
+    /// Loop names from a `NEXT I, J` still waiting to close their loops.
+    ///
+    /// One NEXT may close several nested loops. The innermost `parse_for` takes
+    /// the first name and leaves the rest here; each enclosing block body picks
+    /// the next one up before reading another token, so the terminator reaches
+    /// every loop it names as the recursion unwinds outward.
+    pending_next: VecDeque<String>,
 }
 
 impl Parser {
@@ -925,6 +935,10 @@ impl Parser {
     /// leaves any block terminator on that line to be read normally, so one bad
     /// statement inside a SUB does not also cost the END SUB.
     fn synchronize(&mut self) {
+        // Whatever a half-parsed statement left queued is meaningless now, and
+        // a stale name would surface as a terminator somewhere unrelated.
+        self.pending_next.clear();
+
         let start = self.pos;
         while !matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
             self.advance();
@@ -940,7 +954,17 @@ impl Parser {
         let mut statements = Vec::new();
         self.skip_newlines();
 
-        while !matches!(self.peek(), Token::Eof) {
+        while !matches!(self.peek(), Token::Eof) || !self.pending_next.is_empty() {
+            // A name left over from `NEXT I, J` has no loop to close: more
+            // loops were named than were open. Draining it here rather than
+            // only inside the loop condition matters, because the commonest
+            // shape -- `FOR I .. NEXT I, J` as the last statement -- leaves the
+            // token stream at Eof with the name still queued.
+            if let Some(name) = self.pending_next.pop_front() {
+                let e = ParseError::Error(format!("NEXT {} without matching FOR", name));
+                self.record(e);
+                continue;
+            }
             match self.parse_statement() {
                 Ok(Parsed::Item(stmt)) => statements.push(stmt),
                 // A terminator here closed nothing: there is no enclosing block
@@ -981,6 +1005,15 @@ impl Parser {
     ) -> PResult<(Vec<Stmt>, BlockEnd)> {
         let mut body = Vec::new();
         loop {
+            // A `NEXT I, J` left names here for the enclosing loops. Take one
+            // before looking at the token stream at all -- the NEXT has already
+            // been consumed, so the next real token is whatever followed it,
+            // and at the end of a program that is Eof. Checking after the guard
+            // below would report "FOR is missing its NEXT" with the terminator
+            // sitting right there.
+            if let Some(name) = self.pending_next.pop_front() {
+                return Ok((body, BlockEnd::Next(vec![name])));
+            }
             if matches!(self.peek(), Token::Eof) {
                 return Err(ParseError::ErrorAt(
                     opener_line,
@@ -1212,11 +1245,20 @@ impl Parser {
             }
             Token::Next => {
                 self.advance();
-                // The control variable is optional and unchecked, as in GW-BASIC.
-                if matches!(self.peek(), Token::Ident(_)) {
+                // `NEXT`, `NEXT I` or `NEXT I, J, ...`. The names used to be
+                // swallowed and discarded, so a NEXT could close a loop it did
+                // not name and a list was a syntax error.
+                let mut names = Vec::new();
+                while let Token::Ident(name) = self.peek().clone() {
                     self.advance();
+                    names.push(name);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
                 }
-                BlockEnd::Next
+                BlockEnd::Next(names)
             }
             Token::Wend => {
                 self.advance();
@@ -1813,7 +1855,36 @@ impl Parser {
 
         self.skip_newlines();
 
-        let body = self.parse_block(BlockEnd::Next, "FOR", for_line)?;
+        // Inspect the terminator rather than letting `parse_block` check only
+        // its variant, so the control variable can be matched against this
+        // loop's. `parse_do_loop` and `parse_if_body` take the same route.
+        let (body, terminator) = self.parse_block_body("FOR", "NEXT", for_line)?;
+        let BlockEnd::Next(mut names) = terminator else {
+            return Err(ParseError::ErrorAt(
+                for_line,
+                format!(
+                    "FOR needs NEXT to close it, but {} came first",
+                    terminator.keyword()
+                ),
+            ));
+        };
+
+        // A bare NEXT closes the innermost loop, whichever it is. A named one
+        // must name *this* loop: `FOR I ... NEXT J` used to compile, and with
+        // two loops open it silently produced a nesting nobody wrote.
+        if !names.is_empty() {
+            let closes = names.remove(0);
+            if closes != var {
+                return Err(ParseError::ErrorAt(
+                    for_line,
+                    format!("FOR {} is closed by NEXT {}", var, closes),
+                ));
+            }
+            // The rest belong to the loops enclosing this one.
+            for name in names.into_iter().rev() {
+                self.pending_next.push_front(name);
+            }
+        }
 
         Ok(StmtKind::For {
             var,

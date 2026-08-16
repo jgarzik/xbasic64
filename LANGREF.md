@@ -482,11 +482,22 @@ FOR K = 0 TO 1 STEP 0.1
 NEXT K
 ```
 
-The loop variable name after `NEXT` is optional:
+The loop variable name after `NEXT` is optional, and a bare `NEXT` closes the
+innermost open loop:
 ```basic
 FOR I = 1 TO 10
     PRINT I
 NEXT
+```
+
+If the name *is* given it must be the one that loop counts, so `FOR I ... NEXT J`
+is an error rather than a loop closed by surprise. One `NEXT` may close several
+nested loops, innermost first:
+```basic
+FOR I = 1 TO 3
+    FOR J = 1 TO 3
+        PRINT I * J
+NEXT J, I
 ```
 
 ### WHILE...WEND
