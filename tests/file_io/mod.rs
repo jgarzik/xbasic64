@@ -647,3 +647,60 @@ fn test_unopened_file_number_is_diagnosed_not_fatal() {
         );
     }
 }
+
+/// A failed OPEN is reported rather than stored.
+///
+/// The fopen/CreateFileA result was written into the handle table whatever it
+/// was, so opening a file that is not there "succeeded", `EOF()` answered -1,
+/// and the mistake surfaced later as a crash or as silence.
+#[test]
+fn test_open_of_a_missing_file_is_diagnosed() {
+    let run = compile_and_run_raw(
+        "OPEN \"definitely-not-here.txt\" FOR INPUT AS #1\nPRINT \"opened\"\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+    assert!(run.stderr.contains("File not found"), "{}", run.stderr);
+    assert!(
+        !run.stdout.contains("opened"),
+        "the OPEN must not appear to succeed: {}",
+        run.stdout
+    );
+}
+
+/// Re-using a file number that is still open is refused, not silently rebound.
+#[test]
+fn test_open_on_an_already_open_number_is_diagnosed() {
+    let run = compile_and_run_raw(
+        "OPEN \"a.txt\" FOR OUTPUT AS #1\nOPEN \"b.txt\" FOR OUTPUT AS #1\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("File already open"),
+        "stderr: {}",
+        run.stderr
+    );
+}
+
+/// Reading past the end is an error, not an endless supply of empty strings.
+///
+/// A loop that forgets its `EOF()` test used to run on quietly rather than say
+/// what was wrong.
+#[test]
+fn test_reading_past_the_end_is_diagnosed() {
+    let run = compile_and_run_raw(
+        "OPEN \"e.txt\" FOR OUTPUT AS #1\nPRINT #1, \"one\"\nCLOSE #1\n\
+         OPEN \"e.txt\" FOR INPUT AS #1\nLINE INPUT #1, A$\nLINE INPUT #1, B$\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("Input past end of file"),
+        "stderr: {}",
+        run.stderr
+    );
+}

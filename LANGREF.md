@@ -1003,7 +1003,10 @@ blanks and line breaks, so several fields may come from one line and one
 field may span several. A field wrapped in quotes may contain commas.
 `LINE INPUT #` takes a whole line, commas and all.
 
-`EOF()` gives the usual read-until-the-end loop:
+Reading past the end of a file is an error (`Input past end of file`), as is
+opening a file that is not there (`File not found`) or re-using a file number
+that is still open (`File already open`). `EOF()` gives the usual
+read-until-the-end loop:
 
 ```basic
 OPEN "data.txt" FOR INPUT AS #1

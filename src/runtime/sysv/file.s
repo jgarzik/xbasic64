@@ -100,6 +100,14 @@ _rt_file_open:
     mov r14d, edx           # mode (0/1/2)
     mov ebx, ecx            # file number
 
+    # A number that is still open must be CLOSEd first. Rebinding it used to
+    # succeed silently, leaking the old FILE* and losing whatever was buffered
+    # in it.
+    lea rax, [rip + _file_handles]
+    mov rax, [rax + rbx*8]
+    test rax, rax
+    jnz .Lopen_already
+
     # Copy filename to buffer and null-terminate
     # memcpy(_file_name_buf, filename_ptr, filename_len)
     lea rdi, [rip + _file_name_buf]
@@ -128,6 +136,12 @@ _rt_file_open:
     # fopen(filename, mode)
     lea rdi, [rip + _file_name_buf]
     call fopen        # returns FILE* in rax (or NULL on error)
+
+    # A failed open used to be stored anyway, so the program carried on with a
+    # NULL handle: OPEN of a missing file "succeeded", EOF() answered -1, and
+    # every later use was a crash or silence.
+    test rax, rax
+    jz .Lopen_failed
 
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
@@ -648,9 +662,11 @@ _rt_file_line_input:
     jz .Lfile_not_open                  # a number nobody OPENed is NULL here
     call fgets
 
-    # Check for EOF/error (fgets returns NULL)
+    # A read past the end used to answer with an empty string, so a loop
+    # missing its EOF() test ran on quietly forever instead of saying what was
+    # wrong. GW-BASIC calls this "Input past end of file".
     test rax, rax
-    jz .Lfile_input_string_empty
+    jz .Lfile_past_end
 
     # Calculate length using strlen
     lea rdi, [rip + _file_input_buf]
@@ -1564,5 +1580,22 @@ _rt_file_lof:
 # and _rt_error prints a bare message for 0.
 .Lfile_not_open:
     lea rdi, [rip + _err_badfile]
+    xor esi, esi
+    call _rt_error
+
+# OPEN failed. The line number is not passed to _rt_file_open, so these report
+# without one; _rt_error prints a bare message for 0.
+.Lopen_failed:
+    lea rdi, [rip + _err_notfound]
+    xor esi, esi
+    call _rt_error
+
+.Lopen_already:
+    lea rdi, [rip + _err_alreadyopen]
+    xor esi, esi
+    call _rt_error
+
+.Lfile_past_end:
+    lea rdi, [rip + _err_pastend]
     xor esi, esi
     call _rt_error
