@@ -1081,6 +1081,12 @@ fn test_generated_calls_are_stack_aligned() {
             "array subscript",
             "DIM A(3)\nA(1) = 2\nPRINT MID$(\"abcdef\", A(1), 2)\n",
         ),
+        ("REDIM PRESERVE", "DIM A(3)\nREDIM PRESERVE A(5)\n"),
+        ("REDIM plain", "DIM A(3)\nREDIM A(5)\n"),
+        ("string concat", "A$ = \"x\" + \"y\"\n"),
+        ("PRINT USING", "PRINT USING \"##.##\"; 1.5\n"),
+        ("SWAP", "A% = 1 : B% = 2\nSWAP A%, B%\n"),
+        ("fixed string", "DIM S AS STRING * 4\nS = \"xy\"\n"),
     ];
 
     let mut problems = Vec::new();
