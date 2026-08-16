@@ -4976,7 +4976,23 @@ impl CodeGen {
     ///
     /// Shared by loads and stores so the index arithmetic -- and the bounds
     /// checks guarding it -- exist in exactly one place.
-    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
+    /// Element sizes x86-64 can scale an index by in an addressing mode.
+    ///
+    /// Which is every scalar element type -- INTEGER 2, LONG and SINGLE 4,
+    /// DOUBLE 8. A string element is sixteen bytes and a record element is
+    /// eight times its word count, and neither is a legal scale, so those keep
+    /// the multiply.
+    fn is_sib_scale(elem_size: i32) -> bool {
+        matches!(elem_size, 1 | 2 | 4 | 8)
+    }
+
+    /// Compute an array element's linear index into `rax`, bounds-checked.
+    ///
+    /// Stops one step short of the address, returning the descriptor and the
+    /// element size so the caller can choose between building a flat pointer
+    /// and folding the scale into whatever addressing mode it was going to
+    /// use anyway.
+    fn gen_array_index(&mut self, name: &str, indices: &[Expr]) -> (Loc, i32) {
         // Descriptors for every declared array are reserved before any code is
         // emitted, and sema has already rejected undeclared ones, so this
         // cannot fail for a program that reached code generation.
@@ -5038,16 +5054,50 @@ impl CodeGen {
             self.emit("    add rax, rcx");
         }
 
-        // Multiply by element size and add to base pointer
-        self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, {}", loc.q(0)));
+        (loc, elem_size)
+    }
+
+    /// The address of an array element, in `rax`.
+    fn gen_array_addr(&mut self, name: &str, indices: &[Expr]) {
+        let (loc, elem_size) = self.gen_array_index(name, indices);
+
+        // `lea` with a scaled index does the multiply and the add at once, and
+        // does the multiply as part of the address rather than as a `imul`.
+        // The base is loaded here rather than earlier because evaluating an
+        // index runs arbitrary code, which is free to clobber r10.
+        if Self::is_sib_scale(elem_size) {
+            self.emit(&format!("    mov r10, {}", loc.q(0)));
+            self.emit(&format!("    lea rax, [r10 + rax*{}]", elem_size));
+        } else {
+            self.emit(&format!("    imul rax, {}", elem_size));
+            self.emit(&format!("    add rax, {}", loc.q(0)));
+        }
     }
 
     fn gen_array_load(&mut self, name: &str, indices: &[Expr]) {
-        self.gen_array_addr(name, indices);
+        let elem_type = DataType::from_suffix(name);
+        let (loc, elem_size) = self.gen_array_index(name, indices);
 
-        // Load value from computed address
-        match DataType::from_suffix(name) {
+        // A scalar element needs no address of its own: the same scaled index
+        // that would have gone into a `lea` goes into the load instead, so the
+        // read costs one instruction rather than three.
+        if Self::is_sib_scale(elem_size) && elem_type != DataType::String {
+            self.emit(&format!("    mov r10, {}", loc.q(0)));
+            let at = format!("[r10 + rax*{}]", elem_size);
+            match elem_type {
+                DataType::Integer => self.emit(&format!("    movsx eax, WORD PTR {}", at)),
+                DataType::Long => self.emit(&format!("    mov eax, DWORD PTR {}", at)),
+                DataType::Single => self.emit(&format!("    movss xmm0, DWORD PTR {}", at)),
+                DataType::Double => self.emit(&format!("    movsd xmm0, QWORD PTR {}", at)),
+                DataType::String => unreachable!("excluded above"),
+            }
+            return;
+        }
+
+        // Otherwise build the address and read through it.
+        self.emit(&format!("    imul rax, {}", elem_size));
+        self.emit(&format!("    add rax, {}", loc.q(0)));
+        match elem_type {
             DataType::String => {
                 self.emit("    mov rcx, rax");
                 self.emit("    mov rax, QWORD PTR [rcx]");

@@ -44,8 +44,8 @@ fn asserts_absent(source: &str, needles: &[&str]) {
         assert!(
             !asm.contains(needle),
             "did not expect `{}` in the generated assembly for:\n{}\n--- got ---\n{}",
-            source,
             needle,
+            source,
             asm
         );
     }
@@ -355,6 +355,121 @@ IF (A% < B%) AND (X# < 2) THEN PRINT \"wrong\" ELSE PRINT \"neither\"
     let out = crate::common::compile_and_run(src).expect("the program must run");
     let got: Vec<&str> = out.lines().map(str::trim).collect();
     assert_eq!(got, vec!["both", "neither"]);
+}
+
+/// A scalar array element is read through a scaled index, not a computed
+/// address.
+///
+/// `imul rax, 8` / `add rax, <base>` / `movsd xmm0, [rax]` is three
+/// instructions for what x86-64 addressing does in one operand.
+///
+/// `add rax, QWORD PTR [rip + _arr_` is the discriminator, not the `imul`:
+/// DIM emits its own `imul rax, <size>` to work out how many bytes to
+/// allocate, and that one is not going anywhere.
+const FLAT_ADDRESS: &str = "add rax, QWORD PTR [rip + _arr_";
+
+#[test]
+fn test_array_element_is_read_through_a_scaled_index() {
+    let src = "DIM A#(10)\nI% = 3\nPRINT A#(I%)\n";
+    asserts_emits(src, &["movsd xmm0, QWORD PTR [r10 + rax*8]"]);
+    asserts_absent(src, &[FLAT_ADDRESS]);
+}
+
+/// Each scalar width gets its own scale.
+#[test]
+fn test_every_scalar_element_width_scales() {
+    for (decl, elem, scale) in [
+        ("DIM A%(10)", "A%", 2),
+        ("DIM A&(10)", "A&", 4),
+        ("DIM A!(10)", "A!", 4),
+        ("DIM A#(10)", "A#", 8),
+    ] {
+        let src = format!("{}\nI% = 3\nPRINT {}(I%)\n", decl, elem);
+        asserts_emits(&src, &[&format!("[r10 + rax*{}]", scale)]);
+        asserts_absent(&src, &[FLAT_ADDRESS]);
+    }
+}
+
+/// A string element is sixteen bytes, which is not a legal scale, so it keeps
+/// the multiply and the flat address.
+#[test]
+fn test_string_array_keeps_the_multiply() {
+    let src = "DIM A$(10)\nI% = 3\nA$(I%) = \"x\"\nPRINT A$(I%)\n";
+    asserts_emits(src, &["imul rax, 16", FLAT_ADDRESS]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "x");
+}
+
+/// Neither is a record element, whose size is eight times its word count.
+#[test]
+fn test_record_array_keeps_the_multiply() {
+    let src = "\
+TYPE Pair
+  A AS DOUBLE
+  B AS DOUBLE
+END TYPE
+DIM R(4) AS Pair
+R(2).A = 1
+R(2).B = 2
+PRINT R(2).A + R(2).B
+";
+    asserts_emits(src, &["imul rax, 16", FLAT_ADDRESS]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "3");
+}
+
+/// The addressing change must not disturb what the elements actually hold.
+#[test]
+fn test_array_elements_round_trip_through_every_type() {
+    let src = "\
+DIM I%(4)
+DIM L&(4)
+DIM S!(4)
+DIM D#(4)
+DIM T$(4)
+FOR K = 0 TO 4
+  I%(K) = K * 2
+  L&(K) = K * 1000
+  S!(K) = K
+  D#(K) = K / 2
+  T$(K) = \"v\"
+NEXT K
+PRINT I%(3), L&(3), S!(3), D#(3), T$(3)
+PRINT I%(0), L&(4), D#(1)
+";
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    let got: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(got.len(), 2);
+    assert!(got[0].starts_with("6\t3000\t3\t1.5\tv"), "got {:?}", got[0]);
+    assert_eq!(got[1], "0\t4000\t0.5");
+}
+
+/// Bounds checking still catches a subscript past the end.
+#[test]
+fn test_scaled_index_is_still_bounds_checked() {
+    let src = "DIM A#(4)\nI% = 9\nPRINT A#(I%)\n";
+    let run = crate::common::compile_and_run_raw(src, "").expect("the program must compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Subscript out of range") || run.stdout.contains("Subscript"),
+        "expected a subscript abort, got {:?} / {:?}",
+        run.stdout,
+        run.stderr
+    );
+}
+
+/// A multi-dimensional array folds its scale the same way, after the
+/// row-major index has been accumulated.
+#[test]
+fn test_multidimensional_array_scales_too() {
+    let src = "\
+DIM A#(3, 3)
+A#(1, 2) = 7
+PRINT A#(1, 2)
+";
+    asserts_emits(src, &["[r10 + rax*8]"]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "7");
 }
 
 /// The truncation above is not decorative: the program must still wrap.
