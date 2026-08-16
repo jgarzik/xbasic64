@@ -485,11 +485,148 @@ fn test_integer_for_loop_counts_in_integers() {
         &[
             "movsx eax, WORD PTR [rip + _var_I_I + 0]",
             "cmp eax, 3",
-            "add eax, 1",
+            // Sixteen-bit, so that stepping past INTEGER's range sets the
+            // overflow flag rather than silently wrapping.
+            "add ax, 1",
             "mov WORD PTR [rip + _var_I_I + 0], ax",
         ],
     );
     asserts_absent(src, &["ucomisd", "addsd", "cvttsd2si"]);
+}
+
+/// Stepping an INTEGER counter past its range is reported, not wrapped.
+///
+/// Wrapping means the counter never passes its limit, so the loop runs
+/// forever. GW-BASIC reports Overflow here and so does this.
+#[test]
+fn test_integer_counter_overflow_is_reported() {
+    let src = "FOR I% = 32764 TO 32767\nPRINT I%\nNEXT I%\n";
+    asserts_emits(src, &["jo .Lerr_ovf"]);
+
+    let run = crate::common::compile_and_run_raw(src, "").expect("the program must compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stdout.contains("32767"),
+        "the in-range iterations must run first, got {:?}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("Overflow") || run.stdout.contains("Overflow"),
+        "expected an Overflow abort, got {:?} / {:?}",
+        run.stdout,
+        run.stderr
+    );
+}
+
+/// A loop that calls nothing keeps its counter in a register.
+///
+/// A counter in memory makes the loop-carried dependency a store followed by
+/// the next iteration's load of the same address -- around ten cycles of
+/// store-to-load forwarding that nothing else in the loop can hide.
+#[test]
+fn test_call_free_loop_promotes_its_counter() {
+    let src = "T# = 0\nFOR I = 1 TO 10\nT# = T# + I\nNEXT I\nPRINT T#\n";
+    asserts_emits(src, &["addsd xmm4,", "movapd xmm4, xmm0"]);
+    // Nothing reads or writes the counter's storage inside the loop; it is
+    // written back once, after it.
+    let asm = compile_to_asm(src).expect("must compile");
+    assert_eq!(
+        asm.matches("_var_I + 0").count(),
+        1,
+        "the counter's storage should be touched once, at the writeback:\n{}",
+        asm
+    );
+}
+
+/// An INTEGER counter goes to a callee-saved GPR, which has to be saved.
+#[test]
+fn test_integer_counter_register_is_saved_and_restored() {
+    let src = "T% = 0\nFOR I% = 1 TO 10\nT% = T% + I%\nNEXT I%\nPRINT T%\n";
+    asserts_emits(
+        src,
+        &[
+            "mov QWORD PTR [rsp], r12",
+            "add r12w, 1",
+            "mov WORD PTR [rip + _var_I_I + 0], r12w",
+            "mov r12, QWORD PTR [rsp]",
+        ],
+    );
+}
+
+/// Nested promotable loops get different registers.
+#[test]
+fn test_nested_promoted_loops_do_not_collide() {
+    let src = "\
+T# = 0
+FOR I = 1 TO 3
+  FOR J = 1 TO 4
+    T# = T# + I * J
+  NEXT J
+NEXT I
+PRINT T#
+";
+    asserts_emits(src, &["xmm4", "xmm5"]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "60", "(1+2+3) * (1+2+3+4)");
+}
+
+/// A loop that calls anything keeps its counter in memory.
+///
+/// System V has no callee-saved XMM register, so a Double counter would not
+/// survive the call; and a called procedure can reach a module-level counter
+/// by name. PRINT is a call, so this is most loops.
+#[test]
+fn test_calling_loop_keeps_its_counter_in_memory() {
+    for src in [
+        // A runtime call.
+        "FOR I = 1 TO 3\nPRINT I\nNEXT I\n",
+        // A libc math call.
+        "T# = 0\nFOR I = 1 TO 3\nT# = T# + SIN(I)\nNEXT I\nPRINT T#\n",
+        // Exponentiation, which calls pow.
+        "T# = 0\nFOR I = 1 TO 3\nT# = T# + I ^ 2\nNEXT I\nPRINT T#\n",
+        // A string operation, which goes through the runtime.
+        "S$ = \"\"\nFOR I = 1 TO 3\nS$ = S$ + \"x\"\nNEXT I\nPRINT S$\n",
+    ] {
+        asserts_absent(src, &["xmm4", "r12"]);
+    }
+}
+
+/// Neither does a loop whose body assigns to the counter, since the register
+/// would go stale and BASIC allows the assignment.
+#[test]
+fn test_loop_assigning_its_counter_keeps_it_in_memory() {
+    // The body steps the counter itself, so it advances by three per
+    // iteration: 1, 4, 7, 10, then 13, which is past the limit. Four
+    // iterations and a final value of 13, both of which depend on the loop
+    // reading the counter back out of memory rather than out of a register it
+    // never saw the assignment through.
+    let src = "\
+N# = 0
+FOR I = 1 TO 10
+  N# = N# + 1
+  I = I + 2
+NEXT I
+PRINT N#
+PRINT I
+";
+    asserts_absent(src, &["xmm4"]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines[0], "4", "the body ran four times");
+    assert_eq!(lines[1], "13", "the body's own step took effect");
+}
+
+/// EXIT FOR leaves through the loop's own exit, where the register is written
+/// back, so the counter is correct afterwards.
+#[test]
+fn test_exit_for_writes_a_promoted_counter_back() {
+    let out = crate::common::compile_and_run(
+        "N# = 0\nFOR I = 1 TO 100\nN# = N# + 1\nIF I = 4 THEN EXIT FOR\nNEXT I\nPRINT N#\nPRINT I\n",
+    )
+    .expect("the program must run");
+    let lines: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(lines[0], "4", "the body ran four times");
+    assert_eq!(lines[1], "4", "the counter survived EXIT FOR");
 }
 
 /// A constant step settles the loop's direction at compile time.

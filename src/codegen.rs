@@ -544,6 +544,9 @@ pub struct CodeGen {
     data_line_index: HashMap<u32, usize>,
     /// The same for named labels.
     data_label_index: HashMap<String, usize>,
+    /// FOR control variables currently held in a register instead of memory,
+    /// innermost last: (variable name, register, counting type).
+    promoted_counters: Vec<(String, String, DataType)>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -1462,6 +1465,139 @@ impl CodeGen {
         }
     }
 
+    /// Whether an expression can be evaluated without calling anything.
+    ///
+    /// A call is what makes a promoted counter unsafe: System V has no
+    /// callee-saved XMM register at all, so a Double counter would not survive
+    /// one, and a called procedure can reach a module-level counter through
+    /// its own name. Strings are rejected wholesale -- every string operation
+    /// goes through the runtime -- as is `^`, which calls libc's pow.
+    fn expr_is_call_free(&self, expr: &Expr) -> bool {
+        if self.expr_type(expr) == DataType::String {
+            return false;
+        }
+        match expr {
+            Expr::Literal(_) => true,
+            // A bare name is not always a variable: a parameterless FUNCTION
+            // and a zero-argument builtin are both spelled this way, and both
+            // compile to a call.
+            Expr::Variable(name) => {
+                let upper = name.to_uppercase();
+                !crate::sema::is_zero_arg_builtin(&upper)
+                    && !self.symbols.procs.contains_key(&upper)
+            }
+            Expr::ArrayAccess { name, indices } => {
+                self.array_elem_type(name).is_none()
+                    && indices.iter().all(|i| self.expr_is_call_free(i))
+            }
+            Expr::Unary { operand, .. } => self.expr_is_call_free(operand),
+            Expr::Binary { op, left, right } => {
+                *op != BinaryOp::Pow
+                    && self.expr_is_call_free(left)
+                    && self.expr_is_call_free(right)
+            }
+            Expr::FnCall { .. } | Expr::Field { .. } => false,
+        }
+    }
+
+    /// Whether a statement can run with `counter` held only in a register.
+    ///
+    /// An allowlist, not a denylist: the set of statements that neither call,
+    /// nor leave the loop by a route that skips its exit, nor write the
+    /// counter behind the register's back. Everything else -- PRINT, INPUT,
+    /// CALL, GOSUB, GOTO, READ, SWAP, file I/O -- says no, which costs those
+    /// loops nothing they had before.
+    fn stmt_allows_register_counter(&self, counter: &str, stmt: &Stmt) -> bool {
+        let all = |s: &[Stmt]| {
+            s.iter()
+                .all(|s| self.stmt_allows_register_counter(counter, s))
+        };
+        match &stmt.kind {
+            StmtKind::Let {
+                name,
+                indices,
+                value,
+            } => {
+                name != counter
+                    && !is_string_var(name)
+                    && self.typed_var(name).is_none()
+                    && indices
+                        .as_ref()
+                        .is_none_or(|ix| ix.iter().all(|e| self.expr_is_call_free(e)))
+                    && self.expr_is_call_free(value)
+            }
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.expr_is_call_free(condition)
+                    && all(then_branch)
+                    && else_branch.as_ref().is_none_or(|b| all(b))
+            }
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => {
+                var != counter
+                    && self.expr_is_call_free(start)
+                    && self.expr_is_call_free(end)
+                    && step.as_ref().is_none_or(|s| self.expr_is_call_free(s))
+                    && all(body)
+            }
+            StmtKind::While { condition, body } => self.expr_is_call_free(condition) && all(body),
+            StmtKind::DoLoop {
+                condition, body, ..
+            } => condition.as_ref().is_none_or(|c| self.expr_is_call_free(c)) && all(body),
+            // Leaves by way of a loop's own exit label, which is where the
+            // register is written back.
+            StmtKind::ExitLoop { .. } => true,
+            StmtKind::Const { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Whether this whole loop can run with its counter in a register.
+    ///
+    /// The bounds are checked as well as the body: they are evaluated before
+    /// the register is loaded, so a call in them would be harmless -- but a
+    /// bound that is not call-free is a sign the loop is not the kind this
+    /// helps, and checking them keeps the rule one sentence long.
+    fn body_allows_register_counter(
+        &self,
+        counter: &str,
+        body: &[Stmt],
+        start: &Expr,
+        end: &Expr,
+        step: Option<&Expr>,
+    ) -> bool {
+        self.expr_is_call_free(start)
+            && self.expr_is_call_free(end)
+            && step.is_none_or(|s| self.expr_is_call_free(s))
+            && body
+                .iter()
+                .all(|s| self.stmt_allows_register_counter(counter, s))
+    }
+
+    /// The register to hold this loop's counter in, if it can have one.
+    ///
+    /// Depth-indexed so that nested promoted loops do not collide, and short,
+    /// so a deeply nested one simply keeps its counter in memory.
+    fn for_counter_register(&self, ct: DataType, depth: usize) -> Option<&'static str> {
+        // r12-r15 and xmm4 upward are the registers this compiler never
+        // allocates for anything else.
+        const GPRS: [&str; 3] = ["r12", "r13", "r14"];
+        const XMMS: [&str; 3] = ["xmm4", "xmm5", "xmm6"];
+        if ct.is_integer() {
+            GPRS.get(depth).copied()
+        } else {
+            XMMS.get(depth).copied()
+        }
+    }
+
     /// Where a FOR control variable lives, and the type it counts in.
     ///
     /// Resolved the same way a read of the name resolves, so that the loop
@@ -1578,19 +1714,109 @@ impl CodeGen {
     }
 
     /// Add `operand` to the counter in the primary register.
+    ///
+    /// The add is done at the counter's own width, so that a step past the
+    /// type's range sets the overflow flag. Without that check the counter
+    /// simply wraps and never passes its limit: `FOR I% = 32760 TO 32767`
+    /// would run forever rather than reporting the Overflow that GW-BASIC
+    /// reports. `--unsafe` drops the check and takes the wraparound.
     fn emit_for_add(&mut self, ct: DataType, operand: &ForOperand) {
-        match (ct, operand) {
-            (DataType::Integer, ForOperand::Slot(off)) => {
-                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
-                self.emit("    add eax, ecx");
+        match ct {
+            DataType::Integer => {
+                self.emit(&format!("    add ax, {}", operand.text(ct)));
+                self.emit_check("jo", RtError::Overflow);
             }
-            (DataType::Integer | DataType::Long, _) => {
+            DataType::Long => {
                 self.emit(&format!("    add eax, {}", operand.text(ct)));
+                self.emit_check("jo", RtError::Overflow);
             }
-            (DataType::Single, _) => {
+            DataType::Single => {
                 self.emit(&format!("    addss xmm0, {}", operand.text(ct)));
             }
             _ => self.emit(&format!("    addsd xmm0, {}", operand.text(ct))),
+        }
+    }
+
+    /// The 32-bit name of a promoted counter's register.
+    fn counter_reg32(reg: &str) -> String {
+        format!("{}d", reg)
+    }
+
+    /// Move the freshly computed start value into the counter's register.
+    fn emit_counter_init(&mut self, ct: DataType, reg: &str) {
+        match ct {
+            // Narrowed on the way in, exactly as the store to a 16-bit slot
+            // would have narrowed it.
+            DataType::Integer => self.emit(&format!("    movsx {}, ax", Self::counter_reg32(reg))),
+            DataType::Long => self.emit(&format!("    mov {}, eax", Self::counter_reg32(reg))),
+            // movaps rather than movss: a register-to-register movss merges
+            // into the destination, so it would depend on what was there.
+            DataType::Single => self.emit(&format!("    movaps {}, xmm0", reg)),
+            _ => self.emit(&format!("    movapd {}, xmm0", reg)),
+        }
+    }
+
+    /// Write a promoted counter back to the variable's storage.
+    fn emit_counter_writeback(&mut self, ct: DataType, reg: &str, mem: &str) {
+        match ct {
+            DataType::Integer => self.emit(&format!("    mov {}, {}w", mem, reg)),
+            DataType::Long => self.emit(&format!("    mov {}, {}", mem, Self::counter_reg32(reg))),
+            DataType::Single => self.emit(&format!("    movss {}, {}", mem, reg)),
+            _ => self.emit(&format!("    movsd {}, {}", mem, reg)),
+        }
+    }
+
+    /// Compare a promoted counter against `operand`.
+    fn emit_counter_compare(&mut self, ct: DataType, reg: &str, operand: &ForOperand) {
+        match (ct, operand) {
+            (DataType::Integer, ForOperand::Slot(off)) => {
+                self.emit(&format!("    movsx ecx, WORD PTR [rbp + {}]", off));
+                self.emit(&format!("    cmp {}, ecx", Self::counter_reg32(reg)));
+            }
+            (DataType::Integer | DataType::Long, _) => {
+                let text = operand.text(ct);
+                self.emit(&format!("    cmp {}, {}", Self::counter_reg32(reg), text));
+            }
+            (DataType::Single, _) => {
+                let text = operand.text(ct);
+                self.emit(&format!("    ucomiss {}, {}", reg, text));
+            }
+            _ => {
+                let text = operand.text(ct);
+                self.emit(&format!("    ucomisd {}, {}", reg, text));
+            }
+        }
+    }
+
+    /// Step a promoted counter. See [`Self::emit_for_add`] on the width.
+    fn emit_counter_add(&mut self, ct: DataType, reg: &str, operand: &ForOperand) {
+        let r32 = Self::counter_reg32(reg);
+        let text = operand.text(ct);
+        match ct {
+            DataType::Integer => {
+                self.emit(&format!("    add {}w, {}", reg, text));
+                self.emit_check("jo", RtError::Overflow);
+                // The narrowing store used to keep an INTEGER counter within
+                // sixteen bits for free; in a register it has to be said.
+                self.emit(&format!("    movsx {}, {}w", r32, reg));
+            }
+            DataType::Long => {
+                self.emit(&format!("    add {}, {}", r32, text));
+                self.emit_check("jo", RtError::Overflow);
+            }
+            DataType::Single => self.emit(&format!("    addss {}, {}", reg, text)),
+            _ => self.emit(&format!("    addsd {}, {}", reg, text)),
+        }
+    }
+
+    /// Read a promoted counter into the register an expression expects.
+    fn emit_counter_read(&mut self, ct: DataType, reg: &str) {
+        match ct {
+            DataType::Integer | DataType::Long => {
+                self.emit(&format!("    mov eax, {}", Self::counter_reg32(reg)))
+            }
+            DataType::Single => self.emit(&format!("    movaps xmm0, {}", reg)),
+            _ => self.emit(&format!("    movapd xmm0, {}", reg)),
         }
     }
 
@@ -2157,9 +2383,42 @@ impl CodeGen {
                 let (var_loc, ct) = self.for_control_var(var);
                 let var_mem = var_loc.at(Self::for_ptr(ct), 0);
 
+                // A counter kept in memory makes the loop-carried dependency a
+                // store followed by the next iteration's load of the same
+                // address -- around ten cycles of store-to-load forwarding that
+                // nothing else in the loop can hide. Held in a register it is
+                // one add. Only loops that call nothing qualify, since System V
+                // has no callee-saved XMM register for a Double counter to
+                // survive a call in, and a called procedure could reach a
+                // module-level counter by name.
+                let counter_reg =
+                    if self.body_allows_register_counter(var, body, start, end, step.as_ref()) {
+                        self.for_counter_register(ct, self.promoted_counters.len())
+                            .map(str::to_string)
+                    } else {
+                        None
+                    };
+
+                // r12-r14 belong to this function's caller, so they are saved
+                // across the loop. Sixteen bytes rather than eight because a
+                // bounds check inside the loop can still reach a trampoline
+                // that calls the runtime, and it must find rsp aligned.
+                if let Some(reg) = &counter_reg {
+                    if ct.is_integer() {
+                        self.emit("    sub rsp, 16        # save a counter register");
+                        self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
+                    }
+                }
+
                 // Initialize the control variable.
                 self.gen_expr_coerced(start, ct);
-                self.emit_for_store(ct, &var_mem);
+                match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        self.emit_counter_init(ct, &reg)
+                    }
+                    None => self.emit_for_store(ct, &var_mem),
+                }
 
                 // The limit and the step are evaluated once. A constant one
                 // needs no slot at all: it becomes the compare's or the add's
@@ -2176,11 +2435,20 @@ impl CodeGen {
                 };
 
                 self.emit_label(&start_label);
-                self.emit_for_load(ct, &var_mem, false);
+                let compare = |s: &mut Self| match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        s.emit_counter_compare(ct, &reg, &end_operand)
+                    }
+                    None => {
+                        s.emit_for_load(ct, &var_mem, false);
+                        s.emit_for_compare(ct, &end_operand);
+                    }
+                };
 
                 match direction {
                     Some(ascending) => {
-                        self.emit_for_compare(ct, &end_operand);
+                        compare(self);
                         self.emit(&format!(
                             "    {} {}",
                             Self::for_exit_branch(ct, ascending),
@@ -2191,45 +2459,72 @@ impl CodeGen {
                         // Step known only at run time, so both directions have
                         // to be present. Only this shape pays for the test.
                         let neg = format!(".Lfor_neg_{}", self.label_counter);
-                        let body = format!(".Lfor_body_{}", self.label_counter);
+                        let body_label = format!(".Lfor_body_{}", self.label_counter);
                         self.label_counter += 1;
 
                         self.emit_for_test_step_sign(ct, &step_operand, &neg);
-                        self.emit_for_compare(ct, &end_operand);
+                        compare(self);
                         self.emit(&format!(
                             "    {} {}",
                             Self::for_exit_branch(ct, true),
                             end_label
                         ));
-                        self.emit(&format!("    jmp {}", body));
+                        self.emit(&format!("    jmp {}", body_label));
 
                         self.emit_label(&neg);
-                        self.emit_for_compare(ct, &end_operand);
+                        compare(self);
                         self.emit(&format!(
                             "    {} {}",
                             Self::for_exit_branch(ct, false),
                             end_label
                         ));
-                        self.emit_label(&body);
+                        self.emit_label(&body_label);
                     }
                 }
 
-                // Body
+                // Body. While it runs, a read of the control variable resolves
+                // to the register rather than to its storage.
+                if let Some(reg) = &counter_reg {
+                    self.promoted_counters.push((var.clone(), reg.clone(), ct));
+                }
                 self.loop_stack.push((true, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
                 self.loop_stack.pop();
+                if counter_reg.is_some() {
+                    self.promoted_counters.pop();
+                }
 
-                // Increment. Reloaded rather than carried over from the
-                // compare above, because the body is allowed to assign to the
-                // control variable and BASIC programs do.
-                self.emit_for_load(ct, &var_mem, false);
-                self.emit_for_add(ct, &step_operand);
-                self.emit_for_store(ct, &var_mem);
+                // Increment. When the counter is in memory it is reloaded
+                // rather than carried over from the compare above, because the
+                // body is allowed to assign to it and BASIC programs do -- the
+                // register form is only reached for bodies that provably do not.
+                match &counter_reg {
+                    Some(reg) => {
+                        let reg = reg.clone();
+                        self.emit_counter_add(ct, &reg, &step_operand);
+                    }
+                    None => {
+                        self.emit_for_load(ct, &var_mem, false);
+                        self.emit_for_add(ct, &step_operand);
+                        self.emit_for_store(ct, &var_mem);
+                    }
+                }
                 self.emit(&format!("    jmp {}", start_label));
 
                 self.emit_label(&end_label);
+
+                // Every route out of the loop passes here, EXIT FOR included,
+                // so this is where the variable becomes visible again.
+                if let Some(reg) = &counter_reg {
+                    let reg = reg.clone();
+                    self.emit_counter_writeback(ct, &reg, &var_mem);
+                    if ct.is_integer() {
+                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+                        self.emit("    add rsp, 16");
+                    }
+                }
             }
 
             StmtKind::While { condition, body } => {
@@ -2771,6 +3066,21 @@ impl CodeGen {
                 // A CONST is substituted with its folded value.
                 if let Some(lit) = self.symbols.consts.get(&name.to_uppercase()).cloned() {
                     return self.gen_expr(&Expr::Literal(lit));
+                }
+
+                // An enclosing FOR may be holding this name in a register
+                // instead of in its storage, in which case that register is
+                // where its current value is. Checked before anything else,
+                // because the storage is stale until the loop ends.
+                if let Some((_, reg, ct)) = self
+                    .promoted_counters
+                    .iter()
+                    .rev()
+                    .find(|(n, _, _)| n == name)
+                    .cloned()
+                {
+                    self.emit_counter_read(ct, &reg);
+                    return ct;
                 }
 
                 // A variable declared with `AS` lives in typed storage, which
