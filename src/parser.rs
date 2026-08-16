@@ -4,25 +4,31 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::Token;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
+///
+/// These are LANGREF's table read upside down -- it numbers 1 as tightest, this
+/// numbers 1 as loosest. `XOR` used to sit alone at 3, binding tighter than
+/// `AND`, which contradicted both LANGREF and GW-BASIC and made
+/// `-1 OR 0 XOR -1` give -1 instead of 0.
+///
 /// Returns (precedence, BinaryOp) or None if not a binary operator
 fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
     match token {
-        // Precedence 1: logical OR (lowest)
+        // Precedence 1: logical OR and XOR (lowest), which share a level
         Token::Or => Some((1, BinaryOp::Or)),
+        Token::Xor => Some((1, BinaryOp::Xor)),
         // Precedence 2: logical AND
         Token::And => Some((2, BinaryOp::And)),
-        // Precedence 3: logical XOR
-        Token::Xor => Some((3, BinaryOp::Xor)),
+        // Precedence 3 is NOT, a prefix operator; see `parse_prec_inner`.
         // Precedence 4: comparison
-        Token::Eq => Some((4, BinaryOp::Eq)),
-        Token::Ne => Some((4, BinaryOp::Ne)),
-        Token::Lt => Some((4, BinaryOp::Lt)),
-        Token::Gt => Some((4, BinaryOp::Gt)),
-        Token::Le => Some((4, BinaryOp::Le)),
-        Token::Ge => Some((4, BinaryOp::Ge)),
+        Token::Eq => Some((CMP_PREC, BinaryOp::Eq)),
+        Token::Ne => Some((CMP_PREC, BinaryOp::Ne)),
+        Token::Lt => Some((CMP_PREC, BinaryOp::Lt)),
+        Token::Gt => Some((CMP_PREC, BinaryOp::Gt)),
+        Token::Le => Some((CMP_PREC, BinaryOp::Le)),
+        Token::Ge => Some((CMP_PREC, BinaryOp::Ge)),
         // Precedence 5: additive
         Token::Plus => Some((5, BinaryOp::Add)),
         Token::Minus => Some((5, BinaryOp::Sub)),
@@ -31,14 +37,33 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
         Token::Slash => Some((6, BinaryOp::Div)),
         Token::Backslash => Some((6, BinaryOp::IntDiv)),
         Token::Mod => Some((6, BinaryOp::Mod)),
-        // Precedence 7: power (handled specially for right-associativity)
+        // Precedence 7: power
         Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
 }
 
+/// Precedence of the comparison operators.
+///
+/// Named because `NOT` sits directly below it: `NOT` takes an operand at this
+/// level, which is what makes `NOT A = B` group as `NOT (A = B)` while
+/// `NOT A AND B` groups as `(NOT A) AND B`.
+const CMP_PREC: u8 = 4;
+
 /// Precedence of `^`, the tightest-binding binary operator.
 const POWER_PREC: u8 = 7;
+
+/// How deeply expressions and blocks may nest before the parser gives up.
+///
+/// This is a recursive-descent parser, so nesting costs stack. Without a bound
+/// it did not refuse deep input, it *died* on it: 50,000 nested parentheses --
+/// or the same number of unary minuses or `NOT`s, which descend through the
+/// same path -- aborted the process with "fatal runtime error: stack overflow"
+/// and exit code 134, which is outside anything a caller can interpret.
+///
+/// The limit is far above what a person writes and far below what the stack
+/// can take, so the only programs it rejects are ones that were going to crash.
+const MAX_DEPTH: u32 = 256;
 
 // AST Definitions
 
@@ -81,6 +106,13 @@ pub enum StmtKind {
     },
     Input {
         prompt: Option<String>,
+        /// Whether to print `? ` after the prompt.
+        ///
+        /// GW-BASIC decides this by the separator: `INPUT "p"; A` prints `p? `
+        /// and `INPUT "p", A` prints `p` alone, while a promptless `INPUT A`
+        /// prints just `? `. The parser used to accept either separator and
+        /// discard which, so no form ever printed a question mark.
+        query: bool,
         vars: Vec<LValue>,
         /// `INPUT #n` reads from a file; `None` is the console.
         file_num: Option<Expr>,
@@ -490,12 +522,17 @@ pub fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
 /// A block-closing keyword, consumed by `parse_statement` on behalf of the
 /// enclosing block parser.
 ///
-/// These are not errors. BASIC's block terminators are statements
-/// syntactically, but they belong to the construct that opened the block, so
-/// `parse_statement` reports them through the error channel and the enclosing
-/// parser (`parse_if_body`, `parse_for`, ...) treats the matching one as a
+/// BASIC's block terminators are statements syntactically, but they belong to
+/// the construct that opened the block, so `parse_statement` hands the matching
+/// one back to the enclosing parser (`parse_if_body`, `parse_for`, ...) as a
 /// normal end-of-body. Any terminator that reaches the top level without a
-/// matching opener is rendered as a real diagnostic.
+/// matching opener becomes a diagnostic there.
+///
+/// This used to travel through the error channel as `ParseError::Block`, which
+/// worked but meant `?` could not be trusted: every `?` in the parser might be
+/// propagating an ordinary end-of-block rather than a failure, and a stray
+/// terminator would be caught by whichever enclosing block parser matched it
+/// first. It is now part of [`Parsed`], so `?` carries only real errors.
 ///
 /// Conditions travel as payloads rather than through parser fields, so a
 /// terminator cannot be separated from its expression.
@@ -505,7 +542,10 @@ pub enum BlockEnd {
     EndSub,
     EndFunction,
     EndSelect,
-    Next,
+    /// `NEXT [var [, var]...]`. The names are carried rather than discarded so
+    /// that `FOR I ... NEXT J` can be refused and `NEXT J, I` can close both
+    /// loops. Empty means a bare `NEXT`, which closes the innermost loop.
+    Next(Vec<String>),
     Wend,
     Loop,
     LoopWhile(Expr),
@@ -522,7 +562,7 @@ impl BlockEnd {
             BlockEnd::EndSub => "END SUB",
             BlockEnd::EndFunction => "END FUNCTION",
             BlockEnd::EndSelect => "END SELECT",
-            BlockEnd::Next => "NEXT",
+            BlockEnd::Next(_) => "NEXT",
             BlockEnd::Wend => "WEND",
             BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "LOOP",
             BlockEnd::Else => "ELSE",
@@ -537,27 +577,50 @@ impl BlockEnd {
             BlockEnd::EndSub => "SUB",
             BlockEnd::EndFunction => "FUNCTION",
             BlockEnd::EndSelect => "SELECT CASE",
-            BlockEnd::Next => "FOR",
+            BlockEnd::Next(_) => "FOR",
             BlockEnd::Wend => "WHILE",
             BlockEnd::Loop | BlockEnd::LoopWhile(_) | BlockEnd::LoopUntil(_) => "DO",
         }
     }
 }
 
+/// The result of parsing one statement: the statement, or the terminator that
+/// closed the block it was in.
+///
+/// Generic over the item so that `parse_statement_kind` (which yields a
+/// `StmtKind`) and `parse_statement` (which tags it with a line to make a
+/// `Stmt`) can share one type.
+#[derive(Debug, Clone)]
+pub enum Parsed<T> {
+    Item(T),
+    End(BlockEnd),
+}
+
 /// Why parsing of a statement stopped.
 #[derive(Debug, Clone)]
 pub enum ParseError {
-    /// A block terminator was consumed; the enclosing block parser handles it.
-    Block(BlockEnd),
-    /// A genuine syntax error.
+    /// A syntax error at the parser's current position.
     Error(String),
+    /// A syntax error belonging to an earlier line -- the opener of a block
+    /// that was never closed. Without this the diagnostic lands on end of file,
+    /// which is where the parser noticed rather than where the mistake is.
+    ErrorAt(u32, String),
+}
+
+impl ParseError {
+    /// The line this error belongs to, if it names one of its own.
+    fn line(&self) -> Option<u32> {
+        match self {
+            ParseError::Error(_) => None,
+            ParseError::ErrorAt(line, _) => Some(*line),
+        }
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Error(msg) => write!(f, "{}", msg),
-            ParseError::Block(b) => write!(f, "{} without matching {}", b.keyword(), b.opener()),
+            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -576,6 +639,96 @@ impl std::fmt::Display for LocatedParseError {
     }
 }
 
+/// How a token is written in BASIC source, for diagnostics.
+///
+/// Every fixed token has a spelling, so a diagnostic can quote what the
+/// programmer would have typed. Errors used to fall back to `{:?}` and show
+/// Rust variant names instead -- "Expected To, got Integer(2)" rather than
+/// "expected TO, got 2", and `EndSelect`, `LParen` and `Ne` at people who had
+/// written `END SELECT`, `(` and `<>`.
+fn token_spelling(tok: &Token) -> Option<&'static str> {
+    Some(match tok {
+        Token::Print => "PRINT",
+        Token::Input => "INPUT",
+        Token::Line => "LINE",
+        Token::Let => "LET",
+        Token::Dim => "DIM",
+        Token::If => "IF",
+        Token::Then => "THEN",
+        Token::Else => "ELSE",
+        Token::ElseIf => "ELSEIF",
+        Token::EndIf => "ENDIF",
+        Token::For => "FOR",
+        Token::To => "TO",
+        Token::Step => "STEP",
+        Token::Next => "NEXT",
+        Token::While => "WHILE",
+        Token::Wend => "WEND",
+        Token::Do => "DO",
+        Token::Loop => "LOOP",
+        Token::Until => "UNTIL",
+        Token::Goto => "GOTO",
+        Token::Gosub => "GOSUB",
+        Token::Return => "RETURN",
+        Token::On => "ON",
+        Token::Sub => "SUB",
+        Token::EndSub => "ENDSUB",
+        Token::Function => "FUNCTION",
+        Token::EndFunction => "ENDFUNCTION",
+        Token::Select => "SELECT",
+        Token::Case => "CASE",
+        Token::EndSelect => "ENDSELECT",
+        Token::End => "END",
+        Token::Stop => "STOP",
+        Token::DataText(_) => "DATA",
+        Token::Read => "READ",
+        Token::Restore => "RESTORE",
+        Token::Cls => "CLS",
+        Token::Open => "OPEN",
+        Token::Close => "CLOSE",
+        Token::As => "AS",
+        Token::Output => "OUTPUT",
+        Token::Append => "APPEND",
+        Token::And => "AND",
+        Token::Or => "OR",
+        Token::Not => "NOT",
+        Token::Xor => "XOR",
+        Token::Mod => "MOD",
+        Token::Using => "USING",
+        Token::Swap => "SWAP",
+        Token::Const => "CONST",
+        Token::Write => "WRITE",
+        Token::Exit => "EXIT",
+        Token::Def => "DEF",
+        Token::Option => "OPTION",
+        Token::Base => "BASE",
+        Token::Redim => "REDIM",
+        Token::Preserve => "PRESERVE",
+        Token::Type => "TYPE",
+        Token::EndType => "ENDTYPE",
+        Token::Plus => "+",
+        Token::Minus => "-",
+        Token::Star => "*",
+        Token::Slash => "/",
+        Token::Backslash => "\\",
+        Token::Caret => "^",
+        Token::Eq => "=",
+        Token::Ne => "<>",
+        Token::Lt => "<",
+        Token::Gt => ">",
+        Token::Le => "<=",
+        Token::Ge => ">=",
+        Token::LParen => "(",
+        Token::RParen => ")",
+        Token::Comma => ",",
+        Token::Semicolon => ";",
+        Token::Colon => ":",
+        Token::Hash => "#",
+        Token::Dot => ".",
+        _ => return None,
+    })
+}
+
 /// Human-readable name for a token, for diagnostics.
 fn describe_token(tok: &Token) -> String {
     match tok {
@@ -585,8 +738,110 @@ fn describe_token(tok: &Token) -> String {
         Token::String(s) => format!("string \"{}\"", s),
         Token::Newline => "end of line".to_string(),
         Token::Eof => "end of file".to_string(),
-        other => format!("{:?}", other),
+        Token::LineNumber(n) => format!("line number {}", n),
+        other => token_spelling(other)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{:?}", other)),
     }
+}
+
+/// One item of a `DATA` statement, as written.
+struct DataItem {
+    text: String,
+    /// Whether it was written in quotes, which decides both whether the
+    /// surrounding spaces were significant and whether it is a string.
+    quoted: bool,
+}
+
+impl DataItem {
+    /// The value this item denotes.
+    ///
+    /// A quoted item is always a string. An unquoted one is whatever it looks
+    /// like: GW-BASIC decides the type when the item is READ, but the table this
+    /// compiles to is tagged per item, and the runtime already converts a string
+    /// entry to a number with `strtod` -- so classifying here loses nothing and
+    /// keeps numeric DATA on the fast path.
+    ///
+    /// An omitted item is the empty string, which reads as 0 or as "".
+    fn literal(&self) -> Literal {
+        if self.quoted {
+            return Literal::String(self.text.clone());
+        }
+        if let Ok(n) = self.text.parse::<i32>() {
+            return Literal::Integer(n as i64);
+        }
+        if let Ok(f) = self.text.parse::<f64>() {
+            if f.is_finite() {
+                return Literal::Float(f);
+            }
+        }
+        Literal::String(self.text.clone())
+    }
+}
+
+/// Split a `DATA` operand into its items.
+///
+/// Items are separated by commas outside quotes. An unquoted item has its
+/// surrounding spaces trimmed; a quoted one keeps everything between the quotes,
+/// which is why quotes are needed for an item containing a comma, a colon, or
+/// spaces that matter. A doubled `""` inside quotes is one quote character, as
+/// everywhere else in the language.
+fn split_data_items(text: &str) -> Vec<DataItem> {
+    // `DATA` with nothing after it declares no items at all, as against
+    // `DATA ,` which declares two empty ones.
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
+            chars.next();
+        }
+
+        let item = if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut body = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    // A doubled quote is one quote character, as everywhere
+                    // else in the language.
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        body.push('"');
+                        continue;
+                    }
+                    break;
+                }
+                body.push(c);
+            }
+            // Whatever separates the closing quote from the comma is not data.
+            while chars.peek().is_some_and(|c| *c != ',') {
+                chars.next();
+            }
+            DataItem {
+                text: body,
+                quoted: true,
+            }
+        } else {
+            let mut body = String::new();
+            while chars.peek().is_some_and(|c| *c != ',') {
+                body.push(chars.next().unwrap());
+            }
+            DataItem {
+                text: body.trim().to_string(),
+                quoted: false,
+            }
+        };
+        items.push(item);
+
+        match chars.next() {
+            Some(',') => continue,
+            _ => break,
+        }
+    }
+    items
 }
 
 /// Shorthand for the parser's result type.
@@ -605,11 +860,22 @@ pub struct Parser {
     /// Source line of each token, parallel to `tokens`. Empty when unknown.
     lines: Vec<u32>,
     pos: usize,
-    /// Tracks declared array names for distinguishing array access from function calls
-    declared_arrays: HashSet<String>,
     /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
     /// start of a line is not mistaken for a label definition.
     declared_procs: HashSet<String>,
+    /// How deep the recursive descent currently is, so that pathological input
+    /// is refused rather than overflowing the stack. See [`MAX_DEPTH`].
+    depth: u32,
+    /// Errors found so far. Parsing continues past each one, so a program with
+    /// several mistakes reports them all rather than one per compile.
+    errors: Vec<LocatedParseError>,
+    /// Loop names from a `NEXT I, J` still waiting to close their loops.
+    ///
+    /// One NEXT may close several nested loops. The innermost `parse_for` takes
+    /// the first name and leaves the rest here; each enclosing block body picks
+    /// the next one up before reading another token, so the terminator reaches
+    /// every loop it names as the recursion unwinds outward.
+    pending_next: VecDeque<String>,
 }
 
 impl Parser {
@@ -712,12 +978,21 @@ impl Parser {
         tok
     }
 
+    /// Consume the next token, which must be `expected`.
+    ///
+    /// Matching is by variant, so a payload would be ignored -- every caller
+    /// passes a payload-free token, and `token_spelling` returning `Some` for
+    /// exactly those is what keeps that honest: a payload-carrying token has no
+    /// fixed spelling to name in the diagnostic, and is refused here.
     fn expect(&mut self, expected: Token) -> PResult<()> {
+        let Some(wanted) = token_spelling(&expected) else {
+            unreachable!("expect takes a token with a fixed spelling")
+        };
         let tok = self.advance();
         if std::mem::discriminant(&tok) == std::mem::discriminant(&expected) {
             Ok(())
         } else {
-            err(format!("Expected {:?}, got {:?}", expected, tok))
+            err(format!("expected {}, got {}", wanted, describe_token(&tok)))
         }
     }
 
@@ -727,42 +1002,234 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self) -> Result<Program, LocatedParseError> {
-        self.parse_program().map_err(|error| LocatedParseError {
-            // `pos` is left at the token that stopped the parse.
-            line: self.cur_line(),
-            error,
-        })
+    /// Parse the whole program, reporting every syntax error it contains.
+    ///
+    /// Sema has always returned a `Vec<Diagnostic>`, so a program with five
+    /// undefined names is told about all five. The parser stopped at the first
+    /// error, so five typos meant five compiles. It now recovers in the same
+    /// way and reports the same way.
+    pub fn parse(&mut self) -> Result<Program, Vec<LocatedParseError>> {
+        let program = match self.parse_program() {
+            Ok(p) => p,
+            // A hard error -- one recovery could not get past, such as an
+            // unterminated block -- ends the parse, but whatever was already
+            // collected is still worth reporting alongside it.
+            Err(error) => {
+                self.record(error);
+                return Err(std::mem::take(&mut self.errors));
+            }
+        };
+        if self.errors.is_empty() {
+            Ok(program)
+        } else {
+            Err(std::mem::take(&mut self.errors))
+        }
+    }
+
+    /// Note an error, giving it a line if it does not name one of its own.
+    fn record(&mut self, error: ParseError) {
+        let line = error.line().unwrap_or_else(|| self.cur_line());
+        self.errors.push(LocatedParseError { line, error });
+    }
+
+    /// Skip to the next place a statement could begin.
+    ///
+    /// Panic-mode recovery. BASIC is line-oriented, which makes this unusually
+    /// reliable: a newline or a colon ends a statement no matter what went
+    /// wrong before it, so the parser can pick up with the next one instead of
+    /// abandoning the file. Stopping *before* the boundary rather than past it
+    /// leaves any block terminator on that line to be read normally, so one bad
+    /// statement inside a SUB does not also cost the END SUB.
+    fn synchronize(&mut self) {
+        // Whatever a half-parsed statement left queued is meaningless now, and
+        // a stale name would surface as a terminator somewhere unrelated.
+        self.pending_next.clear();
+
+        let start = self.pos;
+        while !matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            self.advance();
+        }
+        // If the error was already at a boundary, step over it: the caller's
+        // loop would otherwise see the same token again and spin.
+        if self.pos == start && !matches!(self.peek(), Token::Eof) {
+            self.advance();
+        }
     }
 
     fn parse_program(&mut self) -> PResult<Program> {
         let mut statements = Vec::new();
         self.skip_newlines();
 
-        while !matches!(self.peek(), Token::Eof) {
-            let stmt = self.parse_statement()?;
-            statements.push(stmt);
+        while !matches!(self.peek(), Token::Eof) || !self.pending_next.is_empty() {
+            // A name left over from `NEXT I, J` has no loop to close: more
+            // loops were named than were open. Draining it here rather than
+            // only inside the loop condition matters, because the commonest
+            // shape -- `FOR I .. NEXT I, J` as the last statement -- leaves the
+            // token stream at Eof with the name still queued.
+            if let Some(name) = self.pending_next.pop_front() {
+                let e = ParseError::Error(format!("NEXT {} without matching FOR", name));
+                self.record(e);
+                continue;
+            }
+            match self.parse_statement() {
+                Ok(Parsed::Item(stmt)) => statements.push(stmt),
+                // A terminator here closed nothing: there is no enclosing block
+                // for it to belong to.
+                Ok(Parsed::End(end)) => {
+                    // Once anything has gone wrong, a stray terminator says
+                    // nothing useful: it is usually the perfectly good closer
+                    // of a block whose *header* failed, so reporting it blames
+                    // a FOR that is sitting right there. Suppress after the
+                    // first error, report it in a clean program.
+                    if self.errors.is_empty() {
+                        let e = ParseError::Error(format!(
+                            "{} without matching {}",
+                            end.keyword(),
+                            end.opener()
+                        ));
+                        self.record(e);
+                    }
+                    self.synchronize();
+                }
+                Err(e) => {
+                    self.record(e);
+                    self.synchronize();
+                }
+            }
             self.skip_newlines();
         }
 
         Ok(Program { statements })
     }
 
-    /// Parse one statement, tagging it with the line it started on.
+    /// Parse the statements of a block, up to and including its terminator.
     ///
-    /// `?` propagates `ParseError::Block` unchanged, so the block-terminator
-    /// protocol is unaffected by the wrapping.
-    fn parse_statement(&mut self) -> PResult<Stmt> {
-        let line = self.cur_line();
-        let kind = self.parse_statement_kind()?;
-        Ok(Stmt { line, kind })
+    /// Every block-bearing construct shares this. `opener` names the construct
+    /// and `closer` the keyword it needs, for the diagnostic when end of file
+    /// arrives first -- none of the seven hand-written loops this replaces
+    /// checked for EOF at all. They terminated only because an unrecognised
+    /// token became "Unexpected token: Eof", so an unterminated SUB blamed the
+    /// last line of the file and named nothing.
+    fn parse_block_body(
+        &mut self,
+        opener: &str,
+        closer: &str,
+        opener_line: u32,
+    ) -> PResult<(Vec<Stmt>, BlockEnd)> {
+        let mut body = Vec::new();
+        loop {
+            // A `NEXT I, J` left names here for the enclosing loops. Take one
+            // before looking at the token stream at all -- the NEXT has already
+            // been consumed, so the next real token is whatever followed it,
+            // and at the end of a program that is Eof. Checking after the guard
+            // below would report "FOR is missing its NEXT" with the terminator
+            // sitting right there.
+            if let Some(name) = self.pending_next.pop_front() {
+                return Ok((body, BlockEnd::Next(vec![name])));
+            }
+            if matches!(self.peek(), Token::Eof) {
+                return Err(ParseError::ErrorAt(
+                    opener_line,
+                    format!("{} is missing its {}", opener, closer),
+                ));
+            }
+            match self.parse_statement() {
+                Ok(Parsed::Item(stmt)) => body.push(stmt),
+                Ok(Parsed::End(end)) => return Ok((body, end)),
+                // Recover here as well as at the top level, so a mistake inside
+                // a block costs that statement rather than the whole block --
+                // otherwise the error would propagate out, the block's own
+                // terminator would be left stranded, and the reader would get a
+                // cascade of complaints about a SUB that was perfectly closed.
+                Err(e) => {
+                    self.record(e);
+                    self.synchronize();
+                }
+            }
+            self.skip_newlines();
+        }
     }
 
-    fn parse_statement_kind(&mut self) -> PResult<StmtKind> {
+    /// A block body that must end with exactly one terminator, named by `want`.
+    ///
+    /// `want` is matched by variant, so a payload-free value stands in for the
+    /// whole family; it also supplies the keyword for both diagnostics.
+    fn parse_block(
+        &mut self,
+        want: BlockEnd,
+        opener: &str,
+        opener_line: u32,
+    ) -> PResult<Vec<Stmt>> {
+        let (body, end) = self.parse_block_body(opener, want.keyword(), opener_line)?;
+        if std::mem::discriminant(&end) != std::mem::discriminant(&want) {
+            return Err(ParseError::ErrorAt(
+                opener_line,
+                format!(
+                    "{} needs {} to close it, but {} came first",
+                    opener,
+                    want.keyword(),
+                    end.keyword()
+                ),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Parse one statement, tagging it with the line it started on.
+    fn parse_statement(&mut self) -> PResult<Parsed<Stmt>> {
+        let line = self.cur_line();
+        Ok(match self.parse_statement_kind()? {
+            Parsed::Item(kind) => Parsed::Item(Stmt { line, kind }),
+            Parsed::End(end) => Parsed::End(end),
+        })
+    }
+
+    /// Parse one statement that is known not to close a block.
+    ///
+    /// Used where a terminator would be meaningless -- the branches of a
+    /// single-line IF -- so the caller does not have to invent a diagnostic.
+    fn parse_inner_statement(&mut self) -> PResult<Stmt> {
+        match self.parse_statement()? {
+            Parsed::Item(stmt) => Ok(stmt),
+            Parsed::End(end) => err(format!(
+                "{} without matching {}",
+                end.keyword(),
+                end.opener()
+            )),
+        }
+    }
+
+    fn parse_statement_kind(&mut self) -> PResult<Parsed<StmtKind>> {
+        self.depth += 1;
+        let r = self.parse_statement_kind_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_statement_kind_inner(&mut self) -> PResult<Parsed<StmtKind>> {
+        if self.depth > MAX_DEPTH {
+            return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
+        }
+
+        // Skip any run of separators and blank lines before the statement
+        // proper. Each of these used to recurse. That is a tail call, so a
+        // release build optimized it away and only a debug build overflowed on
+        // a long run of colons -- the worst way to hold a bug, since CI runs
+        // `cargo test --release`. A loop costs no stack in any profile.
+        while matches!(self.peek(), Token::Colon | Token::Newline) {
+            self.advance();
+        }
+
+        // A block-closing keyword belongs to the construct that opened the
+        // block, so hand it back rather than parsing it as a statement.
+        if let Some(end) = self.try_block_end()? {
+            return Ok(Parsed::End(end));
+        }
+
         // Handle line numbers as labels
         if let Token::LineNumber(n) = self.peek().clone() {
             self.advance();
-            return Ok(StmtKind::Label(n));
+            return Ok(Parsed::Item(StmtKind::Label(n)));
         }
 
         // A named label definition: `Retry:` at the start of a line.
@@ -771,16 +1238,10 @@ impl Parser {
                 unreachable!("at_label_definition checked for an identifier")
             };
             self.advance(); // consume ':'
-            return Ok(StmtKind::LabelName(name));
+            return Ok(Parsed::Item(StmtKind::LabelName(name)));
         }
 
-        // Handle colon as statement separator
-        if matches!(self.peek(), Token::Colon) {
-            self.advance();
-            return self.parse_statement_kind();
-        }
-
-        match self.peek().clone() {
+        let kind = match self.peek().clone() {
             Token::Print => self.parse_print(false),
             Token::Write => self.parse_print(true),
             Token::Swap => self.parse_swap(),
@@ -807,7 +1268,7 @@ impl Parser {
             Token::Type => self.parse_type_def(),
             Token::Sub => self.parse_sub(),
             Token::Function => self.parse_function(),
-            Token::Data => self.parse_data(),
+            Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
@@ -816,88 +1277,15 @@ impl Parser {
             }
             Token::Open => self.parse_open(),
             Token::Close => self.parse_close(),
+            // `try_block_end` has already taken END followed by IF, SUB,
+            // FUNCTION or SELECT, so a bare END is the statement.
             Token::End => {
                 self.advance();
-                // Check for END IF, END SUB, END FUNCTION, END SELECT
-                match self.peek() {
-                    Token::If => {
-                        self.advance();
-                        // Return to caller - this is a terminator, not a statement
-                        Err(ParseError::Block(BlockEnd::EndIf))
-                    }
-                    Token::Sub => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndSub))
-                    }
-                    Token::Function => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndFunction))
-                    }
-                    Token::Select => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndSelect))
-                    }
-                    _ => Ok(StmtKind::End),
-                }
-            }
-            Token::EndIf => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndIf))
-            }
-            Token::EndSub => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndSub))
-            }
-            Token::EndFunction => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndFunction))
-            }
-            Token::EndSelect => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndSelect))
+                Ok(StmtKind::End)
             }
             Token::Stop => {
                 self.advance();
                 Ok(StmtKind::Stop)
-            }
-            Token::Next => {
-                self.advance();
-                // Skip optional variable name
-                if let Token::Ident(_) = self.peek() {
-                    self.advance();
-                }
-                Err(ParseError::Block(BlockEnd::Next))
-            }
-            Token::Wend => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::Wend))
-            }
-            Token::Loop => {
-                self.advance();
-                // Check for WHILE/UNTIL condition
-                match self.peek() {
-                    Token::While => {
-                        self.advance();
-                        let cond = self.parse_expression()?;
-                        Err(ParseError::Block(BlockEnd::LoopWhile(cond)))
-                    }
-                    Token::Until => {
-                        self.advance();
-                        let cond = self.parse_expression()?;
-                        Err(ParseError::Block(BlockEnd::LoopUntil(cond)))
-                    }
-                    _ => Err(ParseError::Block(BlockEnd::Loop)),
-                }
-            }
-            Token::Else => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::Else))
-            }
-            Token::ElseIf => {
-                self.advance();
-                let cond = self.parse_expression()?;
-                self.expect(Token::Then)?;
-                Err(ParseError::Block(BlockEnd::ElseIf(cond)))
             }
             Token::Select => self.parse_select_case(),
             // `parse_select_case` consumes CASE itself, so a CASE reaching here
@@ -915,17 +1303,108 @@ impl Parser {
                     "PUT" if self.next_is(Token::Hash) => self.parse_get_put(true),
                     "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
+                    "CALL" if self.next_is_ident() => self.parse_call(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),
                 }
             }
-            Token::Newline => {
+            // Newline and Colon are consumed by the skip loop above, so
+            // reaching here means the statement itself is unrecognised.
+            _ => err(format!(
+                "unexpected {} at the start of a statement",
+                describe_token(self.peek())
+            )),
+        }?;
+        Ok(Parsed::Item(kind))
+    }
+
+    /// Consume a block-closing keyword if one is next, leaving the position
+    /// untouched otherwise.
+    ///
+    /// `END` is the awkward one: alone it terminates the program, and only the
+    /// token after it decides. `NEXT` swallows its optional control variable,
+    /// and `LOOP`/`ELSEIF` carry the condition they were written with, so that
+    /// a terminator can never be separated from its expression.
+    fn try_block_end(&mut self) -> PResult<Option<BlockEnd>> {
+        let end = match self.peek().clone() {
+            Token::End => {
+                let closes = match self.peek_at(1) {
+                    Token::If => BlockEnd::EndIf,
+                    Token::Sub => BlockEnd::EndSub,
+                    Token::Function => BlockEnd::EndFunction,
+                    Token::Select => BlockEnd::EndSelect,
+                    // A bare END is the program-termination statement.
+                    _ => return Ok(None),
+                };
                 self.advance();
-                self.parse_statement_kind()
+                self.advance();
+                closes
             }
-            _ => err(format!("Unexpected token: {:?}", self.peek())),
-        }
+            Token::EndIf => {
+                self.advance();
+                BlockEnd::EndIf
+            }
+            Token::EndSub => {
+                self.advance();
+                BlockEnd::EndSub
+            }
+            Token::EndFunction => {
+                self.advance();
+                BlockEnd::EndFunction
+            }
+            Token::EndSelect => {
+                self.advance();
+                BlockEnd::EndSelect
+            }
+            Token::Next => {
+                self.advance();
+                // `NEXT`, `NEXT I` or `NEXT I, J, ...`. The names used to be
+                // swallowed and discarded, so a NEXT could close a loop it did
+                // not name and a list was a syntax error.
+                let mut names = Vec::new();
+                while let Token::Ident(name) = self.peek().clone() {
+                    self.advance();
+                    names.push(name);
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                BlockEnd::Next(names)
+            }
+            Token::Wend => {
+                self.advance();
+                BlockEnd::Wend
+            }
+            Token::Loop => {
+                self.advance();
+                match self.peek() {
+                    Token::While => {
+                        self.advance();
+                        BlockEnd::LoopWhile(self.parse_expression()?)
+                    }
+                    Token::Until => {
+                        self.advance();
+                        BlockEnd::LoopUntil(self.parse_expression()?)
+                    }
+                    _ => BlockEnd::Loop,
+                }
+            }
+            Token::Else => {
+                self.advance();
+                BlockEnd::Else
+            }
+            Token::ElseIf => {
+                self.advance();
+                let cond = self.parse_expression()?;
+                self.expect(Token::Then)?;
+                BlockEnd::ElseIf(cond)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(end))
     }
 
     fn parse_print(&mut self, write: bool) -> PResult<StmtKind> {
@@ -1086,6 +1565,7 @@ impl Parser {
 
     fn parse_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume INPUT
+        self.skip_input_suppressor();
 
         // Check for INPUT #n (file input)
         if matches!(self.peek(), Token::Hash) {
@@ -1106,6 +1586,8 @@ impl Parser {
 
             return Ok(StmtKind::Input {
                 prompt: None,
+                // A file read prompts for nothing.
+                query: false,
                 vars,
                 file_num: Some(file_num),
             });
@@ -1113,14 +1595,25 @@ impl Parser {
 
         let mut prompt = None;
         let mut vars = Vec::new();
+        // A promptless INPUT still asks: GW-BASIC prints a bare `? `.
+        let mut query = true;
 
         // Check for prompt string
         if let Token::String(s) = self.peek().clone() {
             self.advance();
             prompt = Some(s);
-            // Expect comma or semicolon after prompt
-            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
-                self.advance();
+            // The separator decides whether a question mark follows the
+            // prompt: `;` adds one, `,` suppresses it. Both were accepted and
+            // the choice thrown away, so neither form ever printed one.
+            match self.peek() {
+                Token::Semicolon => {
+                    self.advance();
+                }
+                Token::Comma => {
+                    self.advance();
+                    query = false;
+                }
+                _ => {}
             }
         }
 
@@ -1136,14 +1629,30 @@ impl Parser {
 
         Ok(StmtKind::Input {
             prompt,
+            query,
             vars,
             file_num: None,
         })
     }
 
+    /// Consume the optional `;` that may precede an INPUT prompt.
+    ///
+    /// In GW-BASIC this suppresses the newline echoed when the operator presses
+    /// Return, so the next PRINT continues the same line. That newline is the
+    /// terminal's echo here -- neither runtime prints one -- so there is nothing
+    /// on our side to suppress and the form is accepted and ignored. Rejecting
+    /// it outright would refuse a program for asking about a difference it
+    /// cannot observe. LANGREF says so.
+    fn skip_input_suppressor(&mut self) {
+        if matches!(self.peek(), Token::Semicolon) {
+            self.advance();
+        }
+    }
+
     fn parse_line_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LINE
         self.expect(Token::Input)?;
+        self.skip_input_suppressor();
 
         // LINE INPUT #n, Var$ -- documented in LANGREF but never parsed.
         let file_num = if matches!(self.peek(), Token::Hash) {
@@ -1158,7 +1667,8 @@ impl Parser {
 
         let mut prompt = None;
 
-        // Check for prompt string
+        // Check for prompt string. Unlike INPUT, LINE INPUT never adds a
+        // question mark, so the separator carries no meaning here.
         if let Token::String(s) = self.peek().clone() {
             self.advance();
             prompt = Some(s);
@@ -1195,19 +1705,7 @@ impl Parser {
             None
         };
         // A record field path may follow: v.field.sub
-        let mut fields = Vec::new();
-        while matches!(self.peek(), Token::Dot) {
-            self.advance();
-            match self.advance() {
-                Token::Ident(f) => fields.push(f),
-                tok => {
-                    return err(format!(
-                        "Expected a field name after '.', got {}",
-                        describe_token(&tok)
-                    ));
-                }
-            }
-        }
+        let fields = self.parse_field_path()?;
         Ok(LValue {
             name,
             indices,
@@ -1238,19 +1736,7 @@ impl Parser {
 
         // A record field assignment: v.field... = value
         if matches!(self.peek(), Token::Dot) {
-            let mut fields = Vec::new();
-            while matches!(self.peek(), Token::Dot) {
-                self.advance();
-                match self.advance() {
-                    Token::Ident(f) => fields.push(f),
-                    tok => {
-                        return err(format!(
-                            "Expected a field name after '.', got {}",
-                            describe_token(&tok)
-                        ));
-                    }
-                }
-            }
+            let fields = self.parse_field_path()?;
             self.expect(Token::Eq)?;
             let value = self.parse_expression()?;
             return Ok(StmtKind::FieldAssign {
@@ -1274,19 +1760,7 @@ impl Parser {
 
             // arr(i).field... = value
             if matches!(self.peek(), Token::Dot) {
-                let mut fields = Vec::new();
-                while matches!(self.peek(), Token::Dot) {
-                    self.advance();
-                    match self.advance() {
-                        Token::Ident(f) => fields.push(f),
-                        tok => {
-                            return err(format!(
-                                "Expected a field name after '.', got {}",
-                                describe_token(&tok)
-                            ));
-                        }
-                    }
-                }
+                let fields = self.parse_field_path()?;
                 self.expect(Token::Eq)?;
                 let value = self.parse_expression()?;
                 return Ok(StmtKind::FieldAssign {
@@ -1358,7 +1832,14 @@ impl Parser {
                 indices: None,
                 fields: Vec::new(),
             },
-            Expr::ArrayAccess { name, indices } => LValue {
+            // A subscripted target arrives as FnCall now that the parser no
+            // longer guesses which one it is; sema turns the surviving calls
+            // into array accesses, but MID$ needs the LValue here.
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } => LValue {
                 name,
                 indices: Some(indices),
                 fields: Vec::new(),
@@ -1374,18 +1855,33 @@ impl Parser {
     }
 
     fn parse_if(&mut self) -> PResult<StmtKind> {
+        let if_line = self.cur_line();
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
         self.expect(Token::Then)?;
 
+        // A run of colons after THEN separates no statements, so the line ends
+        // there and this is a block IF. Treating them as the start of a
+        // statement -- as any non-newline token used to be -- made
+        // `IF X = 1 THEN :` a one-line IF whose END IF was then unmatched.
+        let mut ahead = 0;
+        while matches!(self.peek_at(ahead), Token::Colon) {
+            ahead += 1;
+        }
+        if matches!(self.peek_at(ahead), Token::Newline | Token::Eof) {
+            for _ in 0..ahead {
+                self.advance();
+            }
+        }
+
         // Check for single-line IF
         if !matches!(self.peek(), Token::Newline | Token::Eof) {
             // Single-line IF
-            let then_branch = vec![self.parse_statement()?];
+            let then_branch = self.parse_single_line_branch()?;
 
             let else_branch = if matches!(self.peek(), Token::Else) {
                 self.advance();
-                Some(vec![self.parse_statement()?])
+                Some(self.parse_single_line_branch()?)
             } else {
                 None
             };
@@ -1399,7 +1895,7 @@ impl Parser {
 
         // Block IF - parse body, handling ELSEIF as nested IF
         self.skip_newlines();
-        let (then_branch, else_branch) = self.parse_if_body()?;
+        let (then_branch, else_branch) = self.parse_if_body(if_line)?;
 
         Ok(StmtKind::If {
             condition,
@@ -1408,59 +1904,95 @@ impl Parser {
         })
     }
 
-    /// Parse the body of an IF block, returning (then_branch, else_branch)
-    /// Handles ELSEIF by constructing nested IF statements in else_branch
-    fn parse_if_body(&mut self) -> PResult<(Vec<Stmt>, Option<Vec<Stmt>>)> {
-        let mut body = Vec::new();
-
-        loop {
-            // Captured before parsing so an ELSEIF's synthesized nested IF can
-            // be attributed to the ELSEIF line rather than to END IF.
-            let stmt_line = self.cur_line();
-            match self.parse_statement() {
-                Ok(stmt) => {
-                    body.push(stmt);
-                }
-                Err(ParseError::Block(BlockEnd::EndIf)) => {
-                    return Ok((body, None));
-                }
-                Err(ParseError::Block(BlockEnd::Else)) => {
-                    // Parse ELSE body until END IF
-                    self.skip_newlines();
-                    let mut else_body = Vec::new();
-                    loop {
-                        match self.parse_statement() {
-                            Ok(stmt) => else_body.push(stmt),
-                            Err(ParseError::Block(BlockEnd::EndIf)) => break,
-                            Err(e) => return Err(e),
-                        }
-                        self.skip_newlines();
-                    }
-                    return Ok((body, Some(else_body)));
-                }
-                Err(ParseError::Block(BlockEnd::ElseIf(elseif_condition))) => {
-                    // Recursively parse the rest as a nested IF
-                    self.skip_newlines();
-                    let (nested_then, nested_else) = self.parse_if_body()?;
-
-                    let nested_if = Stmt {
-                        line: stmt_line,
-                        kind: StmtKind::If {
-                            condition: elseif_condition,
-                            then_branch: nested_then,
-                            else_branch: nested_else,
-                        },
-                    };
-
-                    return Ok((body, Some(vec![nested_if])));
-                }
-                Err(e) => return Err(e),
+    /// Parse one branch of a single-line IF: a colon-separated statement list.
+    ///
+    /// Everything after `THEN` up to `ELSE` or the end of the line is the THEN
+    /// clause, and everything after `ELSE` is the ELSE clause. Taking only the
+    /// first statement -- as this used to -- let the rest of the line escape
+    /// the conditional and run unconditionally, so `IF X = 1 THEN PRINT "A" :
+    /// PRINT "B"` printed `B` when X was 0. It also broke the ELSE form
+    /// outright: the second statement became a sibling of the IF, leaving the
+    /// `ELSE` to reach the top level as "ELSE without matching IF".
+    ///
+    /// The check for a terminator after the separator is what keeps a trailing
+    /// colon from pulling in the next line: `parse_statement` skips a leading
+    /// newline, so without it `IF C THEN PRINT "x" :` would swallow the
+    /// statement below it.
+    fn parse_single_line_branch(&mut self) -> PResult<Vec<Stmt>> {
+        let mut body = vec![self.parse_branch_statement()?];
+        while matches!(self.peek(), Token::Colon) {
+            self.advance();
+            if matches!(self.peek(), Token::Else | Token::Newline | Token::Eof) {
+                break;
             }
-            self.skip_newlines();
+            body.push(self.parse_branch_statement()?);
+        }
+        Ok(body)
+    }
+
+    /// One statement of a single-line IF branch, where a bare line number is
+    /// an implied GOTO.
+    ///
+    /// `IF X < 0 THEN 900` is how GW-BASIC spells its commonest branch, and it
+    /// is unambiguous: no other statement may begin with a number, so this used
+    /// to be rejected as "Unexpected token: Integer(900)".
+    fn parse_branch_statement(&mut self) -> PResult<Stmt> {
+        let line = self.cur_line();
+        if let Token::Integer(_) | Token::LineNumber(_) = self.peek() {
+            let target = self.parse_goto_target()?;
+            return Ok(Stmt {
+                line,
+                kind: StmtKind::Goto(target),
+            });
+        }
+        self.parse_inner_statement()
+    }
+
+    /// Parse the body of an IF block, returning (then_branch, else_branch).
+    /// Handles ELSEIF by constructing nested IF statements in else_branch.
+    ///
+    /// `if_line` is the line of the IF or ELSEIF that opened this body, used to
+    /// blame the right line when END IF never arrives.
+    fn parse_if_body(&mut self, if_line: u32) -> PResult<(Vec<Stmt>, Option<Vec<Stmt>>)> {
+        let (body, end) = self.parse_block_body("IF", "END IF", if_line)?;
+        // Captured before the newline is skipped, so an ELSEIF's synthesized
+        // nested IF is attributed to the ELSEIF's own line: a terminator is
+        // followed by the newline that ends the line it was written on.
+        let elseif_line = self.cur_line();
+
+        match end {
+            BlockEnd::EndIf => Ok((body, None)),
+            BlockEnd::Else => {
+                self.skip_newlines();
+                let else_body = self.parse_block(BlockEnd::EndIf, "IF", if_line)?;
+                Ok((body, Some(else_body)))
+            }
+            BlockEnd::ElseIf(condition) => {
+                // The rest of the chain is an IF nested in this one's ELSE.
+                self.skip_newlines();
+                let (nested_then, nested_else) = self.parse_if_body(if_line)?;
+                let nested_if = Stmt {
+                    line: elseif_line,
+                    kind: StmtKind::If {
+                        condition,
+                        then_branch: nested_then,
+                        else_branch: nested_else,
+                    },
+                };
+                Ok((body, Some(vec![nested_if])))
+            }
+            other => Err(ParseError::ErrorAt(
+                if_line,
+                format!(
+                    "IF needs END IF to close it, but {} came first",
+                    other.keyword()
+                ),
+            )),
         }
     }
 
     fn parse_for(&mut self) -> PResult<StmtKind> {
+        let for_line = self.cur_line();
         self.advance(); // consume FOR
         let var = if let Token::Ident(n) = self.advance() {
             n
@@ -1482,14 +2014,35 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Next)) => break,
-                Err(e) => return Err(e),
+        // Inspect the terminator rather than letting `parse_block` check only
+        // its variant, so the control variable can be matched against this
+        // loop's. `parse_do_loop` and `parse_if_body` take the same route.
+        let (body, terminator) = self.parse_block_body("FOR", "NEXT", for_line)?;
+        let BlockEnd::Next(mut names) = terminator else {
+            return Err(ParseError::ErrorAt(
+                for_line,
+                format!(
+                    "FOR needs NEXT to close it, but {} came first",
+                    terminator.keyword()
+                ),
+            ));
+        };
+
+        // A bare NEXT closes the innermost loop, whichever it is. A named one
+        // must name *this* loop: `FOR I ... NEXT J` used to compile, and with
+        // two loops open it silently produced a nesting nobody wrote.
+        if !names.is_empty() {
+            let closes = names.remove(0);
+            if closes != var {
+                return Err(ParseError::ErrorAt(
+                    for_line,
+                    format!("FOR {} is closed by NEXT {}", var, closes),
+                ));
             }
-            self.skip_newlines();
+            // The rest belong to the loops enclosing this one.
+            for name in names.into_iter().rev() {
+                self.pending_next.push_front(name);
+            }
         }
 
         Ok(StmtKind::For {
@@ -1502,24 +2055,18 @@ impl Parser {
     }
 
     fn parse_while(&mut self) -> PResult<StmtKind> {
+        let while_line = self.cur_line();
         self.advance(); // consume WHILE
         let condition = self.parse_expression()?;
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Wend)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(BlockEnd::Wend, "WHILE", while_line)?;
 
         Ok(StmtKind::While { condition, body })
     }
 
     fn parse_do_loop(&mut self) -> PResult<StmtKind> {
+        let do_line = self.cur_line();
         self.advance(); // consume DO
 
         // Check for DO WHILE/UNTIL at start
@@ -1537,34 +2084,35 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        let mut end_condition: Option<Expr> = None;
-        let mut end_is_until = false;
-
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Loop)) => break,
-                Err(ParseError::Block(BlockEnd::LoopWhile(cond))) => {
-                    end_condition = Some(cond);
-                    end_is_until = false;
-                    break;
-                }
-                Err(ParseError::Block(BlockEnd::LoopUntil(cond))) => {
-                    end_condition = Some(cond);
-                    end_is_until = true;
-                    break;
-                }
-                Err(e) => return Err(e),
+        let (body, end) = self.parse_block_body("DO", "LOOP", do_line)?;
+        let (end_condition, end_is_until) = match end {
+            BlockEnd::Loop => (None, false),
+            BlockEnd::LoopWhile(cond) => (Some(cond), false),
+            BlockEnd::LoopUntil(cond) => (Some(cond), true),
+            other => {
+                return Err(ParseError::ErrorAt(
+                    do_line,
+                    format!(
+                        "DO needs LOOP to close it, but {} came first",
+                        other.keyword()
+                    ),
+                ));
             }
-            self.skip_newlines();
+        };
+
+        // A loop tests at one end or the other. These used to be merged with
+        // `condition.or(end_condition)`, which silently discarded the one on
+        // the LOOP: `DO WHILE I < 3 ... LOOP UNTIL I > 100` ran on the WHILE
+        // alone, with the UNTIL having no effect at all. Writing both is a
+        // mistake about which test applies, so say so rather than pick one.
+        if condition.is_some() && end_condition.is_some() {
+            return err(
+                "a DO loop may test its condition at only one end, not on both DO and LOOP",
+            );
         }
 
-        // Use end condition if no start condition, or start condition takes precedence
-        let final_condition = condition.or(end_condition);
-
         Ok(StmtKind::DoLoop {
-            condition: final_condition,
+            condition: condition.or(end_condition),
             cond_at_start,
             is_until: if cond_at_start {
                 is_until
@@ -1576,6 +2124,7 @@ impl Parser {
     }
 
     fn parse_select_case(&mut self) -> PResult<StmtKind> {
+        let select_line = self.cur_line();
         self.advance(); // consume SELECT
         self.expect(Token::Case)?;
         let expr = self.parse_expression()?;
@@ -1585,6 +2134,17 @@ impl Parser {
 
         // Parse CASE blocks until END SELECT
         loop {
+            // The body loop below stops at end of file rather than spinning, so
+            // this is where an unterminated SELECT CASE is caught. It used to
+            // fall through to `expect(Token::Case)` and report "Expected Case,
+            // got Eof" against the last line of the file.
+            if matches!(self.peek(), Token::Eof) {
+                return Err(ParseError::ErrorAt(
+                    select_line,
+                    "SELECT CASE is missing its END SELECT".to_string(),
+                ));
+            }
+
             // Check for END SELECT
             if self.at_end_select() {
                 // Consume END SELECT
@@ -1619,7 +2179,7 @@ impl Parser {
                     break;
                 }
 
-                body.push(self.parse_statement()?);
+                body.push(self.parse_inner_statement()?);
                 self.skip_newlines();
             }
 
@@ -1691,7 +2251,10 @@ impl Parser {
             Token::Integer(n) => Ok(GotoTarget::Line(n as u32)),
             Token::LineNumber(n) => Ok(GotoTarget::Line(n)),
             Token::Ident(name) => Ok(GotoTarget::Label(name)),
-            tok => err(format!("Expected line number or label, got {:?}", tok)),
+            tok => err(format!(
+                "expected a line number or label, got {}",
+                describe_token(&tok)
+            )),
         }
     }
 
@@ -1754,9 +2317,6 @@ impl Parser {
                 self.advance();
                 let dims = self.parse_expr_list()?;
                 self.expect(Token::RParen)?;
-                // Track the name so that `name(i)` parses as an array access
-                // rather than a function call.
-                self.declared_arrays.insert(name.to_uppercase());
                 Some(dims)
             } else {
                 None
@@ -1879,6 +2439,7 @@ impl Parser {
     }
 
     fn parse_sub(&mut self) -> PResult<StmtKind> {
+        let sub_line = self.cur_line();
         self.advance(); // consume SUB
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -1905,21 +2466,14 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::EndSub)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(BlockEnd::EndSub, &format!("SUB '{}'", name), sub_line)?;
 
         Ok(StmtKind::Sub { name, params, body })
     }
 
     /// `FUNCTION name(params)` ... `END FUNCTION`
     fn parse_function(&mut self) -> PResult<StmtKind> {
+        let fn_line = self.cur_line();
         self.advance(); // consume FUNCTION
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -1954,15 +2508,11 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::EndFunction)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(
+            BlockEnd::EndFunction,
+            &format!("FUNCTION '{}'", name),
+            fn_line,
+        )?;
 
         Ok(StmtKind::Function {
             name,
@@ -1993,42 +2543,23 @@ impl Parser {
         Ok(params)
     }
 
-    fn parse_data(&mut self) -> PResult<StmtKind> {
-        self.advance(); // consume DATA
-        let mut values = Vec::new();
-
-        loop {
-            match self.peek().clone() {
-                Token::Integer(n) => {
-                    self.advance();
-                    values.push(Literal::Integer(n));
-                }
-                Token::Float(f) => {
-                    self.advance();
-                    values.push(Literal::Float(f));
-                }
-                Token::String(s) => {
-                    self.advance();
-                    values.push(Literal::String(s));
-                }
-                Token::Minus => {
-                    self.advance();
-                    match self.advance() {
-                        Token::Integer(n) => values.push(Literal::Integer(-n)),
-                        Token::Float(f) => values.push(Literal::Float(-f)),
-                        _ => return err("Expected number after minus in DATA"),
-                    }
-                }
-                _ => break,
-            }
-            if matches!(self.peek(), Token::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        Ok(StmtKind::Data(values))
+    /// `DATA item, item, ...`, where the items arrived as raw source text.
+    ///
+    /// The lexer hands over the whole operand verbatim (see
+    /// `Lexer::read_data_text`), because a DATA item is not an expression: it is
+    /// a literal run of characters, and tokenizing it would uppercase words and
+    /// renormalize numbers. This used to accept only Integer, Float, String and
+    /// a leading minus, so `DATA hello, world` ended the list at `hello` -- and
+    /// silently, since the loop simply broke, leaving the word to be parsed as a
+    /// fresh statement and produce an error about the word rather than the DATA.
+    fn parse_data(&mut self, text: &str) -> PResult<StmtKind> {
+        self.advance(); // consume the DATA token
+        Ok(StmtKind::Data(
+            split_data_items(text)
+                .iter()
+                .map(|it| it.literal())
+                .collect(),
+        ))
     }
 
     fn parse_read(&mut self) -> PResult<StmtKind> {
@@ -2096,9 +2627,10 @@ impl Parser {
                 FileMode::Random
             }
             tok => {
+                let tok = tok.clone();
                 return err(format!(
-                    "Expected INPUT, OUTPUT, APPEND or RANDOM, got {:?}",
-                    tok
+                    "expected INPUT, OUTPUT, APPEND or RANDOM, got {}",
+                    describe_token(&tok)
                 ));
             }
         };
@@ -2152,6 +2684,30 @@ impl Parser {
         }
 
         Ok(StmtKind::Field { file_num, fields })
+    }
+
+    /// `CALL Name(args)` or `CALL Name` -- the explicit form of a procedure
+    /// call, which GW-BASIC and QuickBASIC both accept.
+    ///
+    /// Recognised only in statement position before a name, like the
+    /// random-access statement names, so a program may still use CALL for a
+    /// variable of its own. Without this the word parsed as a paren-less call
+    /// to a subroutine named CALL, and the diagnostic complained about the
+    /// callee rather than about CALL.
+    fn parse_call(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume CALL
+        let Token::Ident(name) = self.advance() else {
+            return err("Expected a procedure name after CALL");
+        };
+        let args = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let args = self.parse_expr_list()?;
+            self.expect(Token::RParen)?;
+            args
+        } else {
+            Vec::new()
+        };
+        Ok(StmtKind::Call { name, args })
     }
 
     /// `LSET v$ = expr` / `RSET v$ = expr`
@@ -2234,6 +2790,29 @@ impl Parser {
 
     /// Precedence-climbing parser for binary expressions
     /// min_prec: minimum precedence level to parse at this level
+    /// Consume a `.field.sub` chain, returning the names.
+    ///
+    /// The statement-level twin of [`Self::parse_field_chain`], which builds
+    /// `Expr::Field` nodes instead. Assignment targets keep their path as a
+    /// plain list of names inside an `LValue`, and three statement parsers
+    /// spelled this loop out identically before it was hoisted here.
+    fn parse_field_path(&mut self) -> PResult<Vec<String>> {
+        let mut fields = Vec::new();
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Token::Ident(f) => fields.push(f),
+                tok => {
+                    return err(format!(
+                        "Expected a field name after '.', got {}",
+                        describe_token(&tok)
+                    ));
+                }
+            }
+        }
+        Ok(fields)
+    }
+
     /// Consume any `.field` chain following an expression.
     fn parse_field_chain(&mut self, mut base: Expr) -> PResult<Expr> {
         while matches!(self.peek(), Token::Dot) {
@@ -2256,11 +2835,34 @@ impl Parser {
         Ok(base)
     }
 
+    /// Every descent into an expression passes through here, so this is the one
+    /// place the depth has to be counted: parentheses re-enter via
+    /// `parse_primary`, and unary `-`, `+` and `NOT` re-enter directly.
     fn parse_prec(&mut self, min_prec: u8) -> PResult<Expr> {
-        // Handle NOT prefix operator (binds tighter than binary ops)
+        self.depth += 1;
+        let r = self.parse_prec_inner(min_prec);
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_prec_inner(&mut self, min_prec: u8) -> PResult<Expr> {
+        if self.depth > MAX_DEPTH {
+            return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
+        }
+
+        // `NOT` is a prefix operator sitting between the comparisons and `AND`,
+        // so its operand is everything that binds at least as tightly as a
+        // comparison -- and no more.
+        //
+        // It used to take its operand at the *caller's* `min_prec`, which at
+        // statement level is the lowest of all, so `NOT` swallowed whatever
+        // followed it: `NOT A AND B` parsed as `NOT (A AND B)`. Taking the
+        // operand at CMP_PREC keeps `NOT A = B` grouping as `NOT (A = B)` --
+        // the form that actually matters -- while leaving `AND` to the loop
+        // below, which is where it belongs.
         let mut left = if matches!(self.peek(), Token::Not) {
             self.advance();
-            let operand = self.parse_prec(min_prec)?; // NOT is right-associative
+            let operand = self.parse_prec(CMP_PREC)?;
             Expr::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
@@ -2275,8 +2877,10 @@ impl Parser {
                 break;
             }
             self.advance();
-            // Power is right-associative; others are left-associative
-            let next_min = if op == BinaryOp::Pow { prec } else { prec + 1 };
+            // Every operator associates left to right, `^` included: GW-BASIC
+            // and QuickBASIC evaluate `2 ^ 3 ^ 2` as `(2^3)^2` = 64. This used
+            // to special-case `Pow` to bind right, giving 512.
+            let next_min = prec + 1;
             let right = self.parse_prec(next_min)?;
             left = Expr::Binary {
                 op,
@@ -2330,16 +2934,14 @@ impl Parser {
                     let args = self.parse_expr_list()?;
                     self.expect(Token::RParen)?;
 
-                    // Distinguish array access from function call based on DIM declarations
-                    let base = if self.declared_arrays.contains(&name.to_uppercase()) {
-                        Expr::ArrayAccess {
-                            name,
-                            indices: args,
-                        }
-                    } else {
-                        Expr::FnCall { name, args }
-                    };
-                    self.parse_field_chain(base)
+                    // `A(1)` is an array element or a call; the parser cannot
+                    // tell, and used to guess from the DIM statements it had
+                    // read so far. That made the AST depend on where the DIM
+                    // was written -- the same source became FnCall before it
+                    // and ArrayAccess after -- and ignored scope entirely, so a
+                    // DIM inside a SUB changed how module-level code parsed.
+                    // Sema resolves it against the finished symbol table.
+                    self.parse_field_chain(Expr::FnCall { name, args })
                 } else {
                     self.parse_field_chain(Expr::Variable(name))
                 }
@@ -2350,7 +2952,10 @@ impl Parser {
                 self.expect(Token::RParen)?;
                 Ok(expr)
             }
-            tok => err(format!("Unexpected token in expression: {:?}", tok)),
+            tok => err(format!(
+                "unexpected {} in an expression",
+                describe_token(&tok)
+            )),
         }
     }
 
@@ -2373,12 +2978,20 @@ mod tests {
     use super::*;
     use crate::lexer::Lexer;
 
+    /// Parse, joining any errors so these tests keep their `Result<_, String>`
+    /// shape now that the parser reports every error it finds rather than one.
     fn parse(input: &str) -> Result<Program, String> {
         let mut lexer = Lexer::new(input);
         let tokens = lexer.tokenize()?;
         let lines = lexer.line_map().to_vec();
         let mut parser = Parser::new(tokens, lines);
-        parser.parse().map_err(|e| e.to_string())
+        parser.parse().map_err(|errors| {
+            errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })
     }
 
     // Label Tests
@@ -3235,14 +3848,16 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_power_right_associative() {
-        // 2 ^ 3 ^ 2 should be 2 ^ (3 ^ 2) = 512, not (2 ^ 3) ^ 2 = 64
+    fn test_expr_power_left_associative() {
+        // 2 ^ 3 ^ 2 is (2 ^ 3) ^ 2 = 64, as GW-BASIC and QuickBASIC evaluate
+        // it. This asserted the opposite nesting until associativity was made
+        // uniform: every operator here associates left to right.
         let prog = parse("X = 2 ^ 3 ^ 2").unwrap();
         if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
-            if let Expr::Binary { op, right, .. } = value {
+            if let Expr::Binary { op, left, .. } = value {
                 assert_eq!(*op, BinaryOp::Pow);
                 assert!(matches!(
-                    right.as_ref(),
+                    left.as_ref(),
                     Expr::Binary {
                         op: BinaryOp::Pow,
                         ..
@@ -3311,19 +3926,43 @@ mod tests {
 
     #[test]
     fn test_expr_logical_operators() {
+        // OR and XOR share the lowest level and associate left to right, and
+        // AND binds tighter than both, so this groups as
+        // ((A AND B) OR C) XOR D and the outermost operator is XOR.
+        //
+        // This asserted OR at the top, which held only because XOR used to have
+        // a level of its own that bound tighter than AND -- contradicting
+        // LANGREF's table, which puts OR and XOR together.
         let prog = parse("X = A AND B OR C XOR D").unwrap();
-        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
-            // OR has lowest precedence, then XOR, then AND
-            assert!(matches!(
-                value,
+        let StmtKind::Let { value, .. } = &prog.statements[0].kind else {
+            panic!("Expected Let");
+        };
+        let Expr::Binary {
+            op: BinaryOp::Xor,
+            left,
+            ..
+        } = value
+        else {
+            panic!("Expected XOR at the top, got {:?}", value);
+        };
+        let Expr::Binary {
+            op: BinaryOp::Or,
+            left: or_left,
+            ..
+        } = left.as_ref()
+        else {
+            panic!("Expected OR beneath the XOR, got {:?}", left);
+        };
+        assert!(
+            matches!(
+                or_left.as_ref(),
                 Expr::Binary {
-                    op: BinaryOp::Or,
+                    op: BinaryOp::And,
                     ..
                 }
-            ));
-        } else {
-            panic!("Expected Let");
-        }
+            ),
+            "AND binds tighter than both"
+        );
     }
 
     #[test]

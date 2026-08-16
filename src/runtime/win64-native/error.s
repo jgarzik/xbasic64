@@ -31,6 +31,9 @@ _err_badfile:   .asciz "Bad file number"
 _err_badmode:   .asciz "Bad file mode"
 _err_fieldovf:  .asciz "FIELD overflow"
 _err_permission: .asciz "Permission denied"
+_err_notfound: .asciz "File not found"
+_err_alreadyopen: .asciz "File already open"
+_err_pastend: .asciz "Input past end of file"
 
 # Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
 # .text below restores the section for the code that follows.

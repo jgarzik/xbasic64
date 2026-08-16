@@ -240,8 +240,17 @@ _rt_instr:
     mov r14, rdx            # needle ptr
     mov r15, rcx            # needle len
     mov rbx, r8             # start position (1-based)
+    # A start below 1 would move the search pointer backwards out of the
+    # buffer; GW-BASIC calls that an illegal argument.
+    cmp rbx, 1
+    jl .Linstr_badstart
     # Adjust for start position
     dec rbx                 # convert to 0-based
+    # A start past the end finds nothing. Without this the `sub` below drove
+    # the remaining length negative -- enormous, unsigned -- so the "room for
+    # the needle" test passed and memcmp read past the end of the string.
+    cmp rbx, r13
+    jae .Linstr_not_found
     add r12, rbx            # advance haystack ptr
     sub r13, rbx            # reduce remaining length
     # Special case: empty needle matches at current position
@@ -274,6 +283,11 @@ _rt_instr:
     jmp .Linstr_done
 .Linstr_not_found:
     xor rax, rax            # return 0
+    jmp .Linstr_done
+.Linstr_badstart:
+    lea rdi, [rip + _err_domain]
+    xor esi, esi
+    call _rt_error
 .Linstr_done:
     # Restore stack and callee-saved registers
     add rsp, 8              # Restore stack alignment
@@ -451,6 +465,68 @@ _rt_space:
     mov rdx, rbx
 
     add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# _rt_fixed - Fit a string to a declared width, for STRING * n
+#
+# A fixed-length string always holds exactly its declared number of characters:
+# a shorter value is padded with spaces on the right, a longer one is truncated.
+# Assignment used to store the source verbatim, so `STRING * 5` held whatever it
+# was given and the declared width meant nothing.
+#
+# A fresh buffer rather than an interior pointer, because the result is stored
+# and the source may be a temporary.
+#
+# Arguments: rdi = source pointer, rsi = source length, rdx = width
+# Returns:   rax = pointer, rdx = width
+.globl _rt_fixed
+_rt_fixed:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rdi            # source pointer
+    mov r13, rsi            # source length
+    mov rbx, rdx            # width
+    cmp rbx, 0
+    jge .Lfixed_ok
+    xor rbx, rbx            # a non-positive width yields the empty string
+.Lfixed_ok:
+    # Copy at most `width` bytes.
+    mov r14, r13
+    cmp r14, rbx
+    jbe .Lfixed_have_n
+    mov r14, rbx
+.Lfixed_have_n:
+
+    lea rdi, [rbx + 1]      # room for the NUL the string helpers expect
+    call malloc
+
+    # Space-fill the whole width first, then overwrite the prefix; memset
+    # returns its destination, so the pointer survives without a save.
+    mov rdi, rax
+    mov esi, ' '
+    mov rdx, rbx
+    call memset
+
+    # memcpy(dest, src, min(len, width)). rax still holds the buffer.
+    mov rdi, rax
+    mov rsi, r12
+    mov rdx, r14
+    mov r13, rax            # keep the buffer across the call; a push here
+    call memcpy             # would leave rsp misaligned
+    mov rax, r13
+
+    mov rdx, rbx            # the result is always `width` long
+
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     leave
     ret

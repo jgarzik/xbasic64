@@ -7,7 +7,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run_flags, compile_and_run_raw, compile_only};
+use crate::common::{compile_and_run, compile_and_run_flags, compile_and_run_raw, compile_only};
 
 /// The harness itself must be able to tell a rejected program from an accepted one.
 #[test]
@@ -51,7 +51,9 @@ fn test_harness_supplies_empty_stdin() {
     let run = compile_and_run_raw("INPUT N\nPRINT \"read\"\n", "").expect("should compile");
     assert_eq!(
         run.lines(),
-        vec!["read"],
+        // The promptless INPUT prints `? `, which shares the line with the
+        // PRINT that follows it.
+        vec!["? read"],
         "program ran to completion at EOF"
     );
     assert_eq!(run.exit_code, Some(0));
@@ -933,6 +935,320 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// A name cannot be both an array and a procedure, or an array and a builtin.
+///
+/// `A(1)` has to resolve to one thing. Sema resolved such a clash in favour of
+/// the array and codegen in favour of the procedure, and the parser's DIM-order
+/// heuristic hid the disagreement for as long as it lasted -- both of these
+/// compiled silently. Nobody writes this on purpose, and either resolution
+/// surprises somebody, so the program is refused instead.
+#[test]
+fn test_array_and_procedure_name_collisions_are_diagnosed() {
+    expect_rejected(
+        "DIM F(5)\nF(1) = 7\nFUNCTION F(X)\nF = X * 2\nEND FUNCTION\n",
+        "declared both as an array and as a FUNCTION",
+    );
+    expect_rejected(
+        "DIM S(5)\nSUB S(X)\nPRINT X\nEND SUB\n",
+        "declared both as an array and as a SUB",
+    );
+    expect_rejected(
+        "DIM LEN(5)\nLEN(1) = 7\n",
+        "'LEN' is the name of a built-in function",
+    );
+}
+
+/// Every syntax error in a program is reported, not just the first.
+///
+/// Sema has always returned a Vec<Diagnostic>, so five undefined names cost one
+/// compile. The parser stopped at the first error, so five typos cost five.
+#[test]
+fn test_parser_reports_every_error() {
+    let e = compile_only("X = )\nGOTO +\nY = *\nPRINT \"ok\"\n")
+        .expect_err("three bad statements must be refused");
+    for expected in [
+        "unexpected ) in an expression",
+        "expected a line number or label, got +",
+        "unexpected * in an expression",
+    ] {
+        assert!(
+            e.contains(expected),
+            "expected {expected:?} among the diagnostics: {}",
+            e.stderr
+        );
+    }
+    assert!(
+        e.contains("3 errors"),
+        "the tally should say 3: {}",
+        e.stderr
+    );
+}
+
+/// One error is "1 error", not "1 errors".
+#[test]
+fn test_single_error_tally_is_singular() {
+    let e = compile_only("X = )\n").expect_err("must be refused");
+    assert!(e.contains("1 error\n") || e.stderr.trim_end().ends_with("1 error"));
+}
+
+/// Recovery happens inside blocks too, so one bad statement costs that
+/// statement and not the block around it.
+///
+/// Recovering only at the top level would let the error escape the SUB, strand
+/// its END SUB, and produce a cascade of complaints about a SUB that was
+/// perfectly well closed.
+#[test]
+fn test_recovery_inside_a_block_does_not_cascade() {
+    let e = compile_only("SUB Foo\nX = )\nPRINT 1\nEND SUB\nPRINT 2\n")
+        .expect_err("the bad statement must be refused");
+    assert!(
+        e.contains("1 error"),
+        "only the bad statement should be reported: {}",
+        e.stderr
+    );
+    assert!(
+        !e.contains("without matching") && !e.contains("missing its"),
+        "the SUB was closed correctly and must not be blamed: {}",
+        e.stderr
+    );
+}
+
+/// Errors found before a block that never closes are kept, not discarded.
+#[test]
+fn test_hard_error_keeps_the_errors_found_before_it() {
+    let e = compile_only("X = )\nFOR I = 1 TO 10\nPRINT I\n")
+        .expect_err("an unclosed FOR must be refused");
+    assert!(
+        e.contains("unexpected ) in an expression"),
+        "the earlier error must survive: {}",
+        e.stderr
+    );
+    assert!(
+        e.contains("FOR is missing its NEXT"),
+        "the unclosed block must be reported: {}",
+        e.stderr
+    );
+}
+
+/// Diagnostics quote BASIC, not Rust.
+///
+/// Errors fell back to `{:?}` on the token, so they showed the lexer's variant
+/// names: "Expected To, got Integer(2)" for a missing TO, and `EndSelect`,
+/// `LParen` and `Ne` at programmers who had written `END SELECT`, `(` and `<>`.
+/// Every fixed token now carries the spelling it was written with.
+#[test]
+fn test_diagnostics_quote_source_spelling() {
+    let cases = [
+        ("FOR I = 1 2 3\nNEXT\n", "expected TO, got 2"),
+        ("IF THEN\n", "unexpected THEN in an expression"),
+        ("GOTO +\n", "expected a line number or label, got +"),
+        ("X = )\n", "unexpected ) in an expression"),
+        (
+            "OPEN \"f\" FOR BOGUS AS #1\n",
+            "expected INPUT, OUTPUT, APPEND or RANDOM, got identifier 'BOGUS'",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+    }
+}
+
+/// No diagnostic may leak a Rust variant name.
+///
+/// A cheap guard over the whole set: these are the spellings `{:?}` produced,
+/// and none of them is a thing anyone can type in BASIC.
+#[test]
+fn test_diagnostics_never_show_rust_variant_names() {
+    let sources = [
+        "FOR I = 1 2 3\nNEXT\n",
+        "X = )\n",
+        "IF THEN\n",
+        "GOTO +\n",
+        "X = 1 <> \n",
+        "SELECT CASE\n",
+    ];
+    for source in sources {
+        let Err(e) = compile_only(source) else {
+            continue;
+        };
+        for leaked in [
+            "EndSelect",
+            "LParen",
+            "RParen",
+            "Integer(",
+            "Ident(",
+            "Newline",
+            "ElseIf",
+        ] {
+            assert!(
+                !e.stderr.contains(leaked),
+                "{source:?} leaked the Rust name {leaked:?}: {}",
+                e.stderr
+            );
+        }
+    }
+}
+
+/// An unclosed block names the construct and the line that opened it.
+///
+/// None of the seven hand-written body loops checked for end of file. They
+/// stopped only because an unrecognised token became "Unexpected token: Eof",
+/// so every one of these reported that against the last line of the file and
+/// named nothing at all -- the reader was told where the parser gave up rather
+/// than where the mistake was.
+#[test]
+fn test_unclosed_blocks_name_their_opener() {
+    let cases = [
+        (
+            "PRINT 1\nFOR I = 1 TO 10\nPRINT I\n",
+            "FOR is missing its NEXT",
+        ),
+        (
+            "PRINT 1\nSUB Foo\nPRINT 1\n",
+            "SUB 'FOO' is missing its END SUB",
+        ),
+        (
+            "FUNCTION Bar(X)\nBar = X\n",
+            "FUNCTION 'BAR' is missing its END FUNCTION",
+        ),
+        ("WHILE X < 3\nX = X + 1\n", "WHILE is missing its WEND"),
+        ("DO\nX = X + 1\n", "DO is missing its LOOP"),
+        ("IF X = 1 THEN\nPRINT 1\n", "IF is missing its END IF"),
+        (
+            "SELECT CASE X\nCASE 1\nPRINT 1\n",
+            "SELECT CASE is missing its END SELECT",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+    }
+}
+
+/// The opener's line is the one reported, not end of file.
+#[test]
+fn test_unclosed_block_reports_the_opening_line() {
+    let e = compile_only("PRINT 1\nPRINT 2\nFOR I = 1 TO 10\nPRINT I\nPRINT I\n")
+        .expect_err("an unclosed FOR must be refused");
+    assert!(
+        e.contains(":3: error:"),
+        "should blame the FOR on line 3, not end of file: {}",
+        e.stderr
+    );
+}
+
+/// A block closed by the wrong terminator says which one it wanted.
+#[test]
+fn test_mismatched_block_terminator_names_both() {
+    expect_rejected(
+        "FOR I = 1 TO 3\nPRINT I\nWEND\n",
+        "FOR needs NEXT to close it, but WEND came first",
+    );
+    expect_rejected(
+        "WHILE X < 3\nX = X + 1\nNEXT\n",
+        "WHILE needs WEND to close it, but NEXT came first",
+    );
+    expect_rejected(
+        "DO\nX = X + 1\nEND SUB\n",
+        "DO needs LOOP to close it, but END SUB came first",
+    );
+}
+
+/// Pathological nesting is diagnosed, not fatal.
+///
+/// The expression parser recursed without a bound, so 50,000 nested parens --
+/// or 50,000 unary minuses, which descend through the same path -- aborted the
+/// process with "fatal runtime error: stack overflow" and exit code 134. A
+/// compiler may refuse its input; it may not die on it, and 134 is outside the
+/// contract `is_clean_rejection` describes.
+#[test]
+fn test_deeply_nested_expressions_are_diagnosed_not_fatal() {
+    let n = 50_000;
+    expect_rejected(
+        &format!("X = {}1{}\n", "(".repeat(n), ")".repeat(n)),
+        "nesting is too deep",
+    );
+    expect_rejected(&format!("X = {}1\n", "-".repeat(n)), "nesting is too deep");
+    expect_rejected(
+        &format!("X = {}1\n", "NOT ".repeat(n)),
+        "nesting is too deep",
+    );
+}
+
+/// Deeply nested blocks descend through the same statement path.
+#[test]
+fn test_deeply_nested_blocks_are_diagnosed_not_fatal() {
+    let n = 50_000;
+    let source = format!(
+        "{}PRINT 1\n{}",
+        "IF 1 = 1 THEN\n".repeat(n),
+        "END IF\n".repeat(n)
+    );
+    expect_rejected(&source, "nesting is too deep");
+}
+
+/// A long run of statement separators must not consume stack either.
+///
+/// `parse_statement_kind` recursed once per separator to skip it. That is a
+/// tail call, so a release build optimized it away and only a debug build
+/// overflowed on 200,000 colons -- which is the worst way to hold a bug, since
+/// CI runs `cargo test --release`. Skipping them in a loop costs no stack in
+/// any profile. A separator run is legal, so this is accepted, not diagnosed.
+#[test]
+fn test_a_long_run_of_separators_costs_no_stack() {
+    let source = format!("X = 1 {}\nPRINT X\n", ":".repeat(200_000));
+    let run = compile_and_run(&source).expect("a run of separators is legal, if pointless");
+    assert_eq!(run.trim(), "1");
+}
+
+/// A line number too large to represent is an error, not a silent zero.
+///
+/// The lexer parsed it with `unwrap_or(0)`, so `99999999999 PRINT "hi"`
+/// compiled as a definition of label 0 -- and any GOTO written to reach it
+/// failed separately, because past LONG range the same digits lex as a Double.
+/// Every other numeric form in the lexer already refuses to guess.
+#[test]
+fn test_line_number_out_of_range_is_diagnosed() {
+    expect_rejected("99999999999 PRINT \"hi\"\n", "line number");
+    // The largest representable one still works.
+    compile_only("4294967295 PRINT \"ok\"\n").expect("u32::MAX is a valid line number");
+}
+
+/// A DO loop tests its condition at one end or the other, never both.
+///
+/// The two conditions used to be merged with `condition.or(end_condition)`, so
+/// the one on the LOOP was silently discarded: the loop below ran three times
+/// and printed 3, with `UNTIL I > 100` having no effect whatever. Writing both
+/// is a mistake about which test is being applied, and saying so beats picking
+/// one.
+#[test]
+fn test_do_loop_rejects_a_condition_at_both_ends() {
+    expect_rejected(
+        "I = 0\nDO WHILE I < 3\nI = I + 1\nLOOP UNTIL I > 100\n",
+        "only one end",
+    );
+    expect_rejected(
+        "I = 0\nDO UNTIL I > 3\nI = I + 1\nLOOP WHILE I < 100\n",
+        "only one end",
+    );
+}
+
+/// Each single-ended form still compiles, so the check above is not simply
+/// rejecting every DO loop.
+#[test]
+fn test_do_loop_single_condition_forms_still_compile() {
+    for source in [
+        "I = 0\nDO WHILE I < 3\nI = I + 1\nLOOP\n",
+        "I = 0\nDO UNTIL I > 3\nI = I + 1\nLOOP\n",
+        "I = 0\nDO\nI = I + 1\nLOOP WHILE I < 3\n",
+        "I = 0\nDO\nI = I + 1\nLOOP UNTIL I > 3\n",
+        "I = 0\nDO\nI = I + 1\nIF I > 3 THEN EXIT DO\nLOOP\n",
+    ] {
+        compile_only(source).unwrap_or_else(|e| {
+            panic!("{:?} should compile, but: {}", source, e.stderr);
+        });
+    }
+}
+
 /// The random-access statement names are recognised only in statement
 /// position, so a program may still use them for its own variables and
 /// procedures -- which GW-BASIC would not allow, but costs nothing to keep.
@@ -950,4 +1266,332 @@ fn test_random_access_keywords_are_not_reserved() {
             panic!("{:?} should still compile, but: {}", source, e.stderr);
         });
     }
+}
+
+/// The front end must never panic, whatever it is fed.
+///
+/// A compiler may reject its input; it may not die on it. The stack overflow on
+/// deeply nested expressions was exactly this class of bug and survived 314
+/// tests, because every one of them fed the compiler a program someone had
+/// thought about. This feeds it token soup instead: every result is acceptable
+/// except a panic or an abort, which `is_clean_rejection` distinguishes by exit
+/// code (1 = diagnosed, 101 = Rust panic, 134 = abort).
+#[test]
+fn test_front_end_never_panics_on_token_soup() {
+    // Deterministic, so a failure is reproducible from the seed alone.
+    let pieces = [
+        "PRINT",
+        "IF",
+        "THEN",
+        "ELSE",
+        "END",
+        "SUB",
+        "FUNCTION",
+        "FOR",
+        "NEXT",
+        "WHILE",
+        "WEND",
+        "DO",
+        "LOOP",
+        "UNTIL",
+        "SELECT",
+        "CASE",
+        "DIM",
+        "TYPE",
+        "AS",
+        "GOTO",
+        "GOSUB",
+        "RETURN",
+        "MID$",
+        "LEN",
+        "(",
+        ")",
+        ",",
+        ";",
+        ":",
+        "#",
+        ".",
+        "=",
+        "<>",
+        "+",
+        "-",
+        "*",
+        "/",
+        "^",
+        "\"s\"",
+        "1",
+        "1.5",
+        "&HFF",
+        "A",
+        "B$",
+        "C%",
+        "\n",
+        "REM x",
+        "'c",
+        "LINE INPUT",
+        "SWAP",
+        "CONST",
+        "EXIT",
+        "OPTION",
+        "BASE",
+        "REDIM",
+        "PRESERVE",
+        "DATA",
+        "READ",
+        "RESTORE",
+        "OPEN",
+        "FIELD",
+        "LSET",
+        "GET",
+        "PUT",
+        "LOCK",
+        "STEP",
+        "TO",
+        "NOT",
+        "AND",
+        "OR",
+        "XOR",
+        "MOD",
+    ];
+    // xorshift, so the corpus is fixed without pulling in a rng crate.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    for case in 0..300 {
+        let len = 1 + (next() % 40) as usize;
+        let mut source = String::new();
+        for _ in 0..len {
+            source.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            source.push(' ');
+        }
+        source.push('\n');
+
+        if let Err(e) = compile_only(&source) {
+            assert!(
+                e.is_clean_rejection(),
+                "case {case} must be diagnosed, not crash; exit={:?}\nsource: {source:?}\nstderr: {}",
+                e.exit_code,
+                e.stderr
+            );
+        }
+    }
+}
+
+/// A number too large to represent is an error, not infinity.
+///
+/// `parse::<f64>()` returns `inf` for an overflowing literal rather than Err,
+/// so the "malformed number" arm never fired and `1e400` compiled to a silent
+/// infinity. Every other numeric form in this lexer refuses to guess.
+#[test]
+fn test_numeric_overflow_is_diagnosed() {
+    expect_rejected("PRINT 1e400\n", "too large");
+    expect_rejected("X# = 1.5D400\n", "too large");
+    // The largest representable double still works.
+    compile_only("PRINT 1.7976931348623157E+308\n").expect("near the maximum is fine");
+}
+
+/// A failed block header must not also blame its own terminator.
+///
+/// `FOR I = 1 2 3` fails, and the NEXT that follows is then orphaned -- so the
+/// reader was told "NEXT without matching FOR" about a FOR sitting one line
+/// above. Once anything has gone wrong, stray terminators say nothing useful.
+#[test]
+fn test_a_failed_block_header_does_not_cascade() {
+    let e = compile_only("FOR I = 1 2 3\nPRINT I\nNEXT\n").expect_err("must be refused");
+    assert!(
+        e.contains("expected TO"),
+        "the real error must survive: {}",
+        e.stderr
+    );
+    assert!(
+        !e.contains("without matching"),
+        "the orphaned NEXT must not be reported: {}",
+        e.stderr
+    );
+    assert!(e.contains("1 error"), "exactly one: {}", e.stderr);
+}
+
+/// A stray terminator in an otherwise clean program is still reported.
+#[test]
+fn test_cascade_suppression_only_applies_after_an_error() {
+    expect_rejected("PRINT 1\nNEXT\n", "NEXT without matching FOR");
+}
+
+/// `RETURN` with no `GOSUB` anywhere is a compile error, not a linker error.
+///
+/// codegen only defines the GOSUB return stack when it has seen a GOSUB, so a
+/// lone RETURN emitted a reference to `_gosub_sp` that nothing defined and the
+/// user was shown `ld: undefined reference to _gosub_sp`. Turning that into a
+/// diagnostic is the whole reason sema exists.
+#[test]
+fn test_return_without_gosub_is_diagnosed() {
+    expect_rejected("PRINT \"x\"\nRETURN\n", "RETURN");
+    expect_rejected("IF 1 = 1 THEN\nRETURN\nEND IF\n", "RETURN");
+    // A program that does use GOSUB is unaffected.
+    compile_only("GOSUB 100\nEND\n100 PRINT 1\nRETURN\n").expect("GOSUB/RETURN pairs compile");
+}
+
+/// SWAP's type check must look at what the operands actually are, not at the
+/// suffix of the variable they hang off.
+///
+/// It compared `a.name.ends_with('$')`, which for `P.N` reads *P* -- a record,
+/// carrying no suffix. So swapping a string field with a numeric one passed the
+/// check, and codegen then read a string into rax/rdx and stored it into an
+/// INTEGER slot: SIGSEGV, exit 139.
+#[test]
+fn test_swap_of_mismatched_record_fields_is_diagnosed() {
+    let ty = "TYPE R\n  N AS STRING * 4\n  V AS INTEGER\nEND TYPE\nDIM P AS R\n";
+    expect_rejected(&format!("{ty}SWAP P.N, P.V\n"), "same type");
+    expect_rejected(&format!("{ty}SWAP P.V, P.N\n"), "same type");
+    // Matching fields still swap.
+    compile_only("TYPE R\n  A AS INTEGER\n  B AS INTEGER\nEND TYPE\nDIM P AS R\nSWAP P.A, P.B\n")
+        .expect("two numeric fields are a legal SWAP");
+}
+
+/// Out-of-range arguments to the string builtins are refused.
+///
+/// Each of these returned something plausible instead. The negative-length
+/// cases were the worst: `_rt_left` compares the count against the length
+/// unsigned, so -1 read as enormous, clamped to the length, and returned the
+/// *whole string*. `MID$`'s negative count is worse still -- it is the
+/// compiler's own sentinel for the two-argument form, so a program writing one
+/// explicitly got "the rest of the string" from a value GW-BASIC rejects.
+#[test]
+fn test_string_builtin_arguments_are_range_checked() {
+    for (source, what) in [
+        ("PRINT LEFT$(\"abc\", -1)\n", "LEFT$ negative count"),
+        ("PRINT RIGHT$(\"abc\", -1)\n", "RIGHT$ negative count"),
+        ("PRINT MID$(\"abc\", 0, 2)\n", "MID$ zero start"),
+        ("PRINT MID$(\"abc\", -1, 2)\n", "MID$ negative start"),
+        ("PRINT MID$(\"abc\", 1, -1)\n", "MID$ negative count"),
+        ("PRINT ASC(\"\")\n", "ASC of the empty string"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+    }
+}
+
+/// The legal forms of the same calls keep working, including MID$ with the
+/// length omitted -- which is what the negative sentinel exists for.
+#[test]
+fn test_string_builtin_legal_arguments_still_work() {
+    let output = compile_and_run(
+        r#"
+PRINT LEFT$("abcdef", 3)
+PRINT LEFT$("abc", 0)
+PRINT LEFT$("abc", 99)
+PRINT RIGHT$("abcdef", 2)
+PRINT MID$("abcdef", 3)
+PRINT MID$("abcdef", 3, 2)
+PRINT MID$("abc", 4)
+PRINT ASC("A")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
+}
+
+/// A negative base with a fractional exponent has no real result. It used to
+/// print `-nan`.
+#[test]
+fn test_fractional_power_of_a_negative_is_refused() {
+    let run =
+        crate::common::compile_and_run_raw("A = -8\nPRINT A ^ 0.5\n", "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "stderr: {}",
+        run.stderr
+    );
+}
+
+/// Integral exponents of a negative base are fine, and so is everything else
+/// that has a real answer.
+#[test]
+fn test_powers_that_have_real_answers_still_work() {
+    let output = compile_and_run(
+        r#"
+A = -2
+PRINT A ^ 3
+PRINT A ^ 2
+PRINT 4 ^ 0.5
+PRINT 2 ^ -2
+PRINT 0 ^ 0
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["-8", "4", "2", "0.25", "1"]);
+}
+
+/// CHR$, SPACE$ and STRING$ refuse counts and codes they cannot represent.
+///
+/// CHR$ kept only the low byte, so CHR$(256) was CHR$(0) and CHR$(-1) was
+/// CHR$(255). SPACE$ and STRING$ clamped a negative count to zero and returned
+/// the empty string. GW-BASIC calls all four an illegal function call.
+#[test]
+fn test_character_and_count_arguments_are_range_checked() {
+    for (source, what) in [
+        ("PRINT CHR$(256)\n", "CHR$ above 255"),
+        ("PRINT CHR$(-1)\n", "CHR$ below 0"),
+        ("PRINT SPACE$(-1)\n", "SPACE$ negative"),
+        ("PRINT STRING$(-1, \"x\")\n", "STRING$ negative"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+    }
+}
+
+/// The whole legal range still works, both ends included.
+#[test]
+fn test_character_and_count_legal_arguments() {
+    let output = compile_and_run(
+        r#"
+PRINT ASC(CHR$(0))
+PRINT ASC(CHR$(255))
+PRINT ASC(CHR$(65))
+PRINT "["; SPACE$(0); "]"
+PRINT "["; SPACE$(3); "]"
+PRINT "["; STRING$(0, "x"); "]"
+PRINT "["; STRING$(3, "x"); "]"
+PRINT HEX$(255)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["0", "255", "65", "[]", "[   ]", "[]", "[xxx]", "FF"]
+    );
+}
+
+/// A `DIM ... AS` type must agree with any suffix on the name.
+///
+/// The identical check has always existed for a FUNCTION's declared result
+/// type, and LANGREF states the rule -- but DIM accepted the contradiction
+/// silently, leaving no way to tell which of the two the program meant.
+#[test]
+fn test_dim_suffix_must_agree_with_its_as_clause() {
+    expect_rejected("DIM X$ AS INTEGER\n", "different type");
+    expect_rejected("DIM X% AS DOUBLE\nX% = 1\n", "different type");
+    expect_rejected("DIM A%(3) AS STRING * 4\n", "different type");
+    // Agreeing, and unsuffixed, are both fine.
+    compile_only("DIM X% AS INTEGER\nDIM Y AS DOUBLE\nDIM S$ AS STRING * 4\nDIM N AS LONG\n")
+        .expect("a suffix that agrees, or none at all, is legal");
 }

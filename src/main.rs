@@ -53,6 +53,23 @@ fn locate(file: &str, line: u32) -> String {
     }
 }
 
+/// Print a batch of diagnostics and exit.
+///
+/// Shared by the parser and by sema so the two stages report identically: both
+/// now produce a list rather than a single error, and a program with several
+/// mistakes should not look different depending on which pass found them.
+fn report(file: &str, diagnostics: &[(u32, String, Option<String>)]) -> ! {
+    for (line, message, note) in diagnostics {
+        eprintln!("{}: error: {}", locate(file, *line), message);
+        if let Some(note) = note {
+            eprintln!("{}: note: {}", locate(file, *line), note);
+        }
+    }
+    let n = diagnostics.len();
+    eprintln!("xbasic64: {} error{}", n, if n == 1 { "" } else { "s" });
+    std::process::exit(1);
+}
+
 /// Whether a failed Windows link looks like GNU coreutils' `link` rather than
 /// the MSVC linker.
 ///
@@ -91,27 +108,28 @@ fn main() {
 
     // Parse
     let mut parser = parser::Parser::new(tokens, line_map);
-    let program = match parser.parse() {
+    let mut program = match parser.parse() {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("{}: error: {}", locate(input_file, e.line), e);
-            std::process::exit(1);
-        }
+        Err(errors) => report(
+            input_file,
+            &errors
+                .iter()
+                .map(|e| (e.line, e.to_string(), None))
+                .collect::<Vec<_>>(),
+        ),
     };
 
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
-    let (symbols, diagnostics) = sema::analyze(&program);
+    let (symbols, diagnostics) = sema::analyze(&mut program);
     if !diagnostics.is_empty() {
-        for d in &diagnostics {
-            eprintln!("{}: error: {}", locate(input_file, d.line), d.message);
-            if let Some(note) = &d.note {
-                eprintln!("{}: note: {}", locate(input_file, d.line), note);
-            }
-        }
-        let n = diagnostics.len();
-        eprintln!("xbasic64: {} error{}", n, if n == 1 { "" } else { "s" });
-        std::process::exit(1);
+        report(
+            input_file,
+            &diagnostics
+                .iter()
+                .map(|d| (d.line, d.message.clone(), d.note.clone()))
+                .collect::<Vec<_>>(),
+        );
     }
 
     // Generate code
@@ -119,12 +137,12 @@ fn main() {
     let opts = codegen::Options {
         checks: !args.no_checks,
     };
-    let asm = codegen.generate(&program, symbols, opts);
+    let mut full_asm = codegen.generate(&program, symbols, opts);
 
-    // Add runtime
-    let runtime_asm = runtime::generate_runtime();
-
-    let full_asm = format!("{}\n{}", asm, runtime_asm);
+    // Append the runtime rather than `format!("{}\n{}", ..)`, which would build
+    // a third copy of an assembly text that reaches 145 MB on a large program.
+    full_asm.push('\n');
+    full_asm.push_str(&runtime::generate_runtime());
 
     // Determine output file names - put temp files next to output
     let input_path = Path::new(&input_file);

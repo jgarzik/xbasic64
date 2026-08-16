@@ -69,6 +69,16 @@ Multiple statements can appear on one line separated by colons:
 A = 1 : B = 2 : PRINT A + B
 ```
 
+### Line Continuation
+
+A trailing underscore joins a statement to the next line. Nothing may follow it
+on the line it ends:
+
+```basic
+Total = Price * Quantity + _
+        Shipping
+```
+
 ### Block Terminators
 
 Each multi-line block may be closed with either the two-word form or a single
@@ -260,12 +270,20 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `XOR`    | Bitwise/logical XOR   |
 | `NOT`    | Bitwise/logical NOT   |
 
-These operate bitwise on integers, allowing both logical tests and bit manipulation:
+These operate bitwise on integers, allowing both logical tests and bit
+manipulation. Their operands are converted to integers first, and the result is
+an integer:
 
 ```basic
 IF A > 0 AND B > 0 THEN PRINT "Both positive"
 Flags% = Flags% OR &H01    ' Set bit 0
+Mask% = NOT &H00FF         ' -256: every bit flipped
 ```
+
+`NOT` complements every bit, so `NOT 1` is `-2`, which is non-zero and therefore
+*true*. This matters only when testing a value that is not already a truth
+value: comparisons yield -1 or 0, and `NOT` maps those to each other, so
+`IF NOT (A > 0)` behaves as expected while `IF NOT 1` does not.
 
 ### String Concatenation
 
@@ -286,6 +304,9 @@ From highest to lowest:
 8. `OR`, `XOR`
 
 Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
+
+Operators of equal precedence associate left to right, `^` included: `2 ^ 3 ^ 2`
+is `(2 ^ 3) ^ 2` = 64, and `100 - 10 - 5` is 85.
 
 Use parentheses to override precedence:
 ```basic
@@ -382,9 +403,23 @@ Read user input:
 
 ```basic
 INPUT X                   ' Prompt with "? "
-INPUT "Enter name: ", N$  ' Custom prompt
+INPUT "Enter name: "; N$  ' Prints: Enter name: ?
+INPUT "Enter name: ", N$  ' Prints: Enter name:
 INPUT "X, Y: ", X, Y      ' Multiple values
 ```
+
+The separator decides the question mark: a `;` after the prompt adds `? `, a
+`,` suppresses it, and a prompt-less `INPUT` prints `? ` on its own.
+
+A `;` *before* the prompt is accepted and ignored:
+
+```basic
+INPUT ; "Enter name: "; N$
+```
+
+In GW-BASIC it suppressed the newline echoed when the operator pressed Return.
+That newline comes from the terminal here rather than from the program, so
+there is nothing for it to suppress.
 
 ### LINE INPUT
 
@@ -394,12 +429,32 @@ Read entire line as string (no parsing):
 LINE INPUT "Enter text: ", Text$
 ```
 
+`LINE INPUT` never adds a question mark; write one into the prompt if you want
+one.
+
 ### IF...THEN...ELSE
 
 **Single-line form:**
 ```basic
 IF X > 0 THEN PRINT "Positive"
 IF X > 0 THEN Y = 1 ELSE Y = 0
+```
+
+Both branches take a list of statements separated by colons. Everything after
+`THEN` up to `ELSE` or the end of the line is conditional, and everything after
+`ELSE` is too:
+
+```basic
+IF X > 0 THEN Y = 1 : PRINT "Positive" ELSE Y = 0 : PRINT "Not positive"
+```
+
+A bare line number after `THEN` or `ELSE` is an implied `GOTO`:
+
+```basic
+10 IF X < 0 THEN 90
+20 IF X = 0 THEN 90 ELSE 80
+80 PRINT "Positive"
+90 PRINT "Done"
 ```
 
 **Block form:**
@@ -454,11 +509,22 @@ FOR K = 0 TO 1 STEP 0.1
 NEXT K
 ```
 
-The loop variable name after `NEXT` is optional:
+The loop variable name after `NEXT` is optional, and a bare `NEXT` closes the
+innermost open loop:
 ```basic
 FOR I = 1 TO 10
     PRINT I
 NEXT
+```
+
+If the name *is* given it must be the one that loop counts, so `FOR I ... NEXT J`
+is an error rather than a loop closed by surprise. One `NEXT` may close several
+nested loops, innermost first:
+```basic
+FOR I = 1 TO 3
+    FOR J = 1 TO 3
+        PRINT I * J
+NEXT J, I
 ```
 
 ### WHILE...WEND
@@ -576,6 +642,18 @@ READ X$, Y$
 RESTORE          ' Reset data pointer to beginning
 RESTORE 100      ' Resume at the DATA on line 100
 ```
+
+A DATA item needs quotes only if it contains a comma, a colon, or spaces that
+matter. Otherwise write it plainly; surrounding spaces are trimmed and the text
+is taken exactly as written, case included. An omitted item reads as 0 or `""`:
+
+```basic
+DATA hello, World, "a,b", "  padded  "
+DATA 1,,3
+```
+
+A colon ends a DATA statement, so another statement may follow it on the same
+line.
 
 ### CLS
 
@@ -925,7 +1003,10 @@ blanks and line breaks, so several fields may come from one line and one
 field may span several. A field wrapped in quotes may contain commas.
 `LINE INPUT #` takes a whole line, commas and all.
 
-`EOF()` gives the usual read-until-the-end loop:
+Reading past the end of a file is an error (`Input past end of file`), as is
+opening a file that is not there (`File not found`) or re-using a file number
+that is still open (`File already open`). `EOF()` gives the usual
+read-until-the-end loop:
 
 ```basic
 OPEN "data.txt" FOR INPUT AS #1
@@ -1080,8 +1161,12 @@ END SUB
 
 ' Call the subroutine
 PrintGreeting "World"
-PrintGreeting("World")    ' Parentheses optional
+PrintGreeting("World")     ' Parentheses optional
+CALL PrintGreeting("World")  ' CALL is accepted too
 ```
+
+`CALL` is recognised only before a name at the start of a statement, so a
+program may still use it as a variable.
 
 ### FUNCTION
 

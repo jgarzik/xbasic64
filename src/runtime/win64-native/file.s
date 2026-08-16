@@ -95,6 +95,13 @@ _rt_file_open:
     mov r14d, r8d           # mode (0/1/2)
     mov ebx, r9d            # file number
 
+    # A number that is still open must be CLOSEd first. Rebinding it used to
+    # succeed silently, leaking the old handle.
+    lea rax, [rip + _file_handles]
+    mov rax, [rax + rbx*8]
+    test rax, rax
+    jnz .Lopen_already
+
     # Copy filename and null-terminate
     lea rcx, [rip + _file_name_buf]
     mov rdx, rdi            # src
@@ -135,6 +142,12 @@ _rt_file_open:
     mov DWORD PTR [rsp + 40], FILE_ATTRIBUTE_NORMAL
     mov QWORD PTR [rsp + 48], 0          # hTemplateFile = NULL
     call CreateFileA
+
+    # A failed open used to be stored anyway, so the program carried on with
+    # INVALID_HANDLE_VALUE. Note this is -1 rather than NULL, so the NULL
+    # guards elsewhere would not have caught it.
+    cmp rax, INVALID_HANDLE_VALUE
+    je .Lopen_failed
 
     # Store HANDLE in handle table
     lea rcx, [rip + _file_handles]
@@ -232,6 +245,8 @@ _rt_file_print_string:
     # Get HANDLE from table
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped)
     mov rdx, rdi            # lpBuffer = string ptr
@@ -429,6 +444,8 @@ _rt_file_print_char:
     # Get HANDLE
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, buffer, 1, &bytesWritten, NULL)
     lea rdx, [rip + _file_output_buf]
@@ -462,6 +479,8 @@ _rt_file_print_newline:
     # Get HANDLE
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # WriteFile(hFile, "\r\n", CRLF_LEN, &bytesWritten, NULL)
     lea rdx, [rip + _file_newline]
@@ -691,6 +710,8 @@ _rt_file_line_input:
     # ReadFile(hFile, &buffer[pos], 1, &bytesRead, NULL)
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
+    test rcx, rcx
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     lea rdx, [rip + _file_input_buf]
     add rdx, r12            # &buffer[pos]
     mov r8, SINGLE_BYTE
@@ -702,7 +723,15 @@ _rt_file_line_input:
     lea rax, [rip + _file_bytes_read]
     mov rax, [rax]
     test rax, rax
-    jz .Lfile_input_str_done    # EOF
+    jnz .Lfile_input_str_have
+    # Nothing read. If nothing was read on this call at all, the file was
+    # already at its end and this read is one too many -- GW-BASIC calls that
+    # "Input past end of file". A partial last line without a trailing newline
+    # is not: that has characters in the buffer already.
+    test r12d, r12d
+    jz .Lfile_past_end
+    jmp .Lfile_input_str_done
+.Lfile_input_str_have:
 
     # Check if it's a newline
     lea rax, [rip + _file_input_buf]
@@ -1606,3 +1635,32 @@ _rt_file_lof:
     pop rbx
     leave
     ret
+
+# Shared tail for a file number that was never OPENed.
+#
+# PRINT # and LINE INPUT # used to hand the NULL handle straight to WriteFile
+# and ReadFile. The System V build died with SIGSEGV on the same programs;
+# _rt_file_getc and _rt_file_eof already guarded and these did not. The line
+# number is unknown here (these helpers are not given one), and _rt_error
+# prints a bare message for 0.
+.Lfile_not_open:
+    lea rcx, [rip + _err_badfile]
+    xor edx, edx
+    call _rt_error
+
+# OPEN failed. The line number is not passed to _rt_file_open, so these report
+# without one; _rt_error prints a bare message for 0.
+.Lopen_failed:
+    lea rcx, [rip + _err_notfound]
+    xor edx, edx
+    call _rt_error
+
+.Lopen_already:
+    lea rcx, [rip + _err_alreadyopen]
+    xor edx, edx
+    call _rt_error
+
+.Lfile_past_end:
+    lea rcx, [rip + _err_pastend]
+    xor edx, edx
+    call _rt_error

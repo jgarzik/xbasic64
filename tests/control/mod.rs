@@ -543,7 +543,9 @@ fn test_swap_record_string_fields() {
         "TYPE P\nN AS STRING * 8\nEND TYPE\nDIM A AS P\nDIM B AS P\nA.N = \"aa\"\nB.N = \"bb\"\nSWAP A.N, B.N\nPRINT A.N; \" \"; B.N\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "bb aa");
+    // Both fields are `STRING * 8`, so each is padded to eight characters;
+    // `output.trim()` removes only the trailing pad of the second.
+    assert_eq!(output.trim(), "bb       aa");
 }
 
 /// And for a field of an array element, whose address is only known at run
@@ -872,4 +874,215 @@ fn test_on_without_goto_or_gosub_is_diagnosed() {
         "the diagnostic should name both: {}",
         err.stderr
     );
+}
+
+/// Every colon-separated statement after `THEN` belongs to the THEN branch.
+///
+/// The parser used to take exactly one statement, so the rest of the line
+/// escaped the conditional and ran unconditionally: with `X = 0`, the program
+/// below printed `B`. Nothing in the suite used the form, so it stayed green.
+#[test]
+fn test_single_line_if_takes_every_statement_after_then() {
+    let output = compile_and_run(
+        r#"
+X = 0
+IF X = 1 THEN PRINT "A" : PRINT "B"
+PRINT "done"
+X = 1
+IF X = 1 THEN PRINT "C" : PRINT "D"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["done", "C", "D"], "the whole tail is conditional");
+}
+
+/// The same, inside a loop, where the leak was loudest.
+///
+/// With the trailing statement unconditional this printed `x two x x` across
+/// three iterations instead of `two x` on the second alone.
+#[test]
+fn test_single_line_if_inside_a_loop() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 3
+IF I = 2 THEN PRINT "two" : PRINT "x"
+NEXT I
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["two", "x"], "only the matching iteration prints");
+}
+
+/// A bare line number after THEN or ELSE is an implied GOTO.
+///
+/// This is how GW-BASIC spells the commonest branch of all, and the form
+/// appears throughout published listings. It was rejected outright with
+/// "Unexpected token: Integer(30)", since a statement cannot otherwise begin
+/// with a number.
+#[test]
+fn test_if_then_line_number_is_an_implied_goto() {
+    let output = compile_and_run(
+        r#"
+10 IF 1 = 1 THEN 30
+20 PRINT "skipped"
+30 PRINT "target"
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "target", "THEN <linenum> branches");
+}
+
+/// The same after ELSE, and mixed with an ordinary statement.
+#[test]
+fn test_if_then_else_line_numbers() {
+    let output = compile_and_run(
+        r#"
+10 X = 0
+20 IF X = 1 THEN 40 ELSE 60
+40 PRINT "then"
+50 GOTO 70
+60 PRINT "else"
+70 IF X = 0 THEN 90 ELSE PRINT "no"
+80 PRINT "unreachable"
+90 PRINT "done"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["else", "done"],
+        "both branches accept a line number"
+    );
+}
+
+/// `ELSE` ends the THEN branch and opens its own colon-separated list.
+///
+/// This form did not merely misbehave, it failed to compile: the second
+/// statement became a sibling of the IF, so the `ELSE` that followed it
+/// reached the top level and was rejected as "ELSE without matching IF".
+#[test]
+fn test_single_line_if_else_both_take_statement_lists() {
+    let output = compile_and_run(
+        r#"
+X = 9
+IF X = 1 THEN PRINT "a" : PRINT "b" ELSE PRINT "c" : PRINT "d"
+PRINT "end"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["c", "d", "end"], "the ELSE branch takes the tail");
+}
+
+/// `NEXT` names the loop it closes, and the name is checked.
+///
+/// The control variable was parsed and thrown away, so crossed NEXTs compiled
+/// into a loop nesting nobody wrote:
+///
+///     FOR I = 1 TO 2
+///       FOR J = 1 TO 2
+///       NEXT I          ' actually closed the J loop
+///     NEXT J            ' actually closed the I loop
+///
+/// GW-BASIC rejects that as "NEXT without FOR".
+#[test]
+fn test_next_variable_must_match_its_for() {
+    for source in [
+        "FOR I = 1 TO 2\nPRINT I\nNEXT J\n",
+        "FOR I = 1 TO 2\nFOR J = 1 TO 2\nPRINT I\nNEXT I\nNEXT J\n",
+    ] {
+        let e = crate::common::compile_only(source)
+            .expect_err(&format!("{source:?} should be refused"));
+        assert!(
+            e.contains("NEXT"),
+            "the diagnostic should name NEXT: {}",
+            e.stderr
+        );
+        assert!(e.is_clean_rejection());
+    }
+}
+
+/// A bare `NEXT` still closes the innermost loop, and a matching name is fine.
+#[test]
+fn test_next_bare_and_matching_still_work() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 2
+  FOR J = 1 TO 2
+    PRINT I; J
+  NEXT J
+NEXT I
+FOR K = 1 TO 2
+  FOR L = 1 TO 2
+  NEXT
+NEXT
+PRINT "done"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["11", "12", "21", "22", "done"]);
+}
+
+/// One `NEXT` may close several loops, innermost name first.
+#[test]
+fn test_next_closes_several_loops() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 2
+  FOR J = 1 TO 2
+    PRINT I; J
+NEXT J, I
+PRINT "done"
+FOR A = 1 TO 2
+  FOR B = 1 TO 2
+    FOR C = 1 TO 2
+      T = T + 1
+NEXT C, B, A
+PRINT T
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["11", "12", "21", "22", "done", "8"]);
+}
+
+/// The names in a multi-loop `NEXT` are checked in order, and a name with no
+/// loop left to close is refused rather than silently dropped.
+#[test]
+fn test_next_list_is_checked() {
+    for source in [
+        // Wrong order: J is the inner loop, so `NEXT I, J` is backwards.
+        "FOR I = 1 TO 2\nFOR J = 1 TO 2\nNEXT I, J\n",
+        // One name too many.
+        "FOR I = 1 TO 2\nNEXT I, J\n",
+    ] {
+        let e = crate::common::compile_only(source)
+            .expect_err(&format!("{source:?} should be refused"));
+        assert!(e.is_clean_rejection(), "stderr: {}", e.stderr);
+    }
+}
+
+/// `IF cond THEN` followed by only colons opens a block, not a single-line IF.
+///
+/// The single-line test treated anything other than end-of-line as the start of
+/// a statement, so the colons made this a one-line IF and the END IF below was
+/// then unmatched.
+#[test]
+fn test_if_then_trailing_colon_is_still_a_block() {
+    let output = compile_and_run(
+        r#"
+X = 1
+IF X = 1 THEN :
+PRINT "in"
+END IF
+PRINT "after"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["in", "after"]);
 }

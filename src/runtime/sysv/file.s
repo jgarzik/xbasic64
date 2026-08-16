@@ -100,6 +100,14 @@ _rt_file_open:
     mov r14d, edx           # mode (0/1/2)
     mov ebx, ecx            # file number
 
+    # A number that is still open must be CLOSEd first. Rebinding it used to
+    # succeed silently, leaking the old FILE* and losing whatever was buffered
+    # in it.
+    lea rax, [rip + _file_handles]
+    mov rax, [rax + rbx*8]
+    test rax, rax
+    jnz .Lopen_already
+
     # Copy filename to buffer and null-terminate
     # memcpy(_file_name_buf, filename_ptr, filename_len)
     lea rdi, [rip + _file_name_buf]
@@ -128,6 +136,12 @@ _rt_file_open:
     # fopen(filename, mode)
     lea rdi, [rip + _file_name_buf]
     call fopen        # returns FILE* in rax (or NULL on error)
+
+    # A failed open used to be stored anyway, so the program carried on with a
+    # NULL handle: OPEN of a missing file "succeeded", EOF() answered -1, and
+    # every later use was a crash or silence.
+    test rax, rax
+    jz .Lopen_failed
 
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
@@ -212,6 +226,8 @@ _rt_file_print_string:
     # Get FILE* from handle table
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE* → 1st arg
+    test rdi, rdi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
 
     # fprintf(file, "%.*s", len, ptr)
     lea rsi, [rip + _file_fmt_str]  # format → 2nd arg
@@ -398,6 +414,8 @@ _rt_file_print_char:
 
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE*
+    test rdi, rdi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     lea rsi, [rip + _file_fmt_char]
     mov rdx, r12            # char
     xor eax, eax
@@ -430,6 +448,8 @@ _rt_file_print_newline:
     # Use fputc('\n', file) - simpler than fprintf
     lea rax, [rip + _file_handles]
     mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
+    test rsi, rsi
+    jz .Lfile_not_open      # a number nobody OPENed is NULL here
     mov edi, 10             # '\n' → edi (1st arg)
     call fputc
 
@@ -638,11 +658,15 @@ _rt_file_line_input:
     mov rsi, 1023                        # max chars (leave room for null)
     lea rax, [rip + _file_handles]
     mov rdx, [rax + rbx*8]              # FILE*
+    test rdx, rdx
+    jz .Lfile_not_open                  # a number nobody OPENed is NULL here
     call fgets
 
-    # Check for EOF/error (fgets returns NULL)
+    # A read past the end used to answer with an empty string, so a loop
+    # missing its EOF() test ran on quietly forever instead of saying what was
+    # wrong. GW-BASIC calls this "Input past end of file".
     test rax, rax
-    jz .Lfile_input_string_empty
+    jz .Lfile_past_end
 
     # Calculate length using strlen
     lea rdi, [rip + _file_input_buf]
@@ -1546,3 +1570,32 @@ _rt_file_lof:
     pop rbx
     leave
     ret
+
+# Shared tail for a file number that was never OPENed.
+#
+# PRINT # and LINE INPUT # used to load the NULL handle and hand it straight to
+# fprintf/fgets, so `PRINT #3, "x"` on an unopened number died with SIGSEGV --
+# no message, exit 139. _rt_file_getc and _rt_file_eof already guarded; these
+# did not. The line number is unknown here (these helpers are not given one),
+# and _rt_error prints a bare message for 0.
+.Lfile_not_open:
+    lea rdi, [rip + _err_badfile]
+    xor esi, esi
+    call _rt_error
+
+# OPEN failed. The line number is not passed to _rt_file_open, so these report
+# without one; _rt_error prints a bare message for 0.
+.Lopen_failed:
+    lea rdi, [rip + _err_notfound]
+    xor esi, esi
+    call _rt_error
+
+.Lopen_already:
+    lea rdi, [rip + _err_alreadyopen]
+    xor esi, esi
+    call _rt_error
+
+.Lfile_past_end:
+    lea rdi, [rip + _err_pastend]
+    xor esi, esi
+    call _rt_error

@@ -407,3 +407,48 @@ PRINT STR$(X!)
         ]
     );
 }
+
+/// A start position past the end of the string finds nothing.
+///
+/// The runtime subtracted `start - 1` from the remaining length without
+/// checking, so a start beyond the string made that length go negative --
+/// which, unsigned, is enormous. The "is there room for the needle" test then
+/// passed and memcmp read past the end of the buffer, returning whatever
+/// position the garbage happened to match at: 253 and 261 on two runs of the
+/// same program.
+#[test]
+fn test_instr_start_beyond_the_string() {
+    let output = compile_and_run(
+        r#"
+PRINT INSTR(10, "abc", "b")
+PRINT INSTR(4, "abc", "b")
+PRINT INSTR(3, "abc", "c")
+PRINT INSTR(1, "abc", "a")
+S = 99
+PRINT INSTR(S, "abc", "b")
+PRINT INSTR(2, "", "x")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["0", "0", "3", "1", "0", "0"]);
+}
+
+/// A start position below 1 is an illegal argument, as it is in GW-BASIC.
+///
+/// It used to move the search pointer *backwards* out of the buffer.
+#[test]
+fn test_instr_start_below_one_is_refused() {
+    for source in [
+        "PRINT INSTR(0, \"abc\", \"b\")\n",
+        "PRINT INSTR(-1, \"abc\", \"b\")\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "stderr: {}",
+            run.stderr
+        );
+    }
+}

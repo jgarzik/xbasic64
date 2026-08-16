@@ -130,3 +130,132 @@ fn test_restore_to_label() {
     .unwrap();
     assert_eq!(output.trim(), "13");
 }
+
+/// DATA items need quotes only when they contain a comma, a colon, or
+/// significant surrounding spaces -- GW-BASIC's rule.
+///
+/// The parser only accepted Integer, Float, String and a leading minus, so an
+/// unquoted word ended the item list silently and the word itself was then
+/// parsed as a fresh statement, producing an error about the *word* rather than
+/// about DATA. Reassembling items from tokens would not have worked either: the
+/// lexer uppercases identifiers, so `DATA hello` would have yielded "HELLO".
+#[test]
+fn test_unquoted_data_items() {
+    let output = compile_and_run(
+        r#"
+DATA hello, World, MiXeD
+READ A$, B$, C$
+PRINT A$
+PRINT B$
+PRINT C$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["hello", "World", "MiXeD"], "case is preserved");
+}
+
+/// Surrounding spaces are trimmed from an unquoted item and kept in a quoted
+/// one, and a quoted item may contain the separators.
+#[test]
+fn test_data_quoting_rules() {
+    let output = compile_and_run(
+        r#"
+DATA   spaced   , "  kept  ", "a,b", "c:d"
+READ A$, B$, C$, D$
+PRINT "["; A$; "]"
+PRINT "["; B$; "]"
+PRINT C$
+PRINT D$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["[spaced]", "[  kept  ]", "a,b", "c:d"],
+        "unquoted items trim, quoted items do not"
+    );
+}
+
+/// An omitted item reads as zero, or as the empty string.
+#[test]
+fn test_data_empty_items() {
+    let output = compile_and_run(
+        r#"
+DATA 1,,3
+READ A, B, C
+PRINT A
+PRINT B
+PRINT C
+DATA ,x
+READ D$, E$
+PRINT "["; D$; "]["; E$; "]"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["1", "0", "3", "[][x]"]);
+}
+
+/// A colon still ends the DATA statement, so a statement may follow it on the
+/// same line -- as it could before.
+#[test]
+fn test_data_ends_at_a_colon() {
+    let output = compile_and_run(
+        r#"
+DATA 1, 2 : PRINT "after"
+READ A, B
+PRINT A + B
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["after", "3"]);
+}
+
+/// A DATA item may be READ as either type, whichever way its tag points.
+///
+/// `_rt_read_number` has always parsed a string entry with strtod, but
+/// `_rt_read_string` ignored the tag entirely and passed the entry's second
+/// word to strlen whatever it held -- so `DATA 42` followed by `READ A$`
+/// measured a string at address 42 and the program died with SIGSEGV. Nothing
+/// in sema caught it, and nothing could: pairing a READ with the item it will
+/// consume needs the execution path, which RESTORE and branching hide.
+#[test]
+fn test_numeric_data_read_into_a_string() {
+    let output = compile_and_run(
+        r#"
+DATA 42, 3.5, -7, text
+READ A$, B$, C$, D$
+PRINT A$
+PRINT B$
+PRINT C$
+PRINT D$
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        vec!["42", "3.5", "-7", "text"],
+        "rendered as PRINT would"
+    );
+}
+
+/// And the mirror image, which already worked: a string item read as a number.
+#[test]
+fn test_string_data_read_as_a_number() {
+    let output = compile_and_run(
+        r#"
+DATA "12", "3.5", "notanumber"
+READ A, B, C
+PRINT A
+PRINT B
+PRINT C
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, vec!["12", "3.5", "0"]);
+}

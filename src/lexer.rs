@@ -3,75 +3,103 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashMap;
 use std::iter::Peekable;
 use std::str::Chars;
-use std::sync::LazyLock;
 
-/// Keyword lookup table (initialized once on first use)
-static KEYWORDS: LazyLock<HashMap<&'static str, Token>> = LazyLock::new(|| {
-    HashMap::from([
-        ("PRINT", Token::Print),
-        ("INPUT", Token::Input),
-        ("LINE", Token::Line),
-        ("LET", Token::Let),
-        ("DIM", Token::Dim),
-        ("IF", Token::If),
-        ("THEN", Token::Then),
-        ("ELSE", Token::Else),
-        ("ELSEIF", Token::ElseIf),
-        ("ENDIF", Token::EndIf),
-        ("FOR", Token::For),
-        ("TO", Token::To),
-        ("STEP", Token::Step),
-        ("NEXT", Token::Next),
-        ("WHILE", Token::While),
-        ("WEND", Token::Wend),
-        ("DO", Token::Do),
-        ("LOOP", Token::Loop),
-        ("UNTIL", Token::Until),
-        ("GOTO", Token::Goto),
-        ("GOSUB", Token::Gosub),
-        ("RETURN", Token::Return),
-        ("ON", Token::On),
-        ("SUB", Token::Sub),
-        ("ENDSUB", Token::EndSub),
-        ("FUNCTION", Token::Function),
-        ("ENDFUNCTION", Token::EndFunction),
-        ("SELECT", Token::Select),
-        ("CASE", Token::Case),
-        ("ENDSELECT", Token::EndSelect),
-        ("END", Token::End),
-        ("STOP", Token::Stop),
-        ("REM", Token::Rem),
-        ("DATA", Token::Data),
-        ("READ", Token::Read),
-        ("RESTORE", Token::Restore),
-        ("CLS", Token::Cls),
-        ("OPEN", Token::Open),
-        ("CLOSE", Token::Close),
-        ("AS", Token::As),
-        ("OUTPUT", Token::Output),
-        ("APPEND", Token::Append),
-        ("AND", Token::And),
-        ("OR", Token::Or),
-        ("NOT", Token::Not),
-        ("XOR", Token::Xor),
-        ("MOD", Token::Mod),
-        ("USING", Token::Using),
-        ("SWAP", Token::Swap),
-        ("CONST", Token::Const),
-        ("WRITE", Token::Write),
-        ("EXIT", Token::Exit),
-        ("DEF", Token::Def),
-        ("OPTION", Token::Option),
-        ("BASE", Token::Base),
-        ("REDIM", Token::Redim),
-        ("PRESERVE", Token::Preserve),
-        ("TYPE", Token::Type),
-        ("ENDTYPE", Token::EndType),
-    ])
-});
+/// An identifier, as the lexer already normalized it.
+///
+/// [`Lexer::read_identifier`] uppercases every character of every name, so by
+/// the time one reaches the parser, sema or codegen it is *already* upper case.
+/// Sixty-odd call sites used to write `name.to_uppercase()` to say so, each
+/// allocating a fresh `String` to produce the string it was handed.
+///
+/// This states the invariant in one place and checks it, rather than having
+/// every consumer defensively re-establish it -- and re-establish it slightly
+/// differently, which is how `Symbols::lookup_array` came to uppercase the name
+/// for its module-level lookup but not for its procedure-local one.
+///
+/// The check is `debug_assert`, so it costs nothing in the shipped compiler and
+/// fires during `cargo test` in a debug profile if a name ever arrives raw.
+pub fn normalized(name: &str) -> &str {
+    debug_assert!(
+        !name.chars().any(char::is_lowercase),
+        "identifier '{}' was not uppercased by the lexer",
+        name
+    );
+    name
+}
+
+/// Recognise a keyword.
+///
+/// A `match` on the string rather than a `HashMap`: rustc lowers this to a
+/// switch on length followed by a memcmp chain, so there is no lazy-init check,
+/// no hashing and no clone of the matched token on every identifier scanned.
+///
+/// REM and DATA are absent deliberately -- `next_token` intercepts both before
+/// this is reached. REM introduces a comment; DATA's operand is raw text rather
+/// than a token sequence, so it arrives as a single `Token::DataText`.
+fn keyword(s: &str) -> Option<Token> {
+    match s {
+        "PRINT" => Some(Token::Print),
+        "INPUT" => Some(Token::Input),
+        "LINE" => Some(Token::Line),
+        "LET" => Some(Token::Let),
+        "DIM" => Some(Token::Dim),
+        "IF" => Some(Token::If),
+        "THEN" => Some(Token::Then),
+        "ELSE" => Some(Token::Else),
+        "ELSEIF" => Some(Token::ElseIf),
+        "ENDIF" => Some(Token::EndIf),
+        "FOR" => Some(Token::For),
+        "TO" => Some(Token::To),
+        "STEP" => Some(Token::Step),
+        "NEXT" => Some(Token::Next),
+        "WHILE" => Some(Token::While),
+        "WEND" => Some(Token::Wend),
+        "DO" => Some(Token::Do),
+        "LOOP" => Some(Token::Loop),
+        "UNTIL" => Some(Token::Until),
+        "GOTO" => Some(Token::Goto),
+        "GOSUB" => Some(Token::Gosub),
+        "RETURN" => Some(Token::Return),
+        "ON" => Some(Token::On),
+        "SUB" => Some(Token::Sub),
+        "ENDSUB" => Some(Token::EndSub),
+        "FUNCTION" => Some(Token::Function),
+        "ENDFUNCTION" => Some(Token::EndFunction),
+        "SELECT" => Some(Token::Select),
+        "CASE" => Some(Token::Case),
+        "ENDSELECT" => Some(Token::EndSelect),
+        "END" => Some(Token::End),
+        "STOP" => Some(Token::Stop),
+        "READ" => Some(Token::Read),
+        "RESTORE" => Some(Token::Restore),
+        "CLS" => Some(Token::Cls),
+        "OPEN" => Some(Token::Open),
+        "CLOSE" => Some(Token::Close),
+        "AS" => Some(Token::As),
+        "OUTPUT" => Some(Token::Output),
+        "APPEND" => Some(Token::Append),
+        "AND" => Some(Token::And),
+        "OR" => Some(Token::Or),
+        "NOT" => Some(Token::Not),
+        "XOR" => Some(Token::Xor),
+        "MOD" => Some(Token::Mod),
+        "USING" => Some(Token::Using),
+        "SWAP" => Some(Token::Swap),
+        "CONST" => Some(Token::Const),
+        "WRITE" => Some(Token::Write),
+        "EXIT" => Some(Token::Exit),
+        "DEF" => Some(Token::Def),
+        "OPTION" => Some(Token::Option),
+        "BASE" => Some(Token::Base),
+        "REDIM" => Some(Token::Redim),
+        "PRESERVE" => Some(Token::Preserve),
+        "TYPE" => Some(Token::Type),
+        "ENDTYPE" => Some(Token::EndType),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -116,8 +144,9 @@ pub enum Token {
     EndSelect,
     End,
     Stop,
-    Rem,
-    Data,
+    /// `DATA` together with its operand, captured as raw source text.
+    /// See `Lexer::read_data_text` for why it is not tokenized.
+    DataText(String),
     Read,
     Restore,
     Cls,
@@ -174,9 +203,7 @@ pub enum Token {
 }
 
 pub struct Lexer<'a> {
-    input: &'a str,
     chars: Peekable<Chars<'a>>,
-    pos: usize,
     line: u32,
     at_line_start: bool,
     /// Source line of each token produced by `tokenize`, parallel to its output.
@@ -186,9 +213,7 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub fn new(input: &'a str) -> Self {
         Lexer {
-            input,
             chars: input.chars().peekable(),
-            pos: 0,
             line: 1,
             at_line_start: true,
             lines: Vec::new(),
@@ -196,11 +221,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn advance(&mut self) -> Option<char> {
-        let c = self.chars.next();
-        if let Some(ch) = c {
-            self.pos += ch.len_utf8();
-        }
-        c
+        self.chars.next()
     }
 
     fn peek(&mut self) -> Option<char> {
@@ -227,9 +248,9 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Scan a string literal. The opening quote is already consumed.
     fn read_string(&mut self) -> Result<String, String> {
         let mut s = String::new();
-        self.advance(); // consume opening "
         loop {
             match self.advance() {
                 Some('"') => {
@@ -248,6 +269,36 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(s)
+    }
+
+    /// Scan the operand of a `DATA` statement as raw source text.
+    ///
+    /// DATA items are not expressions and cannot be reassembled from tokens:
+    /// [`Self::read_identifier`] uppercases, so `DATA hello` would come back as
+    /// `HELLO`, and `DATA 007` and `DATA 1.50` would lose their spelling. So the
+    /// text is taken verbatim and split by the parser, which is also how the
+    /// interpreters this follows did it.
+    ///
+    /// Scanning stops at end of line, or at a colon *outside* quotes so that a
+    /// statement may follow on the same line -- which is what this compiler has
+    /// always allowed. GW-BASIC runs DATA to the end of the line and treats a
+    /// colon as data; nothing in the wild depends on that, and stopping keeps
+    /// `DATA 1,2 : PRINT 3` working.
+    ///
+    /// The newline itself is left for `next_token`, which owns `at_line_start`.
+    fn read_data_text(&mut self) -> String {
+        let mut s = String::new();
+        let mut in_quotes = false;
+        while let Some(c) = self.peek() {
+            match c {
+                '\n' => break,
+                ':' if !in_quotes => break,
+                '"' => in_quotes = !in_quotes,
+                _ => {}
+            }
+            s.push(self.advance().unwrap());
+        }
+        s
     }
 
     /// Scan a decimal number.
@@ -287,21 +338,32 @@ impl<'a> Lexer<'a> {
         // Replace D with E for parsing
         let s = s.replace(['d', 'D'], "e");
 
+        // `parse::<f64>()` answers `inf` for a literal too large to represent
+        // rather than failing, so an overflow used to slip through as a silent
+        // infinity -- the one numeric form in this lexer that guessed.
+        let finite = |v: f64, text: &str| {
+            if v.is_finite() {
+                Ok(Token::Float(v))
+            } else {
+                Err(format!("number '{}' is too large", text))
+            }
+        };
+
         if is_float {
-            return s
-                .parse::<f64>()
-                .map(Token::Float)
-                .map_err(|_| format!("malformed number '{}'", s));
+            return match s.parse::<f64>() {
+                Ok(v) => finite(v, &s),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            };
         }
 
         match s.parse::<i32>() {
             Ok(n) => Ok(Token::Integer(n as i64)),
             // Outside LONG range: widen to Double, as MS BASIC does, rather
             // than truncating to 32 bits.
-            Err(_) => s
-                .parse::<f64>()
-                .map(Token::Float)
-                .map_err(|_| format!("number '{}' is too large", s)),
+            Err(_) => match s.parse::<f64>() {
+                Ok(v) => finite(v, &s),
+                Err(_) => Err(format!("number '{}' is too large", s)),
+            },
         }
     }
 
@@ -334,6 +396,13 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Scan an identifier, uppercasing it.
+    ///
+    /// This is where BASIC's case-insensitivity is implemented, and it is the
+    /// only place: every name that reaches the AST has been through here, and
+    /// the entry gate in `next_token` is `is_ascii_alphabetic`, so there is no
+    /// Unicode folding to worry about and the type suffixes (`% & ! # $`) are
+    /// case-invariant. See [`normalized`] for the invariant this establishes.
     fn read_identifier(&mut self, first: char) -> String {
         let mut s = String::new();
         s.push(first.to_ascii_uppercase());
@@ -367,14 +436,26 @@ impl<'a> Lexer<'a> {
         if s.ends_with(['%', '&', '!', '#', '$']) {
             return Token::Ident(s.to_string());
         }
-        KEYWORDS
-            .get(s)
-            .cloned()
-            .unwrap_or_else(|| Token::Ident(s.to_string()))
+        keyword(s).unwrap_or_else(|| Token::Ident(s.to_string()))
     }
 
     pub fn next_token(&mut self) -> Result<Token, String> {
         self.skip_whitespace();
+
+        // A trailing `_` joins this line to the next one. The newline is
+        // swallowed so no Newline token is produced and the statement carries
+        // on, but the line counter still advances so diagnostics keep pointing
+        // at the line the text was written on.
+        while self.peek() == Some('_') {
+            self.advance();
+            self.skip_whitespace();
+            if self.peek() != Some('\n') {
+                return Err("'_' continues a line, so nothing may follow it".to_string());
+            }
+            self.advance();
+            self.line += 1;
+            self.skip_whitespace();
+        }
 
         // Check for line number at start of line
         if self.at_line_start {
@@ -390,7 +471,15 @@ impl<'a> Lexer<'a> {
                     }
                     self.at_line_start = false;
                     self.skip_whitespace();
-                    return Ok(Token::LineNumber(num.parse().unwrap_or(0)));
+                    // A number too large to represent used to become label 0,
+                    // so the program silently defined a label nobody wrote and
+                    // every GOTO to it failed separately -- past LONG range the
+                    // same digits lex as a Double. Every other numeric form in
+                    // this lexer refuses to guess; so does this one.
+                    return match num.parse::<u32>() {
+                        Ok(n) => Ok(Token::LineNumber(n)),
+                        Err(_) => Err(format!("line number '{}' is too large", num)),
+                    };
                 }
             }
         }
@@ -408,12 +497,7 @@ impl<'a> Lexer<'a> {
                 Ok(Token::Newline)
             }
 
-            '"' => {
-                self.pos -= 1; // back up to re-read the quote
-                self.chars = self.input[self.pos..].chars().peekable();
-                let s = self.read_string()?;
-                Ok(Token::String(s))
-            }
+            '"' => Ok(Token::String(self.read_string()?)),
 
             '\'' => {
                 self.skip_comment();
@@ -494,6 +578,13 @@ impl<'a> Lexer<'a> {
                 if ident == "REM" {
                     self.skip_comment();
                     return Ok(Token::Newline);
+                }
+
+                // DATA's operand is raw text, not a sequence of tokens; see
+                // `read_data_text`. The comparison is against the bare word, so
+                // a suffixed `Data$` is still an ordinary variable.
+                if ident == "DATA" {
+                    return Ok(Token::DataText(self.read_data_text()));
                 }
 
                 Ok(self.keyword_or_ident(&ident))
@@ -733,11 +824,41 @@ mod tests {
 
     #[test]
     fn test_keywords_data() {
-        let mut lexer = Lexer::new("DATA READ RESTORE");
+        let mut lexer = Lexer::new("READ RESTORE");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[0], Token::Data);
-        assert_eq!(tokens[1], Token::Read);
-        assert_eq!(tokens[2], Token::Restore);
+        assert_eq!(tokens[0], Token::Read);
+        assert_eq!(tokens[1], Token::Restore);
+    }
+
+    /// DATA takes the rest of its line as raw text, keeping case and spacing.
+    /// Reassembling from tokens would uppercase the words and renormalize the
+    /// numbers, so it is captured verbatim and split by the parser.
+    #[test]
+    fn test_data_operand_is_raw_text() {
+        let mut lexer = Lexer::new("DATA hello, 007, 1.50\nPRINT 1");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::DataText(" hello, 007, 1.50".to_string()));
+        assert_eq!(tokens[1], Token::Newline);
+        assert_eq!(tokens[2], Token::Print);
+    }
+
+    /// A colon outside quotes ends the statement; one inside is data.
+    #[test]
+    fn test_data_stops_at_an_unquoted_colon() {
+        let mut lexer = Lexer::new("DATA 1, \"a:b\" : PRINT 2");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::DataText(" 1, \"a:b\" ".to_string()));
+        assert_eq!(tokens[1], Token::Colon);
+        assert_eq!(tokens[2], Token::Print);
+    }
+
+    /// A suffixed `Data$` is an ordinary variable, not the keyword.
+    #[test]
+    fn test_data_with_a_suffix_is_an_identifier() {
+        let mut lexer = Lexer::new("Data$ = \"c\"");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("DATA$".to_string()));
+        assert_eq!(tokens[1], Token::Eq);
     }
 
     #[test]
@@ -958,5 +1079,31 @@ mod tests {
         let result = lexer.tokenize();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unexpected character"));
+    }
+
+    // The uppercase invariant
+
+    /// Every identifier the lexer produces satisfies `normalized`, whatever
+    /// case it was written in and whatever suffix it carries.
+    #[test]
+    fn test_every_identifier_is_normalized() {
+        let mut lexer = Lexer::new("MyVar counter FOO123 a$ b% c& d! e# under_score");
+        for tok in lexer.tokenize().unwrap() {
+            if let Token::Ident(name) = &tok {
+                assert_eq!(normalized(name), name);
+            }
+        }
+    }
+
+    /// And the guard is real: it fires on a name that skipped the lexer.
+    ///
+    /// Without this the invariant would be documented and unenforced, which is
+    /// how sixty-odd call sites came to re-assert it defensively in the first
+    /// place.
+    #[test]
+    #[should_panic(expected = "was not uppercased")]
+    #[cfg(debug_assertions)]
+    fn test_normalized_rejects_a_raw_name() {
+        normalized("lowercase");
     }
 }

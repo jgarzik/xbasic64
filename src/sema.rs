@@ -24,6 +24,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
+use crate::lexer::normalized;
 use crate::parser::*;
 use std::collections::{HashMap, HashSet};
 
@@ -243,7 +244,7 @@ pub fn unsupported_reason(name: &str) -> Option<&'static str> {
 /// mention of either is a call. Without this they parsed as ordinary variable
 /// reads and quietly returned the zero of a slot nobody ever wrote.
 pub fn is_zero_arg_builtin(name: &str) -> bool {
-    builtin(&name.to_uppercase()).is_some_and(|(_, min, _)| *min == 0)
+    builtin(normalized(name)).is_some_and(|(_, min, _)| *min == 0)
 }
 
 fn builtin(name: &str) -> Option<&'static (&'static str, usize, usize)> {
@@ -338,7 +339,7 @@ impl Symbols {
             TypeRef::FixedString(_) => 2,
             TypeRef::Record(name) => self
                 .records
-                .get(&name.to_uppercase())
+                .get(normalized(name))
                 .map(|r| r.words)
                 .unwrap_or(1),
         }
@@ -385,12 +386,188 @@ pub struct Diagnostic {
     pub note: Option<String>,
 }
 
-/// Analyze a program: collect its symbols and report any problems.
-pub fn analyze(program: &Program) -> (Symbols, Vec<Diagnostic>) {
+/// Analyze a program: collect its symbols, resolve `A(1)`, and report problems.
+///
+/// The program is taken by `&mut` because of the middle step. `A(1)` is either
+/// an array element or a call, and only the finished symbol table can say
+/// which. The parser used to guess from the DIM statements it had read so far,
+/// which meant the same source produced a different AST depending on whether
+/// its DIM came earlier or later in the file, and ignored scope entirely.
+pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
     let mut a = Analyzer::default();
     a.collect(&program.statements, &Scope::Module);
+    a.check_name_collisions();
+    a.check_return_has_a_gosub(&program.statements);
+    a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
+}
+
+/// Call `f` for every statement in `stmts`, nested bodies included.
+fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+    for stmt in stmts {
+        f(stmt);
+        for body in child_bodies(stmt) {
+            walk_stmts(body, f);
+        }
+    }
+}
+
+/// Apply `f` to every expression directly held by `stmt`, in place.
+///
+/// Deliberately exhaustive, with no wildcard arm: this is the single place that
+/// knows where a statement keeps its expressions, so a new `StmtKind` that
+/// carries one must fail to compile here rather than be silently skipped.
+/// Nested statement bodies are *not* visited -- the caller walks those itself,
+/// because it has to change scope on the way in.
+fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+    /// Every expression an assignment target can hold: its subscripts.
+    fn lvalue(lv: &mut LValue, f: &mut impl FnMut(&mut Expr)) {
+        if let Some(indices) = &mut lv.indices {
+            indices.iter_mut().for_each(&mut *f);
+        }
+    }
+
+    match &mut stmt.kind {
+        StmtKind::Let { indices, value, .. } => {
+            if let Some(indices) = indices {
+                indices.iter_mut().for_each(&mut *f);
+            }
+            f(value);
+        }
+        StmtKind::Print {
+            file_num,
+            items,
+            using,
+            ..
+        } => {
+            file_num.iter_mut().for_each(&mut *f);
+            using.iter_mut().for_each(&mut *f);
+            for item in items {
+                if let PrintItem::Expr(e) = item {
+                    f(e);
+                }
+            }
+        }
+        StmtKind::Input { vars, file_num, .. } => {
+            file_num.iter_mut().for_each(&mut *f);
+            vars.iter_mut().for_each(|v| lvalue(v, f));
+        }
+        StmtKind::LineInput { var, file_num, .. } => {
+            file_num.iter_mut().for_each(&mut *f);
+            lvalue(var, f);
+        }
+        StmtKind::If { condition, .. } => f(condition),
+        StmtKind::For {
+            start, end, step, ..
+        } => {
+            f(start);
+            f(end);
+            step.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::While { condition, .. } => f(condition),
+        StmtKind::DoLoop { condition, .. } => condition.iter_mut().for_each(&mut *f),
+        StmtKind::OnGoto { expr, .. } | StmtKind::OnGosub { expr, .. } => f(expr),
+        StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+            for d in decls {
+                if let Some(dims) = &mut d.dimensions {
+                    dims.iter_mut().for_each(&mut *f);
+                }
+            }
+        }
+        StmtKind::Call { args, .. } => args.iter_mut().for_each(&mut *f),
+        StmtKind::MidAssign {
+            target,
+            start,
+            len,
+            value,
+        } => {
+            lvalue(target, f);
+            f(start);
+            len.iter_mut().for_each(&mut *f);
+            f(value);
+        }
+        StmtKind::Swap(a, b) => {
+            lvalue(a, f);
+            lvalue(b, f);
+        }
+        StmtKind::Const { value, .. } => f(value),
+        StmtKind::FieldAssign { target, value } => {
+            lvalue(target, f);
+            f(value);
+        }
+        StmtKind::Read(vars) => vars.iter_mut().for_each(|v| lvalue(v, f)),
+        StmtKind::SelectCase { expr, cases } => {
+            f(expr);
+            for (clauses, _) in cases {
+                for clause in clauses.iter_mut().flatten() {
+                    match clause {
+                        CaseClause::Value(e) | CaseClause::Compare(_, e) => f(e),
+                        CaseClause::Range(lo, hi) => {
+                            f(lo);
+                            f(hi);
+                        }
+                    }
+                }
+            }
+        }
+        StmtKind::Open {
+            filename,
+            file_num,
+            reclen,
+            ..
+        } => {
+            f(filename);
+            f(file_num);
+            reclen.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Close { file_num } => file_num.iter_mut().for_each(&mut *f),
+        StmtKind::Field { file_num, fields } => {
+            f(file_num);
+            for slice in fields {
+                f(&mut slice.width);
+                lvalue(&mut slice.target, f);
+            }
+        }
+        StmtKind::SetField { target, value, .. } => {
+            lvalue(target, f);
+            f(value);
+        }
+        StmtKind::GetPut {
+            file_num, record, ..
+        } => {
+            f(file_num);
+            record.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Lock {
+            file_num, range, ..
+        } => {
+            f(file_num);
+            if let Some((start, end)) = range {
+                f(start);
+                end.iter_mut().for_each(&mut *f);
+            }
+        }
+        // Statements that hold no expression of their own. Listed rather than
+        // matched with a wildcard so that a new variant carrying one is a
+        // compile error here.
+        StmtKind::Label(_)
+        | StmtKind::LabelName(_)
+        | StmtKind::Goto(_)
+        | StmtKind::Gosub(_)
+        | StmtKind::Return
+        | StmtKind::Sub { .. }
+        | StmtKind::Function { .. }
+        | StmtKind::ExitLoop { .. }
+        | StmtKind::ExitProc
+        | StmtKind::OptionBase(_)
+        | StmtKind::TypeDef { .. }
+        | StmtKind::Data(_)
+        | StmtKind::Restore(_)
+        | StmtKind::Cls
+        | StmtKind::End
+        | StmtKind::Stop => {}
+    }
 }
 
 #[derive(Default)]
@@ -532,8 +709,24 @@ impl Analyzer {
                         let key = (scope.clone(), decl.name.to_uppercase());
 
                         if let Some(ty) = &decl.ty {
+                            // A declared type and a type suffix must agree, or
+                            // there is no telling which the program meant. The
+                            // same check has always guarded a FUNCTION's result
+                            // type; DIM accepted the contradiction silently.
+                            if decl.name.ends_with(|c| "%&!#$".contains(c))
+                                && !matches!(ty, TypeRef::Record(_))
+                                && DataType::from_type_ref(ty) != DataType::from_suffix(&decl.name)
+                            {
+                                self.error(
+                                    stmt.line,
+                                    format!(
+                                        "'{}' is declared AS a different type than its name's suffix",
+                                        decl.name
+                                    ),
+                                );
+                            }
                             if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                if !self.symbols.records.contains_key(normalized(r)) {
                                     self.error(stmt.line, format!("undefined TYPE '{}'", r));
                                 }
                             }
@@ -635,7 +828,7 @@ impl Analyzer {
                     for p in params {
                         if let Some(ty) = &p.ty {
                             if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(&r.to_uppercase()) {
+                                if !self.symbols.records.contains_key(normalized(r)) {
                                     self.error(
                                         stmt.line,
                                         format!(
@@ -662,7 +855,169 @@ impl Analyzer {
         }
     }
 
-    // Pass 2: check uses
+    /// Refuse a `RETURN` in a program that contains no `GOSUB`.
+    ///
+    /// codegen defines the GOSUB return stack only when it has seen a GOSUB, so
+    /// a lone RETURN emitted a reference to `_gosub_sp` that nothing defined and
+    /// the user was handed `ld: undefined reference to _gosub_sp`. Reaching the
+    /// linker with a name the compiler invented is exactly what this pass exists
+    /// to prevent.
+    ///
+    /// The check is deliberately whole-program rather than per-path: deciding
+    /// whether a particular RETURN can be reached from a particular GOSUB needs
+    /// the control flow, and GOTO makes that undecidable. "No GOSUB at all" is
+    /// sound, and it is the shape a mistake actually takes.
+    fn check_return_has_a_gosub(&mut self, stmts: &[Stmt]) {
+        let mut has_gosub = false;
+        let mut first_return = None;
+        walk_stmts(stmts, &mut |stmt| match &stmt.kind {
+            StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => has_gosub = true,
+            StmtKind::Return if first_return.is_none() => first_return = Some(stmt.line),
+            _ => {}
+        });
+        if let (false, Some(line)) = (has_gosub, first_return) {
+            self.error_with_note(
+                line,
+                "RETURN without GOSUB".to_string(),
+                "RETURN ends a GOSUB; use EXIT SUB or EXIT FUNCTION to leave a procedure"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// Refuse a name declared as an array and also as a procedure or builtin.
+    ///
+    /// `A(1)` reaches the compiler as one shape and has to become one thing.
+    /// Sema resolved such a clash in favour of the array and codegen in favour
+    /// of the procedure, and the parser's DIM-order heuristic hid the
+    /// disagreement for as long as it lasted. `DIM F(5)` alongside
+    /// `FUNCTION F(X)` compiled silently; so did `DIM LEN(5)`, where codegen's
+    /// builtin table would answer first and the array would never be read.
+    ///
+    /// Rather than pick an order and document it, refuse the program: nobody
+    /// writes this on purpose, and either resolution surprises somebody.
+    fn check_name_collisions(&mut self) {
+        let arrays: Vec<(Scope, String, u32)> = self
+            .symbols
+            .arrays
+            .iter()
+            .map(|((scope, name), info)| (scope.clone(), name.clone(), info.line))
+            .collect();
+
+        for (_, name, line) in arrays {
+            if let Some(proc_info) = self.symbols.procs.get(&name) {
+                let kind = if proc_info.is_function {
+                    "FUNCTION"
+                } else {
+                    "SUB"
+                };
+                let proc_line = proc_info.line;
+                self.error_with_note(
+                    line,
+                    format!("'{}' is declared both as an array and as a {}", name, kind),
+                    format!("the {} is on line {}", kind, proc_line),
+                );
+            } else if builtin(&name).is_some() {
+                self.error(
+                    line,
+                    format!(
+                        "'{}' is the name of a built-in function and cannot also be an array",
+                        name
+                    ),
+                );
+            }
+        }
+    }
+
+    // Pass 2: resolve `A(1)` against the symbol table
+
+    /// Turn every `FnCall` naming an array into an `ArrayAccess`.
+    ///
+    /// The parser emits `FnCall` for all of `name(args)`, because at that point
+    /// nothing knows whether `name` is an array, a procedure or a builtin. Here
+    /// the symbol table is complete and scoped, so the question has one answer
+    /// regardless of where the `DIM` was written.
+    ///
+    /// Doing it as a rewrite keeps `ArrayAccess` in the AST that codegen sees,
+    /// which matters for more than tidiness: `expr_is_call_free` treats every
+    /// `FnCall` as opaque, so leaving array reads as calls would silently
+    /// disable FOR-counter promotion, and `walk_array_uses` collects names only
+    /// from `ArrayAccess`, so loop-invariant descriptor hoisting would stop
+    /// firing. Both would have been invisible except as lost performance.
+    fn resolve_array_accesses(&mut self, stmts: &mut [Stmt], scope: &Scope) {
+        for stmt in stmts {
+            for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+
+            // Nested bodies, entering procedure scope where there is one.
+            match &mut stmt.kind {
+                StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. } => {
+                    // `clone`, not `to_uppercase`: the lexer already uppercased
+                    // it, and `collect` and `check` build this scope the same
+                    // way -- a scope key that normalized differently from
+                    // theirs would simply fail to match.
+                    let inner = Scope::Proc(name.clone());
+                    self.resolve_array_accesses(body, &inner);
+                }
+                StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.resolve_array_accesses(then_branch, scope);
+                    if let Some(eb) = else_branch {
+                        self.resolve_array_accesses(eb, scope);
+                    }
+                }
+                StmtKind::SelectCase { cases, .. } => {
+                    for (_, body) in cases {
+                        self.resolve_array_accesses(body, scope);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::While { body, .. }
+                | StmtKind::DoLoop { body, .. } => self.resolve_array_accesses(body, scope),
+                _ => {}
+            }
+        }
+    }
+
+    /// Rewrite one expression tree, innermost first.
+    fn resolve_expr(symbols: &Symbols, expr: &mut Expr, scope: &Scope) {
+        match expr {
+            Expr::Literal(_) | Expr::Variable(_) => return,
+            Expr::Unary { operand, .. } => Self::resolve_expr(symbols, operand, scope),
+            Expr::Binary { left, right, .. } => {
+                Self::resolve_expr(symbols, left, scope);
+                Self::resolve_expr(symbols, right, scope);
+            }
+            Expr::Field { base, .. } => Self::resolve_expr(symbols, base, scope),
+            Expr::ArrayAccess { indices, .. } => {
+                for i in indices {
+                    Self::resolve_expr(symbols, i, scope);
+                }
+            }
+            Expr::FnCall { args, .. } => {
+                for a in args.iter_mut() {
+                    Self::resolve_expr(symbols, a, scope);
+                }
+            }
+        }
+
+        // A procedure wins over an array of the same name, matching what
+        // codegen has always done; `check_name_collisions` refuses the program
+        // that makes the two disagree, so the order is unobservable.
+        if let Expr::FnCall { name, args } = expr {
+            let upper = normalized(name);
+            if !symbols.procs.contains_key(upper) && symbols.lookup_array(scope, upper).is_some() {
+                *expr = Expr::ArrayAccess {
+                    name: std::mem::take(name),
+                    indices: std::mem::take(args),
+                };
+            }
+        }
+    }
+
+    // Pass 3: check uses
 
     fn check(&mut self, stmts: &[Stmt], scope: &Scope) {
         for stmt in stmts {
@@ -942,7 +1297,14 @@ impl Analyzer {
                         }
                     }
                 }
-                if a.name.ends_with('$') != b.name.ends_with('$') {
+                // Compare what the operands *are*, not the suffix of the
+                // variable they hang off: for `P.N` the base is a record and
+                // carries no suffix, so a string field and a numeric one both
+                // looked non-string and the mismatch reached codegen, which
+                // stored a string pointer into an INTEGER slot and crashed.
+                let a_str = self.expr_is_string(&lvalue_as_expr(a), scope);
+                let b_str = self.expr_is_string(&lvalue_as_expr(b), scope);
+                if a_str.is_some() && b_str.is_some() && a_str != b_str {
                     self.error(line, "SWAP requires both values to be the same type");
                 }
             }
@@ -1033,7 +1395,7 @@ impl Analyzer {
     fn const_eval(&self, e: &Expr) -> Option<Literal> {
         match e {
             Expr::Literal(l) => Some(l.clone()),
-            Expr::Variable(n) => self.symbols.consts.get(&n.to_uppercase()).cloned(),
+            Expr::Variable(n) => self.symbols.consts.get(normalized(n)).cloned(),
             Expr::Unary { op, operand } => {
                 let v = self.const_eval(operand)?;
                 match (op, v) {
@@ -1086,7 +1448,7 @@ impl Analyzer {
             let Expr::Variable(arr) = first else {
                 return Some(format!("argument 1 of '{}' must be an array name", name));
             };
-            let Some(info) = self.symbols.lookup_array(scope, &arr.to_uppercase()) else {
+            let Some(info) = self.symbols.lookup_array(scope, normalized(arr)) else {
                 return Some(format!("'{}' is not a declared array", arr));
             };
             let rank = info.rank;
@@ -1183,7 +1545,7 @@ impl Analyzer {
                     };
                     for f in &fields {
                         let TypeRef::Record(rec) = &ty else { return };
-                        let Some(info) = self.symbols.records.get(&rec.to_uppercase()) else {
+                        let Some(info) = self.symbols.records.get(normalized(rec)) else {
                             return;
                         };
                         match info.field(f) {
@@ -1597,7 +1959,7 @@ impl Analyzer {
             ty = self
                 .symbols
                 .records
-                .get(&rec.to_uppercase())?
+                .get(normalized(rec))?
                 .field(field)?
                 .ty
                 .clone();
@@ -1626,12 +1988,12 @@ impl Analyzer {
                 );
                 return None;
             };
-            let info = self.symbols.records.get(&rec.to_uppercase())?;
+            let info = self.symbols.records.get(normalized(rec))?;
             match info.field(field) {
                 Some(f) => ty = f.ty.clone(),
                 None => {
                     let known: Vec<&str> = info.fields.iter().map(|(n, _)| n.as_str()).collect();
-                    match closest(&field.to_uppercase(), &known) {
+                    match closest(normalized(field), &known) {
                         Some(sug) => self.error_with_note(
                             line,
                             format!("TYPE '{}' has no field '{}'", rec, field),
@@ -1691,8 +2053,16 @@ impl Analyzer {
         match expr {
             Expr::Literal(Literal::String(_)) => Some(true),
             Expr::Literal(_) => Some(false),
-            Expr::Variable(name) => Some(name.ends_with('$')),
-            Expr::ArrayAccess { name, .. } => Some(name.ends_with('$')),
+            // A `$` suffix is the usual way to be a string, but not the only
+            // one: `DIM S AS STRING * 4` says so with no suffix at all, and
+            // without consulting that, `LEN(S)` and `S = "xy"` were both
+            // rejected as numeric.
+            Expr::Variable(name) | Expr::ArrayAccess { name, .. } => {
+                Some(match self.symbols.typed_var(scope, name) {
+                    Some(t) => matches!(t, TypeRef::FixedString(_)),
+                    None => name.ends_with('$'),
+                })
+            }
             Expr::Unary { .. } => Some(false),
             Expr::Binary { op, left, .. } => {
                 if matches!(
@@ -1716,7 +2086,7 @@ impl Analyzer {
                     let TypeRef::Record(rec) = &ty else {
                         return None;
                     };
-                    let info = self.symbols.records.get(&rec.to_uppercase())?;
+                    let info = self.symbols.records.get(normalized(rec))?;
                     ty = info.field(field)?.ty.clone();
                 }
                 Some(matches!(ty, TypeRef::FixedString(_)))

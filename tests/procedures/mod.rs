@@ -396,3 +396,37 @@ fn test_function_return_type_without_as() {
     let output = compile_and_run("FUNCTION K(X)\nK = X / 2\nEND FUNCTION\nPRINT K(7)\n").unwrap();
     assert_eq!(output.trim(), "3.5");
 }
+
+/// `CALL` is the explicit form of a procedure call.
+///
+/// It was not recognised at all, so `CALL MySub(1)` parsed as a paren-less call
+/// to a subroutine named CALL whose argument was `MySub(1)`, and the diagnostic
+/// talked about MySub having no value rather than about CALL.
+#[test]
+fn test_call_statement() {
+    let output = compile_and_run(
+        r#"
+SUB Greet(N)
+  PRINT "n="; N
+END SUB
+SUB Plain
+  PRINT "plain"
+END SUB
+CALL Greet(7)
+CALL Plain
+Greet 8
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["n=7", "plain", "n=8"]);
+}
+
+/// CALL is recognised only in statement position before a name, so a program
+/// may still use it as a variable -- the same rule the random-access statement
+/// names follow.
+#[test]
+fn test_call_is_not_reserved() {
+    let output = compile_and_run("CALL = 5\nPRINT CALL\n").unwrap();
+    assert_eq!(output.trim(), "5");
+}

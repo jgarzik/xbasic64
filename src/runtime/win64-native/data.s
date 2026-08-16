@@ -73,6 +73,15 @@ _rt_read_number:
 
 # _rt_read_string - Read next DATA value as a string
 # Reads the next value from the DATA table and returns it as a string.
+# Type conversion is performed automatically, mirroring _rt_read_number:
+#   - String (type 2): return the literal
+#   - Integer (type 0) / Float (type 1): render with _rt_str, as PRINT would
+#
+# The numeric cases used to be absent: the entry's second word was passed to
+# lstrlenA whatever its type, so `DATA 42` followed by `READ A$` measured a
+# string at address 42. GW-BASIC converts, and _rt_read_number already converts
+# in the other direction, so the table's tag need not match the variable the
+# program reads it into.
 #
 # Arguments: none
 #
@@ -92,6 +101,11 @@ _rt_read_string:
     lea rcx, [rip + _data_table]
     add rcx, rax                        # rcx = entry address
 
+    # Load type tag
+    mov rax, QWORD PTR [rcx]            # rax = type (0=int, 1=float, 2=string)
+    cmp rax, 2
+    jne .Lread_num_as_str
+
     # Load string pointer and save for later
     mov rdi, QWORD PTR [rcx + 8]        # rdi = string pointer
 
@@ -109,6 +123,20 @@ _rt_read_string:
     pop rdi
     leave
     ret
+
+.Lread_num_as_str:
+    # Numeric entry: widen to double and render it the way PRINT would.
+    movsd xmm0, QWORD PTR [rcx + 8]     # float bits, if type 1
+    cmp rax, 0
+    jne .Lread_num_as_str_go
+    mov rax, QWORD PTR [rcx + 8]        # integer: load and convert
+    cvtsi2sd xmm0, rax
+.Lread_num_as_str_go:
+    inc QWORD PTR [rip + _data_ptr]     # advance before the tail call
+    add rsp, 40
+    pop rdi
+    leave
+    jmp _rt_str                         # returns (rax, rdx) already
 
 # _rt_restore - Reset DATA pointer (RESTORE statement)
 # Resets the DATA read position.
