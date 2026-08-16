@@ -24,6 +24,9 @@
 struct Runtime {
     data_defs: &'static str,
     parts: [&'static str; 8],
+    /// Appended after the last part. Object-format specific, so it is a
+    /// property of the tree rather than something [`emit`] decides.
+    trailer: &'static str,
 }
 
 // Under test both trees are compiled in, so the one this host does not use is
@@ -41,6 +44,11 @@ const SYSV: Runtime = Runtime {
         include_str!("runtime/sysv/error.s"),
         include_str!("runtime/sysv/using.s"),
     ],
+    // Without this note GNU ld cannot tell whether the object needs an
+    // executable stack, assumes it does, and warns on every single compile --
+    // and the program it links really does get a writable, executable stack.
+    // This runtime never runs code from the stack, so say so.
+    trailer: ".section .note.GNU-stack,\"\",@progbits\n",
 };
 
 #[cfg(any(test, windows))]
@@ -56,6 +64,8 @@ const WIN64: Runtime = Runtime {
         include_str!("runtime/win64-native/error.s"),
         include_str!("runtime/win64-native/using.s"),
     ],
+    // COFF has no equivalent note, and clang rejects the ELF spelling.
+    trailer: "",
 };
 
 /// Concatenate one runtime tree into a single assembly unit.
@@ -73,6 +83,8 @@ fn emit(rt: &Runtime) -> String {
         output.push_str(part);
         output.push('\n');
     }
+
+    output.push_str(rt.trailer);
 
     output
 }
