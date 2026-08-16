@@ -48,6 +48,10 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("CLNG", 1, 1),
     ("COS", 1, 1),
     ("CSNG", 1, 1),
+    ("CVD", 1, 1),
+    ("CVI", 1, 1),
+    ("CVL", 1, 1),
+    ("CVS", 1, 1),
     ("EOF", 1, 1),
     ("EXP", 1, 1),
     ("FIX", 1, 1),
@@ -58,10 +62,15 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("LCASE$", 1, 1),
     ("LEFT$", 2, 2),
     ("LEN", 1, 1),
+    ("LOC", 1, 1),
     ("LOF", 1, 1),
     ("LTRIM$", 1, 1),
     ("LOG", 1, 1),
     ("MID$", 2, 3),
+    ("MKD$", 1, 1),
+    ("MKI$", 1, 1),
+    ("MKL$", 1, 1),
+    ("MKS$", 1, 1),
     ("OCT$", 1, 1),
     ("RIGHT$", 2, 2),
     ("RTRIM$", 1, 1),
@@ -80,6 +89,153 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("TIMER", 0, 1),
     ("VAL", 1, 1),
 ];
+
+/// GW-BASIC names xbasic64 does not implement, and what to say about each.
+///
+/// Without this table these names are not errors at all: an unrecognised name
+/// is simply a new variable, so `PRINT DATE$` printed an empty string and
+/// `ON ERROR GOTO 100` compiled into a computed GOTO on a variable that is
+/// always zero -- falling through, silently, exactly where a program expected
+/// its error handler to take over. A GW-BASIC program would compile clean and
+/// then misbehave at run time, which is the worst outcome available.
+///
+/// The second field is the reason, phrased to say whether waiting will help.
+/// LANGREF's "Not supported" section is the prose version of this table; the
+/// two are meant to be read together.
+const UNSUPPORTED: &[(&str, &str)] = &[
+    // Planned: implementable on both platforms, not written yet.
+    ("ERR", "error trapping is not implemented yet"),
+    ("ERL", "error trapping is not implemented yet"),
+    ("ERROR", "error trapping is not implemented yet"),
+    ("RESUME", "error trapping is not implemented yet"),
+    ("DATE$", "DATE$ is not implemented yet"),
+    ("TIME$", "TIME$ is not implemented yet"),
+    (
+        "INKEY$",
+        "INKEY$ needs raw console input, which is not implemented yet",
+    ),
+    ("INPUT$", "INPUT$ is not implemented yet"),
+    ("LOCATE", "console cursor control is not implemented yet"),
+    ("COLOR", "console colour control is not implemented yet"),
+    ("WIDTH", "console width control is not implemented yet"),
+    ("CSRLIN", "console cursor position is not implemented yet"),
+    ("POS", "console cursor position is not implemented yet"),
+    ("VIEW", "console windowing is not implemented yet"),
+    ("BEEP", "BEEP is not implemented yet"),
+    ("SLEEP", "SLEEP is not implemented yet"),
+    ("RANDOMIZE", "RANDOMIZE is not implemented yet"),
+    (
+        "ERASE",
+        "ERASE is not implemented yet; REDIM clears an array",
+    ),
+    (
+        "SHARED",
+        "SHARED is not implemented; module-level names are already global",
+    ),
+    ("STATIC", "STATIC is not implemented yet"),
+    ("SHELL", "SHELL is not implemented yet"),
+    ("ENVIRON$", "ENVIRON$ is not implemented yet"),
+    ("KILL", "KILL is not implemented yet"),
+    ("FILES", "FILES is not implemented yet"),
+    ("CHDIR", "CHDIR is not implemented yet"),
+    ("MKDIR", "MKDIR is not implemented yet"),
+    ("RMDIR", "RMDIR is not implemented yet"),
+    ("FRE", "FRE is not implemented yet"),
+    (
+        "DEFINT",
+        "DEFINT is not supported; use a type suffix or DIM ... AS",
+    ),
+    (
+        "DEFLNG",
+        "DEFLNG is not supported; use a type suffix or DIM ... AS",
+    ),
+    (
+        "DEFSNG",
+        "DEFSNG is not supported; use a type suffix or DIM ... AS",
+    ),
+    (
+        "DEFDBL",
+        "DEFDBL is not supported; use a type suffix or DIM ... AS",
+    ),
+    (
+        "DEFSTR",
+        "DEFSTR is not supported; use a type suffix or DIM ... AS",
+    ),
+    // Permanent non-goals: these describe a machine xbasic64 does not target.
+    (
+        "PEEK",
+        "direct memory access has no meaning in a 64-bit hosted program",
+    ),
+    (
+        "POKE",
+        "direct memory access has no meaning in a 64-bit hosted program",
+    ),
+    (
+        "VARPTR",
+        "direct memory access has no meaning in a 64-bit hosted program",
+    ),
+    (
+        "VARPTR$",
+        "direct memory access has no meaning in a 64-bit hosted program",
+    ),
+    ("VARSEG", "segmented addressing does not exist on x86-64"),
+    ("USR", "USR calls 8086 machine code; use a SUB instead"),
+    ("INP", "port I/O is not available to a user-mode program"),
+    ("OUT", "port I/O is not available to a user-mode program"),
+    ("WAIT", "port I/O is not available to a user-mode program"),
+    ("BLOAD", "memory images are tied to the 8086 memory map"),
+    ("BSAVE", "memory images are tied to the 8086 memory map"),
+    ("SCREEN", "graphics modes are not supported"),
+    ("PSET", "graphics is not supported"),
+    ("PRESET", "graphics is not supported"),
+    ("CIRCLE", "graphics is not supported"),
+    ("PAINT", "graphics is not supported"),
+    ("DRAW", "graphics is not supported"),
+    ("PALETTE", "graphics is not supported"),
+    ("WINDOW", "graphics is not supported"),
+    ("PMAP", "graphics is not supported"),
+    ("POINT", "graphics is not supported"),
+    ("SOUND", "sound is not supported"),
+    ("PLAY", "sound is not supported"),
+    ("PEN", "light-pen input is not supported"),
+    ("STICK", "joystick input is not supported"),
+    ("STRIG", "joystick input is not supported"),
+    ("KEY", "soft function keys are not supported"),
+    (
+        "LPRINT",
+        "there is no line printer; PRINT to a file instead",
+    ),
+    ("LPOS", "there is no line printer"),
+    (
+        "CHAIN",
+        "a compiled program cannot load another program's code",
+    ),
+    ("COMMON", "COMMON passes variables to a CHAINed program"),
+    ("RUN", "RUN is an interpreter command"),
+    ("LOAD", "LOAD is an interpreter command"),
+    ("SAVE", "SAVE is an interpreter command"),
+    ("MERGE", "MERGE is an interpreter command"),
+    ("LIST", "LIST is an interpreter command"),
+    ("LLIST", "LLIST is an interpreter command"),
+    ("NEW", "NEW is an interpreter command"),
+    ("EDIT", "EDIT is an interpreter command"),
+    ("RENUM", "RENUM is an interpreter command"),
+    ("AUTO", "AUTO is an interpreter command"),
+    ("CONT", "CONT is an interpreter command"),
+    ("TRON", "TRON is an interpreter command"),
+    ("TROFF", "TROFF is an interpreter command"),
+    ("CLEAR", "CLEAR sets interpreter memory limits"),
+];
+
+/// The reason a GW-BASIC name is unavailable, when it is one this compiler
+/// knows about but does not implement.
+pub fn unsupported_reason(name: &str) -> Option<&'static str> {
+    let upper = name.to_uppercase();
+    UNSUPPORTED
+        .iter()
+        .find(|(n, _)| *n == upper)
+        .map(|(_, why)| *why)
+}
 
 /// Whether a bare identifier of this name is a call rather than a variable.
 ///
@@ -535,6 +691,15 @@ impl Analyzer {
                         ),
                     );
                 }
+                // `DATE$ = "01-01-2026"` is a GW-BASIC statement, not the
+                // creation of a variable called DATE$.
+                if let Some(why) = unsupported_reason(name) {
+                    self.error_with_note(
+                        line,
+                        format!("'{}' is not supported", name.to_uppercase()),
+                        why.to_string(),
+                    );
+                }
                 if let Some(idx) = indices {
                     self.check_array_use(name, idx.len(), scope, line);
                     for e in idx {
@@ -716,6 +881,12 @@ impl Analyzer {
                     self.check_target(t, line, "ON ... GOTO");
                 }
             }
+            StmtKind::OnGosub { expr, targets } => {
+                self.check_expr(expr, scope, line);
+                for t in targets {
+                    self.check_target(t, line, "ON ... GOSUB");
+                }
+            }
             StmtKind::Restore(Some(target)) => self.check_target(target, line, "RESTORE"),
             StmtKind::Dim { decls } => {
                 for decl in decls {
@@ -788,6 +959,68 @@ impl Analyzer {
                 file_num: Some(file_num),
             } => {
                 self.check_file_num(file_num, scope, line);
+            }
+            StmtKind::Field { file_num, fields } => {
+                self.check_file_num(file_num, scope, line);
+                for f in fields {
+                    self.check_expr(&f.width, scope, line);
+                    // A field names a slice of the record buffer, so only a
+                    // string variable can hold one.
+                    if !f.target.name.ends_with('$') {
+                        self.error(
+                            line,
+                            format!("FIELD target '{}' must be a string variable", f.target.name),
+                        );
+                    }
+                    if let Some(indices) = &f.target.indices {
+                        self.check_array_use(&f.target.name, indices.len(), scope, line);
+                        for e in indices {
+                            self.check_expr(e, scope, line);
+                        }
+                    }
+                }
+            }
+            StmtKind::SetField {
+                target,
+                value,
+                right,
+            } => {
+                self.check_expr(value, scope, line);
+                let word = if *right { "RSET" } else { "LSET" };
+                if !target.name.ends_with('$') {
+                    self.error(
+                        line,
+                        format!("{} needs a string variable, not '{}'", word, target.name),
+                    );
+                }
+                if self.expr_is_string(value, scope) == Some(false) {
+                    self.error(line, format!("{} needs a string value", word));
+                }
+                if let Some(indices) = &target.indices {
+                    self.check_array_use(&target.name, indices.len(), scope, line);
+                    for e in indices {
+                        self.check_expr(e, scope, line);
+                    }
+                }
+            }
+            StmtKind::GetPut {
+                file_num, record, ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+                if let Some(r) = record {
+                    self.check_expr(r, scope, line);
+                }
+            }
+            StmtKind::Lock {
+                file_num, range, ..
+            } => {
+                self.check_file_num(file_num, scope, line);
+                if let Some((start, end)) = range {
+                    self.check_expr(start, scope, line);
+                    if let Some(e) = end {
+                        self.check_expr(e, scope, line);
+                    }
+                }
             }
             _ => {}
         }
@@ -883,6 +1116,8 @@ impl Analyzer {
         let string_args: &[usize] = match name {
             "LEN" | "ASC" | "VAL" | "LTRIM$" | "RTRIM$" | "UCASE$" | "LCASE$" => &[0],
             "LEFT$" | "RIGHT$" | "MID$" => &[0],
+            // The CV* family decodes the bytes MK*$ produced.
+            "CVI" | "CVL" | "CVS" | "CVD" => &[0],
             // INSTR is either (haystack, needle) or (start, haystack, needle).
             "INSTR" if args.len() == 2 => &[0, 1],
             "INSTR" => &[1, 2],
@@ -907,6 +1142,10 @@ impl Analyzer {
                 | "STRING$"
                 | "LBOUND"
                 | "UBOUND"
+                | "CVI"
+                | "CVL"
+                | "CVS"
+                | "CVD"
         );
 
         for (i, arg) in args.iter().enumerate() {
@@ -1215,6 +1454,18 @@ impl Analyzer {
             return;
         }
 
+        // A GW-BASIC name this compiler knows but does not provide is worth
+        // saying so about, rather than offering a spelling suggestion for a
+        // word that is spelled perfectly well.
+        if let Some(why) = unsupported_reason(&upper) {
+            self.error_with_note(
+                line,
+                format!("'{}' is not supported", name.to_uppercase()),
+                why.to_string(),
+            );
+            return;
+        }
+
         // `NAME(...)` is ambiguous between a call and an array reference, so
         // say both rather than guessing which the user meant.
         let what = if is_stmt {
@@ -1293,7 +1544,20 @@ impl Analyzer {
 
     fn check_expr(&mut self, expr: &Expr, scope: &Scope, line: u32) {
         match expr {
-            Expr::Literal(_) | Expr::Variable(_) => {}
+            Expr::Literal(_) => {}
+            // An unrecognised name is normally just a new variable, which is
+            // what makes an unimplemented GW-BASIC name so dangerous here: it
+            // would read as an empty string or a zero forever. Naming it is the
+            // whole point of the check.
+            Expr::Variable(name) => {
+                if let Some(why) = unsupported_reason(name) {
+                    self.error_with_note(
+                        line,
+                        format!("'{}' is not supported", name.to_uppercase()),
+                        why.to_string(),
+                    );
+                }
+            }
             Expr::ArrayAccess { name, indices } => {
                 self.check_array_use(name, indices.len(), scope, line);
                 for i in indices {

@@ -23,13 +23,16 @@ xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBA
 - Procedures: `SUB` and `FUNCTION` with recursion; `DEF FN` for one-liners
 - Arrays with `REDIM`, `REDIM PRESERVE`, `OPTION BASE`, and `LBOUND`/`UBOUND`
 - User-defined record types with `TYPE`, including nesting and arrays of records
-- File I/O: sequential reading and writing, with `EOF` and `LOF`
+- File I/O: sequential reading and writing, with `EOF` and `LOF`; random-access
+  records with `FIELD`, `LSET`/`RSET`, `GET`/`PUT`, `LOCK` and the `MKI$`/`CVI`
+  conversion family
 - `DATA`/`READ`/`RESTORE` for inline data
 - Formatted output with `PRINT USING`
 - Runtime checks for out-of-range subscripts and division by zero, with
   `--unsafe` to remove them
 - Diagnostics that name the file, line and problem rather than failing at link
-  time
+  time, including a reason for every GW-BASIC keyword the compiler does not
+  provide, so a program using one is refused rather than quietly misbehaving
 
 ## Quick Start
 
@@ -74,6 +77,8 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 ## Documentation
 
 - **[Language Reference](LANGREF.md)** - Complete guide to the supported BASIC dialect
+- **[Non-Goals](NONGOALS.md)** - The parts of GW-BASIC that will never be
+  supported, and why
 
 ## Architecture
 

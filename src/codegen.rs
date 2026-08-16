@@ -242,7 +242,6 @@ enum Builtin {
     /// One string argument, passed as (pointer, length).
     CallStr(&'static str),
     /// One numeric argument, widened to Double in xmm0.
-    CallDouble(&'static str),
     /// One numeric argument, narrowed to Long and sign-extended.
     CallLong(&'static str),
     /// No helper at all: the conversion *is* the coercion.
@@ -257,7 +256,9 @@ static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| 
         ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
         ("UCASE$", Builtin::CallStr("_rt_ucase")),
         ("LCASE$", Builtin::CallStr("_rt_lcase")),
-        ("STR$", Builtin::CallDouble("_rt_str")),
+        // STR$ is not here: it picks its formatter from the argument's static
+        // type, which this table has no way to express. It was the only user of
+        // a "coerce to double and call" form, which is why none remains.
         ("CHR$", Builtin::CallLong("_rt_chr")),
         ("SPACE$", Builtin::CallLong("_rt_space")),
         ("HEX$", Builtin::CallLong("_rt_hex")),
@@ -282,6 +283,9 @@ const ASCII_COMMA: i64 = 44;
 /// The console's file number. The runtime seeds handle 0 with standard
 /// output, so PRINT and PRINT # are the same helpers with a different handle.
 const CONSOLE: i64 = 0;
+
+/// Record length of a `FOR RANDOM` open with no `LEN =` clause, as in GW-BASIC.
+const DEFAULT_RECLEN: i64 = 128;
 
 const ASCII_QUOTE: i64 = 34;
 
@@ -419,6 +423,7 @@ impl Default for Options {
 }
 
 /// A file number, ready to be placed in an argument register.
+#[derive(Clone)]
 enum FileNum {
     /// A literal, placed directly as an immediate.
     Imm(i64),
@@ -1171,7 +1176,9 @@ impl CodeGen {
     fn preprocess(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Data(values) => self.data_items.extend(values.clone()),
-            StmtKind::Gosub(_) => self.gosub_used = true,
+            // Both forms push a return address, so both need the GOSUB stack
+            // emitted; without this, ON ... GOSUB alone failed to link.
+            StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => self.gosub_used = true,
             // Record where each label sits in the DATA stream, so RESTORE can
             // resume from it.
             StmtKind::Label(n) => {
@@ -2000,6 +2007,54 @@ impl CodeGen {
                 }
             }
 
+            StmtKind::OnGosub { expr, targets } => {
+                // One return address serves the whole statement: whichever
+                // subroutine runs, RETURN comes back to the same place, which
+                // is the statement after this one.
+                //
+                // That address must not be pushed when the selector picks
+                // nothing, or a GOSUB that never happened would leave a frame
+                // behind and the next RETURN would jump to it. So the range is
+                // checked first, and out-of-range branches past the push --
+                // to the very label the return address points at, since
+                // "matched nothing" and "came back" continue identically.
+                let expr_type = self.gen_expr(expr);
+                if expr_type.is_integer() {
+                    self.emit("    movsxd rax, eax");
+                } else {
+                    self.emit("    cvttsd2si rax, xmm0");
+                }
+                // The push sequence below needs rax and rcx, so the selector
+                // is parked in r8: caller-saved on both ABIs, and nothing is
+                // called between here and the dispatch.
+                self.emit("    mov r8, rax");
+
+                let after = self.new_label("on_gosub_ret");
+                self.emit("    cmp r8, 1");
+                self.emit(&format!("    jl {}", after));
+                self.emit(&format!("    cmp r8, {}", targets.len()));
+                self.emit(&format!("    jg {}", after));
+
+                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+                self.emit("    sub rcx, 8");
+                self.emit("    lea rax, [rip + _gosub_stack]");
+                self.emit("    cmp rcx, rax");
+                self.emit_check("jb", RtError::GosubOverflow);
+                self.emit(&format!("    lea rax, [rip + {}]", after));
+                self.emit("    mov QWORD PTR [rcx], rax");
+                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+
+                for (i, target) in targets.iter().enumerate() {
+                    let label = match target {
+                        GotoTarget::Line(n) => format!("_line_{}", n),
+                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
+                    };
+                    self.emit(&format!("    cmp r8, {}", i + 1));
+                    self.emit(&format!("    je {}", label));
+                }
+                self.emit_label(&after);
+            }
+
             StmtKind::Dim { decls } => {
                 for decl in decls {
                     self.gen_declarator(decl, false);
@@ -2179,20 +2234,148 @@ impl CodeGen {
                 filename,
                 mode,
                 file_num,
+                reclen,
             } => {
-                // _rt_file_open(filename_ptr, filename_len, mode, file_num)
+                // _rt_file_open(filename_ptr, filename_len, mode, file_num), or
+                // _rt_file_open_random(filename_ptr, filename_len, file_num,
+                // record_length) -- which carries no mode, because being the
+                // random entry point is the mode.
+                //
+                // Four arguments each, and that is a hard limit rather than a
+                // preference: Win64 passes only four in registers, so a fifth
+                // would have to go on the stack. Folding the mode away is what
+                // keeps the record length in a register.
                 let fnum = self.gen_file_num(file_num);
+                let rec = match (mode, reclen) {
+                    // GW-BASIC's default record length.
+                    (FileMode::Random, None) => Some(FileNum::Imm(DEFAULT_RECLEN)),
+                    (FileMode::Random, Some(e)) => Some(self.gen_file_num_like(e)),
+                    _ => None,
+                };
                 self.gen_expr(filename);
                 self.emit_arg_reg(0, "rax"); // filename ptr
                 self.emit_arg_reg(1, "rdx"); // filename len
-                let mode_num = match mode {
-                    FileMode::Input => 0,
-                    FileMode::Output => 1,
-                    FileMode::Append => 2,
+                match rec {
+                    Some(r) => {
+                        self.emit_arg_file_num(2, &fnum);
+                        self.emit_arg_file_num(3, &r);
+                        self.emit("    call _rt_file_open_random");
+                    }
+                    None => {
+                        let mode_num = match mode {
+                            FileMode::Input => 0,
+                            FileMode::Output => 1,
+                            FileMode::Append => 2,
+                            FileMode::Random => unreachable!("a random open took the other path"),
+                        };
+                        self.emit_arg_imm(2, mode_num);
+                        self.emit_arg_file_num(3, &fnum);
+                        self.emit("    call _rt_file_open");
+                    }
+                }
+            }
+
+            StmtKind::Field { file_num, fields } => {
+                // Each clause binds its variable to (buffer + offset, width).
+                // The offsets accumulate across the statement, so they are
+                // tracked by the runtime rather than recomputed here: a width
+                // may be any expression.
+                let fnum = self.gen_file_num(file_num);
+                self.emit_arg_file_num(0, &fnum);
+                self.emit("    call _rt_field_reset");
+                for f in fields {
+                    let width = self.gen_file_num_like(&f.width);
+                    self.emit_arg_file_num(0, &fnum);
+                    self.emit_arg_file_num(1, &width);
+                    self.emit("    call _rt_field_next");
+                    // rax/rdx now hold the slice; bind without copying, which
+                    // is what makes the variable alias the record buffer.
+                    self.gen_bind_alias(&f.target);
+                }
+            }
+
+            StmtKind::SetField {
+                target,
+                value,
+                right,
+            } => {
+                // The destination is read first: LSET writes *through* the
+                // field's existing pointer, so the target keeps its address and
+                // width while the bytes underneath change.
+                self.gen_expr(value);
+                self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+                self.emit("    mov QWORD PTR [rsp], rax");
+                self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                self.gen_load_lvalue_string(target);
+                self.emit_arg_reg(0, "rax"); // dest ptr
+                self.emit_arg_reg(1, "rdx"); // dest len
+                // The source is loaded straight into its argument registers
+                // rather than staged through rax/rdx: on System V argument 2
+                // *is* rdx, so moving the pointer there first would destroy the
+                // length that argument 3 has yet to read.
+                let src_ptr = Self::arg_reg(2);
+                let src_len = Self::arg_reg(3);
+                self.emit(&format!("    mov {}, QWORD PTR [rsp]", src_ptr));
+                self.emit(&format!("    mov {}, QWORD PTR [rsp + 8]", src_len));
+                self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+                if *right {
+                    self.emit("    call _rt_rset");
+                } else {
+                    self.emit("    call _rt_lset");
+                }
+            }
+
+            StmtKind::GetPut {
+                file_num,
+                record,
+                is_put,
+            } => {
+                let fnum = self.gen_file_num(file_num);
+                // Record 0 means "the one after the last", which is how the
+                // runtime reads a missing record number.
+                let rec = match record {
+                    Some(e) => self.gen_file_num_like(e),
+                    None => FileNum::Imm(0),
                 };
-                self.emit_arg_imm(2, mode_num);
-                self.emit_arg_file_num(3, &fnum);
-                self.emit("    call _rt_file_open");
+                self.emit_arg_file_num(0, &fnum);
+                self.emit_arg_file_num(1, &rec);
+                self.emit_arg_imm(2, self.current_line as i64);
+                if *is_put {
+                    self.emit("    call _rt_file_put");
+                } else {
+                    self.emit("    call _rt_file_get");
+                }
+            }
+
+            StmtKind::Lock {
+                file_num,
+                range,
+                is_unlock,
+            } => {
+                let fnum = self.gen_file_num(file_num);
+                // A missing range is the whole file, which the runtime reads as
+                // first record 0.
+                let (start, end) = match range {
+                    Some((s, e)) => {
+                        let s = self.gen_file_num_like(s);
+                        let e = match e {
+                            Some(e) => self.gen_file_num_like(e),
+                            // `LOCK #1, 5` locks exactly record 5.
+                            None => s.clone(),
+                        };
+                        (s, e)
+                    }
+                    None => (FileNum::Imm(0), FileNum::Imm(0)),
+                };
+                self.emit_arg_file_num(0, &fnum);
+                self.emit_arg_file_num(1, &start);
+                self.emit_arg_file_num(2, &end);
+                self.emit_arg_imm(3, self.current_line as i64);
+                if *is_unlock {
+                    self.emit("    call _rt_unlock");
+                } else {
+                    self.emit("    call _rt_lock");
+                }
             }
 
             StmtKind::Close { file_num } => match file_num {
@@ -2644,6 +2827,79 @@ impl CodeGen {
         let loc = Loc::Frame(self.stack_offset);
         self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
         FileNum::Slot(loc)
+    }
+
+    /// Bytes one of the MK*$ conversions writes, which is the width of the
+    /// BASIC type it names.
+    fn mk_width(name: &str) -> i64 {
+        match name {
+            "MKI$" => 2,
+            "MKD$" => 8,
+            // MKL$ (LONG) and MKS$ (SINGLE) are both 4 bytes.
+            _ => 4,
+        }
+    }
+
+    /// Evaluate a numeric expression into a parked slot, the way a file number
+    /// is, but without the 1-to-15 range check.
+    ///
+    /// Record numbers, record lengths and FIELD widths all need the same
+    /// treatment -- a Long parked somewhere the argument setup can reach after
+    /// other expressions have clobbered `rax` -- but none of them is a file
+    /// number, so none may be checked against the handle table's bounds.
+    fn gen_file_num_like(&mut self, e: &Expr) -> FileNum {
+        if let Expr::Literal(Literal::Integer(n)) = e {
+            return FileNum::Imm(*n);
+        }
+        let ty = self.gen_expr(e);
+        self.gen_coercion(ty, DataType::Long);
+        self.stack_offset -= 8;
+        let loc = Loc::Frame(self.stack_offset);
+        self.emit(&format!("    mov {}, eax", loc.at("DWORD PTR", 0)));
+        FileNum::Slot(loc)
+    }
+
+    /// Bind a string variable to the (pointer, length) pair in `rax`/`rdx`
+    /// without copying it.
+    ///
+    /// This is what makes a FIELD variable alias the record buffer instead of
+    /// holding a snapshot of it: an ordinary assignment would call `_rt_strdup`
+    /// first, and the variable would then stop tracking what `GET` reads.
+    fn gen_bind_alias(&mut self, target: &LValue) {
+        if let Some(indices) = &target.indices {
+            let indices = indices.clone();
+            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rsp], rax");
+            self.emit("    mov QWORD PTR [rsp + 8], rdx");
+            self.gen_array_addr(&target.name, &indices);
+            self.emit("    mov rcx, rax");
+            self.emit("    mov rax, QWORD PTR [rsp]");
+            self.emit("    mov rdx, QWORD PTR [rsp + 8]");
+            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+            self.emit("    mov QWORD PTR [rcx], rax");
+            self.emit("    mov QWORD PTR [rcx + 8], rdx");
+            return;
+        }
+        let loc = self.get_var_loc(&target.name);
+        self.emit(&format!("    mov {}, rax", loc.q(0)));
+        self.emit(&format!("    mov {}, rdx", loc.q(1)));
+    }
+
+    /// Load a string lvalue's current (pointer, length) into `rax`/`rdx`.
+    ///
+    /// Used by LSET/RSET, which need the field's address rather than its value:
+    /// the bytes are overwritten where they already are.
+    fn gen_load_lvalue_string(&mut self, target: &LValue) {
+        if let Some(indices) = &target.indices {
+            let indices = indices.clone();
+            self.gen_array_addr(&target.name, &indices);
+            self.emit("    mov rdx, QWORD PTR [rax + 8]");
+            self.emit("    mov rax, QWORD PTR [rax]");
+            return;
+        }
+        let loc = self.get_var_loc(&target.name);
+        self.emit(&format!("    mov rax, {}", loc.q(0)));
+        self.emit(&format!("    mov rdx, {}", loc.q(1)));
     }
 
     /// Resolve where a PRINT writes: a file number, or the console.
@@ -3685,11 +3941,6 @@ impl CodeGen {
                     self.emit_arg_reg(0, "rax");
                     self.emit(&format!("    call {}", sym));
                 }
-                Builtin::CallDouble(sym) => {
-                    let arg_type = self.gen_expr(&args[0]);
-                    self.gen_coercion(arg_type, DataType::Double);
-                    self.emit(&format!("    call {}", sym));
-                }
                 Builtin::CallLong(sym) => {
                     let arg_type = self.gen_expr(&args[0]);
                     self.gen_coercion(arg_type, DataType::Long);
@@ -3954,16 +4205,77 @@ impl CodeGen {
                 }
                 self.emit("    dec rax");
             }
-            // File status. Both take a file number and return a number.
-            "EOF" | "LOF" => {
+            // File status. All take a file number and return a number.
+            "EOF" | "LOF" | "LOC" => {
                 let arg_type = self.gen_expr(&args[0]);
                 self.gen_coercion(arg_type, DataType::Long);
                 self.emit_file_num_check();
                 self.emit_arg_reg(0, "rax");
-                let rt = if upper_name == "EOF" {
-                    "_rt_file_eof"
+                let rt = match upper_name.as_str() {
+                    "EOF" => "_rt_file_eof",
+                    "LOC" => "_rt_file_loc",
+                    _ => "_rt_file_lof",
+                };
+                self.emit(&format!("    call {}", rt));
+            }
+            // STR$ renders what PRINT would, which means picking the same
+            // table PRINT would: a SINGLE carries ~7 digits, and rendering it
+            // at full double precision would turn 3.14159! into
+            // "3.141590118408203".
+            "STR$" => {
+                // The *static* type, not what gen_expr reports: loading a
+                // SINGLE already widens it to a double, so asking afterwards
+                // would never see one.
+                let single = self.expr_type(&args[0]) == DataType::Single;
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, DataType::Double);
+                if single {
+                    self.emit("    call _rt_str_single");
                 } else {
-                    "_rt_file_lof"
+                    self.emit("    call _rt_str");
+                }
+            }
+            // MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string. The width
+            // is the type's own, so the value is coerced to it first and the
+            // runtime just copies that many bytes out.
+            "MKI$" | "MKL$" | "MKS$" | "MKD$" => {
+                let want = match upper_name.as_str() {
+                    "MKI$" => DataType::Integer,
+                    "MKL$" => DataType::Long,
+                    "MKS$" => DataType::Single,
+                    _ => DataType::Double,
+                };
+                let arg_type = self.gen_expr(&args[0]);
+                self.gen_coercion(arg_type, want);
+                match want {
+                    // Integers arrive in rax, floats in xmm0; the runtime takes
+                    // the bytes in rdi either way.
+                    DataType::Integer | DataType::Long => self.emit_arg_reg(0, "rax"),
+                    DataType::Single => {
+                        self.emit("    movd eax, xmm0");
+                        self.emit_arg_reg(0, "rax");
+                    }
+                    _ => {
+                        self.emit("    movq rax, xmm0");
+                        self.emit_arg_reg(0, "rax");
+                    }
+                }
+                self.emit_arg_imm(1, Self::mk_width(&upper_name));
+                self.emit("    call _rt_mk");
+            }
+            // CVI/CVL/CVS/CVD: read those bytes back as a number. A string
+            // narrower than the type is an error rather than a value, so the
+            // line number goes along for the diagnostic.
+            "CVI" | "CVL" | "CVS" | "CVD" => {
+                self.gen_expr(&args[0]);
+                self.emit_arg_reg(0, "rax"); // string ptr
+                self.emit_arg_reg(1, "rdx"); // string len
+                self.emit_arg_imm(2, self.current_line as i64);
+                let rt = match upper_name.as_str() {
+                    "CVI" => "_rt_cvi",
+                    "CVL" => "_rt_cvl",
+                    "CVS" => "_rt_cvs",
+                    _ => "_rt_cvd",
                 };
                 self.emit(&format!("    call {}", rt));
             }

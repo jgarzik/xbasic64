@@ -799,6 +799,768 @@ _rt_file_eof:
     leave
     ret
 
+# ---------------------------------------------------------------------------
+# Random-access files
+#
+# The model matches the System V tree exactly, and the comment there is the
+# one worth reading: a file opened FOR RANDOM carries a record length, a
+# record buffer, and a cursor recording how much of that buffer FIELD has
+# handed out. FIELD binds each variable to a (pointer, length) pair naming its
+# slice, so the variable is a window onto the buffer rather than a copy of it.
+#
+# Only the mechanics differ here: Win32 handles instead of FILE*, ReadFile and
+# WriteFile instead of fread and fwrite, and LockFileEx instead of fcntl.
+.data
+.p2align 3
+_file_recbuf:   .skip 128       # record buffer per file number (malloc'd)
+_file_reclen:   .skip 128       # record length per file number
+_file_recnum:   .skip 128       # last record read or written, 1-based; 0 = none
+_file_fieldoff: .skip 128       # bytes of the buffer FIELD has assigned so far
+
+# MKI$/MKL$/MKS$/MKD$ assemble their bytes here, then return a heap copy; the
+# buffer itself is never handed out.
+_mk_buf: .skip 16
+
+# Scratch for the file-pointer position SetFilePointerEx reports back.
+_file_pos: .quad 0
+
+.equ MAX_RECLEN, 32767
+.equ FILE_BEGIN,   0
+.equ FILE_CURRENT, 1
+.equ LOCKFILE_FAIL_IMMEDIATELY, 1
+.equ LOCKFILE_EXCLUSIVE_LOCK,   2
+
+.text
+
+# _rt_file_open_random - OPEN ... FOR RANDOM AS #n LEN = r
+#
+# Four arguments, not five: Win64 passes only four in registers, and a fifth
+# would have to be read back off the caller's stack. There is no mode byte
+# because reaching this entry point *is* the mode.
+#
+# Arguments:
+#   rcx = filename pointer, rdx = filename length
+#   r8  = file number, r9 = record length
+.globl _rt_file_open_random
+_rt_file_open_random:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rdi
+    push rsi
+    sub rsp, 64             # shadow space plus CreateFileA's stack arguments
+
+    mov rdi, rcx            # filename ptr
+    mov rsi, rdx            # filename len
+    mov ebx, r8d            # file number
+    mov r14, r9             # record length
+
+    # Null-terminate the filename in the shared buffer.
+    lea rcx, [rip + _file_name_buf]
+    mov rdx, rdi
+    mov r8, rsi
+    call memcpy
+    lea rax, [rip + _file_name_buf]
+    mov BYTE PTR [rax + rsi], 0
+
+    # A random file is read and written, and is created when absent, which is
+    # exactly OPEN_ALWAYS with both access bits.
+    lea rcx, [rip + _file_name_buf]
+    mov edx, GENERIC_READ
+    or  edx, GENERIC_WRITE
+    mov r8d, FILE_SHARE_READ
+    xor r9d, r9d
+    mov DWORD PTR [rsp + 32], OPEN_ALWAYS
+    mov DWORD PTR [rsp + 40], FILE_ATTRIBUTE_NORMAL
+    mov QWORD PTR [rsp + 48], 0
+    call CreateFileA
+
+    lea rcx, [rip + _file_handles]
+    mov [rcx + rbx*8], rax
+
+    lea rcx, [rip + _file_col]
+    mov QWORD PTR [rcx + rbx*8], 0
+
+    # Clamp the record length into 1..MAX_RECLEN.
+    cmp r14, 1
+    jge .Lwrandom_len_ok
+    mov r14, 128
+.Lwrandom_len_ok:
+    cmp r14, MAX_RECLEN
+    jle .Lwrandom_len_set
+    mov r14, MAX_RECLEN
+.Lwrandom_len_set:
+    lea rcx, [rip + _file_reclen]
+    mov [rcx + rbx*8], r14
+
+    # Release the buffer a previous OPEN on this number left behind.
+    lea rax, [rip + _file_recbuf]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Lwrandom_alloc
+    call free
+
+.Lwrandom_alloc:
+    mov rcx, r14
+    call malloc
+    test rax, rax
+    jz .Lwrandom_nomem
+    lea rcx, [rip + _file_recbuf]
+    mov [rcx + rbx*8], rax
+
+    # A fresh buffer reads as blanks, not as whatever the allocator returned.
+    mov rcx, rax
+    mov edx, ' '
+    mov r8, r14
+    call memset
+
+    lea rax, [rip + _file_recnum]
+    mov QWORD PTR [rax + rbx*8], 0
+    lea rax, [rip + _file_fieldoff]
+    mov QWORD PTR [rax + rbx*8], 0
+
+    add rsp, 64
+    pop rsi
+    pop rdi
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+.Lwrandom_nomem:
+    lea rcx, [rip + _err_memory]
+    xor edx, edx
+    call _rt_error
+
+# _rt_field_reset - Start a fresh FIELD statement
+# Arguments: rcx = file number
+.globl _rt_field_reset
+_rt_field_reset:
+    lea rax, [rip + _file_fieldoff]
+    mov QWORD PTR [rax + rcx*8], 0
+    ret
+
+# _rt_field_next - Carve the next slice out of the record buffer
+# Arguments: rcx = file number, rdx = width in bytes
+# Returns:   rax = pointer into the record buffer, rdx = width
+.globl _rt_field_next
+_rt_field_next:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32             # shadow space for the error paths
+
+    lea rax, [rip + _file_recbuf]
+    mov r8, [rax + rcx*8]
+    test r8, r8
+    jz .Lwfield_badmode
+
+    test rdx, rdx
+    jns .Lwfield_width_ok
+    xor edx, edx
+.Lwfield_width_ok:
+
+    lea rax, [rip + _file_fieldoff]
+    mov r9, [rax + rcx*8]
+    lea rax, [rip + _file_reclen]
+    mov r10, [rax + rcx*8]
+
+    mov r11, r9
+    add r11, rdx
+    cmp r11, r10
+    jg .Lwfield_overflow
+
+    lea rax, [rip + _file_fieldoff]
+    mov [rax + rcx*8], r11
+
+    mov rax, r8
+    add rax, r9
+    add rsp, 32
+    leave
+    ret
+
+.Lwfield_badmode:
+    lea rcx, [rip + _err_badmode]
+    xor edx, edx
+    call _rt_error
+
+.Lwfield_overflow:
+    lea rcx, [rip + _err_fieldovf]
+    xor edx, edx
+    call _rt_error
+
+# _rt_lset - LSET: copy left-justified into a fixed-width field
+# Arguments:
+#   rcx = destination pointer, rdx = destination length
+#   r8  = source pointer,      r9  = source length
+.globl _rt_lset
+_rt_lset:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push rdi
+    push rsi
+    sub rsp, 40
+
+    mov rbx, rcx            # dest ptr
+    mov rdi, rdx            # dest len
+    mov rsi, r9             # source len
+
+    test rdi, rdi
+    jle .Lwlset_done
+
+    # n = min(source length, destination width)
+    cmp rsi, rdi
+    cmova rsi, rdi
+    test rsi, rsi
+    jle .Lwlset_pad
+
+    mov rcx, rbx
+    mov rdx, r8
+    mov r8, rsi
+    call memcpy
+
+.Lwlset_pad:
+    mov rcx, rbx
+    add rcx, rsi
+    mov edx, ' '
+    mov r8, rdi
+    sub r8, rsi
+    test r8, r8
+    jle .Lwlset_done
+    call memset
+
+.Lwlset_done:
+    add rsp, 40
+    pop rsi
+    pop rdi
+    pop rbx
+    leave
+    ret
+
+# _rt_rset - RSET: the same, right-justified
+# Arguments: as _rt_lset
+.globl _rt_rset
+_rt_rset:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push rdi
+    push rsi
+    push r12
+    sub rsp, 32
+
+    mov rbx, rcx            # dest ptr
+    mov rdi, rdx            # dest len
+    mov r12, r8             # source ptr
+    mov rsi, r9             # source len
+
+    test rdi, rdi
+    jle .Lwrset_done
+
+    cmp rsi, rdi
+    cmova rsi, rdi
+    test rsi, rsi
+    jl .Lwrset_blank
+
+    # Pad on the left, then place the text against the right edge.
+    mov rcx, rbx
+    mov edx, ' '
+    mov r8, rdi
+    sub r8, rsi
+    test r8, r8
+    jle .Lwrset_copy
+    call memset
+
+.Lwrset_copy:
+    test rsi, rsi
+    jle .Lwrset_done
+    mov rcx, rbx
+    add rcx, rdi
+    sub rcx, rsi
+    mov rdx, r12
+    mov r8, rsi
+    call memcpy
+    jmp .Lwrset_done
+
+.Lwrset_blank:
+    mov rcx, rbx
+    mov edx, ' '
+    mov r8, rdi
+    call memset
+
+.Lwrset_done:
+    add rsp, 32
+    pop r12
+    pop rsi
+    pop rdi
+    pop rbx
+    leave
+    ret
+
+# _rt_random_prepare - Shared GET/PUT setup: validate and seek
+# Arguments:
+#   rcx = file number, rdx = record number (0 = the one after the last)
+#   r8  = BASIC line number
+#
+# Returns: rax = HANDLE, rbx = file number, r12 = record length,
+#          r13 = buffer, r15 = HANDLE
+# Clobbers the callee-saved registers it returns in; both callers save them.
+.globl _rt_random_prepare
+_rt_random_prepare:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32             # shadow space
+
+    mov ebx, ecx
+    mov r14, r8             # line number, for the error paths
+
+    lea rax, [rip + _file_handles]
+    mov r15, [rax + rbx*8]
+    test r15, r15
+    jz .Lwrandom_badfile
+    cmp r15, INVALID_HANDLE_VALUE
+    je .Lwrandom_badfile
+
+    lea rax, [rip + _file_recbuf]
+    mov r13, [rax + rbx*8]
+    test r13, r13
+    jz .Lwrandom_badmode
+
+    lea rax, [rip + _file_reclen]
+    mov r12, [rax + rbx*8]
+
+    # No record number means the one after the last one touched.
+    test rdx, rdx
+    jg .Lwrandom_have_rec
+    lea rax, [rip + _file_recnum]
+    mov rdx, [rax + rbx*8]
+    inc rdx
+.Lwrandom_have_rec:
+
+    lea rax, [rip + _file_recnum]
+    mov [rax + rbx*8], rdx
+
+    # Records are 1-based, so record n starts at (n-1) * reclen.
+    dec rdx
+    mov rax, rdx
+    imul rax, r12
+    mov rcx, r15
+    mov rdx, rax
+    xor r8d, r8d            # lpNewFilePointer = NULL
+    mov r9d, FILE_BEGIN
+    call SetFilePointerEx
+
+    mov rax, r15
+    add rsp, 32
+    leave
+    ret
+
+.Lwrandom_badfile:
+    lea rcx, [rip + _err_badfile]
+    mov rdx, r14
+    call _rt_error
+
+.Lwrandom_badmode:
+    lea rcx, [rip + _err_badmode]
+    mov rdx, r14
+    call _rt_error
+
+# _rt_file_get - GET #n[, rec]: read one record into the buffer
+# A record reaching past the end of the file is padded with NULs.
+#
+# Arguments: rcx = file number, rdx = record number (0 = next), r8 = BASIC line
+.globl _rt_file_get
+_rt_file_get:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rdi
+    push rsi
+    sub rsp, 40
+
+    call _rt_random_prepare
+
+    # ReadFile(hFile, buffer, reclen, &bytesRead, NULL)
+    mov rcx, r15
+    mov rdx, r13
+    mov r8, r12
+    lea r9, [rip + _file_bytes_read]
+    mov QWORD PTR [rsp + 32], 0
+    call ReadFile
+
+    # Zero whatever the file was too short to supply.
+    lea rax, [rip + _file_bytes_read]
+    mov rax, [rax]
+    mov r8, r12
+    sub r8, rax
+    jle .Lwget_done
+    mov rcx, r13
+    add rcx, rax
+    xor edx, edx
+    call memset
+
+.Lwget_done:
+    add rsp, 40
+    pop rsi
+    pop rdi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# _rt_file_put - PUT #n[, rec]: write the buffer as one record
+# Arguments: as _rt_file_get
+.globl _rt_file_put
+_rt_file_put:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rdi
+    push rsi
+    sub rsp, 40
+
+    call _rt_random_prepare
+
+    # WriteFile(hFile, buffer, reclen, &bytesWritten, NULL)
+    mov rcx, r15
+    mov rdx, r13
+    mov r8, r12
+    lea r9, [rip + _file_bytes_written]
+    mov QWORD PTR [rsp + 32], 0
+    call WriteFile
+
+    # Flush so LOF and a second handle see the record now.
+    mov rcx, r15
+    call FlushFileBuffers
+
+    add rsp, 40
+    pop rsi
+    pop rdi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# _rt_file_loc - LOC(n): where the file is positioned
+# For a random file this is the last record read or written; for a sequential
+# one GW-BASIC counts 128-byte blocks, which is what this reports.
+#
+# Arguments: rcx = file number
+# Returns:   xmm0 = the position
+.globl _rt_file_loc
+_rt_file_loc:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 56
+
+    mov ebx, ecx
+
+    lea rax, [rip + _file_recbuf]
+    mov rax, [rax + rbx*8]
+    test rax, rax
+    jz .Lwloc_sequential
+
+    lea rax, [rip + _file_recnum]
+    mov rax, [rax + rbx*8]
+    cvtsi2sd xmm0, rax
+    jmp .Lwloc_done
+
+.Lwloc_sequential:
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Lwloc_zero
+    cmp rcx, INVALID_HANDLE_VALUE
+    je .Lwloc_zero
+
+    # SetFilePointerEx(h, 0, &pos, FILE_CURRENT) reads the position without
+    # moving it.
+    xor edx, edx
+    lea r8, [rip + _file_pos]
+    mov r9d, FILE_CURRENT
+    call SetFilePointerEx
+    test eax, eax
+    jz .Lwloc_zero
+
+    lea rax, [rip + _file_pos]
+    mov rax, [rax]
+    test rax, rax
+    js .Lwloc_zero
+    # GW-BASIC reports sequential position in 128-byte blocks.
+    mov rcx, 128
+    xor edx, edx
+    div rcx
+    cvtsi2sd xmm0, rax
+    jmp .Lwloc_done
+
+.Lwloc_zero:
+    xorpd xmm0, xmm0
+
+.Lwloc_done:
+    add rsp, 56
+    pop rbx
+    leave
+    ret
+
+# _rt_lock / _rt_unlock - LOCK and UNLOCK: advisory record locking
+#
+# LockFileEx takes the byte range through an OVERLAPPED, built on the stack.
+# LOCKFILE_FAIL_IMMEDIATELY makes a held lock an error rather than a wait,
+# which is the behaviour GW-BASIC programs expect.
+#
+# Arguments:
+#   rcx = file number, rdx = first record, r8 = last record, r9 = BASIC line
+# A first record of 0 means the whole file.
+.globl _rt_lock
+_rt_lock:
+    mov eax, 1
+    jmp .Lwdo_lock
+
+.globl _rt_unlock
+_rt_unlock:
+    xor eax, eax
+
+.Lwdo_lock:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push rdi
+    push rsi
+    sub rsp, 80             # [rsp, rsp+48) call area, [rsp+48, rsp+80) OVERLAPPED
+
+    mov ebx, ecx
+    mov r13, r9             # BASIC line
+    mov r14d, eax           # 1 = lock, 0 = unlock
+    mov rdi, rdx            # first record
+    mov rsi, r8             # last record
+
+    lea rax, [rip + _file_handles]
+    mov r12, [rax + rbx*8]
+    test r12, r12
+    jz .Lwlock_badfile
+    cmp r12, INVALID_HANDLE_VALUE
+    je .Lwlock_badfile
+
+    # Zero the OVERLAPPED, then fill in the offset.
+    lea rcx, [rsp + 48]
+    xor edx, edx
+    mov r8, 32
+    call memset
+
+    # A first record of 0, or a sequential file, locks everything.
+    test rdi, rdi
+    jle .Lwlock_whole
+    lea rax, [rip + _file_reclen]
+    mov r9, [rax + rbx*8]
+    test r9, r9
+    jz .Lwlock_whole
+
+    # Byte range [ (first-1)*reclen, (last-first+1)*reclen )
+    mov rax, rdi
+    dec rax
+    imul rax, r9
+    mov QWORD PTR [rsp + 48 + 16], rax      # Offset / OffsetHigh
+
+    sub rsi, rdi
+    inc rsi
+    test rsi, rsi
+    jg .Lwlock_have_count
+    mov rsi, 1
+.Lwlock_have_count:
+    imul rsi, r9
+    jmp .Lwlock_call
+
+.Lwlock_whole:
+    mov QWORD PTR [rsp + 48 + 16], 0
+    # Win32 needs a length, so "the whole file" is the largest range there is.
+    mov rsi, 0x7FFFFFFFFFFFFFFF
+
+.Lwlock_call:
+    # rsi = byte count; split into the low and high halves both calls take.
+    mov r10, rsi
+    shr r10, 32
+    mov r11d, esi
+
+    test r14d, r14d
+    jz .Lwlock_do_unlock
+
+    # LockFileEx(h, flags, 0, countLow, countHigh, &overlapped)
+    mov rcx, r12
+    mov edx, LOCKFILE_EXCLUSIVE_LOCK
+    or  edx, LOCKFILE_FAIL_IMMEDIATELY
+    xor r8d, r8d
+    mov r9d, r11d
+    mov DWORD PTR [rsp + 32], r10d
+    lea rax, [rsp + 48]
+    mov QWORD PTR [rsp + 40], rax
+    call LockFileEx
+    jmp .Lwlock_check
+
+.Lwlock_do_unlock:
+    # UnlockFileEx(h, 0, countLow, countHigh, &overlapped)
+    mov rcx, r12
+    xor edx, edx
+    mov r8d, r11d
+    mov r9d, r10d
+    lea rax, [rsp + 48]
+    mov QWORD PTR [rsp + 32], rax
+    call UnlockFileEx
+
+.Lwlock_check:
+    test eax, eax
+    jz .Lwlock_denied
+
+    add rsp, 80
+    pop rsi
+    pop rdi
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
+.Lwlock_denied:
+    lea rcx, [rip + _err_permission]
+    mov rdx, r13
+    call _rt_error
+
+.Lwlock_badfile:
+    lea rcx, [rip + _err_badfile]
+    mov rdx, r13
+    call _rt_error
+
+# _rt_mk - MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string
+# Arguments: rcx = the value's bits, rdx = width in bytes (2, 4 or 8)
+# Returns:   rax = pointer to a fresh heap copy of the bytes, rdx = width
+# (_mk_buf is scratch and never leaves the runtime.)
+.globl _rt_mk
+_rt_mk:
+    lea rax, [rip + _mk_buf]
+    mov QWORD PTR [rax], rcx        # little-endian, so a short width just
+                                    # takes the low bytes
+    mov rcx, rax
+    jmp _rt_strdup                  # rdx already holds the width
+
+# _rt_cvi / _rt_cvl / _rt_cvs / _rt_cvd - read MK*$ bytes back as a number
+#
+# The string must be at least as wide as the type being read; see the System V
+# tree for why a short one is an error rather than a zero.
+#
+# Arguments: rcx = string pointer, rdx = string length, r8 = BASIC line
+# Returns:   xmm0 = the value
+.globl _rt_cvi
+_rt_cvi:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp rdx, 2
+    jb .Lwcv_short
+    mov r9d, 2
+    call .Lwcv_gather
+    movsx rax, ax                   # INTEGER is signed 16-bit
+    cvtsi2sd xmm0, rax
+    add rsp, 32
+    leave
+    ret
+
+.globl _rt_cvl
+_rt_cvl:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp rdx, 4
+    jb .Lwcv_short
+    mov r9d, 4
+    call .Lwcv_gather
+    movsxd rax, eax                 # LONG is signed 32-bit
+    cvtsi2sd xmm0, rax
+    add rsp, 32
+    leave
+    ret
+
+.globl _rt_cvs
+_rt_cvs:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp rdx, 4
+    jb .Lwcv_short
+    mov r9d, 4
+    call .Lwcv_gather
+    movd xmm0, eax
+    cvtss2sd xmm0, xmm0
+    add rsp, 32
+    leave
+    ret
+
+.globl _rt_cvd
+_rt_cvd:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    cmp rdx, 8
+    jb .Lwcv_short
+    mov r9d, 8
+    call .Lwcv_gather
+    movq xmm0, rax
+    add rsp, 32
+    leave
+    ret
+
+# r8 still holds the line number: the width goes in r9 precisely so it does not
+# have to be disturbed.
+.Lwcv_short:
+    lea rcx, [rip + _err_domain]
+    mov rdx, r8
+    call _rt_error
+
+# Gather r9 bytes of the string at rcx into rax, low byte first.
+.Lwcv_gather:
+    xor eax, eax
+    test rcx, rcx
+    jz .Lwcv_gather_done
+    test r9, r9
+    jle .Lwcv_gather_done
+    xor r8d, r8d
+.Lwcv_gather_loop:
+    movzx r10d, BYTE PTR [rcx + r8]
+    mov r11, r8
+    shl r11, 3                      # bit position = index * 8
+    push rcx
+    mov rcx, r11
+    shl r10, cl
+    pop rcx
+    or rax, r10
+    inc r8
+    cmp r8, r9
+    jl .Lwcv_gather_loop
+.Lwcv_gather_done:
+    ret
+
 # _rt_file_lof - LOF(n): length of the file in bytes
 # Arguments:
 #   rcx = file number

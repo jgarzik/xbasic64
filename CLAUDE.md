@@ -53,6 +53,9 @@ Integration tests organized by feature area:
   `compile_only()` for "this must be rejected, with this message"; and
   `compile_and_run_raw()` for "printed this, then aborted with this exit code"
 - `docs/mod.rs` - Compiles every ```basic example in LANGREF.md and README.md
+- `megatest/` - One large program (`mega.bas`) exercising most of the language
+  at once, so that features are tested coexisting rather than in isolation. It
+  is its own assertion harness: a regression names itself
 - Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
 
 ### Key Design Decisions
@@ -69,6 +72,16 @@ Integration tests organized by feature area:
 - **Runtime checks on by default**: `--unsafe` removes them
 - **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
   the same `.globl` names; a new helper must be added to both
+- **A runtime helper takes at most four arguments**: Win64 passes only four in
+  registers, so `arg_reg(4)` panics there while System V accepts six. A helper
+  that needs a fifth is invisible on Linux and breaks every Windows compile;
+  fold an argument away instead (see `_rt_file_open_random`)
+- **Unsupported GW-BASIC names are refused, not ignored**: an unrecognised name
+  is otherwise just a new variable, so `UNSUPPORTED` in `sema.rs` names the
+  keywords this compiler does not provide and why. See [NONGOALS.md](NONGOALS.md)
+- **String builtins returning a static buffer must copy**: two calls in one
+  expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
+  `_rt_oct` and `_rt_mk` end in `_rt_strdup`
 
 ## Language Reference
 

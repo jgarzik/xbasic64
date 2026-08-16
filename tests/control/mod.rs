@@ -499,3 +499,221 @@ fn test_case_on_strings() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["is b", "first half"]);
 }
+
+// ---------------------------------------------------------------------------
+// ON ... GOSUB
+//
+// The property that separates it from ON ... GOTO is that control comes back,
+// and comes back to the same place whichever subroutine ran. The property that
+// separates it from GOSUB is that a selector matching nothing must leave the
+// return stack exactly as it found it.
+
+/// The selector picks the nth subroutine, and RETURN resumes after the
+/// statement rather than at the target's caller.
+#[test]
+fn test_on_gosub_dispatches_and_returns() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 3
+    Hit$ = "none"
+    ON I GOSUB One, Two, Three
+    PRINT Hit$; "/back"
+NEXT I
+END
+One:
+Hit$ = "one"
+RETURN
+Two:
+Hit$ = "two"
+RETURN
+Three:
+Hit$ = "three"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim().lines().collect::<Vec<_>>(),
+        vec!["one/back", "two/back", "three/back"]
+    );
+}
+
+/// A selector outside the list runs nothing and continues, as in GW-BASIC --
+/// zero, past the end, and negative alike.
+#[test]
+fn test_on_gosub_out_of_range_falls_through() {
+    let output = compile_and_run(
+        r#"
+Hit$ = "none"
+ON 0 GOSUB Only
+PRINT Hit$
+ON 5 GOSUB Only
+PRINT Hit$
+ON -3 GOSUB Only
+PRINT Hit$
+ON 1 GOSUB Only
+PRINT Hit$
+END
+Only:
+Hit$ = "ran"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim().lines().collect::<Vec<_>>(),
+        vec!["none", "none", "none", "ran"]
+    );
+}
+
+/// The return stack is left balanced, so an ordinary GOSUB still works after
+/// an ON ... GOSUB -- including after one that matched nothing.
+#[test]
+fn test_on_gosub_leaves_the_return_stack_balanced() {
+    let output = compile_and_run(
+        r#"
+Count = 0
+ON 1 GOSUB Bump
+ON 9 GOSUB Bump
+GOSUB Bump
+ON 0 GOSUB Bump
+GOSUB Bump
+PRINT Count
+END
+Bump:
+Count = Count + 1
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim(),
+        "3",
+        "only the three that should have run, ran"
+    );
+}
+
+/// A fall-through must not push a return address it never pops. The GOSUB
+/// stack holds 64K entries, so 200000 unmatched dispatches would overflow it
+/// if even one address leaked per statement.
+#[test]
+fn test_on_gosub_fallthrough_does_not_leak_return_addresses() {
+    let output = compile_and_run(
+        r#"
+FOR I = 1 TO 100000
+    ON 0 GOSUB Never
+    ON 7 GOSUB Never
+NEXT I
+GOSUB Never
+PRINT Hit$
+END
+Never:
+Hit$ = "survived"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "survived");
+}
+
+/// The selector is an expression, not just a variable, and is truncated to an
+/// integer the way ON ... GOTO's is.
+#[test]
+fn test_on_gosub_selector_is_an_expression() {
+    let output = compile_and_run(
+        r#"
+X = 4
+ON X / 2 GOSUB One, Two
+PRINT Hit$
+ON 1.9 GOSUB One, Two
+PRINT Hit$
+END
+One:
+Hit$ = "one"
+RETURN
+Two:
+Hit$ = "two"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim().lines().collect::<Vec<_>>(),
+        vec!["two", "one"],
+        "4/2 selects the second; 1.9 truncates to 1"
+    );
+}
+
+/// Targets may be line numbers as well as named labels, and the two may be
+/// mixed in one statement.
+#[test]
+fn test_on_gosub_targets_may_be_line_numbers() {
+    let output = compile_and_run(
+        r#"
+ON 1 GOSUB 100, Named
+PRINT Hit$
+ON 2 GOSUB 100, Named
+PRINT Hit$
+END
+100 Hit$ = "line"
+110 RETURN
+Named:
+Hit$ = "label"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim().lines().collect::<Vec<_>>(),
+        vec!["line", "label"]
+    );
+}
+
+/// A subroutine reached by ON ... GOSUB may itself GOSUB, so the two share one
+/// return stack correctly.
+#[test]
+fn test_on_gosub_nests() {
+    let output = compile_and_run(
+        r#"
+ON 1 GOSUB Outer
+PRINT Trace$
+END
+Outer:
+Trace$ = Trace$ + "outer("
+GOSUB Inner
+Trace$ = Trace$ + ")"
+RETURN
+Inner:
+Trace$ = Trace$ + "inner"
+RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "outer(inner)");
+}
+
+/// An unknown target is refused, naming the statement, rather than reaching
+/// the assembler as a missing label.
+#[test]
+fn test_on_gosub_unknown_target_is_diagnosed() {
+    let err = crate::common::compile_only("ON 1 GOSUB NoSuchLabel\n")
+        .expect_err("an undefined target must be refused");
+    assert!(
+        err.contains("ON ... GOSUB"),
+        "the diagnostic should name the statement: {}",
+        err.stderr
+    );
+    assert!(err.is_clean_rejection());
+}
+
+/// `ON` must be followed by one of the two keywords, and says so.
+#[test]
+fn test_on_without_goto_or_gosub_is_diagnosed() {
+    let err = crate::common::compile_only("ON 1 PRINT 2\n")
+        .expect_err("ON with neither GOTO nor GOSUB must be refused");
+    assert!(
+        err.contains("GOTO or GOSUB"),
+        "the diagnostic should name both: {}",
+        err.stderr
+    );
+}

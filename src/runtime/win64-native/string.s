@@ -14,6 +14,9 @@
 # Memory Management:
 #   - Substring functions return pointers into original string (no allocation)
 #   - String concatenation uses HeapAlloc(GetProcessHeap(), 0, size)
+#   - Conversion functions (STR$, CHR$, HEX$, OCT$) format into a scratch
+#     buffer and return a heap copy of it, so that two of them in one
+#     expression cannot alias; see the System V tree for the failure
 #
 # Win64 ABI:
 #   - Args: rcx, rdx, r8, r9 (then stack)
@@ -24,10 +27,10 @@
 .equ CHR_RESULT_LEN, 1          # CHR$() always returns 1 character
 
 .data
-_str_buf: .skip 64          # Buffer for STR$() conversion
+_str_buf: .skip 64          # Scratch for HEX$()/OCT$(); never returned
 _fmt_hex: .asciz "%llX"
 _fmt_oct: .asciz "%llo"
-_chr_buf: .skip 2           # Buffer for CHR$()
+_chr_buf: .skip 2           # Scratch for CHR$(); never returned
 
 .text
 
@@ -49,56 +52,69 @@ _rt_val:
     ret
 
 # _rt_str - Convert number to string (STR$ function)
+#
+# Renders exactly what PRINT would render, by going through the same helper;
+# see the System V tree for why the old sprintf("%g") was wrong.
+#
 # Arguments:
 #   xmm0 = number to convert (double)
 #
 # Returns:
-#   rax = pointer to string (_str_buf)
+#   rax = pointer to a fresh heap copy of the text
 #   rdx = length of string
 .globl _rt_str
 _rt_str:
     push rbp
     mov rbp, rsp
-    sub rsp, 48             # Shadow space + alignment
-
-    # sprintf(buffer, "%g", value)
-    lea rcx, [rip + _str_buf]
-    lea rdx, [rip + _fmt_float]
-    movsd xmm2, xmm0        # value in xmm2
-    movq r8, xmm0           # also in r8 for varargs
-    call sprintf
-
-    # Calculate result length
-    lea rax, [rip + _str_buf]
-    mov rcx, rax            # save ptr
-    xor rdx, rdx            # length counter
-.Lstr_len:
-    cmp BYTE PTR [rax + rdx], 0
-    je .Lstr_done
-    inc rdx
-    jmp .Lstr_len
-.Lstr_done:
-    mov rax, rcx            # restore ptr
+    sub rsp, 32             # shadow space
+    lea rcx, [rip + _fmt_g_table]
+    xor edx, edx
+    call _rt_fmt_double
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax            # length
+    add rsp, 32
     leave
-    ret
+    jmp _rt_strdup          # the caller may hold another such result
+
+# _rt_str_single - STR$ of a SINGLE
+#
+# A SINGLE carries only ~7 significant digits, so it uses the shorter table for
+# the same reason PRINT does.
+#
+# Arguments: xmm0 = value, already widened to double
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
+.globl _rt_str_single
+_rt_str_single:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32             # shadow space
+    lea rcx, [rip + _fmt_g_single_table]
+    mov edx, 1
+    call _rt_fmt_double
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax
+    add rsp, 32
+    leave
+    jmp _rt_strdup
 
 # _rt_chr - Convert ASCII code to single character (CHR$ function)
 # Arguments:
 #   rcx = ASCII code (0-255)
 #
 # Returns:
-#   rax = pointer to string (_chr_buf)
+#   rax = pointer to a fresh heap copy of the character
 #   rdx = 1 (length)
 .globl _rt_chr
 _rt_chr:
     push rbp
     mov rbp, rsp
     lea rax, [rip + _chr_buf]
-    mov BYTE PTR [rax], cl
+    mov BYTE PTR [rax], cl          # read cl before rcx becomes the buffer
     mov BYTE PTR [rax + 1], 0
+    mov rcx, rax
     mov rdx, CHR_RESULT_LEN
     leave
-    ret
+    jmp _rt_strdup                  # the caller may hold another such result
 
 # _rt_left - Extract leftmost characters (LEFT$ function)
 # Arguments:
@@ -553,7 +569,7 @@ _rt_case_convert:
 
 # _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
 # Arguments: rcx = value (already truncated to an integer)
-# Returns:   rax = pointer, rdx = length
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
 .globl _rt_hex
 _rt_hex:
     push rbp
@@ -563,11 +579,11 @@ _rt_hex:
     lea rcx, [rip + _str_buf]
     lea rdx, [rip + _fmt_hex]
     call sprintf
+    lea rcx, [rip + _str_buf]
     mov rdx, rax
-    lea rax, [rip + _str_buf]
     add rsp, 48
     leave
-    ret
+    jmp _rt_strdup
 
 .globl _rt_oct
 _rt_oct:
@@ -578,11 +594,11 @@ _rt_oct:
     lea rcx, [rip + _str_buf]
     lea rdx, [rip + _fmt_oct]
     call sprintf
+    lea rcx, [rip + _str_buf]
     mov rdx, rax
-    lea rax, [rip + _str_buf]
     add rsp, 48
     leave
-    ret
+    jmp _rt_strdup
 
 # _rt_strdup - Copy a string onto the heap
 # String assignment copies, so that mutating one variable cannot be seen

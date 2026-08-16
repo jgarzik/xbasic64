@@ -30,6 +30,9 @@ _err_undim:     .asciz "Array used before DIM"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
 _err_badfile:   .asciz "Bad file number"
+_err_badmode:   .asciz "Bad file mode"
+_err_fieldovf:  .asciz "FIELD overflow"
+_err_permission: .asciz "Permission denied"
 
 .text
 
