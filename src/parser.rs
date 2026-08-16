@@ -7,22 +7,28 @@ use crate::lexer::Token;
 use std::collections::HashSet;
 
 /// Binary operator precedence levels (higher = tighter binding)
+///
+/// These are LANGREF's table read upside down -- it numbers 1 as tightest, this
+/// numbers 1 as loosest. `XOR` used to sit alone at 3, binding tighter than
+/// `AND`, which contradicted both LANGREF and GW-BASIC and made
+/// `-1 OR 0 XOR -1` give -1 instead of 0.
+///
 /// Returns (precedence, BinaryOp) or None if not a binary operator
 fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
     match token {
-        // Precedence 1: logical OR (lowest)
+        // Precedence 1: logical OR and XOR (lowest), which share a level
         Token::Or => Some((1, BinaryOp::Or)),
+        Token::Xor => Some((1, BinaryOp::Xor)),
         // Precedence 2: logical AND
         Token::And => Some((2, BinaryOp::And)),
-        // Precedence 3: logical XOR
-        Token::Xor => Some((3, BinaryOp::Xor)),
+        // Precedence 3 is NOT, a prefix operator; see `parse_prec_inner`.
         // Precedence 4: comparison
-        Token::Eq => Some((4, BinaryOp::Eq)),
-        Token::Ne => Some((4, BinaryOp::Ne)),
-        Token::Lt => Some((4, BinaryOp::Lt)),
-        Token::Gt => Some((4, BinaryOp::Gt)),
-        Token::Le => Some((4, BinaryOp::Le)),
-        Token::Ge => Some((4, BinaryOp::Ge)),
+        Token::Eq => Some((CMP_PREC, BinaryOp::Eq)),
+        Token::Ne => Some((CMP_PREC, BinaryOp::Ne)),
+        Token::Lt => Some((CMP_PREC, BinaryOp::Lt)),
+        Token::Gt => Some((CMP_PREC, BinaryOp::Gt)),
+        Token::Le => Some((CMP_PREC, BinaryOp::Le)),
+        Token::Ge => Some((CMP_PREC, BinaryOp::Ge)),
         // Precedence 5: additive
         Token::Plus => Some((5, BinaryOp::Add)),
         Token::Minus => Some((5, BinaryOp::Sub)),
@@ -31,11 +37,18 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
         Token::Slash => Some((6, BinaryOp::Div)),
         Token::Backslash => Some((6, BinaryOp::IntDiv)),
         Token::Mod => Some((6, BinaryOp::Mod)),
-        // Precedence 7: power (handled specially for right-associativity)
+        // Precedence 7: power
         Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
 }
+
+/// Precedence of the comparison operators.
+///
+/// Named because `NOT` sits directly below it: `NOT` takes an operand at this
+/// level, which is what makes `NOT A = B` group as `NOT (A = B)` while
+/// `NOT A AND B` groups as `(NOT A) AND B`.
+const CMP_PREC: u8 = 4;
 
 /// Precedence of `^`, the tightest-binding binary operator.
 const POWER_PREC: u8 = 7;
@@ -2602,10 +2615,19 @@ impl Parser {
             return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
         }
 
-        // Handle NOT prefix operator (binds tighter than binary ops)
+        // `NOT` is a prefix operator sitting between the comparisons and `AND`,
+        // so its operand is everything that binds at least as tightly as a
+        // comparison -- and no more.
+        //
+        // It used to take its operand at the *caller's* `min_prec`, which at
+        // statement level is the lowest of all, so `NOT` swallowed whatever
+        // followed it: `NOT A AND B` parsed as `NOT (A AND B)`. Taking the
+        // operand at CMP_PREC keeps `NOT A = B` grouping as `NOT (A = B)` --
+        // the form that actually matters -- while leaving `AND` to the loop
+        // below, which is where it belongs.
         let mut left = if matches!(self.peek(), Token::Not) {
             self.advance();
-            let operand = self.parse_prec(min_prec)?; // NOT is right-associative
+            let operand = self.parse_prec(CMP_PREC)?;
             Expr::Unary {
                 op: UnaryOp::Not,
                 operand: Box::new(operand),
@@ -2620,8 +2642,10 @@ impl Parser {
                 break;
             }
             self.advance();
-            // Power is right-associative; others are left-associative
-            let next_min = if op == BinaryOp::Pow { prec } else { prec + 1 };
+            // Every operator associates left to right, `^` included: GW-BASIC
+            // and QuickBASIC evaluate `2 ^ 3 ^ 2` as `(2^3)^2` = 64. This used
+            // to special-case `Pow` to bind right, giving 512.
+            let next_min = prec + 1;
             let right = self.parse_prec(next_min)?;
             left = Expr::Binary {
                 op,
@@ -3589,14 +3613,16 @@ mod tests {
     }
 
     #[test]
-    fn test_expr_power_right_associative() {
-        // 2 ^ 3 ^ 2 should be 2 ^ (3 ^ 2) = 512, not (2 ^ 3) ^ 2 = 64
+    fn test_expr_power_left_associative() {
+        // 2 ^ 3 ^ 2 is (2 ^ 3) ^ 2 = 64, as GW-BASIC and QuickBASIC evaluate
+        // it. This asserted the opposite nesting until associativity was made
+        // uniform: every operator here associates left to right.
         let prog = parse("X = 2 ^ 3 ^ 2").unwrap();
         if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
-            if let Expr::Binary { op, right, .. } = value {
+            if let Expr::Binary { op, left, .. } = value {
                 assert_eq!(*op, BinaryOp::Pow);
                 assert!(matches!(
-                    right.as_ref(),
+                    left.as_ref(),
                     Expr::Binary {
                         op: BinaryOp::Pow,
                         ..
@@ -3665,19 +3691,43 @@ mod tests {
 
     #[test]
     fn test_expr_logical_operators() {
+        // OR and XOR share the lowest level and associate left to right, and
+        // AND binds tighter than both, so this groups as
+        // ((A AND B) OR C) XOR D and the outermost operator is XOR.
+        //
+        // This asserted OR at the top, which held only because XOR used to have
+        // a level of its own that bound tighter than AND -- contradicting
+        // LANGREF's table, which puts OR and XOR together.
         let prog = parse("X = A AND B OR C XOR D").unwrap();
-        if let StmtKind::Let { value, .. } = &prog.statements[0].kind {
-            // OR has lowest precedence, then XOR, then AND
-            assert!(matches!(
-                value,
+        let StmtKind::Let { value, .. } = &prog.statements[0].kind else {
+            panic!("Expected Let");
+        };
+        let Expr::Binary {
+            op: BinaryOp::Xor,
+            left,
+            ..
+        } = value
+        else {
+            panic!("Expected XOR at the top, got {:?}", value);
+        };
+        let Expr::Binary {
+            op: BinaryOp::Or,
+            left: or_left,
+            ..
+        } = left.as_ref()
+        else {
+            panic!("Expected OR beneath the XOR, got {:?}", left);
+        };
+        assert!(
+            matches!(
+                or_left.as_ref(),
                 Expr::Binary {
-                    op: BinaryOp::Or,
+                    op: BinaryOp::And,
                     ..
                 }
-            ));
-        } else {
-            panic!("Expected Let");
-        }
+            ),
+            "AND binds tighter than both"
+        );
     }
 
     #[test]

@@ -295,6 +295,9 @@ From highest to lowest:
 
 Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
 
+Operators of equal precedence associate left to right, `^` included: `2 ^ 3 ^ 2`
+is `(2 ^ 3) ^ 2` = 64, and `100 - 10 - 5` is 85.
+
 Use parentheses to override precedence:
 ```basic
 Result = (A + B) * C

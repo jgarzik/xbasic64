@@ -250,7 +250,6 @@ PRINT (-2) ^ 2
 PRINT 0 - 2 ^ 2
 A = 3
 PRINT -A ^ 2
-PRINT 2 ^ 3 ^ 2
 PRINT -2 * 3
 PRINT 1 - -2
 "#,
@@ -259,8 +258,8 @@ PRINT 1 - -2
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(
         lines,
-        vec!["-4", "-8", "4", "-4", "-9", "512", "-6", "3"],
-        "^ binds tighter than unary minus; ^ stays right-associative"
+        vec!["-4", "-8", "4", "-4", "-9", "-6", "3"],
+        "^ binds tighter than unary minus"
     );
 }
 
@@ -436,4 +435,82 @@ PRINT A > B
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, vec!["1", "2", "22", "1.2", "0", "-1"]);
+}
+
+/// Operator precedence must match LANGREF's own table.
+///
+/// It listed `NOT` (6) as binding tighter than `AND` (7), and `OR` and `XOR`
+/// together at 8 -- but the parser gave `XOR` its own level tighter than `AND`,
+/// and parsed `NOT`'s operand at the caller's precedence so that `NOT` swallowed
+/// whatever followed it. Both are silent wrong answers, not rejections.
+#[test]
+fn test_logical_operator_precedence() {
+    let output = compile_and_run(
+        r#"
+A% = 0 : B% = 0
+PRINT NOT A% AND B%
+PRINT (NOT A%) AND B%
+PRINT -1 OR 0 XOR -1
+PRINT (-1 OR 0) XOR -1
+PRINT 1 AND 0 OR 1
+PRINT 12 XOR 10 AND 6
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    // NOT binds tighter than AND, so the first two agree.
+    assert_eq!(&lines[0..2], &["0", "0"], "NOT binds tighter than AND");
+    // OR and XOR share a level and associate left to right, so these agree too.
+    assert_eq!(&lines[2..4], &["0", "0"], "OR and XOR share a level");
+    // AND binds tighter than OR: (1 AND 0) OR 1 = 1.
+    assert_eq!(lines[4], "1", "AND binds tighter than OR");
+    // AND binds tighter than XOR: 12 XOR (10 AND 6) = 12 XOR 2 = 14.
+    assert_eq!(lines[5], "14", "AND binds tighter than XOR");
+}
+
+/// `NOT` still binds looser than a comparison, which is the form that matters.
+#[test]
+fn test_not_binds_looser_than_comparison() {
+    let output = compile_and_run(
+        r#"
+A = 1 : B = 2
+IF NOT A = B THEN PRINT "not-equal" ELSE PRINT "equal"
+IF NOT A < B THEN PRINT "not-less" ELSE PRINT "less"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    // NOT (A = B): A <> B, so NOT 0 = -1, true.
+    assert_eq!(
+        lines[0], "not-equal",
+        "NOT groups over the whole comparison"
+    );
+    // NOT (A < B): A < B, so NOT -1 = 0, false.
+    assert_eq!(lines[1], "less");
+}
+
+/// Equal-precedence operators associate left to right, `^` included.
+///
+/// `^` was right-associative, so `2 ^ 3 ^ 2` gave 512 where GW-BASIC and
+/// QuickBASIC give 64. Unary minus still binds looser than `^`.
+#[test]
+fn test_operator_associativity() {
+    let output = compile_and_run(
+        r#"
+PRINT 2 ^ 3 ^ 2
+PRINT -2 ^ 2
+PRINT 2 ^ -2
+PRINT 100 - 10 - 5
+PRINT 100 / 10 / 5
+PRINT 2 ^ 3 ^ 2 ^ 1
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "64", "(2^3)^2, not 2^(3^2)");
+    assert_eq!(lines[1], "-4", "^ binds tighter than unary minus");
+    assert_eq!(lines[2], "0.25", "a negative exponent still parses");
+    assert_eq!(lines[3], "85", "subtraction is left to right");
+    assert_eq!(lines[4], "2", "division is left to right");
+    assert_eq!(lines[5], "64", "((2^3)^2)^1");
 }
