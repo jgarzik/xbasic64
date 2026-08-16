@@ -502,12 +502,17 @@ pub fn child_bodies(stmt: &Stmt) -> Vec<&[Stmt]> {
 /// A block-closing keyword, consumed by `parse_statement` on behalf of the
 /// enclosing block parser.
 ///
-/// These are not errors. BASIC's block terminators are statements
-/// syntactically, but they belong to the construct that opened the block, so
-/// `parse_statement` reports them through the error channel and the enclosing
-/// parser (`parse_if_body`, `parse_for`, ...) treats the matching one as a
+/// BASIC's block terminators are statements syntactically, but they belong to
+/// the construct that opened the block, so `parse_statement` hands the matching
+/// one back to the enclosing parser (`parse_if_body`, `parse_for`, ...) as a
 /// normal end-of-body. Any terminator that reaches the top level without a
-/// matching opener is rendered as a real diagnostic.
+/// matching opener becomes a diagnostic there.
+///
+/// This used to travel through the error channel as `ParseError::Block`, which
+/// worked but meant `?` could not be trusted: every `?` in the parser might be
+/// propagating an ordinary end-of-block rather than a failure, and a stray
+/// terminator would be caught by whichever enclosing block parser matched it
+/// first. It is now part of [`Parsed`], so `?` carries only real errors.
 ///
 /// Conditions travel as payloads rather than through parser fields, so a
 /// terminator cannot be separated from its expression.
@@ -556,20 +561,43 @@ impl BlockEnd {
     }
 }
 
+/// The result of parsing one statement: the statement, or the terminator that
+/// closed the block it was in.
+///
+/// Generic over the item so that `parse_statement_kind` (which yields a
+/// `StmtKind`) and `parse_statement` (which tags it with a line to make a
+/// `Stmt`) can share one type.
+#[derive(Debug, Clone)]
+pub enum Parsed<T> {
+    Item(T),
+    End(BlockEnd),
+}
+
 /// Why parsing of a statement stopped.
 #[derive(Debug, Clone)]
 pub enum ParseError {
-    /// A block terminator was consumed; the enclosing block parser handles it.
-    Block(BlockEnd),
-    /// A genuine syntax error.
+    /// A syntax error at the parser's current position.
     Error(String),
+    /// A syntax error belonging to an earlier line -- the opener of a block
+    /// that was never closed. Without this the diagnostic lands on end of file,
+    /// which is where the parser noticed rather than where the mistake is.
+    ErrorAt(u32, String),
+}
+
+impl ParseError {
+    /// The line this error belongs to, if it names one of its own.
+    fn line(&self) -> Option<u32> {
+        match self {
+            ParseError::Error(_) => None,
+            ParseError::ErrorAt(line, _) => Some(*line),
+        }
+    }
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Error(msg) => write!(f, "{}", msg),
-            ParseError::Block(b) => write!(f, "{} without matching {}", b.keyword(), b.opener()),
+            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -744,8 +772,9 @@ impl Parser {
 
     pub fn parse(&mut self) -> Result<Program, LocatedParseError> {
         self.parse_program().map_err(|error| LocatedParseError {
-            // `pos` is left at the token that stopped the parse.
-            line: self.cur_line(),
+            // An error that names its own line keeps it; otherwise `pos` is
+            // left at the token that stopped the parse.
+            line: error.line().unwrap_or_else(|| self.cur_line()),
             error,
         })
     }
@@ -755,32 +784,111 @@ impl Parser {
         self.skip_newlines();
 
         while !matches!(self.peek(), Token::Eof) {
-            let stmt = self.parse_statement()?;
-            statements.push(stmt);
+            match self.parse_statement()? {
+                Parsed::Item(stmt) => statements.push(stmt),
+                // A terminator here closed nothing: there is no enclosing block
+                // for it to belong to.
+                Parsed::End(end) => {
+                    return err(format!(
+                        "{} without matching {}",
+                        end.keyword(),
+                        end.opener()
+                    ));
+                }
+            }
             self.skip_newlines();
         }
 
         Ok(Program { statements })
     }
 
-    /// Parse one statement, tagging it with the line it started on.
+    /// Parse the statements of a block, up to and including its terminator.
     ///
-    /// `?` propagates `ParseError::Block` unchanged, so the block-terminator
-    /// protocol is unaffected by the wrapping.
-    fn parse_statement(&mut self) -> PResult<Stmt> {
-        let line = self.cur_line();
-        let kind = self.parse_statement_kind()?;
-        Ok(Stmt { line, kind })
+    /// Every block-bearing construct shares this. `opener` names the construct
+    /// and `closer` the keyword it needs, for the diagnostic when end of file
+    /// arrives first -- none of the seven hand-written loops this replaces
+    /// checked for EOF at all. They terminated only because an unrecognised
+    /// token became "Unexpected token: Eof", so an unterminated SUB blamed the
+    /// last line of the file and named nothing.
+    fn parse_block_body(
+        &mut self,
+        opener: &str,
+        closer: &str,
+        opener_line: u32,
+    ) -> PResult<(Vec<Stmt>, BlockEnd)> {
+        let mut body = Vec::new();
+        loop {
+            if matches!(self.peek(), Token::Eof) {
+                return Err(ParseError::ErrorAt(
+                    opener_line,
+                    format!("{} is missing its {}", opener, closer),
+                ));
+            }
+            match self.parse_statement()? {
+                Parsed::Item(stmt) => body.push(stmt),
+                Parsed::End(end) => return Ok((body, end)),
+            }
+            self.skip_newlines();
+        }
     }
 
-    fn parse_statement_kind(&mut self) -> PResult<StmtKind> {
+    /// A block body that must end with exactly one terminator, named by `want`.
+    ///
+    /// `want` is matched by variant, so a payload-free value stands in for the
+    /// whole family; it also supplies the keyword for both diagnostics.
+    fn parse_block(
+        &mut self,
+        want: BlockEnd,
+        opener: &str,
+        opener_line: u32,
+    ) -> PResult<Vec<Stmt>> {
+        let (body, end) = self.parse_block_body(opener, want.keyword(), opener_line)?;
+        if std::mem::discriminant(&end) != std::mem::discriminant(&want) {
+            return Err(ParseError::ErrorAt(
+                opener_line,
+                format!(
+                    "{} needs {} to close it, but {} came first",
+                    opener,
+                    want.keyword(),
+                    end.keyword()
+                ),
+            ));
+        }
+        Ok(body)
+    }
+
+    /// Parse one statement, tagging it with the line it started on.
+    fn parse_statement(&mut self) -> PResult<Parsed<Stmt>> {
+        let line = self.cur_line();
+        Ok(match self.parse_statement_kind()? {
+            Parsed::Item(kind) => Parsed::Item(Stmt { line, kind }),
+            Parsed::End(end) => Parsed::End(end),
+        })
+    }
+
+    /// Parse one statement that is known not to close a block.
+    ///
+    /// Used where a terminator would be meaningless -- the branches of a
+    /// single-line IF -- so the caller does not have to invent a diagnostic.
+    fn parse_inner_statement(&mut self) -> PResult<Stmt> {
+        match self.parse_statement()? {
+            Parsed::Item(stmt) => Ok(stmt),
+            Parsed::End(end) => err(format!(
+                "{} without matching {}",
+                end.keyword(),
+                end.opener()
+            )),
+        }
+    }
+
+    fn parse_statement_kind(&mut self) -> PResult<Parsed<StmtKind>> {
         self.depth += 1;
         let r = self.parse_statement_kind_inner();
         self.depth -= 1;
         r
     }
 
-    fn parse_statement_kind_inner(&mut self) -> PResult<StmtKind> {
+    fn parse_statement_kind_inner(&mut self) -> PResult<Parsed<StmtKind>> {
         if self.depth > MAX_DEPTH {
             return err(format!("nesting is too deep (limit {} levels)", MAX_DEPTH));
         }
@@ -794,10 +902,16 @@ impl Parser {
             self.advance();
         }
 
+        // A block-closing keyword belongs to the construct that opened the
+        // block, so hand it back rather than parsing it as a statement.
+        if let Some(end) = self.try_block_end()? {
+            return Ok(Parsed::End(end));
+        }
+
         // Handle line numbers as labels
         if let Token::LineNumber(n) = self.peek().clone() {
             self.advance();
-            return Ok(StmtKind::Label(n));
+            return Ok(Parsed::Item(StmtKind::Label(n)));
         }
 
         // A named label definition: `Retry:` at the start of a line.
@@ -806,10 +920,10 @@ impl Parser {
                 unreachable!("at_label_definition checked for an identifier")
             };
             self.advance(); // consume ':'
-            return Ok(StmtKind::LabelName(name));
+            return Ok(Parsed::Item(StmtKind::LabelName(name)));
         }
 
-        match self.peek().clone() {
+        let kind = match self.peek().clone() {
             Token::Print => self.parse_print(false),
             Token::Write => self.parse_print(true),
             Token::Swap => self.parse_swap(),
@@ -845,88 +959,15 @@ impl Parser {
             }
             Token::Open => self.parse_open(),
             Token::Close => self.parse_close(),
+            // `try_block_end` has already taken END followed by IF, SUB,
+            // FUNCTION or SELECT, so a bare END is the statement.
             Token::End => {
                 self.advance();
-                // Check for END IF, END SUB, END FUNCTION, END SELECT
-                match self.peek() {
-                    Token::If => {
-                        self.advance();
-                        // Return to caller - this is a terminator, not a statement
-                        Err(ParseError::Block(BlockEnd::EndIf))
-                    }
-                    Token::Sub => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndSub))
-                    }
-                    Token::Function => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndFunction))
-                    }
-                    Token::Select => {
-                        self.advance();
-                        Err(ParseError::Block(BlockEnd::EndSelect))
-                    }
-                    _ => Ok(StmtKind::End),
-                }
-            }
-            Token::EndIf => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndIf))
-            }
-            Token::EndSub => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndSub))
-            }
-            Token::EndFunction => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndFunction))
-            }
-            Token::EndSelect => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::EndSelect))
+                Ok(StmtKind::End)
             }
             Token::Stop => {
                 self.advance();
                 Ok(StmtKind::Stop)
-            }
-            Token::Next => {
-                self.advance();
-                // Skip optional variable name
-                if let Token::Ident(_) = self.peek() {
-                    self.advance();
-                }
-                Err(ParseError::Block(BlockEnd::Next))
-            }
-            Token::Wend => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::Wend))
-            }
-            Token::Loop => {
-                self.advance();
-                // Check for WHILE/UNTIL condition
-                match self.peek() {
-                    Token::While => {
-                        self.advance();
-                        let cond = self.parse_expression()?;
-                        Err(ParseError::Block(BlockEnd::LoopWhile(cond)))
-                    }
-                    Token::Until => {
-                        self.advance();
-                        let cond = self.parse_expression()?;
-                        Err(ParseError::Block(BlockEnd::LoopUntil(cond)))
-                    }
-                    _ => Err(ParseError::Block(BlockEnd::Loop)),
-                }
-            }
-            Token::Else => {
-                self.advance();
-                Err(ParseError::Block(BlockEnd::Else))
-            }
-            Token::ElseIf => {
-                self.advance();
-                let cond = self.parse_expression()?;
-                self.expect(Token::Then)?;
-                Err(ParseError::Block(BlockEnd::ElseIf(cond)))
             }
             Token::Select => self.parse_select_case(),
             // `parse_select_case` consumes CASE itself, so a CASE reaching here
@@ -952,7 +993,87 @@ impl Parser {
             // Newline and Colon are consumed by the skip loop above, so
             // reaching here means the statement itself is unrecognised.
             _ => err(format!("Unexpected token: {:?}", self.peek())),
-        }
+        }?;
+        Ok(Parsed::Item(kind))
+    }
+
+    /// Consume a block-closing keyword if one is next, leaving the position
+    /// untouched otherwise.
+    ///
+    /// `END` is the awkward one: alone it terminates the program, and only the
+    /// token after it decides. `NEXT` swallows its optional control variable,
+    /// and `LOOP`/`ELSEIF` carry the condition they were written with, so that
+    /// a terminator can never be separated from its expression.
+    fn try_block_end(&mut self) -> PResult<Option<BlockEnd>> {
+        let end = match self.peek().clone() {
+            Token::End => {
+                let closes = match self.peek_at(1) {
+                    Token::If => BlockEnd::EndIf,
+                    Token::Sub => BlockEnd::EndSub,
+                    Token::Function => BlockEnd::EndFunction,
+                    Token::Select => BlockEnd::EndSelect,
+                    // A bare END is the program-termination statement.
+                    _ => return Ok(None),
+                };
+                self.advance();
+                self.advance();
+                closes
+            }
+            Token::EndIf => {
+                self.advance();
+                BlockEnd::EndIf
+            }
+            Token::EndSub => {
+                self.advance();
+                BlockEnd::EndSub
+            }
+            Token::EndFunction => {
+                self.advance();
+                BlockEnd::EndFunction
+            }
+            Token::EndSelect => {
+                self.advance();
+                BlockEnd::EndSelect
+            }
+            Token::Next => {
+                self.advance();
+                // The control variable is optional and unchecked, as in GW-BASIC.
+                if matches!(self.peek(), Token::Ident(_)) {
+                    self.advance();
+                }
+                BlockEnd::Next
+            }
+            Token::Wend => {
+                self.advance();
+                BlockEnd::Wend
+            }
+            Token::Loop => {
+                self.advance();
+                match self.peek() {
+                    Token::While => {
+                        self.advance();
+                        BlockEnd::LoopWhile(self.parse_expression()?)
+                    }
+                    Token::Until => {
+                        self.advance();
+                        BlockEnd::LoopUntil(self.parse_expression()?)
+                    }
+                    _ => BlockEnd::Loop,
+                }
+            }
+            Token::Else => {
+                self.advance();
+                BlockEnd::Else
+            }
+            Token::ElseIf => {
+                self.advance();
+                let cond = self.parse_expression()?;
+                self.expect(Token::Then)?;
+                BlockEnd::ElseIf(cond)
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(end))
     }
 
     fn parse_print(&mut self, write: bool) -> PResult<StmtKind> {
@@ -1401,6 +1522,7 @@ impl Parser {
     }
 
     fn parse_if(&mut self) -> PResult<StmtKind> {
+        let if_line = self.cur_line();
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
         self.expect(Token::Then)?;
@@ -1426,7 +1548,7 @@ impl Parser {
 
         // Block IF - parse body, handling ELSEIF as nested IF
         self.skip_newlines();
-        let (then_branch, else_branch) = self.parse_if_body()?;
+        let (then_branch, else_branch) = self.parse_if_body(if_line)?;
 
         Ok(StmtKind::If {
             condition,
@@ -1476,62 +1598,54 @@ impl Parser {
                 kind: StmtKind::Goto(target),
             });
         }
-        self.parse_statement()
+        self.parse_inner_statement()
     }
 
-    /// Parse the body of an IF block, returning (then_branch, else_branch)
-    /// Handles ELSEIF by constructing nested IF statements in else_branch
-    fn parse_if_body(&mut self) -> PResult<(Vec<Stmt>, Option<Vec<Stmt>>)> {
-        let mut body = Vec::new();
+    /// Parse the body of an IF block, returning (then_branch, else_branch).
+    /// Handles ELSEIF by constructing nested IF statements in else_branch.
+    ///
+    /// `if_line` is the line of the IF or ELSEIF that opened this body, used to
+    /// blame the right line when END IF never arrives.
+    fn parse_if_body(&mut self, if_line: u32) -> PResult<(Vec<Stmt>, Option<Vec<Stmt>>)> {
+        let (body, end) = self.parse_block_body("IF", "END IF", if_line)?;
+        // Captured before the newline is skipped, so an ELSEIF's synthesized
+        // nested IF is attributed to the ELSEIF's own line: a terminator is
+        // followed by the newline that ends the line it was written on.
+        let elseif_line = self.cur_line();
 
-        loop {
-            // Captured before parsing so an ELSEIF's synthesized nested IF can
-            // be attributed to the ELSEIF line rather than to END IF.
-            let stmt_line = self.cur_line();
-            match self.parse_statement() {
-                Ok(stmt) => {
-                    body.push(stmt);
-                }
-                Err(ParseError::Block(BlockEnd::EndIf)) => {
-                    return Ok((body, None));
-                }
-                Err(ParseError::Block(BlockEnd::Else)) => {
-                    // Parse ELSE body until END IF
-                    self.skip_newlines();
-                    let mut else_body = Vec::new();
-                    loop {
-                        match self.parse_statement() {
-                            Ok(stmt) => else_body.push(stmt),
-                            Err(ParseError::Block(BlockEnd::EndIf)) => break,
-                            Err(e) => return Err(e),
-                        }
-                        self.skip_newlines();
-                    }
-                    return Ok((body, Some(else_body)));
-                }
-                Err(ParseError::Block(BlockEnd::ElseIf(elseif_condition))) => {
-                    // Recursively parse the rest as a nested IF
-                    self.skip_newlines();
-                    let (nested_then, nested_else) = self.parse_if_body()?;
-
-                    let nested_if = Stmt {
-                        line: stmt_line,
-                        kind: StmtKind::If {
-                            condition: elseif_condition,
-                            then_branch: nested_then,
-                            else_branch: nested_else,
-                        },
-                    };
-
-                    return Ok((body, Some(vec![nested_if])));
-                }
-                Err(e) => return Err(e),
+        match end {
+            BlockEnd::EndIf => Ok((body, None)),
+            BlockEnd::Else => {
+                self.skip_newlines();
+                let else_body = self.parse_block(BlockEnd::EndIf, "IF", if_line)?;
+                Ok((body, Some(else_body)))
             }
-            self.skip_newlines();
+            BlockEnd::ElseIf(condition) => {
+                // The rest of the chain is an IF nested in this one's ELSE.
+                self.skip_newlines();
+                let (nested_then, nested_else) = self.parse_if_body(if_line)?;
+                let nested_if = Stmt {
+                    line: elseif_line,
+                    kind: StmtKind::If {
+                        condition,
+                        then_branch: nested_then,
+                        else_branch: nested_else,
+                    },
+                };
+                Ok((body, Some(vec![nested_if])))
+            }
+            other => Err(ParseError::ErrorAt(
+                if_line,
+                format!(
+                    "IF needs END IF to close it, but {} came first",
+                    other.keyword()
+                ),
+            )),
         }
     }
 
     fn parse_for(&mut self) -> PResult<StmtKind> {
+        let for_line = self.cur_line();
         self.advance(); // consume FOR
         let var = if let Token::Ident(n) = self.advance() {
             n
@@ -1553,15 +1667,7 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Next)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(BlockEnd::Next, "FOR", for_line)?;
 
         Ok(StmtKind::For {
             var,
@@ -1573,24 +1679,18 @@ impl Parser {
     }
 
     fn parse_while(&mut self) -> PResult<StmtKind> {
+        let while_line = self.cur_line();
         self.advance(); // consume WHILE
         let condition = self.parse_expression()?;
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Wend)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(BlockEnd::Wend, "WHILE", while_line)?;
 
         Ok(StmtKind::While { condition, body })
     }
 
     fn parse_do_loop(&mut self) -> PResult<StmtKind> {
+        let do_line = self.cur_line();
         self.advance(); // consume DO
 
         // Check for DO WHILE/UNTIL at start
@@ -1608,28 +1708,21 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        let mut end_condition: Option<Expr> = None;
-        let mut end_is_until = false;
-
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::Loop)) => break,
-                Err(ParseError::Block(BlockEnd::LoopWhile(cond))) => {
-                    end_condition = Some(cond);
-                    end_is_until = false;
-                    break;
-                }
-                Err(ParseError::Block(BlockEnd::LoopUntil(cond))) => {
-                    end_condition = Some(cond);
-                    end_is_until = true;
-                    break;
-                }
-                Err(e) => return Err(e),
+        let (body, end) = self.parse_block_body("DO", "LOOP", do_line)?;
+        let (end_condition, end_is_until) = match end {
+            BlockEnd::Loop => (None, false),
+            BlockEnd::LoopWhile(cond) => (Some(cond), false),
+            BlockEnd::LoopUntil(cond) => (Some(cond), true),
+            other => {
+                return Err(ParseError::ErrorAt(
+                    do_line,
+                    format!(
+                        "DO needs LOOP to close it, but {} came first",
+                        other.keyword()
+                    ),
+                ));
             }
-            self.skip_newlines();
-        }
+        };
 
         // A loop tests at one end or the other. These used to be merged with
         // `condition.or(end_condition)`, which silently discarded the one on
@@ -1655,6 +1748,7 @@ impl Parser {
     }
 
     fn parse_select_case(&mut self) -> PResult<StmtKind> {
+        let select_line = self.cur_line();
         self.advance(); // consume SELECT
         self.expect(Token::Case)?;
         let expr = self.parse_expression()?;
@@ -1664,6 +1758,17 @@ impl Parser {
 
         // Parse CASE blocks until END SELECT
         loop {
+            // The body loop below stops at end of file rather than spinning, so
+            // this is where an unterminated SELECT CASE is caught. It used to
+            // fall through to `expect(Token::Case)` and report "Expected Case,
+            // got Eof" against the last line of the file.
+            if matches!(self.peek(), Token::Eof) {
+                return Err(ParseError::ErrorAt(
+                    select_line,
+                    "SELECT CASE is missing its END SELECT".to_string(),
+                ));
+            }
+
             // Check for END SELECT
             if self.at_end_select() {
                 // Consume END SELECT
@@ -1698,7 +1803,7 @@ impl Parser {
                     break;
                 }
 
-                body.push(self.parse_statement()?);
+                body.push(self.parse_inner_statement()?);
                 self.skip_newlines();
             }
 
@@ -1958,6 +2063,7 @@ impl Parser {
     }
 
     fn parse_sub(&mut self) -> PResult<StmtKind> {
+        let sub_line = self.cur_line();
         self.advance(); // consume SUB
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -1984,21 +2090,14 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::EndSub)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(BlockEnd::EndSub, &format!("SUB '{}'", name), sub_line)?;
 
         Ok(StmtKind::Sub { name, params, body })
     }
 
     /// `FUNCTION name(params)` ... `END FUNCTION`
     fn parse_function(&mut self) -> PResult<StmtKind> {
+        let fn_line = self.cur_line();
         self.advance(); // consume FUNCTION
         let name = if let Token::Ident(n) = self.advance() {
             n
@@ -2033,15 +2132,11 @@ impl Parser {
 
         self.skip_newlines();
 
-        let mut body = Vec::new();
-        loop {
-            match self.parse_statement() {
-                Ok(stmt) => body.push(stmt),
-                Err(ParseError::Block(BlockEnd::EndFunction)) => break,
-                Err(e) => return Err(e),
-            }
-            self.skip_newlines();
-        }
+        let body = self.parse_block(
+            BlockEnd::EndFunction,
+            &format!("FUNCTION '{}'", name),
+            fn_line,
+        )?;
 
         Ok(StmtKind::Function {
             name,

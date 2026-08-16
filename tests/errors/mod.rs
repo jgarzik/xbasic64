@@ -933,6 +933,70 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// An unclosed block names the construct and the line that opened it.
+///
+/// None of the seven hand-written body loops checked for end of file. They
+/// stopped only because an unrecognised token became "Unexpected token: Eof",
+/// so every one of these reported that against the last line of the file and
+/// named nothing at all -- the reader was told where the parser gave up rather
+/// than where the mistake was.
+#[test]
+fn test_unclosed_blocks_name_their_opener() {
+    let cases = [
+        (
+            "PRINT 1\nFOR I = 1 TO 10\nPRINT I\n",
+            "FOR is missing its NEXT",
+        ),
+        (
+            "PRINT 1\nSUB Foo\nPRINT 1\n",
+            "SUB 'FOO' is missing its END SUB",
+        ),
+        (
+            "FUNCTION Bar(X)\nBar = X\n",
+            "FUNCTION 'BAR' is missing its END FUNCTION",
+        ),
+        ("WHILE X < 3\nX = X + 1\n", "WHILE is missing its WEND"),
+        ("DO\nX = X + 1\n", "DO is missing its LOOP"),
+        ("IF X = 1 THEN\nPRINT 1\n", "IF is missing its END IF"),
+        (
+            "SELECT CASE X\nCASE 1\nPRINT 1\n",
+            "SELECT CASE is missing its END SELECT",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+    }
+}
+
+/// The opener's line is the one reported, not end of file.
+#[test]
+fn test_unclosed_block_reports_the_opening_line() {
+    let e = compile_only("PRINT 1\nPRINT 2\nFOR I = 1 TO 10\nPRINT I\nPRINT I\n")
+        .expect_err("an unclosed FOR must be refused");
+    assert!(
+        e.contains(":3: error:"),
+        "should blame the FOR on line 3, not end of file: {}",
+        e.stderr
+    );
+}
+
+/// A block closed by the wrong terminator says which one it wanted.
+#[test]
+fn test_mismatched_block_terminator_names_both() {
+    expect_rejected(
+        "FOR I = 1 TO 3\nPRINT I\nWEND\n",
+        "FOR needs NEXT to close it, but WEND came first",
+    );
+    expect_rejected(
+        "WHILE X < 3\nX = X + 1\nNEXT\n",
+        "WHILE needs WEND to close it, but NEXT came first",
+    );
+    expect_rejected(
+        "DO\nX = X + 1\nEND SUB\n",
+        "DO needs LOOP to close it, but END SUB came first",
+    );
+}
+
 /// Pathological nesting is diagnosed, not fatal.
 ///
 /// The expression parser recursed without a bound, so 50,000 nested parens --
