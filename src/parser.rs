@@ -1505,19 +1505,7 @@ impl Parser {
             None
         };
         // A record field path may follow: v.field.sub
-        let mut fields = Vec::new();
-        while matches!(self.peek(), Token::Dot) {
-            self.advance();
-            match self.advance() {
-                Token::Ident(f) => fields.push(f),
-                tok => {
-                    return err(format!(
-                        "Expected a field name after '.', got {}",
-                        describe_token(&tok)
-                    ));
-                }
-            }
-        }
+        let fields = self.parse_field_path()?;
         Ok(LValue {
             name,
             indices,
@@ -1548,19 +1536,7 @@ impl Parser {
 
         // A record field assignment: v.field... = value
         if matches!(self.peek(), Token::Dot) {
-            let mut fields = Vec::new();
-            while matches!(self.peek(), Token::Dot) {
-                self.advance();
-                match self.advance() {
-                    Token::Ident(f) => fields.push(f),
-                    tok => {
-                        return err(format!(
-                            "Expected a field name after '.', got {}",
-                            describe_token(&tok)
-                        ));
-                    }
-                }
-            }
+            let fields = self.parse_field_path()?;
             self.expect(Token::Eq)?;
             let value = self.parse_expression()?;
             return Ok(StmtKind::FieldAssign {
@@ -1584,19 +1560,7 @@ impl Parser {
 
             // arr(i).field... = value
             if matches!(self.peek(), Token::Dot) {
-                let mut fields = Vec::new();
-                while matches!(self.peek(), Token::Dot) {
-                    self.advance();
-                    match self.advance() {
-                        Token::Ident(f) => fields.push(f),
-                        tok => {
-                            return err(format!(
-                                "Expected a field name after '.', got {}",
-                                describe_token(&tok)
-                            ));
-                        }
-                    }
-                }
+                let fields = self.parse_field_path()?;
                 self.expect(Token::Eq)?;
                 let value = self.parse_expression()?;
                 return Ok(StmtKind::FieldAssign {
@@ -2578,6 +2542,29 @@ impl Parser {
 
     /// Precedence-climbing parser for binary expressions
     /// min_prec: minimum precedence level to parse at this level
+    /// Consume a `.field.sub` chain, returning the names.
+    ///
+    /// The statement-level twin of [`Self::parse_field_chain`], which builds
+    /// `Expr::Field` nodes instead. Assignment targets keep their path as a
+    /// plain list of names inside an `LValue`, and three statement parsers
+    /// spelled this loop out identically before it was hoisted here.
+    fn parse_field_path(&mut self) -> PResult<Vec<String>> {
+        let mut fields = Vec::new();
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            match self.advance() {
+                Token::Ident(f) => fields.push(f),
+                tok => {
+                    return err(format!(
+                        "Expected a field name after '.', got {}",
+                        describe_token(&tok)
+                    ));
+                }
+            }
+        }
+        Ok(fields)
+    }
+
     /// Consume any `.field` chain following an expression.
     fn parse_field_chain(&mut self, mut base: Expr) -> PResult<Expr> {
         while matches!(self.peek(), Token::Dot) {

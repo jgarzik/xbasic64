@@ -1265,3 +1265,117 @@ fn test_random_access_keywords_are_not_reserved() {
         });
     }
 }
+
+/// The front end must never panic, whatever it is fed.
+///
+/// A compiler may reject its input; it may not die on it. The stack overflow on
+/// deeply nested expressions was exactly this class of bug and survived 314
+/// tests, because every one of them fed the compiler a program someone had
+/// thought about. This feeds it token soup instead: every result is acceptable
+/// except a panic or an abort, which `is_clean_rejection` distinguishes by exit
+/// code (1 = diagnosed, 101 = Rust panic, 134 = abort).
+#[test]
+fn test_front_end_never_panics_on_token_soup() {
+    // Deterministic, so a failure is reproducible from the seed alone.
+    let pieces = [
+        "PRINT",
+        "IF",
+        "THEN",
+        "ELSE",
+        "END",
+        "SUB",
+        "FUNCTION",
+        "FOR",
+        "NEXT",
+        "WHILE",
+        "WEND",
+        "DO",
+        "LOOP",
+        "UNTIL",
+        "SELECT",
+        "CASE",
+        "DIM",
+        "TYPE",
+        "AS",
+        "GOTO",
+        "GOSUB",
+        "RETURN",
+        "MID$",
+        "LEN",
+        "(",
+        ")",
+        ",",
+        ";",
+        ":",
+        "#",
+        ".",
+        "=",
+        "<>",
+        "+",
+        "-",
+        "*",
+        "/",
+        "^",
+        "\"s\"",
+        "1",
+        "1.5",
+        "&HFF",
+        "A",
+        "B$",
+        "C%",
+        "\n",
+        "REM x",
+        "'c",
+        "LINE INPUT",
+        "SWAP",
+        "CONST",
+        "EXIT",
+        "OPTION",
+        "BASE",
+        "REDIM",
+        "PRESERVE",
+        "DATA",
+        "READ",
+        "RESTORE",
+        "OPEN",
+        "FIELD",
+        "LSET",
+        "GET",
+        "PUT",
+        "LOCK",
+        "STEP",
+        "TO",
+        "NOT",
+        "AND",
+        "OR",
+        "XOR",
+        "MOD",
+    ];
+    // xorshift, so the corpus is fixed without pulling in a rng crate.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    for case in 0..300 {
+        let len = 1 + (next() % 40) as usize;
+        let mut source = String::new();
+        for _ in 0..len {
+            source.push_str(pieces[(next() % pieces.len() as u64) as usize]);
+            source.push(' ');
+        }
+        source.push('\n');
+
+        if let Err(e) = compile_only(&source) {
+            assert!(
+                e.is_clean_rejection(),
+                "case {case} must be diagnosed, not crash; exit={:?}\nsource: {source:?}\nstderr: {}",
+                e.exit_code,
+                e.stderr
+            );
+        }
+    }
+}
