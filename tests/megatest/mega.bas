@@ -390,6 +390,18 @@ Chose$ = "third"
 DoneChoosing:
 Check "ON GOTO", Chose$, "second"
 
+Counter = 0
+ON 2 GOSUB Bump, BumpTwice
+Check "ON GOSUB dispatches", STR$(Counter), "2"
+ON 1 GOSUB Bump, BumpTwice
+Check "ON GOSUB returns to the next statement", STR$(Counter), "3"
+ON 0 GOSUB Bump, BumpTwice
+Check "ON GOSUB ignores a zero selector", STR$(Counter), "3"
+ON 9 GOSUB Bump, BumpTwice
+Check "ON GOSUB ignores a selector past the end", STR$(Counter), "3"
+GOSUB Bump
+Check "ON GOSUB leaves the return stack balanced", STR$(Counter), "4"
+
 ' ---------------------------------------------------------------------------
 ' Procedures
 ' ---------------------------------------------------------------------------
@@ -681,6 +693,10 @@ END
 ' ---------------------------------------------------------------------------
 Bump:
 Counter = Counter + 1
+RETURN
+
+BumpTwice:
+Counter = Counter + 2
 RETURN
 
 ' ---------------------------------------------------------------------------

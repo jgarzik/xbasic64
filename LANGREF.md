@@ -519,7 +519,7 @@ END
 1010 RETURN
 ```
 
-### ON...GOTO
+### ON...GOTO / ON...GOSUB
 
 Computed jump:
 
@@ -532,6 +532,25 @@ ON Choice GOTO 100, 200, 300
 210 END
 300 PRINT "three"
 ```
+
+`ON...GOSUB` calls the chosen subroutine instead, and every `RETURN` comes back
+to the statement after the `ON`, whichever one ran:
+
+```basic
+ON Choice GOSUB Draw, Erase
+PRINT "back, whichever ran"
+END
+Draw:
+PRINT "drawing"
+RETURN
+Erase:
+PRINT "erasing"
+RETURN
+```
+
+The selector is truncated to an integer. A value that matches nothing -- zero,
+negative, or past the end of the list -- runs no subroutine and continues with
+the next statement.
 
 ### DIM
 

@@ -120,6 +120,15 @@ pub enum StmtKind {
         expr: Expr,
         targets: Vec<GotoTarget>,
     },
+    /// `ON expr GOSUB t1, t2, ...` -- call the nth subroutine.
+    ///
+    /// Separate from `OnGoto` rather than a flag on it, because the generated
+    /// code differs in more than the jump: there is a return address to push,
+    /// and it must *not* be pushed when the selector matches nothing.
+    OnGosub {
+        expr: Expr,
+        targets: Vec<GotoTarget>,
+    },
     Dim {
         decls: Vec<Declarator>,
     },
@@ -1686,10 +1695,21 @@ impl Parser {
         }
     }
 
+    /// `ON expr GOTO t, ...` and `ON expr GOSUB t, ...`, which differ only in
+    /// the one keyword and in whether the subroutine comes back.
     fn parse_on_goto(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ON
         let expr = self.parse_expression()?;
-        self.expect(Token::Goto)?;
+        let is_gosub = match self.advance() {
+            Token::Goto => false,
+            Token::Gosub => true,
+            tok => {
+                return err(format!(
+                    "Expected GOTO or GOSUB after ON, got {}",
+                    describe_token(&tok)
+                ));
+            }
+        };
 
         let mut targets = Vec::new();
         loop {
@@ -1701,7 +1721,11 @@ impl Parser {
             }
         }
 
-        Ok(StmtKind::OnGoto { expr, targets })
+        Ok(if is_gosub {
+            StmtKind::OnGosub { expr, targets }
+        } else {
+            StmtKind::OnGoto { expr, targets }
+        })
     }
 
     fn parse_dim(&mut self) -> PResult<StmtKind> {

@@ -881,6 +881,12 @@ impl Analyzer {
                     self.check_target(t, line, "ON ... GOTO");
                 }
             }
+            StmtKind::OnGosub { expr, targets } => {
+                self.check_expr(expr, scope, line);
+                for t in targets {
+                    self.check_target(t, line, "ON ... GOSUB");
+                }
+            }
             StmtKind::Restore(Some(target)) => self.check_target(target, line, "RESTORE"),
             StmtKind::Dim { decls } => {
                 for decl in decls {

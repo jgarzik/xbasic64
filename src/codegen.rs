@@ -1176,7 +1176,9 @@ impl CodeGen {
     fn preprocess(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Data(values) => self.data_items.extend(values.clone()),
-            StmtKind::Gosub(_) => self.gosub_used = true,
+            // Both forms push a return address, so both need the GOSUB stack
+            // emitted; without this, ON ... GOSUB alone failed to link.
+            StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => self.gosub_used = true,
             // Record where each label sits in the DATA stream, so RESTORE can
             // resume from it.
             StmtKind::Label(n) => {
@@ -2003,6 +2005,54 @@ impl CodeGen {
                     self.emit(&format!("    cmp rax, {}", i + 1));
                     self.emit(&format!("    je {}", label));
                 }
+            }
+
+            StmtKind::OnGosub { expr, targets } => {
+                // One return address serves the whole statement: whichever
+                // subroutine runs, RETURN comes back to the same place, which
+                // is the statement after this one.
+                //
+                // That address must not be pushed when the selector picks
+                // nothing, or a GOSUB that never happened would leave a frame
+                // behind and the next RETURN would jump to it. So the range is
+                // checked first, and out-of-range branches past the push --
+                // to the very label the return address points at, since
+                // "matched nothing" and "came back" continue identically.
+                let expr_type = self.gen_expr(expr);
+                if expr_type.is_integer() {
+                    self.emit("    movsxd rax, eax");
+                } else {
+                    self.emit("    cvttsd2si rax, xmm0");
+                }
+                // The push sequence below needs rax and rcx, so the selector
+                // is parked in r8: caller-saved on both ABIs, and nothing is
+                // called between here and the dispatch.
+                self.emit("    mov r8, rax");
+
+                let after = self.new_label("on_gosub_ret");
+                self.emit("    cmp r8, 1");
+                self.emit(&format!("    jl {}", after));
+                self.emit(&format!("    cmp r8, {}", targets.len()));
+                self.emit(&format!("    jg {}", after));
+
+                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+                self.emit("    sub rcx, 8");
+                self.emit("    lea rax, [rip + _gosub_stack]");
+                self.emit("    cmp rcx, rax");
+                self.emit_check("jb", RtError::GosubOverflow);
+                self.emit(&format!("    lea rax, [rip + {}]", after));
+                self.emit("    mov QWORD PTR [rcx], rax");
+                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+
+                for (i, target) in targets.iter().enumerate() {
+                    let label = match target {
+                        GotoTarget::Line(n) => format!("_line_{}", n),
+                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
+                    };
+                    self.emit(&format!("    cmp r8, {}", i + 1));
+                    self.emit(&format!("    je {}", label));
+                }
+                self.emit_label(&after);
             }
 
             StmtKind::Dim { decls } => {

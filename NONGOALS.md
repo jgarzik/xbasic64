@@ -191,7 +191,7 @@ Reference*. Every entry has a status:
 | `CVD` | yes | `ON PLAY(n)` | never |
 | `CVI` | yes | `ON STRIG(n)` | never |
 | `CVS` | yes | `ON TIMER(n)` | never |
-| `DATA` | yes | `ON...GOSUB` | later |
+| `DATA` | yes | `ON...GOSUB` | yes |
 | `DATE$` | later | `ON...GOTO` | yes |
 | `DEF FN` | yes | `OPEN` | yes |
 | `DEF SEG` | never | `OPEN "COM(n)"` | never |
