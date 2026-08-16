@@ -455,6 +455,68 @@ _rt_space:
     leave
     ret
 
+# _rt_fixed - Fit a string to a declared width, for STRING * n
+#
+# A fixed-length string always holds exactly its declared number of characters:
+# a shorter value is padded with spaces on the right, a longer one is truncated.
+# Assignment used to store the source verbatim, so `STRING * 5` held whatever it
+# was given and the declared width meant nothing.
+#
+# A fresh buffer rather than an interior pointer, because the result is stored
+# and the source may be a temporary.
+#
+# Arguments: rdi = source pointer, rsi = source length, rdx = width
+# Returns:   rax = pointer, rdx = width
+.globl _rt_fixed
+_rt_fixed:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    mov r12, rdi            # source pointer
+    mov r13, rsi            # source length
+    mov rbx, rdx            # width
+    cmp rbx, 0
+    jge .Lfixed_ok
+    xor rbx, rbx            # a non-positive width yields the empty string
+.Lfixed_ok:
+    # Copy at most `width` bytes.
+    mov r14, r13
+    cmp r14, rbx
+    jbe .Lfixed_have_n
+    mov r14, rbx
+.Lfixed_have_n:
+
+    lea rdi, [rbx + 1]      # room for the NUL the string helpers expect
+    call malloc
+
+    # Space-fill the whole width first, then overwrite the prefix; memset
+    # returns its destination, so the pointer survives without a save.
+    mov rdi, rax
+    mov esi, ' '
+    mov rdx, rbx
+    call memset
+
+    # memcpy(dest, src, min(len, width)). rax still holds the buffer.
+    mov rdi, rax
+    mov rsi, r12
+    mov rdx, r14
+    mov r13, rax            # keep the buffer across the call; a push here
+    call memcpy             # would leave rsp misaligned
+    mov rax, r13
+
+    mov rdx, rbx            # the result is always `width` long
+
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    leave
+    ret
+
 # _rt_string_n - STRING$(n, ch): a string of n copies of one character
 # Arguments: rdi = count, rsi = character code
 # Returns:   rax = pointer, rdx = length

@@ -2037,8 +2037,16 @@ impl Analyzer {
         match expr {
             Expr::Literal(Literal::String(_)) => Some(true),
             Expr::Literal(_) => Some(false),
-            Expr::Variable(name) => Some(name.ends_with('$')),
-            Expr::ArrayAccess { name, .. } => Some(name.ends_with('$')),
+            // A `$` suffix is the usual way to be a string, but not the only
+            // one: `DIM S AS STRING * 4` says so with no suffix at all, and
+            // without consulting that, `LEN(S)` and `S = "xy"` were both
+            // rejected as numeric.
+            Expr::Variable(name) | Expr::ArrayAccess { name, .. } => {
+                Some(match self.symbols.typed_var(scope, name) {
+                    Some(t) => matches!(t, TypeRef::FixedString(_)),
+                    None => name.ends_with('$'),
+                })
+            }
             Expr::Unary { .. } => Some(false),
             Expr::Binary { op, left, .. } => {
                 if matches!(

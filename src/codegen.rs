@@ -5066,8 +5066,16 @@ impl CodeGen {
                 self.gen_coercion(value_type, DataType::Double);
                 emit!(self, "    movsd {}, xmm0", loc.q(0));
             }
-            TypeRef::FixedString(_) => {
-                self.emit_string_copy();
+            TypeRef::FixedString(width) => {
+                // A fixed-length string holds exactly its declared width: a
+                // short value is space-padded, a long one truncated. Storing
+                // the source verbatim -- as this did -- made the width mean
+                // nothing, so `STRING * 5` held whatever it was given and a
+                // record laid over a random-access file stopped lining up.
+                self.emit_arg_reg(0, "rax");
+                self.emit_arg_reg(1, "rdx");
+                self.emit_arg_imm(2, *width as i64);
+                self.emit("    call _rt_fixed");
                 emit!(self, "    mov {}, rax", loc.q(0));
                 emit!(self, "    mov {}, rdx", loc.q(1));
             }

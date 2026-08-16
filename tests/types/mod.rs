@@ -209,7 +209,10 @@ fn test_type_records() {
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines[0], "0", "a record starts zeroed");
     assert_eq!(lines[1], "71000002.51.25", "each field keeps its own type");
-    assert_eq!(lines[2], "hello5");
+    // A `STRING * 20` field holds twenty characters whatever it is given, so
+    // "hello" is space-padded and LEN is 20. This asserted "hello5" while
+    // assignment stored the source verbatim and the declared width did nothing.
+    assert_eq!(lines[2], "hello               20");
 }
 
 /// A TYPE may contain another TYPE, to any depth.
@@ -330,7 +333,8 @@ fn test_as_typed_variables() {
     )
     .unwrap();
     let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["42hi", "84"]);
+    // `S` is `STRING * 10`, so "hi" is padded to ten characters.
+    assert_eq!(lines, vec!["42hi        ", "84"]);
 }
 
 /// A typed parameter, and a FUNCTION with a declared result type.
@@ -378,4 +382,60 @@ fn test_record_argument_from_nested_field() {
     )
     .unwrap();
     assert_eq!(output.trim(), "4");
+}
+
+/// A `STRING * n` field always holds exactly n characters.
+///
+/// Assignment stored the source verbatim, so the declared width did nothing at
+/// all: a longer value was kept whole and a shorter one stayed short. That is
+/// the entire purpose of a fixed-length string, and it is what makes a record
+/// laid out over a random-access file line up.
+#[test]
+fn test_fixed_length_string_pads_and_truncates() {
+    let output = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 5
+END TYPE
+DIM P AS R
+P.N = "abcdefgh"
+PRINT "["; P.N; "]"
+PRINT LEN(P.N)
+P.N = "ab"
+PRINT "["; P.N; "]"
+PRINT LEN(P.N)
+P.N = ""
+PRINT "["; P.N; "]"
+PRINT LEN(P.N)
+P.N = "exact"
+PRINT "["; P.N; "]"
+PRINT LEN(P.N)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &[
+            "[abcde]", "5", "[ab   ]", "5", "[     ]", "5", "[exact]", "5"
+        ]
+    );
+}
+
+/// The same for a standalone `DIM ... AS STRING * n`, and it compares equal to
+/// the padded text.
+#[test]
+fn test_fixed_length_string_variable() {
+    let output = compile_and_run(
+        r#"
+DIM S AS STRING * 4
+S = "xy"
+PRINT "["; S; "]"
+PRINT S = "xy  "
+PRINT LEN(S)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["[xy  ]", "-1", "4"]);
 }

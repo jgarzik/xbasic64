@@ -543,7 +543,9 @@ fn test_swap_record_string_fields() {
         "TYPE P\nN AS STRING * 8\nEND TYPE\nDIM A AS P\nDIM B AS P\nA.N = \"aa\"\nB.N = \"bb\"\nSWAP A.N, B.N\nPRINT A.N; \" \"; B.N\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "bb aa");
+    // Both fields are `STRING * 8`, so each is padded to eight characters;
+    // `output.trim()` removes only the trailing pad of the second.
+    assert_eq!(output.trim(), "bb       aa");
 }
 
 /// And for a field of an array element, whose address is only known at run
