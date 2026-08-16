@@ -680,3 +680,78 @@ PRINT Y
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "24464");
 }
+
+/// Each runtime helper is emitted into a section of its own.
+///
+/// A linker discards an unreferenced *section*, never an unreferenced label,
+/// so this is what lets `--gc-sections` drop the helpers a program does not
+/// call. Without it all 69 went into every binary.
+#[test]
+fn test_runtime_helpers_get_their_own_sections() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let bas = tmp.path().join("t.bas");
+    std::fs::write(&bas, "PRINT \"hi\"\n").expect("write");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg("-S")
+        .arg(&bas)
+        .arg("-o")
+        .arg(tmp.path().join("t"))
+        .output()
+        .expect("run compiler");
+    assert!(out.status.success());
+    let asm = std::fs::read_to_string(tmp.path().join("t.s")).expect("read asm");
+
+    let sections = asm.matches(".section .text._rt_").count();
+    let labels = asm
+        .lines()
+        .filter(|l| l.starts_with("_rt_") && l.ends_with(':'))
+        .count();
+    assert!(labels > 50, "expected the whole runtime, saw {}", labels);
+    assert_eq!(
+        sections, labels,
+        "every helper label needs a section directive of its own"
+    );
+}
+
+/// No runtime helper may fall through into the next one.
+///
+/// Sections are not laid out in source order, so a helper that ran off its
+/// end into its neighbour would land somewhere else entirely once each is
+/// sectioned separately. `_rt_lcase` used to do this, into `_rt_case_convert`.
+#[test]
+fn test_no_runtime_helper_falls_through() {
+    for tree in ["sysv", "win64-native"] {
+        for file in [
+            "print.s", "input.s", "string.s", "math.s", "data.s", "file.s", "error.s", "using.s",
+        ] {
+            let path = format!("src/runtime/{}/{}", tree, file);
+            let text = std::fs::read_to_string(&path).expect(&path);
+            let mut previous: Option<String> = None;
+            for line in text.lines() {
+                let t = line.trim();
+                if t.starts_with("_rt_") && t.ends_with(':') {
+                    if let Some(prev) = &previous {
+                        let op = prev.split_whitespace().next().unwrap_or("");
+                        // `_rt_error` never returns, so reaching a label after
+                        // a call to it is not a fall-through.
+                        let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
+                            || prev.starts_with("call _rt_error");
+                        assert!(terminal, "{} falls into {} from `{}`", path, t, prev);
+                    }
+                }
+                // Track the last thing that is an instruction: not a comment,
+                // not a directive, and not a label -- including the
+                // `name: .skip 1024` form, whose first token ends in a colon
+                // but whose line does not.
+                let first = t.split_whitespace().next().unwrap_or("");
+                if !t.is_empty()
+                    && !t.starts_with('#')
+                    && !t.starts_with('.')
+                    && !first.ends_with(':')
+                {
+                    previous = Some(t.to_string());
+                }
+            }
+        }
+    }
+}

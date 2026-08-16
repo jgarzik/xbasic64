@@ -27,6 +27,14 @@ struct Runtime {
     /// Appended after the last part. Object-format specific, so it is a
     /// property of the tree rather than something [`emit`] decides.
     trailer: &'static str,
+    /// Directive putting one helper in a section of its own, with `{}` where
+    /// its name goes. Empty leaves the whole runtime in one `.text`.
+    ///
+    /// A linker discards an unreferenced *section*, never an unreferenced
+    /// label, so this is what lets a program drop the helpers it never calls.
+    /// Object-format specific, and the flags are not the same spelling on
+    /// COFF, which is why it lives here rather than in [`emit`].
+    function_section: &'static str,
 }
 
 // Under test both trees are compiled in, so the one this host does not use is
@@ -49,6 +57,7 @@ const SYSV: Runtime = Runtime {
     // and the program it links really does get a writable, executable stack.
     // This runtime never runs code from the stack, so say so.
     trailer: ".section .note.GNU-stack,\"\",@progbits\n",
+    function_section: ".section .text.{},\"ax\",@progbits\n",
 };
 
 #[cfg(any(test, windows))]
@@ -66,7 +75,48 @@ const WIN64: Runtime = Runtime {
     ],
     // COFF has no equivalent note, and clang rejects the ELF spelling.
     trailer: "",
+    // Left alone deliberately: the ELF flag spelling is not COFF's, and there
+    // is no COFF assembler on the machine this was developed on -- not clang,
+    // not llvm-mc, not mingw -- so the directive could not be checked even for
+    // syntax. Windows keeps the whole runtime; correctness is not affected.
+    function_section: "",
 };
+
+/// Put each `_rt_*` helper in `part` into a section of its own.
+///
+/// Done here rather than by hand in the sources so that a helper added later
+/// is covered without anyone remembering to, and so the two trees cannot
+/// drift apart on it.
+///
+/// Only the exported entry points are split. A helper's internal `.L` labels
+/// stay with it, and a private label that is *not* an entry point -- like
+/// `_rt_case_convert`, which `_rt_ucase` and `_rt_lcase` both jump to -- gets
+/// its own section too and is kept alive by those references.
+///
+/// This is only sound because no helper falls through into the next one:
+/// sections are not laid out in source order, so a fall-through would land
+/// somewhere else entirely. `_rt_lcase` used to, and now jumps explicitly.
+fn split_helpers(part: &str, template: &str) -> String {
+    let mut output = String::with_capacity(part.len() + part.len() / 8);
+    for line in part.lines() {
+        if let Some(name) = helper_label(line) {
+            output.push_str(&template.replace("{}", name));
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
+/// The helper name on a line that is exactly a `_rt_*` label definition.
+fn helper_label(line: &str) -> Option<&str> {
+    let name = line.strip_prefix("_rt_")?.strip_suffix(':')?;
+    // A label and nothing else: `_rt_foo:` yes, `_rt_foo: .quad 0` no.
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        return None;
+    }
+    Some(&line[..line.len() - 1])
+}
 
 /// Concatenate one runtime tree into a single assembly unit.
 fn emit(rt: &Runtime) -> String {
@@ -80,7 +130,11 @@ fn emit(rt: &Runtime) -> String {
     output.push_str("\n.text\n\n");
 
     for part in rt.parts {
-        output.push_str(part);
+        if rt.function_section.is_empty() {
+            output.push_str(part);
+        } else {
+            output.push_str(&split_helpers(part, rt.function_section));
+        }
         output.push('\n');
     }
 

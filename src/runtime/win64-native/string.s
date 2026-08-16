@@ -523,6 +523,8 @@ _rt_ucase:
 .globl _rt_lcase
 _rt_lcase:
     xor r9b, r9b
+    # An explicit jump, not a fall-through: see the System V tree.
+    jmp _rt_case_convert
 
 _rt_case_convert:
     push rbp

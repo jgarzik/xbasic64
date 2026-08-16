@@ -215,9 +215,21 @@ fn main() {
         ])
         .output();
 
+    // --gc-sections drops the runtime helpers this program never calls. The
+    // runtime emits each into a section of its own for exactly this; without
+    // that the flag has nothing to work with, since a linker discards
+    // unreferenced sections, never unreferenced labels. All 69 helpers used to
+    // be linked into every program: `PRINT "hi"` calls three of them.
     #[cfg(not(windows))]
     let cc_output = Command::new("cc")
-        .args(["-o", &exe_file, &obj_file, "-lm", "-no-pie"])
+        .args([
+            "-o",
+            &exe_file,
+            &obj_file,
+            "-lm",
+            "-no-pie",
+            "-Wl,--gc-sections",
+        ])
         .output();
 
     match cc_output {
