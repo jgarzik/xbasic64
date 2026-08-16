@@ -35,8 +35,9 @@ pub fn normalized(name: &str) -> &str {
 /// switch on length followed by a memcmp chain, so there is no lazy-init check,
 /// no hashing and no clone of the matched token on every identifier scanned.
 ///
-/// REM is absent deliberately -- `next_token` intercepts it before this is
-/// reached, because it introduces a comment rather than producing a token.
+/// REM and DATA are absent deliberately -- `next_token` intercepts both before
+/// this is reached. REM introduces a comment; DATA's operand is raw text rather
+/// than a token sequence, so it arrives as a single `Token::DataText`.
 fn keyword(s: &str) -> Option<Token> {
     match s {
         "PRINT" => Some(Token::Print),
@@ -71,7 +72,6 @@ fn keyword(s: &str) -> Option<Token> {
         "ENDSELECT" => Some(Token::EndSelect),
         "END" => Some(Token::End),
         "STOP" => Some(Token::Stop),
-        "DATA" => Some(Token::Data),
         "READ" => Some(Token::Read),
         "RESTORE" => Some(Token::Restore),
         "CLS" => Some(Token::Cls),
@@ -144,7 +144,9 @@ pub enum Token {
     EndSelect,
     End,
     Stop,
-    Data,
+    /// `DATA` together with its operand, captured as raw source text.
+    /// See `Lexer::read_data_text` for why it is not tokenized.
+    DataText(String),
     Read,
     Restore,
     Cls,
@@ -267,6 +269,36 @@ impl<'a> Lexer<'a> {
             }
         }
         Ok(s)
+    }
+
+    /// Scan the operand of a `DATA` statement as raw source text.
+    ///
+    /// DATA items are not expressions and cannot be reassembled from tokens:
+    /// [`Self::read_identifier`] uppercases, so `DATA hello` would come back as
+    /// `HELLO`, and `DATA 007` and `DATA 1.50` would lose their spelling. So the
+    /// text is taken verbatim and split by the parser, which is also how the
+    /// interpreters this follows did it.
+    ///
+    /// Scanning stops at end of line, or at a colon *outside* quotes so that a
+    /// statement may follow on the same line -- which is what this compiler has
+    /// always allowed. GW-BASIC runs DATA to the end of the line and treats a
+    /// colon as data; nothing in the wild depends on that, and stopping keeps
+    /// `DATA 1,2 : PRINT 3` working.
+    ///
+    /// The newline itself is left for `next_token`, which owns `at_line_start`.
+    fn read_data_text(&mut self) -> String {
+        let mut s = String::new();
+        let mut in_quotes = false;
+        while let Some(c) = self.peek() {
+            match c {
+                '\n' => break,
+                ':' if !in_quotes => break,
+                '"' => in_quotes = !in_quotes,
+                _ => {}
+            }
+            s.push(self.advance().unwrap());
+        }
+        s
     }
 
     /// Scan a decimal number.
@@ -522,6 +554,13 @@ impl<'a> Lexer<'a> {
                     return Ok(Token::Newline);
                 }
 
+                // DATA's operand is raw text, not a sequence of tokens; see
+                // `read_data_text`. The comparison is against the bare word, so
+                // a suffixed `Data$` is still an ordinary variable.
+                if ident == "DATA" {
+                    return Ok(Token::DataText(self.read_data_text()));
+                }
+
                 Ok(self.keyword_or_ident(&ident))
             }
 
@@ -759,11 +798,41 @@ mod tests {
 
     #[test]
     fn test_keywords_data() {
-        let mut lexer = Lexer::new("DATA READ RESTORE");
+        let mut lexer = Lexer::new("READ RESTORE");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[0], Token::Data);
-        assert_eq!(tokens[1], Token::Read);
-        assert_eq!(tokens[2], Token::Restore);
+        assert_eq!(tokens[0], Token::Read);
+        assert_eq!(tokens[1], Token::Restore);
+    }
+
+    /// DATA takes the rest of its line as raw text, keeping case and spacing.
+    /// Reassembling from tokens would uppercase the words and renormalize the
+    /// numbers, so it is captured verbatim and split by the parser.
+    #[test]
+    fn test_data_operand_is_raw_text() {
+        let mut lexer = Lexer::new("DATA hello, 007, 1.50\nPRINT 1");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::DataText(" hello, 007, 1.50".to_string()));
+        assert_eq!(tokens[1], Token::Newline);
+        assert_eq!(tokens[2], Token::Print);
+    }
+
+    /// A colon outside quotes ends the statement; one inside is data.
+    #[test]
+    fn test_data_stops_at_an_unquoted_colon() {
+        let mut lexer = Lexer::new("DATA 1, \"a:b\" : PRINT 2");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::DataText(" 1, \"a:b\" ".to_string()));
+        assert_eq!(tokens[1], Token::Colon);
+        assert_eq!(tokens[2], Token::Print);
+    }
+
+    /// A suffixed `Data$` is an ordinary variable, not the keyword.
+    #[test]
+    fn test_data_with_a_suffix_is_an_identifier() {
+        let mut lexer = Lexer::new("Data$ = \"c\"");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("DATA$".to_string()));
+        assert_eq!(tokens[1], Token::Eq);
     }
 
     #[test]

@@ -616,6 +616,18 @@ RESTORE          ' Reset data pointer to beginning
 RESTORE 100      ' Resume at the DATA on line 100
 ```
 
+A DATA item needs quotes only if it contains a comma, a colon, or spaces that
+matter. Otherwise write it plainly; surrounding spaces are trimmed and the text
+is taken exactly as written, case included. An omitted item reads as 0 or `""`:
+
+```basic
+DATA hello, World, "a,b", "  padded  "
+DATA 1,,3
+```
+
+A colon ends a DATA statement, so another statement may follow it on the same
+line.
+
 ### CLS
 
 Clear screen:

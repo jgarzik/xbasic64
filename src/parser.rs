@@ -673,7 +673,7 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::EndSelect => "ENDSELECT",
         Token::End => "END",
         Token::Stop => "STOP",
-        Token::Data => "DATA",
+        Token::DataText(_) => "DATA",
         Token::Read => "READ",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
@@ -736,6 +736,105 @@ fn describe_token(tok: &Token) -> String {
             .map(str::to_string)
             .unwrap_or_else(|| format!("{:?}", other)),
     }
+}
+
+/// One item of a `DATA` statement, as written.
+struct DataItem {
+    text: String,
+    /// Whether it was written in quotes, which decides both whether the
+    /// surrounding spaces were significant and whether it is a string.
+    quoted: bool,
+}
+
+impl DataItem {
+    /// The value this item denotes.
+    ///
+    /// A quoted item is always a string. An unquoted one is whatever it looks
+    /// like: GW-BASIC decides the type when the item is READ, but the table this
+    /// compiles to is tagged per item, and the runtime already converts a string
+    /// entry to a number with `strtod` -- so classifying here loses nothing and
+    /// keeps numeric DATA on the fast path.
+    ///
+    /// An omitted item is the empty string, which reads as 0 or as "".
+    fn literal(&self) -> Literal {
+        if self.quoted {
+            return Literal::String(self.text.clone());
+        }
+        if let Ok(n) = self.text.parse::<i32>() {
+            return Literal::Integer(n as i64);
+        }
+        if let Ok(f) = self.text.parse::<f64>() {
+            if f.is_finite() {
+                return Literal::Float(f);
+            }
+        }
+        Literal::String(self.text.clone())
+    }
+}
+
+/// Split a `DATA` operand into its items.
+///
+/// Items are separated by commas outside quotes. An unquoted item has its
+/// surrounding spaces trimmed; a quoted one keeps everything between the quotes,
+/// which is why quotes are needed for an item containing a comma, a colon, or
+/// spaces that matter. A doubled `""` inside quotes is one quote character, as
+/// everywhere else in the language.
+fn split_data_items(text: &str) -> Vec<DataItem> {
+    // `DATA` with nothing after it declares no items at all, as against
+    // `DATA ,` which declares two empty ones.
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+    let mut chars = text.chars().peekable();
+    loop {
+        while chars.peek() == Some(&' ') || chars.peek() == Some(&'\t') {
+            chars.next();
+        }
+
+        let item = if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut body = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    // A doubled quote is one quote character, as everywhere
+                    // else in the language.
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        body.push('"');
+                        continue;
+                    }
+                    break;
+                }
+                body.push(c);
+            }
+            // Whatever separates the closing quote from the comma is not data.
+            while chars.peek().is_some_and(|c| *c != ',') {
+                chars.next();
+            }
+            DataItem {
+                text: body,
+                quoted: true,
+            }
+        } else {
+            let mut body = String::new();
+            while chars.peek().is_some_and(|c| *c != ',') {
+                body.push(chars.next().unwrap());
+            }
+            DataItem {
+                text: body.trim().to_string(),
+                quoted: false,
+            }
+        };
+        items.push(item);
+
+        match chars.next() {
+            Some(',') => continue,
+            _ => break,
+        }
+    }
+    items
 }
 
 /// Shorthand for the parser's result type.
@@ -1155,7 +1254,7 @@ impl Parser {
             Token::Type => self.parse_type_def(),
             Token::Sub => self.parse_sub(),
             Token::Function => self.parse_function(),
-            Token::Data => self.parse_data(),
+            Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
@@ -2384,42 +2483,23 @@ impl Parser {
         Ok(params)
     }
 
-    fn parse_data(&mut self) -> PResult<StmtKind> {
-        self.advance(); // consume DATA
-        let mut values = Vec::new();
-
-        loop {
-            match self.peek().clone() {
-                Token::Integer(n) => {
-                    self.advance();
-                    values.push(Literal::Integer(n));
-                }
-                Token::Float(f) => {
-                    self.advance();
-                    values.push(Literal::Float(f));
-                }
-                Token::String(s) => {
-                    self.advance();
-                    values.push(Literal::String(s));
-                }
-                Token::Minus => {
-                    self.advance();
-                    match self.advance() {
-                        Token::Integer(n) => values.push(Literal::Integer(-n)),
-                        Token::Float(f) => values.push(Literal::Float(-f)),
-                        _ => return err("Expected number after minus in DATA"),
-                    }
-                }
-                _ => break,
-            }
-            if matches!(self.peek(), Token::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        Ok(StmtKind::Data(values))
+    /// `DATA item, item, ...`, where the items arrived as raw source text.
+    ///
+    /// The lexer hands over the whole operand verbatim (see
+    /// `Lexer::read_data_text`), because a DATA item is not an expression: it is
+    /// a literal run of characters, and tokenizing it would uppercase words and
+    /// renormalize numbers. This used to accept only Integer, Float, String and
+    /// a leading minus, so `DATA hello, world` ended the list at `hello` -- and
+    /// silently, since the loop simply broke, leaving the word to be parsed as a
+    /// fresh statement and produce an error about the word rather than the DATA.
+    fn parse_data(&mut self, text: &str) -> PResult<StmtKind> {
+        self.advance(); // consume the DATA token
+        Ok(StmtKind::Data(
+            split_data_items(text)
+                .iter()
+                .map(|it| it.literal())
+                .collect(),
+        ))
     }
 
     fn parse_read(&mut self) -> PResult<StmtKind> {
