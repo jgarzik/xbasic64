@@ -122,3 +122,16 @@ fn test_input_leading_semicolon_is_accepted() {
     let line = compile_and_run_with_stdin("LINE INPUT ; \"N: \"; A$\nPRINT A$\n", "Bob\n").unwrap();
     assert_eq!(line.trim_end(), "N: Bob");
 }
+
+/// INPUT into a narrow scalar must narrow it, like every other store.
+#[test]
+fn test_input_into_narrow_scalars() {
+    let out = compile_and_run_with_stdin("INPUT A%\nPRINT A%\n", "5\n").unwrap();
+    assert_eq!(out.trim(), "? 5");
+
+    let single = compile_and_run_with_stdin("INPUT A!\nPRINT A!\n", "6\n").unwrap();
+    assert_eq!(single.trim(), "? 6");
+
+    let long = compile_and_run_with_stdin("INPUT A&\nPRINT A&\n", "70000\n").unwrap();
+    assert_eq!(long.trim(), "? 70000");
+}

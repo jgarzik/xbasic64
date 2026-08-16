@@ -1281,7 +1281,14 @@ impl Analyzer {
                         }
                     }
                 }
-                if a.name.ends_with('$') != b.name.ends_with('$') {
+                // Compare what the operands *are*, not the suffix of the
+                // variable they hang off: for `P.N` the base is a record and
+                // carries no suffix, so a string field and a numeric one both
+                // looked non-string and the mismatch reached codegen, which
+                // stored a string pointer into an INTEGER slot and crashed.
+                let a_str = self.expr_is_string(&lvalue_as_expr(a), scope);
+                let b_str = self.expr_is_string(&lvalue_as_expr(b), scope);
+                if a_str.is_some() && b_str.is_some() && a_str != b_str {
                     self.error(line, "SWAP requires both values to be the same type");
                 }
             }

@@ -5117,12 +5117,37 @@ impl CodeGen {
         }
 
         let Some(indices) = &target.indices else {
+            // A variable declared with `AS` lives in typed storage and carries
+            // its own width; gen_store_typed is what narrows for it, and is the
+            // same helper an ordinary assignment to it uses.
+            if let Some((loc, ty)) = self.typed_storage(&target.name) {
+                self.gen_store_typed(&loc, &ty, DataType::Double);
+                return;
+            }
+
             let loc = self.get_var_loc(&target.name);
             if is_string {
                 emit!(self, "    mov {}, rax", loc.q(0));
                 emit!(self, "    mov {}, rdx", loc.q(1));
-            } else {
-                emit!(self, "    movsd {}, xmm0", loc.q(0));
+                return;
+            }
+            // Narrow to the variable's declared type, exactly as the array
+            // element path below does and for the same reason.
+            //
+            // This used to store the incoming Double whole, so an INTEGER slot
+            // received eight bytes of a double's bit pattern and every later
+            // read -- `movsx eax, WORD PTR` -- took its low sixteen bits, which
+            // for any ordinary value are zero. READ, INPUT and SWAP all store
+            // through here, so `READ A%`, `INPUT A%` and `SWAP A%, B%` each
+            // yielded 0 while plain `A% = 7`, which stores elsewhere, was fine.
+            let ty = self.expr_type(&Expr::Variable(target.name.clone()));
+            self.gen_coercion(DataType::Double, ty);
+            match ty {
+                DataType::Integer => emit!(self, "    mov {}, ax", loc.at("WORD PTR", 0)),
+                DataType::Long => emit!(self, "    mov {}, eax", loc.at("DWORD PTR", 0)),
+                DataType::Single => emit!(self, "    movss {}, xmm0", loc.at("DWORD PTR", 0)),
+                DataType::Double => emit!(self, "    movsd {}, xmm0", loc.q(0)),
+                DataType::String => unreachable!("handled above"),
             }
             return;
         };

@@ -1435,3 +1435,20 @@ fn test_return_without_gosub_is_diagnosed() {
     // A program that does use GOSUB is unaffected.
     compile_only("GOSUB 100\nEND\n100 PRINT 1\nRETURN\n").expect("GOSUB/RETURN pairs compile");
 }
+
+/// SWAP's type check must look at what the operands actually are, not at the
+/// suffix of the variable they hang off.
+///
+/// It compared `a.name.ends_with('$')`, which for `P.N` reads *P* -- a record,
+/// carrying no suffix. So swapping a string field with a numeric one passed the
+/// check, and codegen then read a string into rax/rdx and stored it into an
+/// INTEGER slot: SIGSEGV, exit 139.
+#[test]
+fn test_swap_of_mismatched_record_fields_is_diagnosed() {
+    let ty = "TYPE R\n  N AS STRING * 4\n  V AS INTEGER\nEND TYPE\nDIM P AS R\n";
+    expect_rejected(&format!("{ty}SWAP P.N, P.V\n"), "same type");
+    expect_rejected(&format!("{ty}SWAP P.V, P.N\n"), "same type");
+    // Matching fields still swap.
+    compile_only("TYPE R\n  A AS INTEGER\n  B AS INTEGER\nEND TYPE\nDIM P AS R\nSWAP P.A, P.B\n")
+        .expect("two numeric fields are a legal SWAP");
+}
