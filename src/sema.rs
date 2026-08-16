@@ -935,7 +935,11 @@ impl Analyzer {
             // Nested bodies, entering procedure scope where there is one.
             match &mut stmt.kind {
                 StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. } => {
-                    let inner = Scope::Proc(name.to_uppercase());
+                    // `clone`, not `to_uppercase`: the lexer already uppercased
+                    // it, and `collect` and `check` build this scope the same
+                    // way -- a scope key that normalized differently from
+                    // theirs would simply fail to match.
+                    let inner = Scope::Proc(name.clone());
                     self.resolve_array_accesses(body, &inner);
                 }
                 StmtKind::If {
@@ -987,9 +991,8 @@ impl Analyzer {
         // codegen has always done; `check_name_collisions` refuses the program
         // that makes the two disagree, so the order is unobservable.
         if let Expr::FnCall { name, args } = expr {
-            let upper = name.to_uppercase();
-            if !symbols.procs.contains_key(&upper) && symbols.lookup_array(scope, &upper).is_some()
-            {
+            let upper = normalized(name);
+            if !symbols.procs.contains_key(upper) && symbols.lookup_array(scope, upper).is_some() {
                 *expr = Expr::ArrayAccess {
                     name: std::mem::take(name),
                     indices: std::mem::take(args),

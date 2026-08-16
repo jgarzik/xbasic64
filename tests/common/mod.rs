@@ -125,6 +125,12 @@ pub fn compile_and_run_flags(
     }
 
     let mut child = Command::new(&exe_file)
+        // Run inside the temp dir, so a program that opens a file by a bare
+        // name writes it there and it dies with the TempDir. Without this the
+        // program inherited the test runner's directory -- the repository root
+        // -- and `OPEN "a.txt" FOR OUTPUT` left a stray file behind on every
+        // run, two of which were committed by accident.
+        .current_dir(tmp.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

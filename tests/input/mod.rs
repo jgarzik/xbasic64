@@ -76,23 +76,36 @@ PRINT A(3)
 #[test]
 fn test_input_prompt_separators() {
     let semi = compile_and_run_with_stdin("INPUT \"Name\"; A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(semi, "Name? Bob\n", "a semicolon adds the question mark");
+    assert_eq!(
+        semi.trim_end(),
+        "Name? Bob",
+        "a semicolon adds the question mark"
+    );
 
     let comma = compile_and_run_with_stdin("INPUT \"Name\", A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(comma, "NameBob\n", "a comma suppresses it");
+    assert_eq!(comma.trim_end(), "NameBob", "a comma suppresses it");
 
     let bare = compile_and_run_with_stdin("INPUT A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(bare, "? Bob\n", "no prompt still asks");
+    assert_eq!(bare.trim_end(), "? Bob", "no prompt still asks");
 }
 
 /// LINE INPUT never adds a question mark, whichever separator is used.
+///
+/// These compare `trim_end()` rather than the raw output: the prompt shares a
+/// line with the echoed input, and the line ending that follows is LF on
+/// System V and CRLF on Windows. Asserting the raw string passed on Linux and
+/// failed the Windows job.
 #[test]
 fn test_line_input_never_adds_a_question_mark() {
     let semi = compile_and_run_with_stdin("LINE INPUT \"N: \"; A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(semi, "N: Bob\n");
+    assert_eq!(semi.trim_end(), "N: Bob");
 
     let bare = compile_and_run_with_stdin("LINE INPUT A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(bare, "Bob\n", "and prompts for nothing when none is given");
+    assert_eq!(
+        bare.trim_end(),
+        "Bob",
+        "and prompts for nothing when none is given"
+    );
 }
 
 /// A leading `;` is accepted on both statements.
@@ -104,8 +117,8 @@ fn test_line_input_never_adds_a_question_mark() {
 #[test]
 fn test_input_leading_semicolon_is_accepted() {
     let out = compile_and_run_with_stdin("INPUT ; \"Name\"; A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(out, "Name? Bob\n");
+    assert_eq!(out.trim_end(), "Name? Bob");
 
     let line = compile_and_run_with_stdin("LINE INPUT ; \"N: \"; A$\nPRINT A$\n", "Bob\n").unwrap();
-    assert_eq!(line, "N: Bob\n");
+    assert_eq!(line.trim_end(), "N: Bob");
 }
