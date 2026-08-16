@@ -11,6 +11,7 @@ This document describes the BASIC dialect supported by xbasic64, a native code c
 - [Statements](#statements)
 - [Built-in Functions](#built-in-functions)
 - [File I/O](#file-io)
+- [Random-Access Files](#random-access-files)
 - [Procedures](#procedures)
 - [Limitations](#limitations)
 
@@ -714,6 +715,12 @@ DIM I AS INTEGER, Grid(9, 9) AS INTEGER, Names$(20)
 
 ```
 
+### FIELD / LSET / RSET / GET / PUT / LOCK
+
+The random-access statements. They are described together in
+[Random-Access Files](#random-access-files), since none of them means anything
+without the others.
+
 ### END / STOP
 
 Terminate program:
@@ -807,8 +814,25 @@ MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 | `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
 | `EOF(n)`      | True once file n has been read to the end      |
 | `LOF(n)`      | Length of file n in bytes                      |
+| `LOC(n)`      | Last record used, or the sequential position   |
 | `TAB(n)`      | In PRINT: advance to column n                  |
 | `SPC(n)`      | In PRINT: emit n spaces                        |
+
+### Record Conversion Functions
+
+These turn numbers into the fixed-width byte strings a random-access record
+holds, and back. See [Random-Access Files](#random-access-files).
+
+| Function   | Description                                     |
+|------------|-------------------------------------------------|
+| `MKI$(x)`  | An INTEGER as 2 bytes                           |
+| `MKL$(x)`  | A LONG as 4 bytes                               |
+| `MKS$(x)`  | A SINGLE as 4 bytes                             |
+| `MKD$(x)`  | A DOUBLE as 8 bytes                             |
+| `CVI(s$)`  | Those 2 bytes back as a number                  |
+| `CVL(s$)`  | Those 4 bytes back as a number                  |
+| `CVS(s$)`  | Those 4 bytes back as a number                  |
+| `CVD(s$)`  | Those 8 bytes back as a number                  |
 
 `TIMER` counts fractional seconds since midnight UTC on every platform, so
 subtracting two readings times a section of code.
@@ -822,13 +846,21 @@ at run time otherwise.
 
 ## File I/O
 
+Files come in two flavours: **sequential**, read and written a line at a time,
+and **random**, read and written a fixed-length record at a time.
+
 ### Opening Files
 
 ```basic
 OPEN "filename.txt" FOR INPUT AS #1    ' Read mode
 OPEN "filename.txt" FOR OUTPUT AS #1   ' Write mode (truncate)
 OPEN "filename.txt" FOR APPEND AS #1   ' Write mode (append)
+OPEN "data.dat" FOR RANDOM AS #1 LEN = 64   ' Fixed-length records
 ```
+
+`FOR RANDOM` opens for reading *and* writing, and creates the file when it
+does not exist. `LEN =` gives the record length in bytes; without it the record
+is 128 bytes, as in GW-BASIC. The largest record is 32767 bytes.
 
 File numbers range from `#1` to `#15`; the runtime has a handle slot for each.
 One outside that range is refused at compile time, or reported as
@@ -903,6 +935,115 @@ INPUT #1, Salary#
 CLOSE #1
 
 PRINT Name$; " is "; Age%; " years old"
+```
+
+---
+
+## Random-Access Files
+
+A random file is a row of fixed-length records, addressed by number. Reading
+record 900 costs the same as reading record 1.
+
+### FIELD
+
+`FIELD` names the parts of a record, giving each a width in bytes:
+
+```basic
+OPEN "people.dat" FOR RANDOM AS #1 LEN = 32
+FIELD #1, 20 AS Name$, 4 AS Age$, 8 AS Pay$
+```
+
+Every field variable is a **window onto the record buffer**, not a copy of it.
+`GET` overwrites that buffer, so all of them change at once; `LSET` and `RSET`
+write through the window, so `PUT` emits what they wrote. A field variable's
+length is its declared width and never changes.
+
+The fields must fit inside the record; asking for more is a `FIELD overflow`.
+
+### LSET and RSET
+
+`LSET` and `RSET` overwrite a field in place, padding with spaces to the
+field's width. A value too long is truncated on the right:
+
+```basic
+LSET Name$ = "Alice"      ' "Alice" followed by 15 spaces
+RSET Name$ = "Alice"      ' 15 spaces followed by "Alice"
+```
+
+Ordinary assignment does *not* do this. `Name$ = "Alice"` makes `Name$` an
+ordinary 5-character string and severs its link to the record buffer, which is
+exactly why `LSET` exists.
+
+### GET and PUT
+
+```basic
+PUT #1, 3         ' write the buffer as record 3
+GET #1, 3         ' read record 3 into the buffer
+PUT #1            ' write the record after the last one touched
+GET #1            ' read the record after the last one touched
+```
+
+Records are numbered from 1. Reading past the end of the file gives a
+zero-filled record rather than the previous one. A record buffer starts out
+blank, so a field never written reads as spaces.
+
+### Numbers in Records
+
+A record holds bytes, so numbers are converted to and from strings of the
+width their type occupies:
+
+| Function   | Width   | Inverse  |
+|------------|---------|----------|
+| `MKI$(x)`  | 2 bytes | `CVI(s$)` |
+| `MKL$(x)`  | 4 bytes | `CVL(s$)` |
+| `MKS$(x)`  | 4 bytes | `CVS(s$)` |
+| `MKD$(x)`  | 8 bytes | `CVD(s$)` |
+
+```basic
+LSET Age$ = MKI$(30)
+PRINT CVI(Age$)           ' 30
+```
+
+Bytes are stored little-endian, in the machine's own format. A string
+narrower than the type it is read as is an `Illegal function call`: padding it
+out would turn two stray characters into a plausible-looking number rather
+than an error.
+
+### LOC
+
+`LOC(n)` is the last record read or written on a random file. On a sequential
+file it is the position in 128-byte blocks, as in GW-BASIC.
+
+### LOCK and UNLOCK
+
+Advisory locks over a record range, for when more than one program has the
+file open:
+
+```basic
+LOCK #1, 5          ' just record 5
+LOCK #1, 5 TO 10    ' a range
+LOCK #1             ' the whole file
+UNLOCK #1, 5        ' released the same way it was taken
+```
+
+These are advisory: they hold against another process that also locks, and do
+nothing against one that simply writes. A lock already held by someone else is
+reported as `Permission denied`.
+
+### Example
+
+```basic
+OPEN "people.dat" FOR RANDOM AS #1 LEN = 32
+FIELD #1, 20 AS Name$, 4 AS Age$, 8 AS Pay$
+
+LSET Name$ = "Alice"
+LSET Age$ = MKI$(30)
+LSET Pay$ = MKD$(50000.5)
+PUT #1, 1
+
+GET #1, 1
+PRINT RTRIM$(Name$); " is "; CVI(Age$)
+CLOSE #1
 ```
 
 ---
@@ -992,8 +1133,10 @@ Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
 run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
 overflows, `SQR` of a negative number, `LOG` of a non-positive number, a file
-number outside 1 to 15, `GOSUB` nested deeper than the return stack holds, and
-allocation failure.
+number outside 1 to 15, `GOSUB` nested deeper than the return stack holds,
+allocation failure, a random-access operation on a file not opened `FOR
+RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
+few bytes, and a `LOCK` another process already holds.
 
 The message names the fault:
 
@@ -1007,6 +1150,9 @@ The message names the fault:
 | `Bad file number`        | A file number outside 1 to 15                    |
 | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth     |
 | `Out of memory`          | A string or array allocation that failed         |
+| `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file     |
+| `FIELD overflow`         | `FIELD` widths exceeding the record length       |
+| `Permission denied`      | A `LOCK` someone else already holds              |
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:
@@ -1019,29 +1165,40 @@ xbasic64 --unsafe program.bas
 
 ## Limitations
 
-The following features are **not supported**:
+A GW-BASIC name this compiler does not provide is **refused, with a reason**,
+rather than quietly read as a new variable. That distinction matters: before
+the compiler knew these words, `PRINT DATE$` printed an empty string and
+`ON ERROR GOTO 100` compiled into a jump on a variable that is always zero, so
+a program's error handler never ran and nothing said so.
 
-### Graphics and Sound
-- `SCREEN`, `PSET`, `LINE`, `CIRCLE`, `PAINT`, `DRAW`
-- `COLOR`, `PALETTE`
-- `BEEP`, `SOUND`, `PLAY`
+The reason says whether waiting will help.
 
-### Memory Access
-- `PEEK`, `POKE`
-- `DEF SEG`
-- `VARPTR`, `VARSEG`
+### Not Implemented Yet
 
-### Error Handling
-- `ON ERROR GOTO`
-- `RESUME`, `RESUME NEXT`
-- `ERR`, `ERL`
+Each of these is practical on both Linux and Windows and simply has not been
+written. Programs using them are refused today.
 
-### Other
-- `DEFINT`, `DEFSNG`, etc. (use type suffixes)
-- `COMMON`, `SHARED` (single-module only)
-- Random-access file I/O (`OPEN FOR RANDOM`, `GET`, `PUT`)
-- `LOCATE`, `WIDTH`, `LPRINT`
+- **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
+- **Console control** -- `LOCATE`, `COLOR`, `WIDTH`, `CSRLIN`, `POS`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
+- **Date and time** -- `DATE$`, `TIME$`
+- **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
+- **Odds and ends** -- `RANDOMIZE`, `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
+- **`DEFINT` and friends** -- `DEFINT`, `DEFLNG`, `DEFSNG`, `DEFDBL`, `DEFSTR`; use a
+  type suffix or `DIM ... AS`
+
+### Never
+
+Graphics, sound, joysticks, light pens, direct memory access, port I/O, the
+line printer, and the interpreter's own commands (`RUN`, `LIST`, `CHAIN`, ...)
+are permanent non-goals: they describe a machine and a way of working that a
+compiled 64-bit program does not have. **[NONGOALS.md](NONGOALS.md)** gives the
+full list and the reasoning.
+
+### Structural
+
+- Single module: no `COMMON`, and no separate compilation
 - A `FUNCTION` cannot return a `TYPE` record; pass one to a `SUB` instead
+- `PRINT USING` has no file form -- `PRINT #n, USING` is refused
 
 ---
 
@@ -1057,3 +1214,28 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 6. **Parameters are by-value only** - No `BYREF` support, records included:
    a record argument is passed as the address of the caller's copy, which the
    callee copies into a local, so changes to it do not escape
+
+### Deliberate Differences from GW-BASIC
+
+These are places where a GW-BASIC program will behave differently here. They
+are choices, not oversights, and each is checked by a test.
+
+7. **Numbers print bare** - GW-BASIC pads a number with a leading space for the
+   sign and a trailing one; `PRINT 42` here writes `42` and nothing else.
+   `STR$` matches `PRINT` exactly, so it also omits GW-BASIC's leading space
+   and round-trips through `VAL`.
+
+8. **Assignment to an integer truncates** - `A% = 7.9` gives 7, where GW-BASIC
+   rounds to 8. `CINT` does round, half to even, as QuickBASIC does, so use
+   `A% = CINT(X)` when rounding is what is wanted.
+
+9. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
+   elements on first use. Here that is `Array used before DIM`, because the
+   implicit version silently hides a typo.
+
+10. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
+    `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
+
+11. **`LOC` on a sequential file counts 128-byte blocks**, which is what
+    GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
+    because the number is useful.
