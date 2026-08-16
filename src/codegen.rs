@@ -523,6 +523,19 @@ impl CodeGen {
         self.output.push('\n');
     }
 
+    /// Whether the instruction just emitted begins with `prefix`.
+    ///
+    /// A peephole over the text, which is all there is to look at without an
+    /// IR. It is deliberately literal: anything at all between -- a label, a
+    /// comment, a branch target -- means no match, so the caller keeps
+    /// whatever it was about to elide.
+    fn last_emitted_is(&self, prefix: &str) -> bool {
+        self.output
+            .rsplit('\n')
+            .nth(1)
+            .is_some_and(|line| line.trim_start().starts_with(prefix))
+    }
+
     /// Get the integer argument register for a given argument position (0-based)
     fn arg_reg(n: usize) -> &'static str {
         PlatformAbi::INT_ARG_REGS
@@ -538,10 +551,37 @@ impl CodeGen {
         }
     }
 
+    /// The 32-bit name of an integer register, for [`emit_arg_imm`].
+    ///
+    /// [`emit_arg_imm`]: Self::emit_arg_imm
+    fn reg32(reg: &str) -> &'static str {
+        match reg {
+            "rax" => "eax",
+            "rbx" => "ebx",
+            "rcx" => "ecx",
+            "rdx" => "edx",
+            "rsi" => "esi",
+            "rdi" => "edi",
+            "r8" => "r8d",
+            "r9" => "r9d",
+            other => panic!("no 32-bit name recorded for {}", other),
+        }
+    }
+
     /// Emit a mov instruction to set up an integer argument from an immediate
+    ///
+    /// Writing a 32-bit register zeroes the upper half, so for a value that
+    /// fits unsigned in 32 bits the narrow form is equivalent and two bytes
+    /// shorter -- `mov edi, 1` rather than `mov rdi, 1`. Every caller today
+    /// passes a small non-negative constant, so this is the form that is
+    /// actually emitted; the wide form remains for anything that needs it.
     fn emit_arg_imm(&mut self, arg_n: usize, value: i64) {
         let dst = Self::arg_reg(arg_n);
-        self.emit(&format!("    mov {}, {}", dst, value));
+        if (0..=u32::MAX as i64).contains(&value) {
+            self.emit(&format!("    mov {}, {}", Self::reg32(dst), value));
+        } else {
+            self.emit(&format!("    mov {}, {}", dst, value));
+        }
     }
 
     /// Emit a lea instruction to set up an integer argument from a memory reference
@@ -986,8 +1026,20 @@ impl CodeGen {
 
         match (from, to) {
             // Integer to Long (sign extension, but both in eax so just use movsxd conceptually)
+            //
+            // Skipped when eax was just loaded by a word-sized `movsx`, which
+            // has already sign-extended it -- the common case, since that is
+            // how every INTEGER variable, array element and record field is
+            // read. It cannot be skipped on the strength of the static type
+            // alone: Integer is also what `promote_types` returns for
+            // INTEGER+INTEGER, whose 32-bit `add` genuinely has to be
+            // truncated back to 16 bits here, and `gen_coercion(Long,
+            // Integer)` is a no-op that leaves an untruncated 32-bit value
+            // behind a value typed Integer.
             (DataType::Integer, DataType::Long) => {
-                self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
+                if !self.last_emitted_is("movsx eax, WORD PTR") {
+                    self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
+                }
             }
             // Long to Integer (truncation - just use lower 16 bits)
             (DataType::Long, DataType::Integer) => {
@@ -2423,7 +2475,9 @@ impl CodeGen {
                 Literal::String(s) => {
                     let idx = self.add_string_literal(s);
                     self.emit(&format!("    lea rax, [rip + _str_{}]", idx));
-                    self.emit(&format!("    mov rdx, {}", s.len()));
+                    // A literal's length cannot approach 2^32, and writing edx
+                    // zeroes the upper half, so the narrow form is equivalent.
+                    self.emit(&format!("    mov edx, {}", s.len()));
                     DataType::String
                 }
             },
@@ -2968,7 +3022,9 @@ impl CodeGen {
                 self.emit("    movsxd rax, eax");
             }
             // No length given: replace as much as the value provides.
-            None => self.emit("    mov rax, 0x7FFFFFFF"),
+            // `mov eax` zeroes the upper half, so this is the same positive
+            // value in rax, in five bytes rather than seven.
+            None => self.emit("    mov eax, 0x7FFFFFFF"),
         }
         self.emit("    mov QWORD PTR [rsp + 24], rax");
 
@@ -4087,7 +4143,7 @@ impl CodeGen {
                         self.emit("    cvttsd2si rbx, xmm0");
                     }
                 } else {
-                    self.emit("    mov rbx, 1");
+                    self.emit("    mov ebx, 1");
                 }
 
                 // Evaluate haystack and save
