@@ -249,6 +249,114 @@ fn test_named_constants_take_the_constant_path() {
     assert_eq!(out.trim(), "6");
 }
 
+/// A comparison used as a condition branches on its own flags.
+///
+/// The `setcc` / `movzx` / `neg` / `test` sequence built a -1/0 word only to
+/// compare it against zero, when the comparison had already set exactly the
+/// flags the jump reads.
+#[test]
+fn test_if_branches_on_comparison_flags() {
+    let src = "A% = 5\nB% = 3\nIF A% > B% THEN PRINT \"y\"\n";
+    asserts_emits(src, &["cmp eax, ecx", "jle "]);
+    asserts_absent(src, &["setg", "neg eax", "test eax, eax"]);
+}
+
+/// The same for a Double comparison, which reads the flags unsigned because
+/// ucomisd reports through CF and ZF.
+#[test]
+fn test_double_comparison_branches_unsigned() {
+    let src = "X# = 1.5\nIF X# < 2 THEN PRINT \"y\"\n";
+    asserts_emits(src, &["ucomisd xmm0, QWORD PTR [rip + _f64_", "jae "]);
+    asserts_absent(src, &["setb", "neg eax"]);
+}
+
+/// ...and for strings, where _rt_strcmp's memcmp-style result reads signed.
+#[test]
+fn test_string_comparison_branches_on_strcmp() {
+    let src = "S$ = \"abc\"\nIF S$ < \"abd\" THEN PRINT \"y\"\n";
+    asserts_emits(src, &["call _rt_strcmp", "test eax, eax", "jge "]);
+    asserts_absent(src, &["setl", "neg eax"]);
+}
+
+/// Every loop form takes the same path, in both branch senses.
+#[test]
+fn test_every_loop_form_branches_on_flags() {
+    for src in [
+        "I% = 0\nWHILE I% < 3\nI% = I% + 1\nWEND\n",
+        "I% = 0\nDO WHILE I% < 3\nI% = I% + 1\nLOOP\n",
+        "I% = 0\nDO UNTIL I% >= 3\nI% = I% + 1\nLOOP\n",
+        "I% = 0\nDO\nI% = I% + 1\nLOOP WHILE I% < 3\n",
+        "I% = 0\nDO\nI% = I% + 1\nLOOP UNTIL I% >= 3\n",
+    ] {
+        asserts_emits(src, &["cmp eax, 3"]);
+        asserts_absent(src, &["setl", "setge", "neg eax"]);
+    }
+}
+
+/// Each of those loops must still run the right number of times.
+///
+/// The post-test forms branch backwards, so their senses are inverted against
+/// the pre-test ones -- the easiest thing in this change to get backwards.
+#[test]
+fn test_every_loop_form_iterates_correctly() {
+    for (src, expected) in [
+        ("I% = 0\nWHILE I% < 3\nI% = I% + 1\nWEND\nPRINT I%\n", "3"),
+        (
+            "I% = 0\nDO WHILE I% < 4\nI% = I% + 1\nLOOP\nPRINT I%\n",
+            "4",
+        ),
+        (
+            "I% = 0\nDO UNTIL I% >= 5\nI% = I% + 1\nLOOP\nPRINT I%\n",
+            "5",
+        ),
+        (
+            "I% = 0\nDO\nI% = I% + 1\nLOOP WHILE I% < 6\nPRINT I%\n",
+            "6",
+        ),
+        (
+            "I% = 0\nDO\nI% = I% + 1\nLOOP UNTIL I% >= 7\nPRINT I%\n",
+            "7",
+        ),
+        // A post-test loop runs its body at least once, however false the
+        // condition was to begin with.
+        (
+            "I% = 9\nDO\nI% = I% + 1\nLOOP WHILE I% < 3\nPRINT I%\n",
+            "10",
+        ),
+    ] {
+        let out = crate::common::compile_and_run(src).expect("the program must run");
+        assert_eq!(out.trim(), expected, "for:\n{}", src);
+    }
+}
+
+/// A comparison that is *not* a condition still produces a -1/0 word.
+///
+/// This is why the fast path is opt-in per site rather than a change to
+/// gen_binary_expr: BASIC's AND is bitwise, so `A > B AND C > D` needs both
+/// halves materialized, and assigning or printing a comparison needs a value.
+#[test]
+fn test_comparison_as_a_value_is_still_materialized() {
+    let src = "A% = 5\nB% = 3\nN% = (A% > B%)\nPRINT N%\n";
+    asserts_emits(src, &["setg", "neg eax"]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "-1");
+}
+
+/// A bitwise AND of two comparisons needs both as words, and must still work.
+#[test]
+fn test_and_of_comparisons_is_correct() {
+    let src = "\
+A% = 5
+B% = 3
+X# = 1.5
+IF (A% > B%) AND (X# < 2) THEN PRINT \"both\"
+IF (A% < B%) AND (X# < 2) THEN PRINT \"wrong\" ELSE PRINT \"neither\"
+";
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    let got: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(got, vec!["both", "neither"]);
+}
+
 /// The truncation above is not decorative: the program must still wrap.
 ///
 /// 300 * 300 is 90000, which does not fit in an INTEGER; GW-BASIC's INTEGER

@@ -1897,16 +1897,7 @@ impl CodeGen {
                 let else_label = self.new_label("else");
                 let end_label = self.new_label("endif");
 
-                let cond_type = self.gen_expr(condition);
-                // Compare with 0 - conditions typically return Long (integer) now
-                if cond_type.is_integer() {
-                    self.emit("    test eax, eax");
-                    self.emit(&format!("    je {}", else_label));
-                } else {
-                    self.emit("    xorpd xmm1, xmm1");
-                    self.emit("    ucomisd xmm0, xmm1");
-                    self.emit(&format!("    je {}", else_label));
-                }
+                self.gen_condition(condition, &else_label, false);
 
                 for s in then_branch {
                     self.gen_stmt(s);
@@ -2006,15 +1997,7 @@ impl CodeGen {
                 let end_label = self.new_label("endwhile");
 
                 self.emit_label(&start_label);
-                let cond_type = self.gen_expr(condition);
-                if cond_type.is_integer() {
-                    self.emit("    test eax, eax");
-                    self.emit(&format!("    je {}", end_label));
-                } else {
-                    self.emit("    xorpd xmm1, xmm1");
-                    self.emit("    ucomisd xmm0, xmm1");
-                    self.emit(&format!("    je {}", end_label));
-                }
+                self.gen_condition(condition, &end_label, false);
 
                 // WHILE is a DO-family loop for EXIT DO purposes.
                 self.loop_stack.push((false, end_label.clone()));
@@ -2040,23 +2023,9 @@ impl CodeGen {
 
                 if *cond_at_start {
                     if let Some(cond) = condition {
-                        let cond_type = self.gen_expr(cond);
-                        if cond_type.is_integer() {
-                            self.emit("    test eax, eax");
-                            if *is_until {
-                                self.emit(&format!("    jne {}", end_label));
-                            } else {
-                                self.emit(&format!("    je {}", end_label));
-                            }
-                        } else {
-                            self.emit("    xorpd xmm1, xmm1");
-                            self.emit("    ucomisd xmm0, xmm1");
-                            if *is_until {
-                                self.emit(&format!("    jne {}", end_label));
-                            } else {
-                                self.emit(&format!("    je {}", end_label));
-                            }
-                        }
+                        // DO WHILE leaves when the condition is false;
+                        // DO UNTIL leaves when it is true.
+                        self.gen_condition(cond, &end_label, *is_until);
                     }
                 }
 
@@ -2068,23 +2037,11 @@ impl CodeGen {
 
                 if !*cond_at_start {
                     if let Some(cond) = condition {
-                        let cond_type = self.gen_expr(cond);
-                        if cond_type.is_integer() {
-                            self.emit("    test eax, eax");
-                            if *is_until {
-                                self.emit(&format!("    je {}", start_label));
-                            } else {
-                                self.emit(&format!("    jne {}", start_label));
-                            }
-                        } else {
-                            self.emit("    xorpd xmm1, xmm1");
-                            self.emit("    ucomisd xmm0, xmm1");
-                            if *is_until {
-                                self.emit(&format!("    je {}", start_label));
-                            } else {
-                                self.emit(&format!("    jne {}", start_label));
-                            }
-                        }
+                        // The senses invert against the pre-test form: this
+                        // branch goes back into the loop rather than out of
+                        // it. LOOP WHILE repeats while true, LOOP UNTIL
+                        // repeats while false.
+                        self.gen_condition(cond, &start_label, !*is_until);
                     } else {
                         self.emit(&format!("    jmp {}", start_label));
                     }
@@ -2774,24 +2731,7 @@ impl CodeGen {
             && self.expr_type(left) == DataType::String
             && self.expr_type(right) == DataType::String
         {
-            // Evaluate left string (ptr in rax, len in rdx)
-            self.gen_expr(left);
-            self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-            self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
-            self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
-
-            // Evaluate right string (ptr in rax, len in rdx)
-            self.gen_expr(right);
-            self.emit("    mov r8, rax"); // right ptr
-            self.emit("    mov r9, rdx"); // right len
-            self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
-            self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
-            self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
-            self.emit_arg_reg(0, "rax");
-            self.emit_arg_reg(1, "rdx");
-            self.emit_arg_reg(2, "r8");
-            self.emit_arg_reg(3, "r9");
-            self.emit("    call _rt_strcmp");
+            self.gen_string_compare(left, right);
 
             // _rt_strcmp returns <0, 0 or >0 in eax, like memcmp. Turn that
             // into BASIC's -1 / 0 by testing it against zero with the signed
@@ -2805,7 +2745,6 @@ impl CodeGen {
                 BinaryOp::Ge => "setge",
                 _ => unreachable!("guarded by is_comparison"),
             };
-            self.emit("    test eax, eax");
             self.emit(&format!("    {} al", setcc));
             self.emit("    movzx eax, al");
             self.emit("    neg eax"); // BASIC true is -1
@@ -2839,37 +2778,7 @@ impl CodeGen {
             return result_type;
         }
 
-        // Evaluate left operand and coerce to work type
-        let left_type = self.gen_expr(left);
-        self.gen_coercion(left_type, work_type);
-
-        // Save left result - use 16 bytes to maintain 16-byte stack alignment
-        // This ensures any function calls while evaluating right operand have aligned stack
-        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
-        if work_type.is_integer() {
-            self.emit("    mov QWORD PTR [rsp], rax");
-        } else if work_type == DataType::Single {
-            self.emit("    movss DWORD PTR [rsp], xmm0");
-        } else {
-            self.emit("    movsd QWORD PTR [rsp], xmm0");
-        }
-
-        // Evaluate right operand and coerce to work type
-        let right_type = self.gen_expr(right);
-        self.gen_coercion(right_type, work_type);
-
-        // Move right to secondary register/location and restore left
-        if work_type.is_integer() {
-            self.emit("    mov ecx, eax"); // right in ecx
-            self.emit("    mov rax, QWORD PTR [rsp]"); // left in rax
-        } else if work_type == DataType::Single {
-            self.emit("    movss xmm1, xmm0"); // right in xmm1
-            self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
-        } else {
-            self.emit("    movsd xmm1, xmm0"); // right in xmm1
-            self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
-        }
-        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.gen_binary_operands(left, right, work_type);
 
         // Generate operation
         match op {
@@ -2966,6 +2875,195 @@ impl CodeGen {
 
         self.expr_depth -= 1;
         result_type
+    }
+
+    /// Branch to `target` on the truth of `cond`.
+    ///
+    /// A comparison already sets exactly the flags a conditional jump reads,
+    /// so when one is used *as* a condition -- which is nearly always -- there
+    /// is no reason to turn the flags into a -1/0 word only to test that word
+    /// against zero. This turns
+    ///
+    /// ```text
+    ///     ucomisd xmm0, xmm1 / setb al / movzx eax, al / neg eax
+    ///     test eax, eax / je .Lelse
+    /// ```
+    ///
+    /// into `ucomisd xmm0, xmm1 / jae .Lelse`.
+    ///
+    /// It has to be requested per site rather than done inside
+    /// `gen_binary_expr`, because a comparison is an ordinary Long-valued
+    /// expression everywhere else: `X = (A > B)` stores it, `PRINT (A > B)`
+    /// prints it, and `A > B AND C > D` needs both halves as -1/0 words,
+    /// since BASIC's AND is bitwise.
+    ///
+    /// Anything that is not a comparison falls back to evaluating the
+    /// condition as a value and testing it, exactly as before.
+    fn gen_condition(&mut self, cond: &Expr, target: &str, jump_if_true: bool) {
+        // Complement rather than negate the mnemonic by hand: jae is exactly
+        // not-jb, jle is not-jg, and so on, including for the unordered case
+        // that ucomisd signals through CF -- so inverting the operator and
+        // inverting the branch agree on NaN, as they must to preserve what the
+        // setcc form did.
+        let effective = |op: BinaryOp| -> BinaryOp {
+            if jump_if_true {
+                op
+            } else {
+                match op {
+                    BinaryOp::Eq => BinaryOp::Ne,
+                    BinaryOp::Ne => BinaryOp::Eq,
+                    BinaryOp::Lt => BinaryOp::Ge,
+                    BinaryOp::Ge => BinaryOp::Lt,
+                    BinaryOp::Gt => BinaryOp::Le,
+                    BinaryOp::Le => BinaryOp::Gt,
+                    other => other,
+                }
+            }
+        };
+
+        // Integers and memcmp results read signed; ucomis* reports through CF
+        // and ZF, so a float comparison reads unsigned.
+        let jcc = |op: BinaryOp, signed: bool| -> &'static str {
+            match (op, signed) {
+                (BinaryOp::Eq, _) => "je",
+                (BinaryOp::Ne, _) => "jne",
+                (BinaryOp::Lt, true) => "jl",
+                (BinaryOp::Lt, false) => "jb",
+                (BinaryOp::Gt, true) => "jg",
+                (BinaryOp::Gt, false) => "ja",
+                (BinaryOp::Le, true) => "jle",
+                (BinaryOp::Le, false) => "jbe",
+                (BinaryOp::Ge, true) => "jge",
+                (BinaryOp::Ge, false) => "jae",
+                _ => unreachable!("guarded by is_comparison"),
+            }
+        };
+
+        if let Expr::Binary { op, left, right } = cond {
+            if Self::is_comparison(*op) {
+                let left_type = self.expr_type(left);
+                let right_type = self.expr_type(right);
+
+                if left_type == DataType::String && right_type == DataType::String {
+                    self.gen_string_compare(left, right);
+                    self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                    return;
+                }
+
+                if left_type != DataType::String && right_type != DataType::String {
+                    let work_type = self.promote_types(left_type, right_type, BinaryOp::Add);
+                    let signed = work_type.is_integer();
+
+                    // Same constant-operand shortcut the value form takes.
+                    if signed {
+                        if let Some(n) = self.const_i32(right) {
+                            let ty = self.gen_expr(left);
+                            self.gen_coercion(ty, work_type);
+                            self.emit(&format!("    cmp eax, {}", n));
+                            self.emit(&format!("    {} {}", jcc(effective(*op), true), target));
+                            return;
+                        }
+                    } else if work_type == DataType::Double {
+                        if let Some(value) = self.const_double(right) {
+                            self.gen_expr_to_double(left);
+                            let operand = self.f64_operand(value);
+                            self.emit(&format!("    ucomisd xmm0, {}", operand));
+                            self.emit(&format!("    {} {}", jcc(effective(*op), false), target));
+                            return;
+                        }
+                    }
+
+                    self.gen_binary_operands(left, right, work_type);
+                    self.emit_typed(
+                        work_type,
+                        "    cmp eax, ecx",
+                        "    ucomiss xmm0, xmm1",
+                        "    ucomisd xmm0, xmm1",
+                    );
+                    self.emit(&format!("    {} {}", jcc(effective(*op), signed), target));
+                    return;
+                }
+            }
+        }
+
+        // Not a comparison: evaluate it as a value and test that.
+        let cond_type = self.gen_expr(cond);
+        if cond_type.is_integer() {
+            self.emit("    test eax, eax");
+        } else {
+            self.emit("    xorpd xmm1, xmm1");
+            self.emit("    ucomisd xmm0, xmm1");
+        }
+        self.emit(&format!(
+            "    {} {}",
+            if jump_if_true { "jne" } else { "je" },
+            target
+        ));
+    }
+
+    /// Compare two strings, leaving memcmp-style flags set.
+    ///
+    /// `_rt_strcmp` returns a negative, zero or positive int in eax like
+    /// memcmp, and the `test` at the end sets the flags a *signed* condition
+    /// reads -- so both the value form and the branch form below can just pick
+    /// a mnemonic.
+    fn gen_string_compare(&mut self, left: &Expr, right: &Expr) {
+        // Evaluate left string (ptr in rax, len in rdx)
+        self.gen_expr(left);
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        self.emit("    mov QWORD PTR [rsp], rax"); // left ptr
+        self.emit("    mov QWORD PTR [rsp + 8], rdx"); // left len
+
+        // Evaluate right string (ptr in rax, len in rdx)
+        self.gen_expr(right);
+        self.emit("    mov r8, rax"); // right ptr
+        self.emit("    mov r9, rdx"); // right len
+        self.emit("    mov rax, QWORD PTR [rsp]"); // left ptr
+        self.emit("    mov rdx, QWORD PTR [rsp + 8]"); // left len
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
+        self.emit_arg_reg(0, "rax");
+        self.emit_arg_reg(1, "rdx");
+        self.emit_arg_reg(2, "r8");
+        self.emit_arg_reg(3, "r9");
+        self.emit("    call _rt_strcmp");
+        self.emit("    test eax, eax");
+    }
+
+    /// Evaluate both operands of a numeric binary operator into the registers
+    /// the operator instruction expects: left in eax/xmm0, right in ecx/xmm1.
+    ///
+    /// The left operand is parked on the stack while the right is evaluated,
+    /// because evaluating the right can call a function and clobber every
+    /// scratch register. Sixteen bytes rather than eight so that such a call
+    /// still finds rsp aligned.
+    fn gen_binary_operands(&mut self, left: &Expr, right: &Expr, work_type: DataType) {
+        let left_type = self.gen_expr(left);
+        self.gen_coercion(left_type, work_type);
+
+        self.emit(&format!("    sub rsp, {}", STACK_TEMP_SPACE));
+        if work_type.is_integer() {
+            self.emit("    mov QWORD PTR [rsp], rax");
+        } else if work_type == DataType::Single {
+            self.emit("    movss DWORD PTR [rsp], xmm0");
+        } else {
+            self.emit("    movsd QWORD PTR [rsp], xmm0");
+        }
+
+        let right_type = self.gen_expr(right);
+        self.gen_coercion(right_type, work_type);
+
+        // Move right to secondary register/location and restore left
+        if work_type.is_integer() {
+            self.emit("    mov ecx, eax"); // right in ecx
+            self.emit("    mov rax, QWORD PTR [rsp]"); // left in rax
+        } else if work_type == DataType::Single {
+            self.emit("    movss xmm1, xmm0"); // right in xmm1
+            self.emit("    movss xmm0, DWORD PTR [rsp]"); // left in xmm0
+        } else {
+            self.emit("    movsd xmm1, xmm0"); // right in xmm1
+            self.emit("    movsd xmm0, QWORD PTR [rsp]"); // left in xmm0
+        }
+        self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
     }
 
     /// Apply `op` with a compile-time constant on the right, or report that it
