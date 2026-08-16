@@ -39,6 +39,29 @@
 _rt_rnd:
     push rbp
     mov rbp, rsp
+    # GW-BASIC's argument selects the behaviour:
+    #   RND(<0) reseeds from that value and returns the next number
+    #   RND(0)  returns the previous number again
+    #   RND(>0), and a bare RND, return the next number
+    # The argument used to be ignored entirely, so RND(0) advanced like any
+    # other call and RND(-1) -- the idiom for a repeatable run -- did nothing.
+    xorpd xmm1, xmm1
+    ucomisd xmm0, xmm1
+    jp .Lrnd_next               # NaN: treat as "next"
+    je .Lrnd_repeat
+    jb .Lrnd_reseed
+    jmp .Lrnd_next
+
+.Lrnd_reseed:
+    call _rt_randomize          # consumes xmm0, leaves the state seeded
+    jmp .Lrnd_next
+
+.Lrnd_repeat:
+    movsd xmm0, QWORD PTR [rip + _rng_last]
+    leave
+    ret
+
+.Lrnd_next:
     # Load current state
     mov rax, QWORD PTR [rip + _rng_state]
     # Xorshift64 algorithm
@@ -62,6 +85,49 @@ _rt_rnd:
     mov rcx, 0x3FF0000000000000
     movq xmm1, rcx
     subsd xmm0, xmm1        # result = [1,2) - 1.0 = [0,1)
+    # Remember it, so that RND(0) can hand back the same number.
+    movsd QWORD PTR [rip + _rng_last], xmm0
+    leave
+    ret
+
+# _rt_randomize - RANDOMIZE: set the generator's seed
+#
+# The state was a fixed constant with no way to change it, so every run of every
+# program produced the same numbers -- a dice game rolled the same dice every
+# time it was played.
+#
+# The seed's bit pattern is passed through a splitmix64 avalanche rather than
+# used directly: BASIC seeds are small integers, and xorshift64 started from a
+# small state produces a visibly poor first few values. Zero is replaced,
+# because it is xorshift's fixed point and would return 0 forever.
+#
+# Arguments: xmm0 = seed
+# Returns: nothing
+.globl _rt_randomize
+_rt_randomize:
+    push rbp
+    mov rbp, rsp
+    movq rax, xmm0
+    mov rcx, 0x9E3779B97F4A7C15
+    add rax, rcx
+    mov rcx, rax
+    shr rcx, 30
+    xor rax, rcx
+    mov rcx, 0xBF58476D1CE4E5B9
+    imul rax, rcx
+    mov rcx, rax
+    shr rcx, 27
+    xor rax, rcx
+    mov rcx, 0x94D049BB133111EB
+    imul rax, rcx
+    mov rcx, rax
+    shr rcx, 31
+    xor rax, rcx
+    test rax, rax
+    jnz .Lrandomize_store
+    mov rax, 0x12345678DEADBEEF     # xorshift64 must never hold zero
+.Lrandomize_store:
+    mov QWORD PTR [rip + _rng_state], rax
     leave
     ret
 

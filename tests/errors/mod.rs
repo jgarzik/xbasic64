@@ -866,7 +866,6 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
         ("A$ = INPUT$(3)\n", "INPUT$"),
         ("LOCATE 1, 1\n", "LOCATE"),
         ("COLOR 7\n", "COLOR"),
-        ("RANDOMIZE 5\n", "RANDOMIZE"),
         ("DEFINT A-Z\n", "DEFINT"),
         ("PRINT PEEK(0)\n", "PEEK"),
         ("POKE 0, 1\n", "POKE"),
@@ -927,7 +926,7 @@ fn test_unsupported_diagnostics_explain_themselves() {
         err.stderr
     );
 
-    let err = compile_only("RANDOMIZE 5\n").expect_err("RANDOMIZE must be refused");
+    let err = compile_only("PRINT INKEY$\n").expect_err("INKEY$ must be refused");
     assert!(
         err.contains("not implemented yet"),
         "a planned feature should say so: {}",

@@ -73,6 +73,7 @@ fn keyword(s: &str) -> Option<Token> {
         "END" => Some(Token::End),
         "STOP" => Some(Token::Stop),
         "READ" => Some(Token::Read),
+        "RANDOMIZE" => Some(Token::Randomize),
         "RESTORE" => Some(Token::Restore),
         "CLS" => Some(Token::Cls),
         "OPEN" => Some(Token::Open),
@@ -148,6 +149,7 @@ pub enum Token {
     /// See `Lexer::read_data_text` for why it is not tokenized.
     DataText(String),
     Read,
+    Randomize,
     Restore,
     Cls,
     Open,

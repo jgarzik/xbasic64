@@ -3386,6 +3386,17 @@ impl CodeGen {
                 self.emit("    call _rt_cls");
             }
 
+            StmtKind::Randomize(seed) => {
+                // With no seed, take the clock: GW-BASIC prompts the operator
+                // for one, and a compiled program has nobody to ask. TIMER
+                // already returns fractional seconds, so it is the clock.
+                match seed {
+                    Some(e) => self.gen_expr_to_double(e),
+                    None => self.emit("    call _rt_timer"),
+                }
+                self.emit("    call _rt_randomize");
+            }
+
             StmtKind::SelectCase { expr, cases } => {
                 let end_label = self.new_label("endselect");
 
@@ -5602,7 +5613,13 @@ impl CodeGen {
                 self.emit("    cvtsi2sd xmm0, eax");
             }
             "RND" => {
-                if !args.is_empty() {
+                if args.is_empty() {
+                    // A bare RND means "next value", which _rt_rnd spells as a
+                    // positive argument. This used to leave whatever happened to
+                    // be in xmm0 -- harmless only while the argument was ignored.
+                    let one = self.f64_operand(1.0);
+                    emit!(self, "    movsd xmm0, {}", one);
+                } else {
                     self.gen_expr_to_double(&args[0]);
                 }
                 self.emit("    call _rt_rnd");

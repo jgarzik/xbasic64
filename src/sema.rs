@@ -124,7 +124,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("VIEW", "console windowing is not implemented yet"),
     ("BEEP", "BEEP is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
-    ("RANDOMIZE", "RANDOMIZE is not implemented yet"),
     (
         "ERASE",
         "ERASE is not implemented yet; REDIM clears an array",
@@ -491,6 +490,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             lvalue(a, f);
             lvalue(b, f);
         }
+        StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
         StmtKind::Const { value, .. } => f(value),
         StmtKind::FieldAssign { target, value } => {
             lvalue(target, f);

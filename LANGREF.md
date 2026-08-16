@@ -852,12 +852,27 @@ STOP    ' Terminate (historically for debugging)
 same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
 `0.3333333333333333`) and a `SINGLE` shows only the ~7 digits it carries.
 
-**RND behavior:**
+**RND behavior:** the argument selects between three behaviours.
+
 ```basic
 X = RND           ' Next random number
-X = RND(0)        ' Same as RND
-X = RND(-1)       ' Reseed with system time (implementation-defined)
+X = RND(1)        ' Next random number; any positive value does this
+X = RND(0)        ' The previous number again
+X = RND(-7)       ' Reseed from -7, then return the next number
 ```
+
+The generator starts from a fixed seed, so a program that never reseeds replays
+the same numbers on every run -- which is useful while debugging and wrong for a
+game. `RANDOMIZE` is how a program chooses:
+
+```basic
+RANDOMIZE            ' Seed from the clock: a different run every time
+RANDOMIZE TIMER      ' The same thing, written out
+RANDOMIZE 42         ' A fixed seed: the same run every time
+```
+
+GW-BASIC's bare `RANDOMIZE` asks the operator for a seed. A compiled program has
+nobody to ask, so it takes the clock.
 
 ### String Functions
 
@@ -1286,7 +1301,7 @@ written. Programs using them are refused today.
 - **Console control** -- `LOCATE`, `COLOR`, `WIDTH`, `CSRLIN`, `POS`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
 - **Date and time** -- `DATE$`, `TIME$`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Odds and ends** -- `RANDOMIZE`, `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
+- **Odds and ends** -- `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
 - **`DEFINT` and friends** -- `DEFINT`, `DEFLNG`, `DEFSNG`, `DEFDBL`, `DEFSTR`; use a
   type suffix or `DIM ... AS`
 

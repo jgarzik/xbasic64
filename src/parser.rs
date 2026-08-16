@@ -221,6 +221,11 @@ pub enum StmtKind {
     },
     Data(Vec<Literal>),
     Read(Vec<LValue>),
+    /// `RANDOMIZE [expr]` -- reseed the random number generator.
+    ///
+    /// GW-BASIC prompts for a seed when none is given; a compiled program has
+    /// nobody to prompt, so `None` means "seed from the clock".
+    Randomize(Option<Expr>),
     Restore(Option<GotoTarget>),
     Cls,
     SelectCase {
@@ -682,6 +687,7 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Stop => "STOP",
         Token::DataText(_) => "DATA",
         Token::Read => "READ",
+        Token::Randomize => "RANDOMIZE",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
         Token::Open => "OPEN",
@@ -1270,6 +1276,7 @@ impl Parser {
             Token::Function => self.parse_function(),
             Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
+            Token::Randomize => self.parse_randomize(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
                 self.advance();
@@ -2576,6 +2583,20 @@ impl Parser {
         }
 
         Ok(StmtKind::Read(vars))
+    }
+
+    /// `RANDOMIZE`, `RANDOMIZE n`, `RANDOMIZE TIMER`.
+    ///
+    /// `TIMER` needs no special case: it is an ordinary builtin, so the general
+    /// expression form covers it.
+    fn parse_randomize(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume RANDOMIZE
+        let seed = if matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        Ok(StmtKind::Randomize(seed))
     }
 
     fn parse_restore(&mut self) -> PResult<StmtKind> {
