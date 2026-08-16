@@ -27,9 +27,14 @@
 .equ CHR_RESULT_LEN, 1          # CHR$() always returns 1 character
 
 .data
-_str_buf: .skip 64          # Scratch for HEX$()/OCT$(); never returned
 _fmt_hex: .asciz "%llX"
 _fmt_oct: .asciz "%llo"
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows.
+.bss
+.p2align 3
+_str_buf: .skip 64          # Scratch for HEX$()/OCT$(); never returned
 _chr_buf: .skip 2           # Scratch for CHR$(); never returned
 
 .text

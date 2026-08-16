@@ -18,9 +18,15 @@
 
 
 .data
-_print_buffer: .skip 64          # Buffer for number formatting
-_bytes_written: .quad 0          # For WriteFile output parameter
 _newline_str: .ascii "\r\n"      # Windows uses CRLF
+
+# Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
+# .text below restores the section for the code that follows; a .bss left
+# open at the end of this file would swallow the next runtime part.
+.bss
+.p2align 3
+_print_buffer: .skip 64          # Buffer for number formatting
+_bytes_written: .skip 8          # For WriteFile output parameter
 
 .text
 

@@ -28,11 +28,21 @@ _fmt_g8: .asciz "%.8g"
 _fmt_g9: .asciz "%.9g"
 .p2align 3
 _fmt_g_single_table: .quad _fmt_g6, _fmt_g7, _fmt_g8, _fmt_g9, 0
-_num_buf: .skip 64
 _redo_msg: .ascii "?Redo from start\r\n"
 .equ _redo_msg_len, . - _redo_msg
 
 # Error messages
 # Lengths are computed by the assembler (. - label), never hand-counted: a
 # hand-counted value here was wrong by one, making WriteFile emit a stray byte.
+
+# Scratch buffers. These start as zeros, so they belong in .bss: in .data
+# every one of these bytes is a zero stored in the executable itself, which
+# came to 8K of the image across the whole runtime.
+#
+# Safe to leave .bss active at the end of this file, and only here: runtime.rs
+# concatenates data_defs.s and then emits .text unconditionally before the
+# first code-bearing part. Every other runtime file must restore .text itself.
+.bss
+.p2align 3
+_num_buf: .skip 64
 
