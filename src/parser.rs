@@ -1604,11 +1604,19 @@ impl Parser {
             self.skip_newlines();
         }
 
-        // Use end condition if no start condition, or start condition takes precedence
-        let final_condition = condition.or(end_condition);
+        // A loop tests at one end or the other. These used to be merged with
+        // `condition.or(end_condition)`, which silently discarded the one on
+        // the LOOP: `DO WHILE I < 3 ... LOOP UNTIL I > 100` ran on the WHILE
+        // alone, with the UNTIL having no effect at all. Writing both is a
+        // mistake about which test applies, so say so rather than pick one.
+        if condition.is_some() && end_condition.is_some() {
+            return err(
+                "a DO loop may test its condition at only one end, not on both DO and LOOP",
+            );
+        }
 
         Ok(StmtKind::DoLoop {
-            condition: final_condition,
+            condition: condition.or(end_condition),
             cond_at_start,
             is_until: if cond_at_start {
                 is_until

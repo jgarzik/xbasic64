@@ -933,6 +933,42 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// A DO loop tests its condition at one end or the other, never both.
+///
+/// The two conditions used to be merged with `condition.or(end_condition)`, so
+/// the one on the LOOP was silently discarded: the loop below ran three times
+/// and printed 3, with `UNTIL I > 100` having no effect whatever. Writing both
+/// is a mistake about which test is being applied, and saying so beats picking
+/// one.
+#[test]
+fn test_do_loop_rejects_a_condition_at_both_ends() {
+    expect_rejected(
+        "I = 0\nDO WHILE I < 3\nI = I + 1\nLOOP UNTIL I > 100\n",
+        "only one end",
+    );
+    expect_rejected(
+        "I = 0\nDO UNTIL I > 3\nI = I + 1\nLOOP WHILE I < 100\n",
+        "only one end",
+    );
+}
+
+/// Each single-ended form still compiles, so the check above is not simply
+/// rejecting every DO loop.
+#[test]
+fn test_do_loop_single_condition_forms_still_compile() {
+    for source in [
+        "I = 0\nDO WHILE I < 3\nI = I + 1\nLOOP\n",
+        "I = 0\nDO UNTIL I > 3\nI = I + 1\nLOOP\n",
+        "I = 0\nDO\nI = I + 1\nLOOP WHILE I < 3\n",
+        "I = 0\nDO\nI = I + 1\nLOOP UNTIL I > 3\n",
+        "I = 0\nDO\nI = I + 1\nIF I > 3 THEN EXIT DO\nLOOP\n",
+    ] {
+        compile_only(source).unwrap_or_else(|e| {
+            panic!("{:?} should compile, but: {}", source, e.stderr);
+        });
+    }
+}
+
 /// The random-access statement names are recognised only in statement
 /// position, so a program may still use them for its own variables and
 /// procedures -- which GW-BASIC would not allow, but costs nothing to keep.
