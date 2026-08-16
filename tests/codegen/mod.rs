@@ -21,25 +21,45 @@
 
 use crate::common::compile_to_asm;
 
-/// The instructions between a loop's label and its exit label.
+/// The instructions of the one loop in a single-loop program.
 ///
 /// Found by the label *definitions*, at the start of a line: searching for
 /// `.Lendfor_` anywhere finds the forward branch at the top of the loop
-/// instead, which sits before the body rather than after it.
+/// instead, which sits before the body rather than after it. And by the
+/// numbered form only, since a loop whose step is not a constant also emits
+/// `.Lfor_neg_N` and `.Lfor_body_N`.
+///
+/// It asserts there is exactly one loop rather than guessing which to take.
+/// Every caller passes a program with one; a test that later grew a nested
+/// loop would otherwise quietly start asserting against the wrong body.
 #[track_caller]
-fn innermost_loop_body(asm: &str) -> String {
-    let start = asm
-        .match_indices("\n.Lfor_")
-        .find(|(_, _)| true)
-        .map(|(i, _)| i)
-        .expect("a loop label");
-    let after = &asm[start + 1..];
-    let end = after
-        .match_indices("\n.Lendfor_")
-        .map(|(i, _)| i)
-        .next()
+fn sole_loop_body(asm: &str) -> String {
+    let starts = label_positions(asm, ".Lfor_");
+    assert_eq!(
+        starts.len(),
+        1,
+        "this helper is for single-loop programs, but found {} loops",
+        starts.len()
+    );
+    let after = &asm[starts[0] + 1..];
+    let end = label_positions(after, ".Lendfor_")
+        .first()
+        .copied()
         .expect("a loop exit label");
     after[..end].to_string()
+}
+
+/// Byte offsets of the `\n<prefix><digits>:` label definitions in `asm`.
+fn label_positions(asm: &str, prefix: &str) -> Vec<usize> {
+    let needle = format!("\n{}", prefix);
+    asm.match_indices(&needle)
+        .filter(|(i, _)| {
+            let rest = &asm[i + needle.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            !digits.is_empty() && rest[digits.len()..].starts_with(':')
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Every one of `needles` must appear in the generated assembly.
@@ -758,8 +778,14 @@ fn test_no_runtime_helper_falls_through() {
         for file in [
             "print.s", "input.s", "string.s", "math.s", "data.s", "file.s", "error.s", "using.s",
         ] {
-            let path = format!("src/runtime/{}/{}", tree, file);
-            let text = std::fs::read_to_string(&path).expect(&path);
+            // Anchored at the manifest rather than the working directory,
+            // which a test runner is free to set wherever it likes.
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/runtime")
+                .join(tree)
+                .join(file);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
             let mut previous: Option<String> = None;
             for line in text.lines() {
                 let t = line.trim();
@@ -770,7 +796,13 @@ fn test_no_runtime_helper_falls_through() {
                         // a call to it is not a fall-through.
                         let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
                             || prev.starts_with("call _rt_error");
-                        assert!(terminal, "{} falls into {} from `{}`", path, t, prev);
+                        assert!(
+                            terminal,
+                            "{} falls into {} from `{}`",
+                            path.display(),
+                            t,
+                            prev
+                        );
                     }
                 }
                 // Track the last thing that is an instruction: not a comment,
@@ -800,7 +832,7 @@ fn test_no_runtime_helper_falls_through() {
 fn test_loop_accumulator_is_promoted() {
     let src = "C# = 0\nFOR I = 1 TO 10\nC# = C# + 1\nNEXT I\nPRINT C#\n";
     let asm = compile_to_asm(src).expect("must compile");
-    let body = innermost_loop_body(&asm);
+    let body = sole_loop_body(&asm);
     assert!(
         !body.contains("_var_C_D"),
         "the accumulator's storage must not be touched inside the loop:\n{}",
@@ -831,7 +863,7 @@ PRINT C#
 PRINT D#
 ";
     let asm = compile_to_asm(src).expect("must compile");
-    let body = innermost_loop_body(&asm);
+    let body = sole_loop_body(&asm);
     assert!(
         body.contains("_var_D_D"),
         "the fourth accumulator should have stayed in memory:\n{}",
@@ -892,7 +924,7 @@ fn test_accumulator_write_back_is_correct() {
 fn test_calling_loop_does_not_promote_accumulators() {
     let src = "T# = 0\nFOR I = 1 TO 3\nT# = T# + I\nPRINT T#\nNEXT I\n";
     let asm = compile_to_asm(src).expect("must compile");
-    let body = innermost_loop_body(&asm);
+    let body = sole_loop_body(&asm);
     assert!(
         body.contains("_var_T_D"),
         "PRINT is a call, so nothing may be promoted:\n{}",
@@ -928,7 +960,7 @@ NEXT I
 PRINT T#
 ";
     let asm = compile_to_asm(src).expect("must compile");
-    let body = innermost_loop_body(&asm);
+    let body = sole_loop_body(&asm);
     assert!(
         !body.contains("_arr_A"),
         "the descriptor should be in registers inside the loop:\n{}",
@@ -953,7 +985,7 @@ NEXT I
 PRINT T#
 ";
     let asm = compile_to_asm(src).expect("must compile");
-    let body = innermost_loop_body(&asm);
+    let body = sole_loop_body(&asm);
     assert!(
         body.contains(".Lerr_undim"),
         "the DIM check belongs with the access:\n{}",

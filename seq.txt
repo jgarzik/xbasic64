@@ -1,5 +1,0 @@
-first line
-25
-1.5
-"quoted",7
-appended
