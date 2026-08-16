@@ -133,6 +133,122 @@ PRINT Y
     asserts_emits(src, &["movsx eax, ax"]);
 }
 
+/// A Double constant is named in memory, not built as a 64-bit immediate.
+///
+/// `mov rax, <imm64>` plus `movq xmm0, rax` is fifteen bytes and costs a
+/// scratch register and a register round trip; a pool reference is eight.
+#[test]
+fn test_double_constants_come_from_the_pool() {
+    let src = "X# = 3.5\nPRINT X#\n";
+    asserts_emits(src, &["_f64_0: .quad 0x400C000000000000"]);
+    asserts_absent(src, &["mov rax, 0x400C000000000000", "movq xmm0, rax"]);
+}
+
+/// Equal constants share one pool entry.
+#[test]
+fn test_double_constant_pool_is_deduplicated() {
+    let asm = compile_to_asm("X# = 2.5 + 2.5\nPRINT X#\n").expect("the program must compile");
+    let entries = asm.lines().filter(|l| l.starts_with("_f64_")).count();
+    assert_eq!(entries, 1, "expected one pooled constant:\n{}", asm);
+}
+
+/// Zero is shorter still as an idiom, and breaks rather than makes a
+/// dependency on whatever xmm0 last held.
+#[test]
+fn test_double_zero_is_an_xor() {
+    let src = "X# = 0.0\nPRINT X#\n";
+    asserts_emits(src, &["xorpd xmm0, xmm0"]);
+}
+
+/// A constant right operand needs no spill: it cannot clobber the left one.
+///
+/// The general path parks the left operand on the stack while the right is
+/// evaluated, because evaluating the right can call a function. A literal
+/// cannot, so the whole `sub rsp` / store / reload / `add rsp` sequence -- and
+/// the `cvtsi2sd` that used to widen an integer literal -- goes away.
+#[test]
+fn test_double_operand_folds_into_the_instruction() {
+    let src = "Y# = 2\nX# = Y# * 3\nPRINT X#\n";
+    asserts_emits(src, &["mulsd xmm0, QWORD PTR [rip + _f64_"]);
+    asserts_absent(src, &["cvtsi2sd", "sub rsp, 16"]);
+}
+
+/// The same for integers, where the constant becomes an immediate.
+#[test]
+fn test_integer_operand_becomes_an_immediate() {
+    let src = "Y% = 2\nX% = Y% + 5\nPRINT X%\n";
+    asserts_emits(src, &["add eax, 5"]);
+    asserts_absent(src, &["sub rsp, 16"]);
+}
+
+/// Dividing by a constant zero is decided at compile time, not re-tested.
+///
+/// The runtime test (`movq r11, xmm1` / `add r11, r11` / `jz`) exists to catch
+/// a divisor only known at run time. When the divisor is written into the
+/// program the branch is not a branch, and the trap is unconditional -- but it
+/// is still a trap.
+#[test]
+fn test_constant_zero_divisor_traps_without_testing() {
+    let src = "Y# = 5\nX# = Y# / 0\nPRINT X#\n";
+    asserts_absent(src, &["movq r11, xmm1"]);
+
+    let run = crate::common::compile_and_run_raw(src, "").expect("the program must compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Division by zero") || run.stdout.contains("Division by zero"),
+        "expected a division-by-zero abort, got {:?} / {:?}",
+        run.stdout,
+        run.stderr
+    );
+}
+
+/// ...and a nonzero constant divisor is not tested at all.
+#[test]
+fn test_constant_nonzero_divisor_is_not_tested() {
+    asserts_absent("Y# = 5\nX# = Y# / 2\nPRINT X#\n", &["movq r11, xmm1"]);
+}
+
+/// Every operator that takes the constant path must still compute correctly.
+///
+/// The shape assertions above say the fast path fired; this says it was right.
+#[test]
+fn test_constant_right_operand_arithmetic_is_correct() {
+    let src = "\
+Y% = 7
+PRINT Y% MOD 3
+PRINT Y% \\ 2
+PRINT Y% + 5
+PRINT Y% - 2
+PRINT Y% * 3
+Z# = 2.5
+PRINT Z# ^ 2
+PRINT Z# / 2
+PRINT -Z#
+PRINT ABS(-Z#)
+PRINT (Y% > 3)
+PRINT (Z# < 1)
+PRINT (Y% = 7)
+PRINT (Z# >= 2.5)
+";
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    let got: Vec<&str> = out.lines().map(str::trim).collect();
+    assert_eq!(
+        got,
+        vec![
+            "1", "3", "12", "5", "21", "6.25", "1.25", "-2.5", "2.5", "-1", "0", "-1", "-1"
+        ]
+    );
+}
+
+/// A CONST is a constant here too, not just a literal.
+#[test]
+fn test_named_constants_take_the_constant_path() {
+    let src = "CONST THREE = 3\nY# = 2\nX# = Y# * THREE\nPRINT X#\n";
+    asserts_emits(src, &["mulsd xmm0, QWORD PTR [rip + _f64_"]);
+    let out = crate::common::compile_and_run(src).expect("the program must run");
+    assert_eq!(out.trim(), "6");
+}
+
 /// The truncation above is not decorative: the program must still wrap.
 ///
 /// 300 * 300 is 90000, which does not fit in an INTEGER; GW-BASIC's INTEGER

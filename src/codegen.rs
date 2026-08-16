@@ -474,9 +474,14 @@ pub struct CodeGen {
     stack_offset: i32,              // current stack offset
     label_counter: u32,             // for generating unique labels
     string_literals: Vec<String>,   // string constants
-    data_items: Vec<Literal>,       // DATA values
-    current_proc: Option<String>,   // current SUB/FUNCTION name
-    proc_vars: HashMap<String, VarInfo>, // local variables for current proc
+    /// Double constants, as bit patterns, in emission order. Deduplicated
+    /// through `f64_index`; keyed on the bits rather than the value so that
+    /// 0.0 and -0.0 stay distinct, as do NaNs with different payloads.
+    f64_pool: Vec<u64>,
+    f64_index: HashMap<u64, usize>,
+    data_items: Vec<Literal>,                // DATA values
+    current_proc: Option<String>,            // current SUB/FUNCTION name
+    proc_vars: HashMap<String, VarInfo>,     // local variables for current proc
     proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
     /// Names resolved by semantic analysis; codegen consults this instead of
     /// guessing from an identifier's spelling.
@@ -699,6 +704,90 @@ impl CodeGen {
         let idx = self.string_literals.len();
         self.string_literals.push(s.to_string());
         idx
+    }
+
+    /// A memory operand naming `value` in the Double constant pool.
+    ///
+    /// Materializing a double as an immediate costs `mov rax, <imm64>` plus
+    /// `movq xmm0, rax`: fifteen bytes, a scratch register, and a register
+    /// round trip. Naming it in memory costs eight bytes and no register, and
+    /// every SSE instruction that wants a second operand will take it from
+    /// memory directly, which is what makes the literal fast paths below
+    /// possible at all.
+    fn f64_operand(&mut self, value: f64) -> String {
+        let bits = value.to_bits();
+        let next = self.f64_pool.len();
+        let idx = *self.f64_index.entry(bits).or_insert(next);
+        if idx == next {
+            self.f64_pool.push(bits);
+        }
+        format!("QWORD PTR [rip + _f64_{}]", idx)
+    }
+
+    /// Load a Double constant into xmm0.
+    fn gen_double_const(&mut self, value: f64) {
+        // Positive zero is the one value with a shorter encoding still: three
+        // bytes, no memory reference, and it breaks rather than creates a
+        // dependency on xmm0's previous contents. Negative zero is a different
+        // bit pattern and does not qualify.
+        if value == 0.0 && value.is_sign_positive() {
+            self.emit("    xorpd xmm0, xmm0");
+            return;
+        }
+        let operand = self.f64_operand(value);
+        self.emit(&format!("    movsd xmm0, {}", operand));
+    }
+
+    /// The constant value of a numeric literal, for the fast paths that need
+    /// to know one at compile time. `None` for anything else, including
+    /// strings.
+    ///
+    /// A `CONST` name counts: sema has already folded it to a literal, and
+    /// `gen_expr` substitutes it, so leaving it out here would mean `X * 2`
+    /// took the fast path while `X * TWO` did not.
+    fn const_double(&self, expr: &Expr) -> Option<f64> {
+        let lit = match expr {
+            Expr::Literal(lit) => lit,
+            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => Some(*n as f64),
+            Literal::Float(f) => Some(*f),
+            Literal::String(_) => None,
+        }
+    }
+
+    /// The value of an integer constant that fits an instruction's imm32.
+    ///
+    /// Read from the literal rather than through [`Self::const_double`]: past
+    /// 2^53 an f64 no longer holds every integer, and the point of this is to
+    /// be exact.
+    fn const_i32(&self, expr: &Expr) -> Option<i32> {
+        let lit = match expr {
+            Expr::Literal(lit) => lit,
+            Expr::Variable(name) => self.symbols.consts.get(&name.to_uppercase())?,
+            _ => return None,
+        };
+        match lit {
+            Literal::Integer(n) => i32::try_from(*n).ok(),
+            _ => None,
+        }
+    }
+
+    /// Evaluate `expr` into xmm0 as a Double.
+    ///
+    /// A numeric constant is loaded straight from the pool. Going through
+    /// `gen_expr` would put an integer literal in eax and then pay a
+    /// `cvtsi2sd` to widen it -- an instruction whose destination register is
+    /// also an input, so it carries a dependency on whatever xmm0 last held.
+    fn gen_expr_to_double(&mut self, expr: &Expr) {
+        if let Some(value) = self.const_double(expr) {
+            self.gen_double_const(value);
+            return;
+        }
+        let ty = self.gen_expr(expr);
+        self.gen_coercion(ty, DataType::Double);
     }
 
     /// Get variable info, allocating if necessary
@@ -1656,8 +1745,16 @@ impl CodeGen {
                 } else if is_string_var(name) {
                     self.gen_string_assign(name, value);
                 } else {
-                    // Evaluate expression and get its type
-                    let expr_type = self.gen_expr(value);
+                    // Evaluate expression and get its type. A Double target is
+                    // worth knowing about first: `X# = 2` is common, and going
+                    // through gen_expr would put 2 in eax only to widen it.
+                    let target_type = self.get_var_info(name).data_type;
+                    let expr_type = if target_type == DataType::Double {
+                        self.gen_expr_to_double(value);
+                        DataType::Double
+                    } else {
+                        self.gen_expr(value)
+                    };
                     let var_info = self.get_var_info(name);
 
                     // Coerce to target type
@@ -1838,26 +1935,21 @@ impl CodeGen {
                 let var_loc = self.get_var_loc(var);
 
                 // Initialize loop variable - coerce to double
-                let start_type = self.gen_expr(start);
-                self.gen_coercion(start_type, DataType::Double);
+                self.gen_expr_to_double(start);
                 self.emit(&format!("    movsd {}, xmm0", var_loc.q(0)));
 
                 // Store end value - coerce to double
                 self.stack_offset -= 8;
                 let end_offset = self.stack_offset;
-                let end_type = self.gen_expr(end);
-                self.gen_coercion(end_type, DataType::Double);
+                self.gen_expr_to_double(end);
                 self.emit(&format!("    movsd QWORD PTR [rbp + {}], xmm0", end_offset));
 
                 // Store step value - coerce to double
                 self.stack_offset -= 8;
                 let step_offset = self.stack_offset;
-                if let Some(s) = step {
-                    let step_type = self.gen_expr(s);
-                    self.gen_coercion(step_type, DataType::Double);
-                } else {
-                    self.emit("    mov rax, 0x3FF0000000000000  # 1.0");
-                    self.emit("    movq xmm0, rax");
+                match step {
+                    Some(s) => self.gen_expr_to_double(s),
+                    None => self.gen_double_const(1.0),
                 }
                 self.emit(&format!(
                     "    movsd QWORD PTR [rbp + {}], xmm0",
@@ -2459,17 +2551,13 @@ impl CodeGen {
                     // -1530494975. The lexer widens such literals already; this
                     // also covers values arriving from DATA.
                     Err(_) => {
-                        let bits = (*n as f64).to_bits();
-                        self.emit(&format!("    mov rax, 0x{:X}", bits));
-                        self.emit("    movq xmm0, rax");
+                        self.gen_double_const(*n as f64);
                         DataType::Double
                     }
                 },
                 Literal::Float(f) => {
                     // Load as double into xmm0
-                    let bits = f.to_bits();
-                    self.emit(&format!("    mov rax, 0x{:X}", bits));
-                    self.emit("    movq xmm0, rax");
+                    self.gen_double_const(*f);
                     DataType::Double
                 }
                 Literal::String(s) => {
@@ -2560,8 +2648,16 @@ impl CodeGen {
                                 self.emit("    movd xmm1, eax");
                                 self.emit("    xorps xmm0, xmm1");
                             } else {
-                                self.emit("    mov rax, 0x8000000000000000");
-                                self.emit("    movq xmm1, rax");
+                                // The mask comes from the pool rather than a
+                                // 64-bit immediate, so rax is left alone.
+                                //
+                                // It is loaded into a register rather than
+                                // named as xorpd's operand: the memory form of
+                                // a packed SSE instruction reads sixteen bytes
+                                // and requires them aligned, and pool entries
+                                // are eight bytes on an eight-byte boundary.
+                                let mask = self.f64_operand(-0.0);
+                                self.emit(&format!("    movsd xmm1, {}", mask));
                                 self.emit("    xorpd xmm0, xmm1");
                             }
                             operand_type
@@ -2735,6 +2831,14 @@ impl CodeGen {
             result_type
         };
 
+        // A constant on the right needs no register of its own, and evaluating
+        // it cannot disturb the left operand, so the spill below is pure
+        // overhead for what is far and away the commonest shape in BASIC.
+        if self.gen_binary_const_rhs(op, left, right, work_type) {
+            self.expr_depth -= 1;
+            return result_type;
+        }
+
         // Evaluate left operand and coerce to work type
         let left_type = self.gen_expr(left);
         self.gen_coercion(left_type, work_type);
@@ -2862,6 +2966,149 @@ impl CodeGen {
 
         self.expr_depth -= 1;
         result_type
+    }
+
+    /// Apply `op` with a compile-time constant on the right, or report that it
+    /// could not be done and leave nothing emitted.
+    ///
+    /// The general path spills the left operand to the stack while the right
+    /// one is evaluated, because evaluating the right operand can call a
+    /// function and clobber every scratch register. A constant cannot: it has
+    /// no side effects, needs no registers, and every instruction here takes
+    /// it as an immediate or straight out of the constant pool. That removes
+    /// four instructions and a store-to-load round trip from what is the
+    /// commonest shape in BASIC arithmetic.
+    ///
+    /// `Single` is left to the general path -- it would want a pool of its own
+    /// and there is very little SINGLE arithmetic to reward one.
+    fn gen_binary_const_rhs(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        work_type: DataType,
+    ) -> bool {
+        // (signed, unsigned): integers compare signed, but ucomisd reports
+        // through CF and ZF, so a float comparison reads as unsigned.
+        let setcc = |op: BinaryOp, signed: bool| -> &'static str {
+            match (op, signed) {
+                (BinaryOp::Eq, _) => "sete",
+                (BinaryOp::Ne, _) => "setne",
+                (BinaryOp::Lt, true) => "setl",
+                (BinaryOp::Lt, false) => "setb",
+                (BinaryOp::Gt, true) => "setg",
+                (BinaryOp::Gt, false) => "seta",
+                (BinaryOp::Le, true) => "setle",
+                (BinaryOp::Le, false) => "setbe",
+                (BinaryOp::Ge, true) => "setge",
+                (BinaryOp::Ge, false) => "setae",
+                _ => unreachable!("guarded by is_comparison"),
+            }
+        };
+
+        match work_type {
+            DataType::Integer | DataType::Long => {
+                let Some(n) = self.const_i32(right) else {
+                    return false;
+                };
+                // Div and Pow always promote to Double, so they never reach
+                // the integer arm; anything else unexpected declines.
+                let arith = match op {
+                    BinaryOp::Add => Some("add"),
+                    BinaryOp::Sub => Some("sub"),
+                    BinaryOp::Mul => Some("imul"),
+                    BinaryOp::And => Some("and"),
+                    BinaryOp::Or => Some("or"),
+                    BinaryOp::Xor => Some("xor"),
+                    _ => None,
+                };
+                if arith.is_none()
+                    && !Self::is_comparison(op)
+                    && !matches!(op, BinaryOp::IntDiv | BinaryOp::Mod)
+                {
+                    return false;
+                }
+
+                let left_type = self.gen_expr(left);
+                self.gen_coercion(left_type, work_type);
+
+                if let Some(instr) = arith {
+                    self.emit(&format!("    {} eax, {}", instr, n));
+                } else if Self::is_comparison(op) {
+                    self.emit(&format!("    cmp eax, {}", n));
+                    self.emit(&format!("    {} al", setcc(op, true)));
+                    self.emit("    movzx eax, al");
+                    self.emit("    neg eax"); // BASIC true is -1
+                } else {
+                    // idiv has no immediate form, so the divisor still has to
+                    // reach ecx -- but it gets there without the spill, and
+                    // the existing checks apply to it unchanged.
+                    self.emit(&format!("    mov ecx, {}", n));
+                    self.emit_integer_divide_checks();
+                    self.emit("    cdq");
+                    self.emit("    idiv ecx");
+                    if op == BinaryOp::Mod {
+                        self.emit("    mov eax, edx");
+                    }
+                }
+                true
+            }
+
+            DataType::Double => {
+                let Some(value) = self.const_double(right) else {
+                    return false;
+                };
+                // IntDiv and Mod promote to Long, so they are handled above
+                // and never arrive here; decline rather than assume it.
+                if matches!(op, BinaryOp::IntDiv | BinaryOp::Mod) {
+                    return false;
+                }
+                self.gen_expr_to_double(left);
+                let operand = self.f64_operand(value);
+
+                match op {
+                    BinaryOp::Add => self.emit(&format!("    addsd xmm0, {}", operand)),
+                    BinaryOp::Sub => self.emit(&format!("    subsd xmm0, {}", operand)),
+                    BinaryOp::Mul => self.emit(&format!("    mulsd xmm0, {}", operand)),
+                    BinaryOp::Div => {
+                        // The divisor is known here, so the check is decided
+                        // here too rather than being re-tested at run time.
+                        // `value == 0.0` is true of -0.0 as well, which is
+                        // exactly the set the runtime test catches.
+                        if value == 0.0 {
+                            self.emit_check("jmp", RtError::DivideByZero);
+                        }
+                        self.emit(&format!("    divsd xmm0, {}", operand));
+                    }
+                    BinaryOp::Pow => {
+                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        self.emit_call_libc("pow");
+                    }
+                    BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                        // Truncation to integer is left to the same conversion
+                        // the general path uses, so an out-of-range constant
+                        // behaves identically to one held in a register.
+                        self.emit(&format!("    movsd xmm1, {}", operand));
+                        self.emit_cvt_float_to_int(work_type);
+                        let instr = match op {
+                            BinaryOp::And => "and",
+                            BinaryOp::Or => "or",
+                            _ => "xor",
+                        };
+                        self.emit(&format!("    {} eax, ecx", instr));
+                    }
+                    _ => {
+                        self.emit(&format!("    ucomisd xmm0, {}", operand));
+                        self.emit(&format!("    {} al", setcc(op, false)));
+                        self.emit("    movzx eax, al");
+                        self.emit("    neg eax");
+                    }
+                }
+                true
+            }
+
+            _ => false,
+        }
     }
 
     /// Evaluate a file-number expression ahead of a runtime call.
@@ -3730,8 +3977,7 @@ impl CodeGen {
                         }
                         let value = values[next];
                         next += 1;
-                        let ty = self.gen_expr(value);
-                        self.gen_coercion(ty, DataType::Double);
+                        self.gen_expr_to_double(value);
                         self.emit_arg_imm(0, *width as i64);
                         self.emit_arg_imm(1, *decimals as i64);
                         self.emit_arg_imm(2, *flags);
@@ -3791,8 +4037,7 @@ impl CodeGen {
         let sel = format!("QWORD PTR [rbp + {}]", temp_offset);
         match clause {
             CaseClause::Value(e) => {
-                let t = self.gen_expr(e);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(e);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    je {}", body_label));
@@ -3801,21 +4046,18 @@ impl CodeGen {
                 // Inclusive at both ends. The low bound is tested first, and a
                 // failure skips the high test.
                 let skip = self.new_label("caseskip");
-                let t = self.gen_expr(lo);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(lo);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    jb {}", skip));
-                let t = self.gen_expr(hi);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(hi);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 self.emit(&format!("    jbe {}", body_label));
                 self.emit_label(&skip);
             }
             CaseClause::Compare(op, e) => {
-                let t = self.gen_expr(e);
-                self.gen_coercion(t, DataType::Double);
+                self.gen_expr_to_double(e);
                 self.emit(&format!("    movsd xmm1, {}", sel));
                 self.emit("    ucomisd xmm1, xmm0");
                 // Unsigned conditions, since ucomisd sets the carry flag.
@@ -3929,8 +4171,8 @@ impl CodeGen {
             // A Single is printed via its own helper, which round-trips
             // against 32-bit precision: widening 3.14159! to a double and
             // printing every digit that survives would show 3.141590118408203.
-            let expr_type = self.gen_expr(expr);
-            self.gen_coercion(expr_type, DataType::Double);
+            let expr_type = self.expr_type(expr);
+            self.gen_expr_to_double(expr);
             self.emit_arg_file_num(0, sink);
             if expr_type == DataType::Single {
                 self.emit("    call _rt_file_print_single");
@@ -3960,8 +4202,7 @@ impl CodeGen {
 
         // Table-driven: libc math functions (SIN, COS, TAN, ATN, EXP, LOG)
         if let Some(libc_fn) = LIBC_MATH_FNS.get(upper_name.as_str()) {
-            let arg_type = self.gen_expr(&args[0]);
-            self.gen_coercion(arg_type, DataType::Double);
+            self.gen_expr_to_double(&args[0]);
             // LOG is undefined at and below zero; libc would quietly return
             // -inf or NaN.
             if upper_name == "LOG" {
@@ -3973,8 +4214,7 @@ impl CodeGen {
 
         // Table-driven: inline math functions (SQR, INT, FIX)
         if let Some(instr) = INLINE_MATH_FNS.get(upper_name.as_str()) {
-            let arg_type = self.gen_expr(&args[0]);
-            self.gen_coercion(arg_type, DataType::Double);
+            self.gen_expr_to_double(&args[0]);
             // sqrtsd of a negative operand yields NaN, which then printed as a
             // huge meaningless integer.
             if upper_name == "SQR" {
@@ -4015,18 +4255,20 @@ impl CodeGen {
         // Complex built-in functions
         match upper_name.as_str() {
             "ABS" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
-                self.emit("    mov rax, 0x7FFFFFFFFFFFFFFF");
-                self.emit("    movq xmm1, rax");
+                let arg_type = self.expr_type(&args[0]);
+                self.gen_expr_to_double(&args[0]);
+                // Everything-but-the-sign-bit, from the pool rather than a
+                // 64-bit immediate, and via a register because the memory form
+                // of andpd wants sixteen aligned bytes. See UnaryOp::Neg.
+                let mask = self.f64_operand(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF));
+                self.emit(&format!("    movsd xmm1, {}", mask));
                 self.emit("    andpd xmm0, xmm1");
                 // ABS preserves its argument's type: narrow back so the value
                 // matches what call_return_type promises.
                 self.gen_coercion(DataType::Double, Self::abs_result_type(arg_type));
             }
             "SGN" => {
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(&args[0]);
                 self.emit("    xorpd xmm1, xmm1");
                 self.emit("    ucomisd xmm0, xmm1");
                 self.emit("    seta al");
@@ -4038,8 +4280,7 @@ impl CodeGen {
             }
             "RND" => {
                 if !args.is_empty() {
-                    let arg_type = self.gen_expr(&args[0]);
-                    self.gen_coercion(arg_type, DataType::Double);
+                    self.gen_expr_to_double(&args[0]);
                 }
                 self.emit("    call _rt_rnd");
             }
@@ -4283,8 +4524,7 @@ impl CodeGen {
                 // SINGLE already widens it to a double, so asking afterwards
                 // would never see one.
                 let single = self.expr_type(&args[0]) == DataType::Single;
-                let arg_type = self.gen_expr(&args[0]);
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(&args[0]);
                 if single {
                     self.emit("    call _rt_str_single");
                 } else {
@@ -4415,8 +4655,8 @@ impl CodeGen {
                     continue;
                 }
             }
-            let arg_type = self.gen_expr(arg);
             if *ty == DataType::String {
+                self.gen_expr(arg);
                 self.emit(&format!("    mov QWORD PTR [rsp + {}], rax", w * 8));
                 self.emit(&format!("    mov QWORD PTR [rsp + {}], rdx", w * 8 + 8));
                 temp_of.push(w * 8);
@@ -4424,7 +4664,7 @@ impl CodeGen {
             } else {
                 // Numeric arguments travel as f64 bit patterns in integer
                 // slots; the callee narrows to the declared type.
-                self.gen_coercion(arg_type, DataType::Double);
+                self.gen_expr_to_double(arg);
                 self.emit(&format!("    movsd QWORD PTR [rsp + {}], xmm0", w * 8));
                 temp_of.push(w * 8);
                 w += 1;
@@ -4799,6 +5039,23 @@ impl CodeGen {
             // to everything that uses the (ptr, len) representation.
             self.output
                 .push_str(&format!("    .asciz \"{}\"\n", escaped));
+        }
+
+        // Double constant pool. Emitted after the strings, which are packed
+        // bytes with no alignment of their own, so it states its own; the
+        // DATA table below is protected by the `.p2align 3` already there.
+        //
+        // `.data` rather than a read-only section: nothing here is ever
+        // written, but `emit_data_section` has no `.section` machinery and the
+        // second assembler this has to please is clang targeting COFF. The
+        // size saved is the same either way.
+        if !self.f64_pool.is_empty() {
+            self.output.push_str(".p2align 3\n");
+            let pool = std::mem::take(&mut self.f64_pool);
+            for (i, bits) in pool.iter().enumerate() {
+                self.output
+                    .push_str(&format!("_f64_{}: .quad 0x{:016X}\n", i, bits));
+            }
         }
 
         // DATA table - always define it (even if empty) to avoid linker errors
