@@ -439,3 +439,159 @@ PRINT LEN(S)
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, &["[xy  ]", "-1", "4"]);
 }
+
+/// `DEFINT A-Z` and friends set the default type for unsuffixed names.
+///
+/// `DEFINT A-Z` is the idiomatic first line of a great many listings; without
+/// it every unsuffixed variable is a Double, which changes both arithmetic and
+/// what PRINT shows.
+#[test]
+fn test_defint_sets_the_default_type() {
+    let output = compile_and_run(
+        r#"
+DEFINT A-Z
+X = 7 / 2
+PRINT X
+Y = 3.7
+PRINT Y
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    // Assignment to an integer truncates here; LANGREF records that as a
+    // deliberate divergence from GW-BASIC, which rounds.
+    assert_eq!(lines, &["3", "3"], "7/2 and 3.7 both truncate to 3");
+}
+
+/// A suffix always wins over the default.
+#[test]
+fn test_suffix_overrides_the_default_type() {
+    let output = compile_and_run(
+        r#"
+DEFINT A-Z
+X = 3.7
+X# = 3.7
+PRINT X
+PRINT X#
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["3", "3.7"], "X is INTEGER, X# is DOUBLE");
+}
+
+/// Each of the five spellings, over its own letter range.
+#[test]
+fn test_all_def_type_statements() {
+    let output = compile_and_run(
+        r#"
+DEFINT I-J
+DEFLNG L
+DEFSNG S
+DEFDBL D
+DEFSTR T
+I = 3.7
+L = 100000.9
+S = 1 / 3
+D = 1 / 3
+T = "text"
+PRINT I
+PRINT L
+PRINT S
+PRINT D
+PRINT T
+PRINT LEN(T)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "3", "DEFINT");
+    assert_eq!(lines[1], "100000", "DEFLNG");
+    assert_eq!(lines[2], "0.33333334", "DEFSNG carries ~7 digits");
+    assert_eq!(
+        lines[3], "0.3333333333333333",
+        "DEFDBL carries full precision"
+    );
+    assert_eq!(lines[4], "text", "DEFSTR");
+    assert_eq!(lines[5], "4", "and a DEFSTR name is a string to LEN");
+}
+
+/// In GW-BASIC a defaulted name and the explicitly suffixed one are the same
+/// variable, so `DEFINT A` makes `A` and `A%` refer to one storage location.
+#[test]
+fn test_defaulted_and_suffixed_names_are_the_same_variable() {
+    let output = compile_and_run(
+        r#"
+DEFINT A
+A = 5
+PRINT A%
+A% = 9
+PRINT A
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["5", "9"]);
+}
+
+/// A single letter, a range, and several clauses on one statement.
+#[test]
+fn test_def_type_ranges() {
+    let output = compile_and_run(
+        r#"
+DEFINT A, C-E
+A = 1.7
+B = 1.7
+C = 1.7
+E = 1.7
+F = 1.7
+PRINT A; B; C; E; F
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        output.trim(),
+        "11.7111.7",
+        "A, C and E are INTEGER; B and F stay DOUBLE"
+    );
+}
+
+/// The default applies inside procedures too, and to arrays.
+#[test]
+fn test_def_type_reaches_arrays_and_procedures() {
+    let output = compile_and_run(
+        r#"
+DEFINT A-Z
+DIM V(3)
+V(1) = 9.7
+PRINT V(1)
+SUB Show(N)
+  PRINT N
+END SUB
+Show 4.6
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["9", "4"],
+        "array elements and parameters both default"
+    );
+}
+
+/// A builtin's name is not a variable and must not be re-typed by DEF*.
+#[test]
+fn test_def_type_does_not_touch_builtins() {
+    let output = compile_and_run(
+        r#"
+DEFSTR A-Z
+PRINT LEN("abcd")
+PRINT SQR(16)
+PRINT MID$("hello", 2, 3)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["4", "4", "ell"]);
+}

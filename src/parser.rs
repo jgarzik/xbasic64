@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::lexer::Token;
+use crate::lexer::{DataTypeWord, Token};
 use std::collections::{HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
@@ -221,6 +221,14 @@ pub enum StmtKind {
     },
     Data(Vec<Literal>),
     Read(Vec<LValue>),
+    /// `DEFINT A-Z` and friends -- the default type for unsuffixed names whose
+    /// first letter falls in one of the ranges.
+    ///
+    /// Held as (first, last) inclusive letter pairs, already upper-cased.
+    DefType {
+        ty: DataType,
+        ranges: Vec<(char, char)>,
+    },
     /// `RANDOMIZE [expr]` -- reseed the random number generator.
     ///
     /// GW-BASIC prompts for a seed when none is given; a compiled program has
@@ -687,6 +695,13 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Stop => "STOP",
         Token::DataText(_) => "DATA",
         Token::Read => "READ",
+        Token::DefType(w) => match w {
+            DataTypeWord::Integer => "DEFINT",
+            DataTypeWord::Long => "DEFLNG",
+            DataTypeWord::Single => "DEFSNG",
+            DataTypeWord::Double => "DEFDBL",
+            DataTypeWord::String => "DEFSTR",
+        },
         Token::Randomize => "RANDOMIZE",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
@@ -1276,6 +1291,7 @@ impl Parser {
             Token::Function => self.parse_function(),
             Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
+            Token::DefType(w) => self.parse_def_type(w),
             Token::Randomize => self.parse_randomize(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
@@ -2583,6 +2599,66 @@ impl Parser {
         }
 
         Ok(StmtKind::Read(vars))
+    }
+
+    /// `DEFINT A-Z`, `DEFSTR S`, `DEFINT A, C-E`.
+    ///
+    /// Each clause is a single letter or an inclusive range of them. The lexer
+    /// has already upper-cased the identifiers, so `a-z` and `A-Z` arrive the
+    /// same.
+    fn parse_def_type(&mut self, word: DataTypeWord) -> PResult<StmtKind> {
+        self.advance(); // consume DEFINT/DEFLNG/...
+        let ty = match word {
+            DataTypeWord::Integer => DataType::Integer,
+            DataTypeWord::Long => DataType::Long,
+            DataTypeWord::Single => DataType::Single,
+            DataTypeWord::Double => DataType::Double,
+            DataTypeWord::String => DataType::String,
+        };
+
+        let mut ranges = Vec::new();
+        loop {
+            let first = self.def_type_letter()?;
+            let last = if matches!(self.peek(), Token::Minus) {
+                self.advance();
+                self.def_type_letter()?
+            } else {
+                first
+            };
+            if last < first {
+                return err(format!(
+                    "the letter range {}-{} runs backwards",
+                    first, last
+                ));
+            }
+            ranges.push((first, last));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(StmtKind::DefType { ty, ranges })
+    }
+
+    /// One letter of a `DEF*` range.
+    ///
+    /// A single letter lexes as an identifier, so this checks the length here
+    /// rather than trusting the token.
+    fn def_type_letter(&mut self) -> PResult<char> {
+        let tok = self.advance();
+        if let Token::Ident(name) = &tok {
+            let mut chars = name.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if c.is_ascii_alphabetic() {
+                    return Ok(c);
+                }
+            }
+        }
+        err(format!(
+            "expected a single letter in the range, got {}",
+            describe_token(&tok)
+        ))
     }
 
     /// `RANDOMIZE`, `RANDOMIZE n`, `RANDOMIZE TIMER`.

@@ -144,7 +144,24 @@ xbasic64 supports five data types, indicated by suffix characters:
 
 ### Default Type
 
-**Unsuffixed numeric variables default to DOUBLE (`#`).**
+**Unsuffixed numeric variables default to DOUBLE (`#`)** unless a `DEF*`
+statement says otherwise.
+
+### DEFINT, DEFLNG, DEFSNG, DEFDBL, DEFSTR
+
+These set the default type for names beginning with the given letters, so a
+listing need not suffix every variable:
+
+```basic
+DEFINT A-Z          ' every unsuffixed name is an INTEGER
+DEFSTR S            ' except those starting with S, which are strings
+DEFINT A, C-E       ' single letters and ranges, comma separated
+```
+
+A suffix always wins over the default, and the two spellings of one name are
+the same variable: after `DEFINT A`, `A` and `A%` share storage. The default
+applies to the whole program rather than from the statement onwards, which is
+where these are written in practice.
 
 ```basic
 X = 3.14159       ' X is Double
@@ -1302,8 +1319,6 @@ written. Programs using them are refused today.
 - **Date and time** -- `DATE$`, `TIME$`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
-- **`DEFINT` and friends** -- `DEFINT`, `DEFLNG`, `DEFSNG`, `DEFDBL`, `DEFSTR`; use a
-  type suffix or `DIM ... AS`
 
 ### Never
 

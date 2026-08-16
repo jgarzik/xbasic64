@@ -3386,6 +3386,10 @@ impl CodeGen {
                 self.emit("    call _rt_cls");
             }
 
+            // DEF* is consumed by sema, which rewrites the names it affects;
+            // nothing is left to emit.
+            StmtKind::DefType { .. } => {}
+
             StmtKind::Randomize(seed) => {
                 // With no seed, take the clock: GW-BASIC prompts the operator
                 // for one, and a compiled program has nobody to ask. TIMER
