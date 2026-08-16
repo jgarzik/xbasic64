@@ -221,8 +221,18 @@ _rt_instr:
     mov r15, r9             # needle len
     mov rbx, rdi            # start position (1-based)
 
+    # A start below 1 would move the search pointer backwards out of the
+    # buffer; GW-BASIC calls that an illegal argument.
+    cmp rbx, 1
+    jl .Linstr_badstart
+
     # Adjust for start position
     dec rbx                 # convert to 0-based
+    # A start past the end finds nothing. Without this the `sub` below drove
+    # the remaining length negative -- enormous, unsigned -- so the "room for
+    # the needle" test passed and memcmp read past the end of the string.
+    cmp rbx, r13
+    jae .Linstr_not_found
     add r12, rbx            # advance haystack ptr
     sub r13, rbx            # reduce remaining length
 
@@ -259,6 +269,11 @@ _rt_instr:
 
 .Linstr_not_found:
     xor rax, rax
+    jmp .Linstr_done
+.Linstr_badstart:
+    lea rcx, [rip + _err_domain]
+    xor edx, edx
+    call _rt_error
 
 .Linstr_done:
     add rsp, 40

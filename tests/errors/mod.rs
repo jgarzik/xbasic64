@@ -1452,3 +1452,85 @@ fn test_swap_of_mismatched_record_fields_is_diagnosed() {
     compile_only("TYPE R\n  A AS INTEGER\n  B AS INTEGER\nEND TYPE\nDIM P AS R\nSWAP P.A, P.B\n")
         .expect("two numeric fields are a legal SWAP");
 }
+
+/// Out-of-range arguments to the string builtins are refused.
+///
+/// Each of these returned something plausible instead. The negative-length
+/// cases were the worst: `_rt_left` compares the count against the length
+/// unsigned, so -1 read as enormous, clamped to the length, and returned the
+/// *whole string*. `MID$`'s negative count is worse still -- it is the
+/// compiler's own sentinel for the two-argument form, so a program writing one
+/// explicitly got "the rest of the string" from a value GW-BASIC rejects.
+#[test]
+fn test_string_builtin_arguments_are_range_checked() {
+    for (source, what) in [
+        ("PRINT LEFT$(\"abc\", -1)\n", "LEFT$ negative count"),
+        ("PRINT RIGHT$(\"abc\", -1)\n", "RIGHT$ negative count"),
+        ("PRINT MID$(\"abc\", 0, 2)\n", "MID$ zero start"),
+        ("PRINT MID$(\"abc\", -1, 2)\n", "MID$ negative start"),
+        ("PRINT MID$(\"abc\", 1, -1)\n", "MID$ negative count"),
+        ("PRINT ASC(\"\")\n", "ASC of the empty string"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+    }
+}
+
+/// The legal forms of the same calls keep working, including MID$ with the
+/// length omitted -- which is what the negative sentinel exists for.
+#[test]
+fn test_string_builtin_legal_arguments_still_work() {
+    let output = compile_and_run(
+        r#"
+PRINT LEFT$("abcdef", 3)
+PRINT LEFT$("abc", 0)
+PRINT LEFT$("abc", 99)
+PRINT RIGHT$("abcdef", 2)
+PRINT MID$("abcdef", 3)
+PRINT MID$("abcdef", 3, 2)
+PRINT MID$("abc", 4)
+PRINT ASC("A")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
+}
+
+/// A negative base with a fractional exponent has no real result. It used to
+/// print `-nan`.
+#[test]
+fn test_fractional_power_of_a_negative_is_refused() {
+    let run =
+        crate::common::compile_and_run_raw("A = -8\nPRINT A ^ 0.5\n", "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "stderr: {}",
+        run.stderr
+    );
+}
+
+/// Integral exponents of a negative base are fine, and so is everything else
+/// that has a real answer.
+#[test]
+fn test_powers_that_have_real_answers_still_work() {
+    let output = compile_and_run(
+        r#"
+A = -2
+PRINT A ^ 3
+PRINT A ^ 2
+PRINT 4 ^ 0.5
+PRINT 2 ^ -2
+PRINT 0 ^ 0
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["-8", "4", "2", "0.25", "1"]);
+}

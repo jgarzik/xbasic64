@@ -1501,6 +1501,35 @@ impl CodeGen {
         self.emit_check(cond, RtError::Domain);
     }
 
+    /// Refuse a `^` that has no real answer.
+    ///
+    /// `pow` returns NaN for a negative base raised to a fractional exponent,
+    /// which printed as `-nan`. Testing the result rather than the operands is
+    /// both cheaper and exact: `ucomisd` sets the parity flag for an unordered
+    /// compare, and a value is unordered with itself only when it is NaN.
+    fn emit_pow_domain_check(&mut self) {
+        if !self.opts.checks {
+            return;
+        }
+        self.emit("    ucomisd xmm0, xmm0");
+        self.emit_check("jp", RtError::Domain);
+    }
+
+    /// Refuse a builtin argument below `min`, as GW-BASIC's "Illegal function
+    /// call" does.
+    ///
+    /// The argument is expected in `reg`, already widened to 64 bits. A signed
+    /// comparison matters: `_rt_left` and friends compare the count against the
+    /// length *unsigned*, so a negative one reads as enormous, clamps to the
+    /// length and returns the whole string rather than failing.
+    fn emit_arg_min_check(&mut self, reg: &str, min: i64) {
+        if !self.opts.checks {
+            return;
+        }
+        emit!(self, "    cmp {}, {}", reg, min);
+        self.emit_check("jl", RtError::Domain);
+    }
+
     /// Guard an integer divide: `idiv` raises #DE (a SIGFPE crash) both when
     /// the divisor is zero and for INT_MIN / -1, which overflows the quotient.
     /// The divisor is expected in `ecx`.
@@ -3912,6 +3941,7 @@ impl CodeGen {
             BinaryOp::Pow => {
                 self.emit_cvt_to_double(work_type);
                 self.emit_call_libc("pow");
+                self.emit_pow_domain_check();
             }
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -4265,6 +4295,7 @@ impl CodeGen {
                     BinaryOp::Pow => {
                         emit!(self, "    movsd xmm1, {}", operand);
                         self.emit_call_libc("pow");
+                        self.emit_pow_domain_check();
                     }
                     BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
                         // Truncation to integer is left to the same conversion
@@ -5571,6 +5602,7 @@ impl CodeGen {
                 } else {
                     emit!(self, "    cvttsd2si {}, xmm0", arg2);
                 }
+                self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
                 self.emit("    call _rt_left");
@@ -5592,6 +5624,7 @@ impl CodeGen {
                 } else {
                     emit!(self, "    cvttsd2si {}, xmm0", arg2);
                 }
+                self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
                 self.emit("    call _rt_right");
@@ -5613,6 +5646,8 @@ impl CodeGen {
                 } else {
                     self.emit("    cvttsd2si r14, xmm0"); // save start
                 }
+                // String indexing is 1-based, so a start below 1 is illegal.
+                self.emit_arg_min_check("r14", 1);
                 let arg3 = Self::arg_reg(3);
                 if args.len() > 2 {
                     let len_type = self.gen_expr(&args[2]); // count - safe now
@@ -5621,6 +5656,10 @@ impl CodeGen {
                     } else {
                         emit!(self, "    cvttsd2si {}, xmm0", arg3);
                     }
+                    // Only a count the program actually wrote is checked: the
+                    // -1 below is this compiler's sentinel for "the rest", and
+                    // _rt_mid reads it as such.
+                    self.emit_arg_min_check(arg3, 0);
                 } else {
                     emit!(self, "    mov {}, -1", arg3); // rest of string
                 }
@@ -5680,6 +5719,10 @@ impl CodeGen {
             }
             "ASC" => {
                 self.gen_expr(&args[0]);
+                // The empty string has no first character. This read one
+                // anyway -- whatever byte the pointer happened at -- and
+                // answered 0 for a string with no bytes at all.
+                self.emit_arg_min_check("rdx", 1);
                 self.emit("    movzx eax, BYTE PTR [rax]");
                 // ASC returns integer in eax (Long type)
             }
