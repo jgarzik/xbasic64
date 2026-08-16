@@ -51,7 +51,9 @@ fn test_harness_supplies_empty_stdin() {
     let run = compile_and_run_raw("INPUT N\nPRINT \"read\"\n", "").expect("should compile");
     assert_eq!(
         run.lines(),
-        vec!["read"],
+        // The promptless INPUT prints `? `, which shares the line with the
+        // PRINT that follows it.
+        vec!["? read"],
         "program ran to completion at EOF"
     );
     assert_eq!(run.exit_code, Some(0));

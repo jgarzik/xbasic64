@@ -106,6 +106,13 @@ pub enum StmtKind {
     },
     Input {
         prompt: Option<String>,
+        /// Whether to print `? ` after the prompt.
+        ///
+        /// GW-BASIC decides this by the separator: `INPUT "p"; A` prints `p? `
+        /// and `INPUT "p", A` prints `p` alone, while a promptless `INPUT A`
+        /// prints just `? `. The parser used to accept either separator and
+        /// discard which, so no form ever printed a question mark.
+        query: bool,
         vars: Vec<LValue>,
         /// `INPUT #n` reads from a file; `None` is the console.
         file_num: Option<Expr>,
@@ -1550,6 +1557,7 @@ impl Parser {
 
     fn parse_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume INPUT
+        self.skip_input_suppressor();
 
         // Check for INPUT #n (file input)
         if matches!(self.peek(), Token::Hash) {
@@ -1570,6 +1578,8 @@ impl Parser {
 
             return Ok(StmtKind::Input {
                 prompt: None,
+                // A file read prompts for nothing.
+                query: false,
                 vars,
                 file_num: Some(file_num),
             });
@@ -1577,14 +1587,25 @@ impl Parser {
 
         let mut prompt = None;
         let mut vars = Vec::new();
+        // A promptless INPUT still asks: GW-BASIC prints a bare `? `.
+        let mut query = true;
 
         // Check for prompt string
         if let Token::String(s) = self.peek().clone() {
             self.advance();
             prompt = Some(s);
-            // Expect comma or semicolon after prompt
-            if matches!(self.peek(), Token::Comma | Token::Semicolon) {
-                self.advance();
+            // The separator decides whether a question mark follows the
+            // prompt: `;` adds one, `,` suppresses it. Both were accepted and
+            // the choice thrown away, so neither form ever printed one.
+            match self.peek() {
+                Token::Semicolon => {
+                    self.advance();
+                }
+                Token::Comma => {
+                    self.advance();
+                    query = false;
+                }
+                _ => {}
             }
         }
 
@@ -1600,14 +1621,30 @@ impl Parser {
 
         Ok(StmtKind::Input {
             prompt,
+            query,
             vars,
             file_num: None,
         })
     }
 
+    /// Consume the optional `;` that may precede an INPUT prompt.
+    ///
+    /// In GW-BASIC this suppresses the newline echoed when the operator presses
+    /// Return, so the next PRINT continues the same line. That newline is the
+    /// terminal's echo here -- neither runtime prints one -- so there is nothing
+    /// on our side to suppress and the form is accepted and ignored. Rejecting
+    /// it outright would refuse a program for asking about a difference it
+    /// cannot observe. LANGREF says so.
+    fn skip_input_suppressor(&mut self) {
+        if matches!(self.peek(), Token::Semicolon) {
+            self.advance();
+        }
+    }
+
     fn parse_line_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LINE
         self.expect(Token::Input)?;
+        self.skip_input_suppressor();
 
         // LINE INPUT #n, Var$ -- documented in LANGREF but never parsed.
         let file_num = if matches!(self.peek(), Token::Hash) {
@@ -1622,7 +1659,8 @@ impl Parser {
 
         let mut prompt = None;
 
-        // Check for prompt string
+        // Check for prompt string. Unlike INPUT, LINE INPUT never adds a
+        // question mark, so the separator carries no meaning here.
         if let Token::String(s) = self.peek().clone() {
             self.advance();
             prompt = Some(s);

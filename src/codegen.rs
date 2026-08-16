@@ -2726,11 +2726,20 @@ impl CodeGen {
 
             StmtKind::Input {
                 prompt,
+                query,
                 vars,
                 file_num,
             } => {
-                if let Some(pstr) = prompt {
-                    self.gen_console_prompt(pstr);
+                // The question mark is part of the prompt text, so it costs
+                // nothing at run time and needs no runtime support.
+                let text = match (prompt.as_deref(), query) {
+                    (Some(p), true) => Some(format!("{}? ", p)),
+                    (Some(p), false) => Some(p.to_string()),
+                    (None, true) => Some("? ".to_string()),
+                    (None, false) => None,
+                };
+                if let Some(text) = text {
+                    self.gen_console_prompt(&text);
                 }
                 let fnum = file_num.as_ref().map(|e| self.gen_file_num(e));
                 for var in vars {

@@ -393,9 +393,23 @@ Read user input:
 
 ```basic
 INPUT X                   ' Prompt with "? "
-INPUT "Enter name: ", N$  ' Custom prompt
+INPUT "Enter name: "; N$  ' Prints: Enter name: ?
+INPUT "Enter name: ", N$  ' Prints: Enter name:
 INPUT "X, Y: ", X, Y      ' Multiple values
 ```
+
+The separator decides the question mark: a `;` after the prompt adds `? `, a
+`,` suppresses it, and a prompt-less `INPUT` prints `? ` on its own.
+
+A `;` *before* the prompt is accepted and ignored:
+
+```basic
+INPUT ; "Enter name: "; N$
+```
+
+In GW-BASIC it suppressed the newline echoed when the operator pressed Return.
+That newline comes from the terminal here rather than from the program, so
+there is nothing for it to suppress.
 
 ### LINE INPUT
 
@@ -404,6 +418,9 @@ Read entire line as string (no parsing):
 ```basic
 LINE INPUT "Enter text: ", Text$
 ```
+
+`LINE INPUT` never adds a question mark; write one into the prompt if you want
+one.
 
 ### IF...THEN...ELSE
 
