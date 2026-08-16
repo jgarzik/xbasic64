@@ -472,6 +472,61 @@ PRINT A#(1, 2)
     assert_eq!(out.trim(), "7");
 }
 
+/// An INTEGER counter counts in integers, not in doubles.
+///
+/// The loop machinery used to work entirely in Double whatever the control
+/// variable's type was, which was both slower and wrong -- see
+/// `control::test_for_loop_control_variable_types`.
+#[test]
+fn test_integer_for_loop_counts_in_integers() {
+    let src = "FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n";
+    asserts_emits(
+        src,
+        &[
+            "movsx eax, WORD PTR [rip + _var_I_I + 0]",
+            "cmp eax, 3",
+            "add eax, 1",
+            "mov WORD PTR [rip + _var_I_I + 0], ax",
+        ],
+    );
+    asserts_absent(src, &["ucomisd", "addsd", "cvttsd2si"]);
+}
+
+/// A constant step settles the loop's direction at compile time.
+///
+/// The step's sign decides whether the loop exits above or below its limit.
+/// It used to be re-tested on every iteration -- three loads, an xorpd, a
+/// ucomisd and two branches -- even when it was written into the program.
+#[test]
+fn test_constant_step_needs_no_direction_test() {
+    for src in [
+        "FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n",
+        "FOR I% = 3 TO 1 STEP -1\nPRINT I%\nNEXT I%\n",
+        "FOR X# = 0 TO 1 STEP 0.5\nPRINT X#\nNEXT X#\n",
+    ] {
+        asserts_absent(src, &[".Lfor_neg_"]);
+    }
+}
+
+/// ...and a step that is not constant still gets one.
+#[test]
+fn test_runtime_step_keeps_its_direction_test() {
+    let src = "S% = 2\nFOR I% = 0 TO 6 STEP S%\nPRINT I%\nNEXT I%\n";
+    asserts_emits(src, &[".Lfor_neg_"]);
+}
+
+/// A constant limit and step need no frame slots either: they are the
+/// compare's and the add's own operands.
+#[test]
+fn test_constant_bounds_need_no_frame_slots() {
+    let asm = compile_to_asm("FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n").expect("must compile");
+    assert!(
+        asm.contains("sub rsp, 0        # STACK_RESERVE"),
+        "expected an empty frame, since nothing needs a slot:\n{}",
+        asm
+    );
+}
+
 /// The truncation above is not decorative: the program must still wrap.
 ///
 /// 300 * 300 is 90000, which does not fit in an INTEGER; GW-BASIC's INTEGER

@@ -22,6 +22,162 @@ FOR I = 3 TO 1 STEP -1: PRINT I: NEXT I
     assert_eq!(&lines[7..10], &["3", "2", "1"], "for step-");
 }
 
+/// A FOR control variable of any type must actually count.
+///
+/// The loop machinery used to store and increment the control variable as a
+/// raw Double whatever its declared type was, while every read of it went
+/// through that type's own load -- so `movsx eax, WORD PTR` on the bit pattern
+/// of 1.0 gave 0, and `FOR I% = 1 TO 3` printed 0 three times. Nothing in the
+/// suite used a suffixed loop variable, so all 253 tests stayed green.
+#[test]
+fn test_for_loop_control_variable_types() {
+    let output = compile_and_run(
+        r#"
+FOR A% = 1 TO 3: PRINT A%: NEXT A%
+FOR B& = 1 TO 3: PRINT B&: NEXT B&
+FOR C! = 1 TO 3: PRINT C!: NEXT C!
+FOR D# = 1 TO 3: PRINT D#: NEXT D#
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(&lines[0..3], &["1", "2", "3"], "INTEGER counter");
+    assert_eq!(&lines[3..6], &["1", "2", "3"], "LONG counter");
+    assert_eq!(&lines[6..9], &["1", "2", "3"], "SINGLE counter");
+    assert_eq!(&lines[9..12], &["1", "2", "3"], "DOUBLE counter");
+}
+
+/// The same for a control variable whose type came from `AS`, which lives in
+/// different storage again.
+#[test]
+fn test_for_loop_control_variable_declared_as() {
+    let output = compile_and_run(
+        r#"
+DIM E AS INTEGER
+DIM F AS LONG
+FOR E = 1 TO 3: PRINT E: NEXT E
+FOR F = 5 TO 7: PRINT F: NEXT F
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(&lines[0..3], &["1", "2", "3"], "AS INTEGER counter");
+    assert_eq!(&lines[3..6], &["5", "6", "7"], "AS LONG counter");
+}
+
+/// A typed counter must still step, count down, and survive its bounds being
+/// expressions rather than literals.
+#[test]
+fn test_for_loop_typed_counter_steps_and_bounds() {
+    let output = compile_and_run(
+        r#"
+FOR I% = 0 TO 6 STEP 2: PRINT I%: NEXT I%
+FOR I% = 3 TO 1 STEP -1: PRINT I%: NEXT I%
+N% = 3
+FOR I% = 1 TO N% * 2 STEP N%: PRINT I%: NEXT I%
+FOR I! = 0 TO 1 STEP 0.5: PRINT I!: NEXT I!
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(&lines[0..4], &["0", "2", "4", "6"], "INTEGER step +2");
+    assert_eq!(&lines[4..7], &["3", "2", "1"], "INTEGER step -1");
+    assert_eq!(&lines[7..9], &["1", "4"], "INTEGER computed bounds");
+    assert_eq!(&lines[9..12], &["0", "0.5", "1"], "SINGLE fractional step");
+}
+
+/// A step that is only known at run time still picks the right direction.
+///
+/// This is the one shape that has to test the step's sign on every iteration,
+/// because the compiler cannot know it; both signs must work, and a loop whose
+/// step runs away from its limit must not execute at all.
+#[test]
+fn test_for_loop_runtime_step_direction() {
+    let output = compile_and_run(
+        r#"
+S% = 2
+FOR I% = 0 TO 6 STEP S%: PRINT I%: NEXT I%
+S% = -1
+FOR I% = 3 TO 1 STEP S%: PRINT I%: NEXT I%
+S% = -1
+FOR I% = 1 TO 3 STEP S%: PRINT "never": NEXT I%
+D# = 0.5
+FOR X# = 0 TO 1 STEP D#: PRINT X#: NEXT X#
+PRINT "done"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(&lines[0..4], &["0", "2", "4", "6"], "runtime step +2");
+    assert_eq!(&lines[4..7], &["3", "2", "1"], "runtime step -1");
+    assert_eq!(&lines[7..10], &["0", "0.5", "1"], "runtime DOUBLE step");
+    assert_eq!(lines[10], "done", "a backwards step ran zero times");
+}
+
+/// The control variable keeps its final value after the loop, as GW-BASIC
+/// leaves it: one step past the limit.
+#[test]
+fn test_for_loop_typed_counter_survives_the_loop() {
+    let output = compile_and_run(
+        r#"
+FOR I% = 1 TO 3: NEXT I%
+PRINT I%
+FOR J% = 1 TO 5
+  IF J% = 3 THEN EXIT FOR
+NEXT J%
+PRINT J%
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "4", "value after a completed loop");
+    assert_eq!(lines[1], "3", "value after EXIT FOR");
+}
+
+/// A typed counter indexes an array correctly -- the shape that first exposed
+/// this, since a wrong counter silently reads element 0 every time.
+#[test]
+fn test_for_loop_typed_counter_indexes_arrays() {
+    let output = compile_and_run(
+        r#"
+DIM A%(10)
+T% = 0
+FOR I% = 0 TO 9
+  A%(I%) = I% * 2 + 1
+NEXT I%
+FOR I% = 0 TO 9
+  T% = T% + A%(I%)
+NEXT I%
+PRINT T%
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "100", "sum of the first ten odd numbers");
+}
+
+/// Nested loops with typed counters must not share state.
+#[test]
+fn test_for_loop_typed_counters_nest() {
+    let output = compile_and_run(
+        r#"
+T% = 0
+FOR I% = 1 TO 3
+  FOR J% = 1 TO 4
+    T% = T% + I% * J%
+  NEXT J%
+NEXT I%
+PRINT T%
+PRINT I%
+PRINT J%
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "60", "(1+2+3) * (1+2+3+4)");
+    assert_eq!(lines[1], "4", "outer counter after the loop");
+    assert_eq!(lines[2], "5", "inner counter after the loop");
+}
+
 #[test]
 fn test_while_loop() {
     let output = compile_and_run(
