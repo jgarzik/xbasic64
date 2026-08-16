@@ -838,3 +838,116 @@ fn test_zero_arg_builtins_are_not_assignable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unimplemented GW-BASIC names
+//
+// These matter more than a typo diagnostic does. An unrecognised name is
+// ordinarily just a new variable, so before the compiler knew these words,
+// `PRINT DATE$` printed an empty string and `ON ERROR GOTO 100` compiled into
+// a computed GOTO on a variable that is always zero -- falling straight
+// through the error handler a program was relying on. A GW-BASIC listing
+// compiled clean and then quietly did the wrong thing.
+
+/// The whole point: every one of these is refused rather than silently read as
+/// an empty variable.
+#[test]
+fn test_unimplemented_gwbasic_names_are_diagnosed() {
+    let cases = [
+        ("PRINT DATE$\n", "DATE$"),
+        ("PRINT TIME$\n", "TIME$"),
+        ("A$ = INKEY$\n", "INKEY$"),
+        ("PRINT ERR\n", "ERR"),
+        ("PRINT ERL\n", "ERL"),
+        ("PRINT CSRLIN\n", "CSRLIN"),
+        ("PRINT FRE(0)\n", "FRE"),
+        ("A$ = INPUT$(3)\n", "INPUT$"),
+        ("LOCATE 1, 1\n", "LOCATE"),
+        ("COLOR 7\n", "COLOR"),
+        ("RANDOMIZE 5\n", "RANDOMIZE"),
+        ("DEFINT A-Z\n", "DEFINT"),
+        ("PRINT PEEK(0)\n", "PEEK"),
+        ("POKE 0, 1\n", "POKE"),
+        ("SCREEN 13\n", "SCREEN"),
+        ("PLAY \"cde\"\n", "PLAY"),
+        ("LPRINT \"x\"\n", "LPRINT"),
+        ("CHAIN \"other\"\n", "CHAIN"),
+    ];
+
+    for (source, name) in cases {
+        let err = compile_only(source)
+            .expect_err(&format!("{} must be refused, not silently accepted", name));
+        assert!(
+            err.contains("not supported"),
+            "{} was refused, but without saying why: {}",
+            name,
+            err.stderr
+        );
+        assert!(
+            err.is_clean_rejection(),
+            "{} should be diagnosed, not panic on: {}",
+            name,
+            err.stderr
+        );
+    }
+}
+
+/// `ON ERROR GOTO` is the dangerous one: it parses as a computed GOTO on a
+/// variable named ERROR, which is always zero, so the handler never runs and
+/// nothing says so.
+#[test]
+fn test_on_error_goto_is_refused() {
+    let err = compile_only("ON ERROR GOTO 100\nPRINT \"x\"\nEND\n100 END\n")
+        .expect_err("ON ERROR GOTO must be refused rather than falling through");
+    assert!(
+        err.contains("not supported"),
+        "expected an explanation, got: {}",
+        err.stderr
+    );
+    assert!(err.is_clean_rejection());
+}
+
+/// Assigning to one of these names is a GW-BASIC statement, not the creation
+/// of a variable that happens to be called DATE$.
+#[test]
+fn test_assignment_to_an_unimplemented_name_is_refused() {
+    let err = compile_only("DATE$ = \"01-01-2026\"\n").expect_err("DATE$ = ... must be refused");
+    assert!(err.contains("not supported"), "got: {}", err.stderr);
+}
+
+/// The diagnostic says why, and distinguishes "not yet" from "not ever".
+#[test]
+fn test_unsupported_diagnostics_explain_themselves() {
+    let err = compile_only("PRINT PEEK(0)\n").expect_err("PEEK must be refused");
+    assert!(
+        err.contains("direct memory access"),
+        "a permanent non-goal should say so: {}",
+        err.stderr
+    );
+
+    let err = compile_only("RANDOMIZE 5\n").expect_err("RANDOMIZE must be refused");
+    assert!(
+        err.contains("not implemented yet"),
+        "a planned feature should say so: {}",
+        err.stderr
+    );
+}
+
+/// The random-access statement names are recognised only in statement
+/// position, so a program may still use them for its own variables and
+/// procedures -- which GW-BASIC would not allow, but costs nothing to keep.
+#[test]
+fn test_random_access_keywords_are_not_reserved() {
+    for source in [
+        "GET = 5\nPRINT GET\n",
+        "PUT = 5\nPRINT PUT\n",
+        "FIELD = 5\nPRINT FIELD\n",
+        "LSET = 5\nPRINT LSET\n",
+        "RANDOM = 5\nPRINT RANDOM\n",
+        "PRINT LEN(\"abc\")\n",
+    ] {
+        compile_only(source).unwrap_or_else(|e| {
+            panic!("{:?} should still compile, but: {}", source, e.stderr);
+        });
+    }
+}
