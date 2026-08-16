@@ -498,6 +498,23 @@ struct Promoted {
     loc: Loc,
 }
 
+/// An array whose descriptor a loop is holding in registers.
+///
+/// The element pointer and the per-dimension element counts do not change
+/// while the loop runs -- DIM and REDIM are outside the allowlist that makes a
+/// loop promotable -- but every subscript re-read them: two loads for the
+/// pointer, since the null check and the address each fetched it, and one per
+/// bound compare.
+#[derive(Clone)]
+struct HoistedArray {
+    /// The name as the AST spells it, which is how a subscript is matched.
+    name: String,
+    /// Register holding the element pointer, if one was free.
+    base: Option<String>,
+    /// Register per dimension holding its element count, where one was free.
+    bounds: Vec<Option<String>>,
+}
+
 /// Registers this compiler never allocates for anything else, so a loop may
 /// keep a variable in one for its whole duration.
 ///
@@ -582,6 +599,8 @@ pub struct CodeGen {
     /// innermost loop last. A read or a write of one of these names has to go
     /// to the register: the storage is stale until the loop ends.
     promoted: Vec<Promoted>,
+    /// Array descriptors currently held in registers, innermost loop last.
+    hoisted_arrays: Vec<HoistedArray>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -1628,9 +1647,208 @@ impl CodeGen {
         } else {
             &PROMO_XMMS
         };
-        pool.iter()
-            .copied()
-            .find(|r| !self.promoted.iter().any(|p| p.reg == *r))
+        pool.iter().copied().find(|r| !self.register_in_use(r))
+    }
+
+    /// Whether an enclosing loop is already holding something in `reg`.
+    fn register_in_use(&self, reg: &str) -> bool {
+        self.promoted.iter().any(|p| p.reg == reg)
+            || self.hoisted_arrays.iter().any(|h| {
+                h.base.as_deref() == Some(reg) || h.bounds.iter().any(|b| b.as_deref() == Some(reg))
+            })
+    }
+
+    /// The register holding `name`'s element pointer, if a loop hoisted it.
+    fn hoisted_base(&self, name: &str) -> Option<String> {
+        self.hoisted_arrays
+            .iter()
+            .rev()
+            .find(|h| h.name == name)
+            .and_then(|h| h.base.clone())
+    }
+
+    /// The register holding dimension `dim`'s element count, if hoisted.
+    fn hoisted_bound(&self, name: &str, dim: usize) -> Option<String> {
+        self.hoisted_arrays
+            .iter()
+            .rev()
+            .find(|h| h.name == name)
+            .and_then(|h| h.bounds.get(dim).cloned().flatten())
+    }
+
+    /// The operand naming an array's element pointer.
+    fn array_base_operand(&self, name: &str, loc: &Loc) -> String {
+        self.hoisted_base(name).unwrap_or_else(|| loc.q(0))
+    }
+
+    /// Pick registers to hold the descriptors of the arrays `body` subscripts.
+    ///
+    /// Element pointers first, then bounds: a pointer is read twice per
+    /// subscript and a bound once, so it is worth more per register. Whatever
+    /// is left over keeps reading memory, which is what it did before.
+    fn hoist_array_descriptors(&mut self, body: &[Stmt], claimed: &[String]) -> Vec<HoistedArray> {
+        let names = Self::arrays_used_in(body);
+        let mut taken: Vec<String> = claimed.to_vec();
+        let mut out: Vec<HoistedArray> = Vec::new();
+
+        for name in &names {
+            let Some(info) = self.lookup_array(name) else {
+                continue;
+            };
+            let ndims = info.ndims;
+            let base = self.free_gpr(&taken);
+            if let Some(reg) = &base {
+                taken.push(reg.clone());
+            }
+            out.push(HoistedArray {
+                name: name.clone(),
+                base,
+                bounds: vec![None; ndims],
+            });
+        }
+
+        for h in out.iter_mut() {
+            for slot in h.bounds.iter_mut() {
+                match self.free_gpr(&taken) {
+                    Some(reg) => {
+                        taken.push(reg.clone());
+                        *slot = Some(reg);
+                    }
+                    None => break,
+                }
+            }
+        }
+
+        out.retain(|h| h.base.is_some() || h.bounds.iter().any(|b| b.is_some()));
+        out
+    }
+
+    /// A callee-saved register neither an enclosing loop nor `taken` is using.
+    fn free_gpr(&self, taken: &[String]) -> Option<String> {
+        PROMO_GPRS
+            .iter()
+            .find(|r| !self.register_in_use(r) && !taken.iter().any(|t| t == *r))
+            .map(|r| r.to_string())
+    }
+
+    /// Save the registers a hoist claimed and load the descriptor into them.
+    fn emit_hoist_loads(&mut self, h: &HoistedArray) {
+        let Some(info) = self.lookup_array(&h.name) else {
+            return;
+        };
+        let loc = info.loc.clone();
+        let mut regs: Vec<(String, String)> = Vec::new();
+        if let Some(reg) = &h.base {
+            regs.push((reg.clone(), loc.q(0)));
+        }
+        for (i, slot) in h.bounds.iter().enumerate() {
+            if let Some(reg) = slot {
+                regs.push((reg.clone(), loc.q(1 + i as i32)));
+            }
+        }
+        for (reg, mem) in regs {
+            self.emit("    sub rsp, 16        # save a descriptor register");
+            self.emit(&format!("    mov QWORD PTR [rsp], {}", reg));
+            self.emit(&format!("    mov {}, {}", reg, mem));
+        }
+    }
+
+    /// Give those registers back, in the order that unwinds the saves.
+    fn emit_hoist_restores(&mut self, h: &HoistedArray) {
+        let mut regs: Vec<String> = Vec::new();
+        if let Some(reg) = &h.base {
+            regs.push(reg.clone());
+        }
+        for reg in h.bounds.iter().flatten() {
+            regs.push(reg.clone());
+        }
+        for reg in regs.into_iter().rev() {
+            self.emit(&format!("    mov {}, QWORD PTR [rsp]", reg));
+            self.emit("    add rsp, 16");
+        }
+    }
+
+    /// An array's element pointer in a register, ready for a scaled index.
+    ///
+    /// Free when a loop has hoisted it; otherwise loaded into r10 here, after
+    /// the last subscript has been evaluated -- evaluating one runs arbitrary
+    /// code, which is free to clobber r10.
+    fn array_base_into_register(&mut self, name: &str, loc: &Loc) -> String {
+        if let Some(reg) = self.hoisted_base(name) {
+            return reg;
+        }
+        self.emit(&format!("    mov r10, {}", loc.q(0)));
+        "r10".to_string()
+    }
+
+    /// The operand naming dimension `dim`'s element count.
+    fn array_bound_operand(&self, name: &str, loc: &Loc, dim: usize) -> String {
+        self.hoisted_bound(name, dim)
+            .unwrap_or_else(|| loc.q(1 + dim as i32))
+    }
+
+    /// Every array subscripted anywhere in `body`, in first-use order.
+    fn arrays_used_in(body: &[Stmt]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        Self::walk_body(body, &mut |stmt| match &stmt.kind {
+            StmtKind::Let {
+                name,
+                indices,
+                value,
+            } => {
+                if let Some(ix) = indices {
+                    if !names.iter().any(|n| n == name) {
+                        names.push(name.clone());
+                    }
+                    for e in ix {
+                        Self::walk_array_uses(e, &mut names);
+                    }
+                }
+                Self::walk_array_uses(value, &mut names);
+            }
+            StmtKind::If { condition, .. } | StmtKind::While { condition, .. } => {
+                Self::walk_array_uses(condition, &mut names)
+            }
+            StmtKind::DoLoop {
+                condition: Some(c), ..
+            } => Self::walk_array_uses(c, &mut names),
+            StmtKind::For {
+                start, end, step, ..
+            } => {
+                Self::walk_array_uses(start, &mut names);
+                Self::walk_array_uses(end, &mut names);
+                if let Some(st) = step {
+                    Self::walk_array_uses(st, &mut names);
+                }
+            }
+            _ => {}
+        });
+        names
+    }
+
+    /// Collect array names subscripted anywhere in `expr`.
+    fn walk_array_uses(expr: &Expr, names: &mut Vec<String>) {
+        match expr {
+            Expr::ArrayAccess { name, indices } => {
+                if !names.iter().any(|n| n == name) {
+                    names.push(name.clone());
+                }
+                for i in indices {
+                    Self::walk_array_uses(i, names);
+                }
+            }
+            Expr::Unary { operand, .. } => Self::walk_array_uses(operand, names),
+            Expr::Binary { left, right, .. } => {
+                Self::walk_array_uses(left, names);
+                Self::walk_array_uses(right, names);
+            }
+            Expr::FnCall { args, .. } => {
+                for a in args {
+                    Self::walk_array_uses(a, names);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The scalars a loop body assigns to, in first-assignment order.
@@ -2653,6 +2871,27 @@ impl CodeGen {
                     self.emit_promotion_load(p);
                 }
 
+                // An array's element pointer and bounds cannot change while
+                // the loop runs -- DIM and REDIM are outside the allowlist --
+                // yet every subscript re-read them: two loads for the pointer,
+                // since the null check and the address each fetched it, and
+                // one per bound compare. Hoisting those was worth 1.45x on a
+                // loop doing four subscripts, which is most of what the bounds
+                // checking costs in the first place.
+                let hoisted = if promotable {
+                    // The counter and the accumulators have registers but are
+                    // not on the promoted stack yet -- that happens as the
+                    // body is entered -- so they are named explicitly here.
+                    let mut claimed: Vec<String> = counter_reg.iter().cloned().collect();
+                    claimed.extend(accumulators.iter().map(|a| a.reg.clone()));
+                    self.hoist_array_descriptors(body, &claimed)
+                } else {
+                    Vec::new()
+                };
+                for h in &hoisted.clone() {
+                    self.emit_hoist_loads(h);
+                }
+
                 // Which way the loop runs is a property of the step's sign. It
                 // is almost always written into the program, so it is almost
                 // always decided here rather than re-tested on every iteration.
@@ -2712,6 +2951,10 @@ impl CodeGen {
                 // Body. While it runs, a read or a write of any promoted name
                 // resolves to its register rather than to its storage.
                 let promoted_here = accumulators.len() + usize::from(counter_reg.is_some());
+                let hoisted_here = hoisted.len();
+                for h in &hoisted {
+                    self.hoisted_arrays.push(h.clone());
+                }
                 if let Some(reg) = &counter_reg {
                     self.promoted.push(Promoted {
                         name: var.clone(),
@@ -2729,6 +2972,8 @@ impl CodeGen {
                 }
                 self.loop_stack.pop();
                 self.promoted.truncate(self.promoted.len() - promoted_here);
+                self.hoisted_arrays
+                    .truncate(self.hoisted_arrays.len() - hoisted_here);
 
                 // Increment. When the counter is in memory it is reloaded
                 // rather than carried over from the compare above, because the
@@ -2753,6 +2998,9 @@ impl CodeGen {
                 // so this is where the variables become visible again. In
                 // reverse order, so the saved registers come off the stack in
                 // the order they went on.
+                for h in hoisted.iter().rev() {
+                    self.emit_hoist_restores(h);
+                }
                 for p in accumulators.iter().rev() {
                     self.emit_promotion_store(p);
                     if p.ty.is_integer() {
@@ -5849,8 +6097,12 @@ impl CodeGen {
         // pointer is null until the DIM executes. Catching that is what turns
         // "used before DIM at run time" into a diagnosable abort rather than a
         // null dereference.
+        //
+        // Kept per access rather than hoisted with the pointer: a loop whose
+        // body never runs must not report an array it never touched.
         if self.opts.checks {
-            self.emit(&format!("    cmp {}, 0", loc.q(0)));
+            let base = self.array_base_operand(name, &loc);
+            self.emit(&format!("    cmp {}, 0", base));
             self.emit_check("je", RtError::Undim);
         }
 
@@ -5868,7 +6120,8 @@ impl CodeGen {
         // end, since a negative value wraps to a huge unsigned one. The stored
         // bound is already the element count (declared bound + 1).
         if self.opts.checks {
-            self.emit(&format!("    cmp rax, {}", loc.q(1)));
+            let bound = self.array_bound_operand(name, &loc, 0);
+            self.emit(&format!("    cmp rax, {}", bound));
             self.emit_check("jae", RtError::Subscript);
             self.emit_lower_bound_check("rax");
         }
@@ -5885,15 +6138,16 @@ impl CodeGen {
             } else {
                 self.emit("    cvttsd2si rcx, xmm0");
             }
+            let bound = self.array_bound_operand(name, &loc, i);
             if self.opts.checks {
-                self.emit(&format!("    cmp rcx, {}", loc.q(1 + i as i32)));
+                self.emit(&format!("    cmp rcx, {}", bound));
                 self.emit_check("jae", RtError::Subscript);
                 self.emit_lower_bound_check("rcx");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
             self.emit(&format!("    add rsp, {}", STACK_TEMP_SPACE));
             // rax = rax * dim[i] + indices[i]
-            self.emit(&format!("    imul rax, {}", loc.q(1 + i as i32)));
+            self.emit(&format!("    imul rax, {}", bound));
             self.emit("    add rax, rcx");
         }
 
@@ -5909,11 +6163,12 @@ impl CodeGen {
         // The base is loaded here rather than earlier because evaluating an
         // index runs arbitrary code, which is free to clobber r10.
         if Self::is_sib_scale(elem_size) {
-            self.emit(&format!("    mov r10, {}", loc.q(0)));
-            self.emit(&format!("    lea rax, [r10 + rax*{}]", elem_size));
+            let base = self.array_base_into_register(name, &loc);
+            self.emit(&format!("    lea rax, [{} + rax*{}]", base, elem_size));
         } else {
             self.emit(&format!("    imul rax, {}", elem_size));
-            self.emit(&format!("    add rax, {}", loc.q(0)));
+            let base = self.array_base_operand(name, &loc);
+            self.emit(&format!("    add rax, {}", base));
         }
     }
 
@@ -5925,8 +6180,8 @@ impl CodeGen {
         // that would have gone into a `lea` goes into the load instead, so the
         // read costs one instruction rather than three.
         if Self::is_sib_scale(elem_size) && elem_type != DataType::String {
-            self.emit(&format!("    mov r10, {}", loc.q(0)));
-            let at = format!("[r10 + rax*{}]", elem_size);
+            let base = self.array_base_into_register(name, &loc);
+            let at = format!("[{} + rax*{}]", base, elem_size);
             match elem_type {
                 DataType::Integer => self.emit(&format!("    movsx eax, WORD PTR {}", at)),
                 DataType::Long => self.emit(&format!("    mov eax, DWORD PTR {}", at)),
@@ -5939,7 +6194,8 @@ impl CodeGen {
 
         // Otherwise build the address and read through it.
         self.emit(&format!("    imul rax, {}", elem_size));
-        self.emit(&format!("    add rax, {}", loc.q(0)));
+        let base = self.array_base_operand(name, &loc);
+        self.emit(&format!("    add rax, {}", base));
         match elem_type {
             DataType::String => {
                 self.emit("    mov rcx, rax");

@@ -898,3 +898,104 @@ fn test_promoted_accumulator_does_not_change_the_limit() {
     let got: Vec<&str> = out.trim().lines().collect();
     assert_eq!(got, vec!["3", "100"]);
 }
+
+/// A loop hoists the array descriptors its body keeps re-reading.
+///
+/// The element pointer and the bounds cannot change while the loop runs, yet
+/// every subscript fetched them again: two loads for the pointer, since the
+/// null check and the address each wanted it, and one per bound compare.
+#[test]
+fn test_loop_hoists_array_descriptors() {
+    let src = "\
+DIM A(5)
+T# = 0
+FOR I = 0 TO 5
+  T# = T# + A(I)
+NEXT I
+PRINT T#
+";
+    let asm = compile_to_asm(src).expect("must compile");
+    let body = innermost_loop_body(&asm);
+    assert!(
+        !body.contains("_arr_A"),
+        "the descriptor should be in registers inside the loop:\n{}",
+        body
+    );
+    // Loaded once, before the loop.
+    asserts_emits(src, &["mov r12, QWORD PTR [rip + _arr_A + 0]"]);
+}
+
+/// The null check stays inside the loop even though the pointer is hoisted.
+///
+/// Hoisting the *check* as well would report an array that a loop running
+/// zero times never touched.
+#[test]
+fn test_undim_check_is_not_hoisted_out_of_the_loop() {
+    let src = "\
+DIM A(5)
+T# = 0
+FOR I = 0 TO 5
+  T# = T# + A(I)
+NEXT I
+PRINT T#
+";
+    let asm = compile_to_asm(src).expect("must compile");
+    let body = innermost_loop_body(&asm);
+    assert!(
+        body.contains(".Lerr_undim"),
+        "the DIM check belongs with the access:\n{}",
+        body
+    );
+
+    // ...and it still fires when it should.
+    let run =
+        crate::common::compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
+    assert!(run.stderr.contains("Array used before DIM"));
+}
+
+/// Bounds checking survives the hoist, against the hoisted bound.
+#[test]
+fn test_bounds_check_uses_the_hoisted_bound() {
+    let run =
+        crate::common::compile_and_run_raw("DIM A(3)\nFOR I = 0 TO 9\nA(I) = I\nNEXT I\n", "")
+            .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Subscript out of range"),
+        "got {:?}",
+        run.stderr
+    );
+}
+
+/// Several arrays, a two-dimensional one, and nesting all still compute.
+#[test]
+fn test_hoisted_arrays_still_compute_correctly() {
+    let out = crate::common::compile_and_run(
+        "\
+DIM A(5)
+DIM B(5)
+DIM C(5)
+DIM D(3, 3)
+FOR I = 0 TO 5
+  A(I) = I
+  B(I) = I * 2
+  C(I) = A(I) + B(I)
+NEXT I
+PRINT C(3)
+FOR I = 0 TO 3
+  FOR J = 0 TO 3
+    D(I, J) = I * 10 + J
+  NEXT J
+NEXT I
+PRINT D(2, 3)
+T# = 0
+FOR I = 0 TO 5
+  T# = T# + A(I) + B(I) + C(I)
+NEXT I
+PRINT T#
+",
+    )
+    .expect("must run");
+    let got: Vec<&str> = out.trim().lines().collect();
+    assert_eq!(got, vec!["9", "23", "90"]);
+}
