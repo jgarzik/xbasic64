@@ -738,8 +738,6 @@ pub struct Parser {
     /// Source line of each token, parallel to `tokens`. Empty when unknown.
     lines: Vec<u32>,
     pos: usize,
-    /// Tracks declared array names for distinguishing array access from function calls
-    declared_arrays: HashSet<String>,
     /// SUB/FUNCTION names, collected before parsing so that `Name:` at the
     /// start of a line is not mistaken for a label definition.
     declared_procs: HashSet<String>,
@@ -1670,7 +1668,14 @@ impl Parser {
                 indices: None,
                 fields: Vec::new(),
             },
-            Expr::ArrayAccess { name, indices } => LValue {
+            // A subscripted target arrives as FnCall now that the parser no
+            // longer guesses which one it is; sema turns the surviving calls
+            // into array accesses, but MID$ needs the LValue here.
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } => LValue {
                 name,
                 indices: Some(indices),
                 fields: Vec::new(),
@@ -2105,9 +2110,6 @@ impl Parser {
                 self.advance();
                 let dims = self.parse_expr_list()?;
                 self.expect(Token::RParen)?;
-                // Track the name so that `name(i)` parses as an array access
-                // rather than a function call.
-                self.declared_arrays.insert(name.to_uppercase());
                 Some(dims)
             } else {
                 None
@@ -2686,16 +2688,14 @@ impl Parser {
                     let args = self.parse_expr_list()?;
                     self.expect(Token::RParen)?;
 
-                    // Distinguish array access from function call based on DIM declarations
-                    let base = if self.declared_arrays.contains(&name.to_uppercase()) {
-                        Expr::ArrayAccess {
-                            name,
-                            indices: args,
-                        }
-                    } else {
-                        Expr::FnCall { name, args }
-                    };
-                    self.parse_field_chain(base)
+                    // `A(1)` is an array element or a call; the parser cannot
+                    // tell, and used to guess from the DIM statements it had
+                    // read so far. That made the AST depend on where the DIM
+                    // was written -- the same source became FnCall before it
+                    // and ArrayAccess after -- and ignored scope entirely, so a
+                    // DIM inside a SUB changed how module-level code parsed.
+                    // Sema resolves it against the finished symbol table.
+                    self.parse_field_chain(Expr::FnCall { name, args })
                 } else {
                     self.parse_field_chain(Expr::Variable(name))
                 }

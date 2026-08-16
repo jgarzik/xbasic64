@@ -385,12 +385,177 @@ pub struct Diagnostic {
     pub note: Option<String>,
 }
 
-/// Analyze a program: collect its symbols and report any problems.
-pub fn analyze(program: &Program) -> (Symbols, Vec<Diagnostic>) {
+/// Analyze a program: collect its symbols, resolve `A(1)`, and report problems.
+///
+/// The program is taken by `&mut` because of the middle step. `A(1)` is either
+/// an array element or a call, and only the finished symbol table can say
+/// which. The parser used to guess from the DIM statements it had read so far,
+/// which meant the same source produced a different AST depending on whether
+/// its DIM came earlier or later in the file, and ignored scope entirely.
+pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
     let mut a = Analyzer::default();
     a.collect(&program.statements, &Scope::Module);
+    a.check_name_collisions();
+    a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
+}
+
+/// Apply `f` to every expression directly held by `stmt`, in place.
+///
+/// Deliberately exhaustive, with no wildcard arm: this is the single place that
+/// knows where a statement keeps its expressions, so a new `StmtKind` that
+/// carries one must fail to compile here rather than be silently skipped.
+/// Nested statement bodies are *not* visited -- the caller walks those itself,
+/// because it has to change scope on the way in.
+fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+    /// Every expression an assignment target can hold: its subscripts.
+    fn lvalue(lv: &mut LValue, f: &mut impl FnMut(&mut Expr)) {
+        if let Some(indices) = &mut lv.indices {
+            indices.iter_mut().for_each(&mut *f);
+        }
+    }
+
+    match &mut stmt.kind {
+        StmtKind::Let { indices, value, .. } => {
+            if let Some(indices) = indices {
+                indices.iter_mut().for_each(&mut *f);
+            }
+            f(value);
+        }
+        StmtKind::Print {
+            file_num,
+            items,
+            using,
+            ..
+        } => {
+            file_num.iter_mut().for_each(&mut *f);
+            using.iter_mut().for_each(&mut *f);
+            for item in items {
+                if let PrintItem::Expr(e) = item {
+                    f(e);
+                }
+            }
+        }
+        StmtKind::Input { vars, file_num, .. } => {
+            file_num.iter_mut().for_each(&mut *f);
+            vars.iter_mut().for_each(|v| lvalue(v, f));
+        }
+        StmtKind::LineInput { var, file_num, .. } => {
+            file_num.iter_mut().for_each(&mut *f);
+            lvalue(var, f);
+        }
+        StmtKind::If { condition, .. } => f(condition),
+        StmtKind::For {
+            start, end, step, ..
+        } => {
+            f(start);
+            f(end);
+            step.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::While { condition, .. } => f(condition),
+        StmtKind::DoLoop { condition, .. } => condition.iter_mut().for_each(&mut *f),
+        StmtKind::OnGoto { expr, .. } | StmtKind::OnGosub { expr, .. } => f(expr),
+        StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+            for d in decls {
+                if let Some(dims) = &mut d.dimensions {
+                    dims.iter_mut().for_each(&mut *f);
+                }
+            }
+        }
+        StmtKind::Call { args, .. } => args.iter_mut().for_each(&mut *f),
+        StmtKind::MidAssign {
+            target,
+            start,
+            len,
+            value,
+        } => {
+            lvalue(target, f);
+            f(start);
+            len.iter_mut().for_each(&mut *f);
+            f(value);
+        }
+        StmtKind::Swap(a, b) => {
+            lvalue(a, f);
+            lvalue(b, f);
+        }
+        StmtKind::Const { value, .. } => f(value),
+        StmtKind::FieldAssign { target, value } => {
+            lvalue(target, f);
+            f(value);
+        }
+        StmtKind::Read(vars) => vars.iter_mut().for_each(|v| lvalue(v, f)),
+        StmtKind::SelectCase { expr, cases } => {
+            f(expr);
+            for (clauses, _) in cases {
+                for clause in clauses.iter_mut().flatten() {
+                    match clause {
+                        CaseClause::Value(e) | CaseClause::Compare(_, e) => f(e),
+                        CaseClause::Range(lo, hi) => {
+                            f(lo);
+                            f(hi);
+                        }
+                    }
+                }
+            }
+        }
+        StmtKind::Open {
+            filename,
+            file_num,
+            reclen,
+            ..
+        } => {
+            f(filename);
+            f(file_num);
+            reclen.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Close { file_num } => file_num.iter_mut().for_each(&mut *f),
+        StmtKind::Field { file_num, fields } => {
+            f(file_num);
+            for slice in fields {
+                f(&mut slice.width);
+                lvalue(&mut slice.target, f);
+            }
+        }
+        StmtKind::SetField { target, value, .. } => {
+            lvalue(target, f);
+            f(value);
+        }
+        StmtKind::GetPut {
+            file_num, record, ..
+        } => {
+            f(file_num);
+            record.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Lock {
+            file_num, range, ..
+        } => {
+            f(file_num);
+            if let Some((start, end)) = range {
+                f(start);
+                end.iter_mut().for_each(&mut *f);
+            }
+        }
+        // Statements that hold no expression of their own. Listed rather than
+        // matched with a wildcard so that a new variant carrying one is a
+        // compile error here.
+        StmtKind::Label(_)
+        | StmtKind::LabelName(_)
+        | StmtKind::Goto(_)
+        | StmtKind::Gosub(_)
+        | StmtKind::Return
+        | StmtKind::Sub { .. }
+        | StmtKind::Function { .. }
+        | StmtKind::ExitLoop { .. }
+        | StmtKind::ExitProc
+        | StmtKind::OptionBase(_)
+        | StmtKind::TypeDef { .. }
+        | StmtKind::Data(_)
+        | StmtKind::Restore(_)
+        | StmtKind::Cls
+        | StmtKind::End
+        | StmtKind::Stop => {}
+    }
 }
 
 #[derive(Default)]
@@ -662,7 +827,136 @@ impl Analyzer {
         }
     }
 
-    // Pass 2: check uses
+    /// Refuse a name declared as an array and also as a procedure or builtin.
+    ///
+    /// `A(1)` reaches the compiler as one shape and has to become one thing.
+    /// Sema resolved such a clash in favour of the array and codegen in favour
+    /// of the procedure, and the parser's DIM-order heuristic hid the
+    /// disagreement for as long as it lasted. `DIM F(5)` alongside
+    /// `FUNCTION F(X)` compiled silently; so did `DIM LEN(5)`, where codegen's
+    /// builtin table would answer first and the array would never be read.
+    ///
+    /// Rather than pick an order and document it, refuse the program: nobody
+    /// writes this on purpose, and either resolution surprises somebody.
+    fn check_name_collisions(&mut self) {
+        let arrays: Vec<(Scope, String, u32)> = self
+            .symbols
+            .arrays
+            .iter()
+            .map(|((scope, name), info)| (scope.clone(), name.clone(), info.line))
+            .collect();
+
+        for (_, name, line) in arrays {
+            if let Some(proc_info) = self.symbols.procs.get(&name) {
+                let kind = if proc_info.is_function {
+                    "FUNCTION"
+                } else {
+                    "SUB"
+                };
+                let proc_line = proc_info.line;
+                self.error_with_note(
+                    line,
+                    format!("'{}' is declared both as an array and as a {}", name, kind),
+                    format!("the {} is on line {}", kind, proc_line),
+                );
+            } else if builtin(&name).is_some() {
+                self.error(
+                    line,
+                    format!(
+                        "'{}' is the name of a built-in function and cannot also be an array",
+                        name
+                    ),
+                );
+            }
+        }
+    }
+
+    // Pass 2: resolve `A(1)` against the symbol table
+
+    /// Turn every `FnCall` naming an array into an `ArrayAccess`.
+    ///
+    /// The parser emits `FnCall` for all of `name(args)`, because at that point
+    /// nothing knows whether `name` is an array, a procedure or a builtin. Here
+    /// the symbol table is complete and scoped, so the question has one answer
+    /// regardless of where the `DIM` was written.
+    ///
+    /// Doing it as a rewrite keeps `ArrayAccess` in the AST that codegen sees,
+    /// which matters for more than tidiness: `expr_is_call_free` treats every
+    /// `FnCall` as opaque, so leaving array reads as calls would silently
+    /// disable FOR-counter promotion, and `walk_array_uses` collects names only
+    /// from `ArrayAccess`, so loop-invariant descriptor hoisting would stop
+    /// firing. Both would have been invisible except as lost performance.
+    fn resolve_array_accesses(&mut self, stmts: &mut [Stmt], scope: &Scope) {
+        for stmt in stmts {
+            for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+
+            // Nested bodies, entering procedure scope where there is one.
+            match &mut stmt.kind {
+                StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. } => {
+                    let inner = Scope::Proc(name.to_uppercase());
+                    self.resolve_array_accesses(body, &inner);
+                }
+                StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    self.resolve_array_accesses(then_branch, scope);
+                    if let Some(eb) = else_branch {
+                        self.resolve_array_accesses(eb, scope);
+                    }
+                }
+                StmtKind::SelectCase { cases, .. } => {
+                    for (_, body) in cases {
+                        self.resolve_array_accesses(body, scope);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::While { body, .. }
+                | StmtKind::DoLoop { body, .. } => self.resolve_array_accesses(body, scope),
+                _ => {}
+            }
+        }
+    }
+
+    /// Rewrite one expression tree, innermost first.
+    fn resolve_expr(symbols: &Symbols, expr: &mut Expr, scope: &Scope) {
+        match expr {
+            Expr::Literal(_) | Expr::Variable(_) => return,
+            Expr::Unary { operand, .. } => Self::resolve_expr(symbols, operand, scope),
+            Expr::Binary { left, right, .. } => {
+                Self::resolve_expr(symbols, left, scope);
+                Self::resolve_expr(symbols, right, scope);
+            }
+            Expr::Field { base, .. } => Self::resolve_expr(symbols, base, scope),
+            Expr::ArrayAccess { indices, .. } => {
+                for i in indices {
+                    Self::resolve_expr(symbols, i, scope);
+                }
+            }
+            Expr::FnCall { args, .. } => {
+                for a in args.iter_mut() {
+                    Self::resolve_expr(symbols, a, scope);
+                }
+            }
+        }
+
+        // A procedure wins over an array of the same name, matching what
+        // codegen has always done; `check_name_collisions` refuses the program
+        // that makes the two disagree, so the order is unobservable.
+        if let Expr::FnCall { name, args } = expr {
+            let upper = name.to_uppercase();
+            if !symbols.procs.contains_key(&upper) && symbols.lookup_array(scope, &upper).is_some()
+            {
+                *expr = Expr::ArrayAccess {
+                    name: std::mem::take(name),
+                    indices: std::mem::take(args),
+                };
+            }
+        }
+    }
+
+    // Pass 3: check uses
 
     fn check(&mut self, stmts: &[Stmt], scope: &Scope) {
         for stmt in stmts {

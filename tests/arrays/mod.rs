@@ -189,3 +189,48 @@ fn test_bounds_with_computed_dimension() {
     .unwrap();
     assert_eq!(output.trim(), "552");
 }
+
+/// An array behaves the same wherever its DIM is written.
+///
+/// The parser used to decide between array access and function call from the
+/// DIM statements it had read so far, so the same source produced a different
+/// AST depending on whether the DIM came earlier or later -- and it ignored
+/// scope, so a DIM inside a SUB changed how module-level code parsed. Sema now
+/// resolves it against the finished symbol table.
+#[test]
+fn test_array_use_before_its_dim() {
+    let output = compile_and_run(
+        r#"
+SUB Show(N)
+PRINT A(N)
+END SUB
+DIM A(3)
+A(1) = 7
+Show 1
+PRINT A(1)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines, &["7", "7"], "read before and after the DIM agree");
+}
+
+/// A DIM inside a procedure must not make module-level code resolve to it.
+#[test]
+fn test_procedure_local_dim_does_not_escape() {
+    let output = compile_and_run(
+        r#"
+SUB Local
+DIM Q(3)
+Q(1) = 5
+PRINT Q(1)
+END SUB
+Local
+PRINT Q
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "5", "the local array works");
+    assert_eq!(lines[1], "0", "Q at module level is an untouched scalar");
+}

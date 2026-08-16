@@ -108,7 +108,7 @@ fn main() {
 
     // Parse
     let mut parser = parser::Parser::new(tokens, line_map);
-    let program = match parser.parse() {
+    let mut program = match parser.parse() {
         Ok(p) => p,
         Err(errors) => report(
             input_file,
@@ -121,7 +121,7 @@ fn main() {
 
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
-    let (symbols, diagnostics) = sema::analyze(&program);
+    let (symbols, diagnostics) = sema::analyze(&mut program);
     if !diagnostics.is_empty() {
         report(
             input_file,

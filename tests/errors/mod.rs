@@ -933,6 +933,29 @@ fn test_unsupported_diagnostics_explain_themselves() {
     );
 }
 
+/// A name cannot be both an array and a procedure, or an array and a builtin.
+///
+/// `A(1)` has to resolve to one thing. Sema resolved such a clash in favour of
+/// the array and codegen in favour of the procedure, and the parser's DIM-order
+/// heuristic hid the disagreement for as long as it lasted -- both of these
+/// compiled silently. Nobody writes this on purpose, and either resolution
+/// surprises somebody, so the program is refused instead.
+#[test]
+fn test_array_and_procedure_name_collisions_are_diagnosed() {
+    expect_rejected(
+        "DIM F(5)\nF(1) = 7\nFUNCTION F(X)\nF = X * 2\nEND FUNCTION\n",
+        "declared both as an array and as a FUNCTION",
+    );
+    expect_rejected(
+        "DIM S(5)\nSUB S(X)\nPRINT X\nEND SUB\n",
+        "declared both as an array and as a SUB",
+    );
+    expect_rejected(
+        "DIM LEN(5)\nLEN(1) = 7\n",
+        "'LEN' is the name of a built-in function",
+    );
+}
+
 /// Every syntax error in a program is reported, not just the first.
 ///
 /// Sema has always returned a Vec<Diagnostic>, so five undefined names cost one
