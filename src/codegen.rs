@@ -483,6 +483,40 @@ impl ForOperand {
     }
 }
 
+/// A variable a loop is holding in a register rather than in its storage.
+///
+/// Both a FOR control variable and an accumulator the body assigns to: the
+/// difference is only where the register's initial value comes from, and both
+/// are written back at the loop's single exit.
+#[derive(Clone)]
+struct Promoted {
+    /// The name as the AST spells it, which is how a reference is matched.
+    name: String,
+    reg: String,
+    ty: DataType,
+    /// The variable's storage, for the write-back.
+    loc: Loc,
+}
+
+/// Registers this compiler never allocates for anything else, so a loop may
+/// keep a variable in one for its whole duration.
+///
+/// The integer ones belong to the calling function and are saved around the
+/// loop. The XMM ones do not need saving -- System V has no callee-saved XMM
+/// register at all, which is the same fact that stops a promoted loop from
+/// containing a call.
+const PROMO_GPRS: [&str; 4] = ["r12", "r13", "r14", "r15"];
+const PROMO_XMMS: [&str; 8] = [
+    "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11",
+];
+
+/// How many variables besides the control variable one loop may promote.
+///
+/// Past a handful the registers are gone and each further one is a save and a
+/// restore for a diminishing return; a loop with more accumulators than this
+/// simply keeps the rest in memory.
+const MAX_PROMOTED_ACCUMULATORS: usize = 3;
+
 /// Metadata for array storage
 #[derive(Clone)]
 struct ArrayInfo {
@@ -544,9 +578,10 @@ pub struct CodeGen {
     data_line_index: HashMap<u32, usize>,
     /// The same for named labels.
     data_label_index: HashMap<String, usize>,
-    /// FOR control variables currently held in a register instead of memory,
-    /// innermost last: (variable name, register, counting type).
-    promoted_counters: Vec<(String, String, DataType)>,
+    /// Variables currently held in a register instead of in their storage,
+    /// innermost loop last. A read or a write of one of these names has to go
+    /// to the register: the storage is stale until the loop ends.
+    promoted: Vec<Promoted>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
     expr_depth: u32,  // current expression nesting depth
 }
@@ -1582,20 +1617,120 @@ impl CodeGen {
                 .all(|s| self.stmt_allows_register_counter(counter, s))
     }
 
-    /// The register to hold this loop's counter in, if it can have one.
+    /// A register of the right class that no enclosing loop is already using.
     ///
-    /// Depth-indexed so that nested promoted loops do not collide, and short,
-    /// so a deeply nested one simply keeps its counter in memory.
-    fn for_counter_register(&self, ct: DataType, depth: usize) -> Option<&'static str> {
-        // r12-r15 and xmm4 upward are the registers this compiler never
-        // allocates for anything else.
-        const GPRS: [&str; 3] = ["r12", "r13", "r14"];
-        const XMMS: [&str; 3] = ["xmm4", "xmm5", "xmm6"];
-        if ct.is_integer() {
-            GPRS.get(depth).copied()
+    /// Nested loops promote too, so the pool is checked against what is live
+    /// rather than indexed by depth; when it runs out the variable simply
+    /// stays in memory.
+    fn free_promotion_register(&self, ty: DataType) -> Option<&'static str> {
+        let pool: &[&'static str] = if ty.is_integer() {
+            &PROMO_GPRS
         } else {
-            XMMS.get(depth).copied()
+            &PROMO_XMMS
+        };
+        pool.iter()
+            .copied()
+            .find(|r| !self.promoted.iter().any(|p| p.reg == *r))
+    }
+
+    /// The scalars a loop body assigns to, in first-assignment order.
+    ///
+    /// These are the ones worth a register: an accumulator's store and the
+    /// next iteration's load of the same address are the loop-carried
+    /// dependency, and removing it is worth far more than the instructions.
+    /// A variable the body only reads costs a load per read and carries no
+    /// dependency, so it is left alone and its register given to an
+    /// accumulator instead.
+    ///
+    /// Only plain numeric scalars. A string would need its two words and its
+    /// ownership rules; an `AS`-typed variable lives in different storage and
+    /// is written through a different path; an array is not a scalar at all.
+    fn promotable_accumulators(&self, counter: &str, body: &[Stmt]) -> Vec<String> {
+        // A nested loop's control variable is written by that loop's own
+        // machinery, which reads and writes its storage directly. Holding it
+        // here as well would mean this loop's write-back put a stale value
+        // over whatever the inner loop had left there.
+        let mut inner_counters: Vec<String> = Vec::new();
+        Self::walk_nested_counters(body, &mut |name| inner_counters.push(name.to_string()));
+
+        let mut found: Vec<String> = Vec::new();
+        Self::walk_assigned_scalars(body, &mut |name| {
+            if name == counter
+                || is_string_var(name)
+                || found.iter().any(|n| n == name)
+                || inner_counters.iter().any(|n| n == name)
+                // Already held by an enclosing loop, which will write it back.
+                || self.promoted.iter().any(|p| p.name == name)
+            {
+                return;
+            }
+            if self.typed_var(name).is_some() || self.lookup_array(name).is_some() {
+                return;
+            }
+            // A name that is really a procedure, or a FUNCTION's own result
+            // variable, is not an ordinary scalar.
+            let upper = name.to_uppercase();
+            if self.symbols.procs.contains_key(&upper) {
+                return;
+            }
+            found.push(name.to_string());
+        });
+        found
+    }
+
+    /// Call `visit` with every scalar name assigned by a `LET` in `body`.
+    fn walk_assigned_scalars(body: &[Stmt], visit: &mut impl FnMut(&str)) {
+        Self::walk_body(body, &mut |stmt| {
+            if let StmtKind::Let {
+                name,
+                indices: None,
+                ..
+            } = &stmt.kind
+            {
+                visit(name);
+            }
+        });
+    }
+
+    /// Call `visit` with the control variable of every loop nested in `body`.
+    fn walk_nested_counters(body: &[Stmt], visit: &mut impl FnMut(&str)) {
+        Self::walk_body(body, &mut |stmt| {
+            if let StmtKind::For { var, .. } = &stmt.kind {
+                visit(var);
+            }
+        });
+    }
+
+    /// Visit every statement in `body`, including nested ones.
+    ///
+    /// Only the statement kinds that can appear in a promotable loop are
+    /// descended into; everything else is outside the allowlist that makes
+    /// the loop promotable at all, so it cannot be there.
+    fn walk_body(body: &[Stmt], visit: &mut impl FnMut(&Stmt)) {
+        for stmt in body {
+            visit(stmt);
+            match &stmt.kind {
+                StmtKind::If {
+                    then_branch,
+                    else_branch,
+                    ..
+                } => {
+                    Self::walk_body(then_branch, visit);
+                    if let Some(eb) = else_branch {
+                        Self::walk_body(eb, visit);
+                    }
+                }
+                StmtKind::For { body, .. }
+                | StmtKind::While { body, .. }
+                | StmtKind::DoLoop { body, .. } => Self::walk_body(body, visit),
+                _ => {}
+            }
         }
+    }
+
+    /// Whether `name` is held in a register by some enclosing loop.
+    fn promotion_of(&self, name: &str) -> Option<Promoted> {
+        self.promoted.iter().rev().find(|p| p.name == name).cloned()
     }
 
     /// Where a FOR control variable lives, and the type it counts in.
@@ -1807,6 +1942,42 @@ impl CodeGen {
             DataType::Single => self.emit(&format!("    addss {}, {}", reg, text)),
             _ => self.emit(&format!("    addsd {}, {}", reg, text)),
         }
+    }
+
+    /// Load a promoted variable's storage into its register, entering a loop.
+    fn emit_promotion_load(&mut self, p: &Promoted) {
+        match p.ty {
+            DataType::Integer => self.emit(&format!(
+                "    movsx {}, {}",
+                Self::counter_reg32(&p.reg),
+                p.loc.at("WORD PTR", 0)
+            )),
+            DataType::Long => self.emit(&format!(
+                "    mov {}, {}",
+                Self::counter_reg32(&p.reg),
+                p.loc.at("DWORD PTR", 0)
+            )),
+            DataType::Single => self.emit(&format!(
+                "    movss {}, {}",
+                p.reg,
+                p.loc.at("DWORD PTR", 0)
+            )),
+            _ => self.emit(&format!("    movsd {}, {}", p.reg, p.loc.q(0))),
+        }
+    }
+
+    /// Write a promoted variable's register back to its storage, leaving.
+    fn emit_promotion_store(&mut self, p: &Promoted) {
+        let mem = p.loc.at(Self::for_ptr(p.ty), 0);
+        self.emit_counter_writeback(p.ty, &p.reg.clone(), &mem);
+    }
+
+    /// Move a freshly computed value from the working register into a
+    /// promoted variable's register.
+    fn emit_promotion_assign(&mut self, p: &Promoted) {
+        // Narrowed on the way in, exactly as the store to its slot would have
+        // narrowed it, so an INTEGER still wraps at sixteen bits.
+        self.emit_counter_init(p.ty, &p.reg.clone());
     }
 
     /// Read a promoted counter into the register an expression expects.
@@ -2211,6 +2382,15 @@ impl CodeGen {
                     // Coerce to target type
                     self.gen_coercion(expr_type, var_info.data_type);
 
+                    // An enclosing loop may be holding this name in a
+                    // register. Writing its storage instead would be lost:
+                    // the register is where every read of it now looks, and
+                    // it is what gets written back when the loop ends.
+                    if let Some(p) = self.promotion_of(name) {
+                        self.emit_promotion_assign(&p);
+                        return;
+                    }
+
                     // Store based on target type
                     let loc = &var_info.loc;
                     match var_info.data_type {
@@ -2391,15 +2571,15 @@ impl CodeGen {
                 // has no callee-saved XMM register for a Double counter to
                 // survive a call in, and a called procedure could reach a
                 // module-level counter by name.
-                let counter_reg =
-                    if self.body_allows_register_counter(var, body, start, end, step.as_ref()) {
-                        self.for_counter_register(ct, self.promoted_counters.len())
-                            .map(str::to_string)
-                    } else {
-                        None
-                    };
+                let promotable =
+                    self.body_allows_register_counter(var, body, start, end, step.as_ref());
+                let counter_reg = if promotable {
+                    self.free_promotion_register(ct).map(str::to_string)
+                } else {
+                    None
+                };
 
-                // r12-r14 belong to this function's caller, so they are saved
+                // r12-r15 belong to this function's caller, so they are saved
                 // across the loop. Sixteen bytes rather than eight because a
                 // bounds check inside the loop can still reach a trampoline
                 // that calls the runtime, and it must find rsp aligned.
@@ -2425,6 +2605,53 @@ impl CodeGen {
                 // own operand.
                 let end_operand = self.gen_for_bound(Some(end), ct);
                 let step_operand = self.gen_for_bound(step.as_ref(), ct);
+
+                // The same argument that puts the counter in a register puts
+                // the body's accumulators there: `T = T + ...` has exactly the
+                // same store-then-reload dependency, and usually a longer one,
+                // since the add is on the critical path too.
+                //
+                // Loaded after the bounds, which are evaluated in memory, and
+                // before the loop label, so a variable the loop never reaches
+                // is still written back unchanged.
+                let mut accumulators: Vec<Promoted> = Vec::new();
+                if promotable {
+                    for name in self.promotable_accumulators(var, body) {
+                        if accumulators.len() == MAX_PROMOTED_ACCUMULATORS {
+                            break;
+                        }
+                        let info = self.get_var_info(&name);
+                        // Ask with the counter already accounted for, so the
+                        // two cannot be given the same register.
+                        let taken: Vec<String> = counter_reg.iter().cloned().collect();
+                        let reg = {
+                            let pool: &[&'static str] = if info.data_type.is_integer() {
+                                &PROMO_GPRS
+                            } else {
+                                &PROMO_XMMS
+                            };
+                            pool.iter().copied().find(|r| {
+                                !taken.iter().any(|t| t == r)
+                                    && !accumulators.iter().any(|a| a.reg == *r)
+                                    && !self.promoted.iter().any(|p| p.reg == *r)
+                            })
+                        };
+                        let Some(reg) = reg else { break };
+                        accumulators.push(Promoted {
+                            name,
+                            reg: reg.to_string(),
+                            ty: info.data_type,
+                            loc: info.loc,
+                        });
+                    }
+                }
+                for p in &accumulators.clone() {
+                    if p.ty.is_integer() {
+                        self.emit("    sub rsp, 16        # save an accumulator register");
+                        self.emit(&format!("    mov QWORD PTR [rsp], {}", p.reg));
+                    }
+                    self.emit_promotion_load(p);
+                }
 
                 // Which way the loop runs is a property of the step's sign. It
                 // is almost always written into the program, so it is almost
@@ -2482,19 +2709,26 @@ impl CodeGen {
                     }
                 }
 
-                // Body. While it runs, a read of the control variable resolves
-                // to the register rather than to its storage.
+                // Body. While it runs, a read or a write of any promoted name
+                // resolves to its register rather than to its storage.
+                let promoted_here = accumulators.len() + usize::from(counter_reg.is_some());
                 if let Some(reg) = &counter_reg {
-                    self.promoted_counters.push((var.clone(), reg.clone(), ct));
+                    self.promoted.push(Promoted {
+                        name: var.clone(),
+                        reg: reg.clone(),
+                        ty: ct,
+                        loc: var_loc.clone(),
+                    });
+                }
+                for p in &accumulators {
+                    self.promoted.push(p.clone());
                 }
                 self.loop_stack.push((true, end_label.clone()));
                 for s in body {
                     self.gen_stmt(s);
                 }
                 self.loop_stack.pop();
-                if counter_reg.is_some() {
-                    self.promoted_counters.pop();
-                }
+                self.promoted.truncate(self.promoted.len() - promoted_here);
 
                 // Increment. When the counter is in memory it is reloaded
                 // rather than carried over from the compare above, because the
@@ -2516,7 +2750,16 @@ impl CodeGen {
                 self.emit_label(&end_label);
 
                 // Every route out of the loop passes here, EXIT FOR included,
-                // so this is where the variable becomes visible again.
+                // so this is where the variables become visible again. In
+                // reverse order, so the saved registers come off the stack in
+                // the order they went on.
+                for p in accumulators.iter().rev() {
+                    self.emit_promotion_store(p);
+                    if p.ty.is_integer() {
+                        self.emit(&format!("    mov {}, QWORD PTR [rsp]", p.reg));
+                        self.emit("    add rsp, 16");
+                    }
+                }
                 if let Some(reg) = &counter_reg {
                     let reg = reg.clone();
                     self.emit_counter_writeback(ct, &reg, &var_mem);
@@ -3072,15 +3315,9 @@ impl CodeGen {
                 // instead of in its storage, in which case that register is
                 // where its current value is. Checked before anything else,
                 // because the storage is stale until the loop ends.
-                if let Some((_, reg, ct)) = self
-                    .promoted_counters
-                    .iter()
-                    .rev()
-                    .find(|(n, _, _)| n == name)
-                    .cloned()
-                {
-                    self.emit_counter_read(ct, &reg);
-                    return ct;
+                if let Some(p) = self.promotion_of(name) {
+                    self.emit_counter_read(p.ty, &p.reg);
+                    return p.ty;
                 }
 
                 // A variable declared with `AS` lives in typed storage, which
