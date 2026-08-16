@@ -397,9 +397,20 @@ pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
     let mut a = Analyzer::default();
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
+    a.check_return_has_a_gosub(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
+}
+
+/// Call `f` for every statement in `stmts`, nested bodies included.
+fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+    for stmt in stmts {
+        f(stmt);
+        for body in child_bodies(stmt) {
+            walk_stmts(body, f);
+        }
+    }
 }
 
 /// Apply `f` to every expression directly held by `stmt`, in place.
@@ -825,6 +836,36 @@ impl Analyzer {
                     }
                 }
             }
+        }
+    }
+
+    /// Refuse a `RETURN` in a program that contains no `GOSUB`.
+    ///
+    /// codegen defines the GOSUB return stack only when it has seen a GOSUB, so
+    /// a lone RETURN emitted a reference to `_gosub_sp` that nothing defined and
+    /// the user was handed `ld: undefined reference to _gosub_sp`. Reaching the
+    /// linker with a name the compiler invented is exactly what this pass exists
+    /// to prevent.
+    ///
+    /// The check is deliberately whole-program rather than per-path: deciding
+    /// whether a particular RETURN can be reached from a particular GOSUB needs
+    /// the control flow, and GOTO makes that undecidable. "No GOSUB at all" is
+    /// sound, and it is the shape a mistake actually takes.
+    fn check_return_has_a_gosub(&mut self, stmts: &[Stmt]) {
+        let mut has_gosub = false;
+        let mut first_return = None;
+        walk_stmts(stmts, &mut |stmt| match &stmt.kind {
+            StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => has_gosub = true,
+            StmtKind::Return if first_return.is_none() => first_return = Some(stmt.line),
+            _ => {}
+        });
+        if let (false, Some(line)) = (has_gosub, first_return) {
+            self.error_with_note(
+                line,
+                "RETURN without GOSUB".to_string(),
+                "RETURN ends a GOSUB; use EXIT SUB or EXIT FUNCTION to leave a procedure"
+                    .to_string(),
+            );
         }
     }
 

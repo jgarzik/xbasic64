@@ -1421,3 +1421,17 @@ fn test_a_failed_block_header_does_not_cascade() {
 fn test_cascade_suppression_only_applies_after_an_error() {
     expect_rejected("PRINT 1\nNEXT\n", "NEXT without matching FOR");
 }
+
+/// `RETURN` with no `GOSUB` anywhere is a compile error, not a linker error.
+///
+/// codegen only defines the GOSUB return stack when it has seen a GOSUB, so a
+/// lone RETURN emitted a reference to `_gosub_sp` that nothing defined and the
+/// user was shown `ld: undefined reference to _gosub_sp`. Turning that into a
+/// diagnostic is the whole reason sema exists.
+#[test]
+fn test_return_without_gosub_is_diagnosed() {
+    expect_rejected("PRINT \"x\"\nRETURN\n", "RETURN");
+    expect_rejected("IF 1 = 1 THEN\nRETURN\nEND IF\n", "RETURN");
+    // A program that does use GOSUB is unaffected.
+    compile_only("GOSUB 100\nEND\n100 PRINT 1\nRETURN\n").expect("GOSUB/RETURN pairs compile");
+}

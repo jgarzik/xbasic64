@@ -1303,6 +1303,7 @@ impl Parser {
                     "PUT" if self.next_is(Token::Hash) => self.parse_get_put(true),
                     "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
+                    "CALL" if self.next_is_ident() => self.parse_call(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),
@@ -2683,6 +2684,30 @@ impl Parser {
         }
 
         Ok(StmtKind::Field { file_num, fields })
+    }
+
+    /// `CALL Name(args)` or `CALL Name` -- the explicit form of a procedure
+    /// call, which GW-BASIC and QuickBASIC both accept.
+    ///
+    /// Recognised only in statement position before a name, like the
+    /// random-access statement names, so a program may still use CALL for a
+    /// variable of its own. Without this the word parsed as a paren-less call
+    /// to a subroutine named CALL, and the diagnostic complained about the
+    /// callee rather than about CALL.
+    fn parse_call(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume CALL
+        let Token::Ident(name) = self.advance() else {
+            return err("Expected a procedure name after CALL");
+        };
+        let args = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let args = self.parse_expr_list()?;
+            self.expect(Token::RParen)?;
+            args
+        } else {
+            Vec::new()
+        };
+        Ok(StmtKind::Call { name, args })
     }
 
     /// `LSET v$ = expr` / `RSET v$ = expr`

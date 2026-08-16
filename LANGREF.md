@@ -1158,8 +1158,12 @@ END SUB
 
 ' Call the subroutine
 PrintGreeting "World"
-PrintGreeting("World")    ' Parentheses optional
+PrintGreeting("World")     ' Parentheses optional
+CALL PrintGreeting("World")  ' CALL is accepted too
 ```
+
+`CALL` is recognised only before a name at the start of a statement, so a
+program may still use it as a variable.
 
 ### FUNCTION
 
