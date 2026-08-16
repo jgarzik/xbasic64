@@ -781,8 +781,8 @@ _file_fieldoff: .skip 128       # bytes of the buffer FIELD has assigned so far
 _mode_update: .asciz "r+b"      # open an existing file for reading and writing
 _mode_create: .asciz "w+b"      # ... or create it when it does not exist
 
-# MKI$/MKL$/MKS$/MKD$ build their result here. Like CHR$, the buffer is static
-# and the caller copies it on assignment.
+# MKI$/MKL$/MKS$/MKD$ assemble their bytes here, then return a heap copy; the
+# buffer itself is never handed out.
 _mk_buf: .skip 16
 
 # Largest record GW-BASIC allows.
@@ -1376,7 +1376,9 @@ _rt_unlock:
 # Arguments:
 #   rdi = the value's bits, rsi = width in bytes (2, 4 or 8)
 #
-# Returns: rax = pointer to the bytes, rdx = width
+# Returns: rax = pointer to a fresh heap copy of the bytes, rdx = width
+# (_mk_buf is scratch and never leaves the runtime, so that two MK*$ calls in
+# one expression cannot alias each other.)
 .globl _rt_mk
 _rt_mk:
     lea rax, [rip + _mk_buf]

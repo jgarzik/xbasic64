@@ -817,7 +817,8 @@ _file_reclen:   .skip 128       # record length per file number
 _file_recnum:   .skip 128       # last record read or written, 1-based; 0 = none
 _file_fieldoff: .skip 128       # bytes of the buffer FIELD has assigned so far
 
-# MKI$/MKL$/MKS$/MKD$ build their result here, like CHR$ does.
+# MKI$/MKL$/MKS$/MKD$ assemble their bytes here, then return a heap copy; the
+# buffer itself is never handed out.
 _mk_buf: .skip 16
 
 # Scratch for the file-pointer position SetFilePointerEx reports back.
@@ -1454,7 +1455,8 @@ _rt_unlock:
 
 # _rt_mk - MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string
 # Arguments: rcx = the value's bits, rdx = width in bytes (2, 4 or 8)
-# Returns:   rax = pointer to the bytes, rdx = width
+# Returns:   rax = pointer to a fresh heap copy of the bytes, rdx = width
+# (_mk_buf is scratch and never leaves the runtime.)
 .globl _rt_mk
 _rt_mk:
     lea rax, [rip + _mk_buf]

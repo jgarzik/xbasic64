@@ -14,6 +14,9 @@
 # Memory Management:
 #   - Substring functions return pointers into original string (no allocation)
 #   - String concatenation uses HeapAlloc(GetProcessHeap(), 0, size)
+#   - Conversion functions (STR$, CHR$, HEX$, OCT$) format into a scratch
+#     buffer and return a heap copy of it, so that two of them in one
+#     expression cannot alias; see the System V tree for the failure
 #
 # Win64 ABI:
 #   - Args: rcx, rdx, r8, r9 (then stack)
@@ -24,10 +27,10 @@
 .equ CHR_RESULT_LEN, 1          # CHR$() always returns 1 character
 
 .data
-_str_buf: .skip 64          # Buffer for STR$() conversion
+_str_buf: .skip 64          # Scratch for HEX$()/OCT$(); never returned
 _fmt_hex: .asciz "%llX"
 _fmt_oct: .asciz "%llo"
-_chr_buf: .skip 2           # Buffer for CHR$()
+_chr_buf: .skip 2           # Scratch for CHR$(); never returned
 
 .text
 
@@ -57,7 +60,7 @@ _rt_val:
 #   xmm0 = number to convert (double)
 #
 # Returns:
-#   rax = pointer to string (_num_buf)
+#   rax = pointer to a fresh heap copy of the text
 #   rdx = length of string
 .globl _rt_str
 _rt_str:
@@ -79,7 +82,7 @@ _rt_str:
 # the same reason PRINT does.
 #
 # Arguments: xmm0 = value, already widened to double
-# Returns:   rax = pointer, rdx = length
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
 .globl _rt_str_single
 _rt_str_single:
     push rbp
@@ -99,7 +102,7 @@ _rt_str_single:
 #   rcx = ASCII code (0-255)
 #
 # Returns:
-#   rax = pointer to string (_chr_buf)
+#   rax = pointer to a fresh heap copy of the character
 #   rdx = 1 (length)
 .globl _rt_chr
 _rt_chr:
@@ -566,7 +569,7 @@ _rt_case_convert:
 
 # _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
 # Arguments: rcx = value (already truncated to an integer)
-# Returns:   rax = pointer, rdx = length
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
 .globl _rt_hex
 _rt_hex:
     push rbp

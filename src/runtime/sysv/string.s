@@ -15,14 +15,18 @@
 #   - Substring functions (LEFT$, MID$, RIGHT$) return pointers into the original
 #     string - no allocation needed
 #   - String concatenation (_rt_strcat) allocates new memory via malloc
-#   - Conversion functions use static buffers (_str_buf, _chr_buf)
+#   - Conversion functions (STR$, CHR$, HEX$, OCT$) format into a scratch
+#     buffer and return a heap copy of it
 #
-# Static Buffers (from data_defs.s):
-#   _str_buf  = 64 bytes  - for STR$() numeric-to-string conversion
-#   _chr_buf  = 2 bytes   - for CHR$() single character + null
+# Scratch Buffers (from data_defs.s):
+#   _str_buf  = 64 bytes  - working space for HEX$() and OCT$()
+#   _chr_buf  = 2 bytes   - working space for CHR$(): character + null
 #
-# Important: Functions using static buffers return pointers that are only
-# valid until the next call to the same function.
+# Important: those buffers never leave the runtime. A conversion function that
+# returned one directly would alias itself, because nothing copies the result
+# until it is assigned -- so STR$(A) + STR$(B) evaluated both halves before
+# either was copied, and the first was already overwritten. They end in
+# _rt_strdup for that reason, and the buffer is reused freely.
 
 # _rt_val - Convert string to number (VAL function)
 # Parses a string as a floating-point number. Leading whitespace is skipped.
@@ -58,10 +62,8 @@ _rt_val:
 #   xmm0 = number to convert (double)
 #
 # Returns:
-#   rax = pointer to string (_num_buf)
+#   rax = pointer to a fresh heap copy of the text
 #   rdx = length of string
-#
-# Note: Uses static buffer - result only valid until next STR$() call.
 .globl _rt_str
 _rt_str:
     push rbp
@@ -81,7 +83,7 @@ _rt_str:
 # come back as "3.141590118408203".
 #
 # Arguments: xmm0 = value, already widened to double
-# Returns:   rax = pointer, rdx = length
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
 .globl _rt_str_single
 _rt_str_single:
     push rbp
@@ -101,10 +103,8 @@ _rt_str_single:
 #   rdi = ASCII code (0-255)
 #
 # Returns:
-#   rax = pointer to string (_chr_buf)
+#   rax = pointer to a fresh heap copy of the character
 #   rdx = 1 (length)
-#
-# Note: Uses static buffer - result only valid until next CHR$() call.
 .globl _rt_chr
 _rt_chr:
     push rbp
@@ -586,7 +586,7 @@ _rt_case_convert:
 
 # _rt_hex / _rt_oct - HEX$(n) / OCT$(n)
 # Arguments: rdi = value (already truncated to an integer)
-# Returns:   rax = pointer, rdx = length
+# Returns:   rax = pointer to a fresh heap copy, rdx = length
 .globl _rt_hex
 _rt_hex:
     push rbp
