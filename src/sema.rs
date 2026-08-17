@@ -114,7 +114,13 @@ const BUILTINS: &[(&str, usize, usize)] = &[
 /// two are meant to be read together.
 const UNSUPPORTED: &[(&str, &str)] = &[
     // Planned: implementable on both platforms, not written yet.
-    ("ERROR", "error trapping is not implemented yet"),
+    // Not "unimplemented": ERROR n works. It stays here so that every *other*
+    // mention -- `PRINT ERROR`, `X = ERROR + 1` -- says why rather than
+    // becoming a variable that reads as zero.
+    (
+        "ERROR",
+        "ERROR is a statement, not a value; write ERROR n to raise error n",
+    ),
     (
         "INKEY$",
         "INKEY$ needs raw console input, which is not implemented yet",
