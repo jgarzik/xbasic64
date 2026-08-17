@@ -228,3 +228,96 @@ fn test_runtime_calls_are_stack_aligned() {
         problems.join("\n")
     );
 }
+
+/// A helper must preserve the registers its own ABI calls callee-saved.
+///
+/// The lists differ, and that is the whole hazard: `rdi` and `rsi` are
+/// callee-saved on Win64 and scratch on System V, so a Win64 helper that uses
+/// one as a temporary is wrong in a way no Linux run can show. `_rt_print_using_str`
+/// did exactly that, and only survived because the code that calls it happens
+/// not to keep anything in `rdi`.
+///
+/// Deliberately crude: any `push` of a register anywhere in the helper counts
+/// as saving it, and only writes through a named destination are seen. That is
+/// enough for hand-written assembly of this shape, and a false negative is
+/// better here than a test nobody trusts.
+#[test]
+fn test_helpers_preserve_callee_saved_registers() {
+    // `rbp` is excluded: every helper frames with it and restores it via
+    // `leave`, which this scan would have to model separately to no purpose.
+    const SYSV_SAVED: &[&str] = &["rbx", "r12", "r13", "r14", "r15"];
+    const WIN64_SAVED: &[&str] = &[
+        "rbx", "rdi", "rsi", "r12", "r13", "r14", "r15", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10",
+        "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
+    ];
+
+    // `_rt_random_prepare` returns four values in callee-saved registers and
+    // says so: it is reached only from GET and PUT, which save them for it.
+    // A helper listed here has a private convention its own comment states.
+    const PRIVATE_CONVENTION: &[&str] = &["_rt_random_prepare"];
+
+    let mut problems = Vec::new();
+
+    for (dir, saved) in [
+        ("src/runtime/sysv", SYSV_SAVED),
+        ("src/runtime/win64-native", WIN64_SAVED),
+    ] {
+        for (path, text) in runtime_sources(dir) {
+            let mut helper = String::new();
+            let mut pushed: BTreeSet<String> = BTreeSet::new();
+            let mut used: Vec<(usize, String)> = Vec::new();
+
+            let mut flush = |helper: &str, pushed: &BTreeSet<String>, used: &[(usize, String)]| {
+                if PRIVATE_CONVENTION.contains(&helper) {
+                    return;
+                }
+                for (line, reg) in used {
+                    if !pushed.contains(reg) {
+                        problems.push(format!(
+                            "{path}:{line}: {helper} writes {reg}, which is callee-saved here, \
+                             without pushing it"
+                        ));
+                    }
+                }
+            };
+
+            for (i, raw) in text.lines().enumerate() {
+                let line = raw.split('#').next().unwrap_or("").trim();
+                if let Some(name) = line.strip_prefix(".globl ") {
+                    flush(&helper, &pushed, &used);
+                    helper = name.trim().to_string();
+                    pushed.clear();
+                    used.clear();
+                    continue;
+                }
+                if let Some(reg) = line.strip_prefix("push ") {
+                    pushed.insert(reg.trim().to_string());
+                    continue;
+                }
+                // `<op> <dest>, ...` -- the destination is what gets written.
+                let Some((_, rest)) = line.split_once(' ') else {
+                    continue;
+                };
+                let dest = rest.split(',').next().unwrap_or("").trim();
+                // 32-bit writes clear the upper half, so they count too.
+                let full = match dest {
+                    "edi" => "rdi",
+                    "esi" => "rsi",
+                    "ebx" => "rbx",
+                    other => other,
+                };
+                if saved.contains(&full) {
+                    used.push((i + 1, full.to_string()));
+                }
+            }
+            flush(&helper, &pushed, &used);
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{} clobbered callee-saved register(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}

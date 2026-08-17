@@ -326,7 +326,9 @@ _rt_print_using_str:
     test r13, r13
     jz .Luse_str_whole
 
-    lea rdi, [rip + _using_out]
+    # r8, not rdi: rdi is callee-saved on Win64 and volatile on System V, so
+    # scratching it here is invisible on the tree this is not compiled into.
+    lea r8, [rip + _using_out]
     xor rcx, rcx
 .Luse_str_copy:
     cmp rcx, r13
@@ -334,11 +336,11 @@ _rt_print_using_str:
     cmp rcx, r12
     jae .Luse_str_pad
     mov al, BYTE PTR [rbx + rcx]
-    mov BYTE PTR [rdi + rcx], al
+    mov BYTE PTR [r8 + rcx], al
     inc rcx
     jmp .Luse_str_copy
 .Luse_str_pad:
-    mov BYTE PTR [rdi + rcx], ' '
+    mov BYTE PTR [r8 + rcx], ' '
     inc rcx
     jmp .Luse_str_copy
 .Luse_str_copied:

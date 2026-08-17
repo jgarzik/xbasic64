@@ -80,7 +80,59 @@ jobs:
             # a different defect, and none of the three can be reproduced on
             # the Linux job.
             if ($LASTEXITCODE -ne 0) {
-              $code = [uint32]($LASTEXITCODE -band 0xFFFFFFFF)
+              # Widen before masking: -band on two int32s stays int32, so the
+              # cast of a negative status threw and hid the number it was
+              # printed to reveal.
+              $code = [uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF)
               throw ("run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $code)
             }
           }
+
+      # An example is a whole program, so a crash in one names the program and
+      # not the statement. These are one statement each, and they are the only
+      # coverage the console statements have anywhere: the test suite runs on
+      # Linux, and CLS, LOCATE and COLOR are precisely the helpers whose two
+      # implementations differ most.
+      #
+      # Every probe runs, and the step reports the whole table before failing,
+      # so one CI run says which statements are broken rather than the first.
+      - name: Probe each console statement
+        if: always()
+        shell: pwsh
+        run: |
+          $probes = [ordered]@{
+            'CLS'             = 'CLS'
+            'COLOR'           = 'COLOR 14, 1'
+            'LOCATE'          = 'LOCATE 2, 5'
+            'LOCATE row only' = 'LOCATE 3'
+            'POS'             = 'PRINT POS(0)'
+            'TIMER'           = 'PRINT TIMER'
+            'RANDOMIZE n'     = 'RANDOMIZE 42'
+            'RANDOMIZE TIMER' = 'RANDOMIZE TIMER'
+            'RND'             = 'PRINT RND'
+            'RND(0)'          = 'PRINT RND(0)'
+            'BEEP'            = 'BEEP'
+            'DATE$'           = 'PRINT DATE$'
+            'TIME$'           = 'PRINT TIME$'
+            'FRE'             = 'PRINT FRE(0)'
+            'DEFINT'          = "DEFINT A-Z`nX = 3`nPRINT X"
+            'EQV'             = 'PRINT 1 EQV 1'
+            'ERASE'           = "DIM A(3)`nERASE A"
+            'SYSTEM'          = 'SYSTEM'
+          }
+          $failed = @()
+          foreach ($p in $probes.GetEnumerator()) {
+            Set-Content -Path probe.bas -Value $p.Value
+            & ./target/release/xbasic64.exe probe.bas -o probe.exe | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host ("{0,-16} DID NOT COMPILE" -f $p.Key)
+              $failed += $p.Key
+              continue
+            }
+            & ./probe.exe | Out-Null
+            $code = $LASTEXITCODE
+            $hex = [uint32]([int64]$code -band 0xFFFFFFFF)
+            Write-Host ("{0,-16} exit {1} (0x{2:X8})" -f $p.Key, $code, $hex)
+            if ($code -ne 0) { $failed += $p.Key }
+          }
+          if ($failed.Count -gt 0) { throw "crashed: $($failed -join ', ')" }
