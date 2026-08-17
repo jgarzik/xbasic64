@@ -78,7 +78,7 @@ Integration tests organized by feature area:
   fold an argument away instead (see `_rt_file_open_random`)
 - **Unsupported GW-BASIC names are refused, not ignored**: an unrecognised name
   is otherwise just a new variable, so `UNSUPPORTED` in `sema.rs` names the
-  keywords this compiler does not provide and why. See [NONGOALS.md](NONGOALS.md)
+  keywords this compiler does not provide and why
 - **String builtins returning a static buffer must copy**: two calls in one
   expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
   `_rt_oct` and `_rt_mk` end in `_rt_strdup`

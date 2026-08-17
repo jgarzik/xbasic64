@@ -932,6 +932,38 @@ fn test_unsupported_diagnostics_explain_themselves() {
         "a planned feature should say so: {}",
         err.stderr
     );
+
+    // Sound was once refused as "not supported", which read as a decision
+    // rather than a queue position. These are deferred, not declined.
+    for source in ["SOUND 440, 5\n", "PLAY \"cde\"\n", "LPRINT \"x\"\n"] {
+        let err = compile_only(source).expect_err("must still be refused");
+        assert!(
+            err.contains("not implemented yet"),
+            "a deferred feature should say so: {}",
+            err.stderr
+        );
+    }
+}
+
+/// `NAME` was documented as unimplemented but missing from the table, so it
+/// fell through to "unknown subroutine" -- the generic message the table exists
+/// to replace. Nothing else distinguishes a name this compiler knows about and
+/// has not written from one the program simply misspelled.
+#[test]
+fn test_documented_unimplemented_names_are_all_in_the_table() {
+    for source in ["NAME \"a\"\n", "KILL \"a\"\n", "FILES\n", "SHELL \"ls\"\n"] {
+        let err = compile_only(source).expect_err("must be refused");
+        assert!(
+            err.contains("not implemented yet"),
+            "expected the table's message, got: {}",
+            err.stderr
+        );
+        assert!(
+            !err.contains("unknown subroutine"),
+            "fell through to the generic message: {}",
+            err.stderr
+        );
+    }
 }
 
 /// A name cannot be both an array and a procedure, or an array and a builtin.

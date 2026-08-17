@@ -1365,13 +1365,26 @@ written. Programs using them are refused today.
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
 
-### Never
+### Out of scope
 
-Graphics, sound, joysticks, light pens, direct memory access, port I/O, the
-line printer, and the interpreter's own commands (`RUN`, `LIST`, `CHAIN`, ...)
-are permanent non-goals: they describe a machine and a way of working that a
-compiled 64-bit program does not have. **[NONGOALS.md](NONGOALS.md)** gives the
-full list and the reasoning.
+**Graphics** -- `SCREEN`, `PSET`, `PRESET`, `LINE` in its graphics form,
+`CIRCLE`, `DRAW`, `PAINT`, `POINT`, `VIEW`, `WINDOW`, `PALETTE`, `PMAP`. These
+need a display this compiler does not provide.
+
+**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`, `USR`,
+`INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`. There is no fixed address worth naming
+in a 64-bit hosted program: the video buffer is not memory, addresses are
+randomised, and the pages are protected. A `POKE` that appeared to work would be
+the worst outcome available, so these are refused rather than emulated.
+
+**Commands to the interpreter** -- `RUN`, `LIST`, `LOAD`, `SAVE`, `MERGE`,
+`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `TRON`, `TROFF`, `CLEAR`.
+These operate on program text that a compiled program no longer has.
+
+**Program chaining** -- `CHAIN` and `COMMON` need separate compilation.
+
+Everything else GW-BASIC provides that is missing here is listed above as not
+yet implemented. Each refused name says which of the two it is.
 
 ### Structural
 

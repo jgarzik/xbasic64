@@ -77,8 +77,6 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 ## Documentation
 
 - **[Language Reference](LANGREF.md)** - Complete guide to the supported BASIC dialect
-- **[Non-Goals](NONGOALS.md)** - The parts of GW-BASIC that will never be
-  supported, and why
 
 ## Architecture
 
