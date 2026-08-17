@@ -424,6 +424,53 @@ fn test_runtime_error_reports_line() {
     );
 }
 
+/// A line-numbered listing reports its BASIC line number, not the source line.
+///
+/// These are two different numbering systems and the error path used the wrong
+/// one: `current_line` is the lexer's physical line, while the `_line_NNN`
+/// labels a program branches to come from `StmtKind::Label(n)`. A listing whose
+/// line 110 failed said "in 4", so the number in the message named nothing the
+/// programmer could see, and disagreed with LANGREF's own example.
+#[test]
+fn test_error_reports_the_basic_line_number() {
+    let run = compile_and_run_raw(
+        "REM a header comment\nREM and another\n100 DIM A(3)\n110 PRINT A(99)\n",
+        "",
+    )
+    .expect("should compile");
+    assert!(
+        run.stderr.contains("in 110"),
+        "expected the BASIC line 110, got {:?}",
+        run.stderr
+    );
+}
+
+/// A program written without line numbers still reports its source line.
+///
+/// GW-BASIC has nothing else to say here and reports nothing; a source line is
+/// what a programmer can act on, and it is the style everything in examples/
+/// is written in.
+#[test]
+fn test_error_reports_the_source_line_without_line_numbers() {
+    let run = compile_and_run_raw("DIM A(2)\nPRINT \"x\"\nA(9) = 1\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 3"),
+        "expected the source line 3, got {:?}",
+        run.stderr
+    );
+}
+
+/// A statement ahead of the first line number has no BASIC line to report.
+#[test]
+fn test_error_before_the_first_line_number() {
+    let run = compile_and_run_raw("DIM A(2)\nA(9) = 1\n100 END\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 2"),
+        "nothing numbered has run yet, so the source line stands: {:?}",
+        run.stderr
+    );
+}
+
 /// Runtime diagnostics go to stderr, leaving the program's own output clean.
 #[test]
 fn test_runtime_errors_go_to_stderr() {

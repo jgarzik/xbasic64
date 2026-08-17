@@ -1312,6 +1312,11 @@ line it happened on to standard error, and exits with status 1:
 ?Subscript out of range in 42
 ```
 
+The number is the **BASIC line number**, as in GW-BASIC -- the number the
+listing itself branches to. A program written without line numbers has none to
+quote, so it reports the source line instead, which is the only number its
+author can act on. A statement ahead of the first line number does the same.
+
 Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
 run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient

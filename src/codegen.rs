@@ -584,8 +584,15 @@ pub struct CodeGen {
     symbols: Symbols,
     /// Code generation options (currently just whether checks are emitted).
     opts: Options,
-    /// BASIC line of the statement being compiled, for runtime diagnostics.
+    /// Physical source line of the statement being compiled.
     current_line: u32,
+    /// The BASIC line number most recently reached, or 0 before the first one.
+    ///
+    /// Separate from `current_line`, which is the lexer's physical line. A
+    /// listing branches to the numbers it wrote, so those are the numbers a
+    /// diagnostic has to quote and `ERL` has to return; reporting the physical
+    /// line named something the programmer could not see.
+    basic_line: u32,
     /// Error trampolines needed so far, keyed by (error, line) so that sites
     /// sharing both share one trampoline. Ordered for reproducible output.
     error_sites: BTreeMap<(RtError, u32), String>,
@@ -1421,6 +1428,9 @@ impl CodeGen {
 
     /// Emit `main`: prologue, module-level statements, epilogue.
     fn gen_main(&mut self, program: &Program) {
+        // Main is rendered before the procedures but shares the field with
+        // them, so each function starts again with no line number reached.
+        self.basic_line = 0;
         self.reserve_array_descriptors(&SemaScope::Module);
         self.emit_label("main");
         self.emit("    push rbp");
@@ -1584,10 +1594,24 @@ impl CodeGen {
         self.emit_label(&skip);
     }
 
+    /// The line number a runtime diagnostic should quote.
+    ///
+    /// The BASIC line number once one has been reached, since that is what the
+    /// programmer wrote and what `ERL` reports. A program with no line numbers
+    /// -- the style everything in examples/ uses -- has only the physical
+    /// source line, and that is more useful than nothing.
+    fn report_line(&self) -> u32 {
+        if self.basic_line != 0 {
+            self.basic_line
+        } else {
+            self.current_line
+        }
+    }
+
     /// Label of the trampoline that raises `kind` at the current line,
     /// creating it if this is the first site to need it.
     fn error_label(&mut self, kind: RtError) -> String {
-        let line = self.current_line;
+        let line = self.report_line();
         self.error_sites
             .entry((kind, line))
             .or_insert_with(|| format!(".Lerr_{}_{}", kind.tag(), line))
@@ -2429,6 +2453,7 @@ impl CodeGen {
 
     fn gen_procedure(&mut self, name: &str, params: &[Param], body: &[Stmt], is_function: bool) {
         self.current_proc = Some(name.to_string());
+        self.basic_line = 0; // see gen_main
         self.proc_vars.clear();
         self.proc_arrays.clear();
         self.proc_types.clear();
@@ -2622,6 +2647,7 @@ impl CodeGen {
         }
         match &stmt.kind {
             StmtKind::Label(n) => {
+                self.basic_line = *n;
                 self.emit_label(&format!("_line_{}", n));
             }
 
@@ -3640,7 +3666,7 @@ impl CodeGen {
                 };
                 self.emit_arg_file_num(0, &fnum);
                 self.emit_arg_file_num(1, &rec);
-                self.emit_arg_imm(2, self.current_line as i64);
+                self.emit_arg_imm(2, self.report_line() as i64);
                 if *is_put {
                     self.emit("    call _rt_file_put");
                 } else {
@@ -3671,7 +3697,7 @@ impl CodeGen {
                 self.emit_arg_file_num(0, &fnum);
                 self.emit_arg_file_num(1, &start);
                 self.emit_arg_file_num(2, &end);
-                self.emit_arg_imm(3, self.current_line as i64);
+                self.emit_arg_imm(3, self.report_line() as i64);
                 if *is_unlock {
                     self.emit("    call _rt_unlock");
                 } else {
@@ -6030,7 +6056,7 @@ impl CodeGen {
                 self.gen_expr(&args[0]);
                 self.emit_arg_reg(0, "rax"); // string ptr
                 self.emit_arg_reg(1, "rdx"); // string len
-                self.emit_arg_imm(2, self.current_line as i64);
+                self.emit_arg_imm(2, self.report_line() as i64);
                 let rt = match upper_name.as_str() {
                     "CVI" => "_rt_cvi",
                     "CVL" => "_rt_cvl",
