@@ -945,6 +945,40 @@ fn test_unsupported_diagnostics_explain_themselves() {
     }
 }
 
+/// A `DEF*` default must not rename a name the compiler refuses.
+///
+/// `apply_default_types` rewrites every unsuffixed name a `DEF*` range covers,
+/// and `unsupported_reason` matches the unsuffixed spelling -- so under
+/// `DEFINT A-Z` the table was consulted for `ERROR%` and missed. That is not a
+/// cosmetic gap: `ON ERROR GOTO 100` went back to compiling as a computed GOTO
+/// on a variable that is always zero, which is the precise silent
+/// fall-through the table was written to prevent, restored by a feature added
+/// four commits later.
+#[test]
+fn test_a_def_type_does_not_defeat_the_refusals() {
+    // Every shape the refusal is reached through: a bare name in an
+    // expression, a statement-position call, and the ON ERROR special case.
+    let cases = [
+        ("DEFINT A-Z\nON ERROR GOTO 100\nEND\n100 END\n", "ERROR"),
+        ("DEFINT A-Z\nPRINT ERR\n", "ERR"),
+        ("DEFINT A-Z\nPRINT ERL\n", "ERL"),
+        ("DEFINT A-Z\nPRINT CSRLIN\n", "CSRLIN"),
+        ("DEFSTR A-Z\nPRINT ERR\n", "ERR"),
+        ("DEFLNG A-Z\nPRINT CSRLIN\n", "CSRLIN"),
+    ];
+
+    for (source, name) in cases {
+        let err = compile_only(source)
+            .expect_err(&format!("{} must stay refused under a DEF* default", name));
+        assert!(
+            err.contains("not supported"),
+            "{name} was accepted under a DEF* default: {}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
 /// `NAME` was documented as unimplemented but missing from the table, so it
 /// fell through to "unknown subroutine" -- the generic message the table exists
 /// to replace. Nothing else distinguishes a name this compiler knows about and

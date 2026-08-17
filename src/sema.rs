@@ -447,7 +447,14 @@ fn defaulted(name: &str, table: &[DataType; 26], procs: &HashSet<String>) -> Opt
     if name.ends_with(['%', '&', '!', '#', '$']) {
         return None; // an explicit suffix always wins
     }
-    if procs.contains(name) || builtin(name).is_some() {
+    // A procedure, a builtin, and a GW-BASIC name this compiler refuses are
+    // all names that do not denote a variable, so none of them takes a default
+    // type. The third was missing: `DEFINT A-Z` renamed `ERROR` to `ERROR%`,
+    // `unsupported_reason` looks the unsuffixed spelling up and missed, and
+    // `ON ERROR GOTO 100` went back to compiling as a computed GOTO on a
+    // variable that is always zero -- the exact silent fall-through the
+    // UNSUPPORTED table exists to prevent.
+    if procs.contains(name) || builtin(name).is_some() || unsupported_reason(name).is_some() {
         return None;
     }
     let first = name.chars().next()?;
