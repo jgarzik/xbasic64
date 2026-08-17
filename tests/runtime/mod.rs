@@ -289,10 +289,16 @@ fn test_helpers_preserve_callee_saved_registers() {
         "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
     ];
 
-    // `_rt_random_prepare` returns four values in callee-saved registers and
-    // says so: it is reached only from GET and PUT, which save them for it.
     // A helper listed here has a private convention its own comment states.
-    const PRIVATE_CONVENTION: &[&str] = &["_rt_random_prepare"];
+    //
+    // `_rt_random_prepare` returns four values in callee-saved registers: it is
+    // reached only from GET and PUT, which save them for it.
+    //
+    // `_rt_error` writes the whole callee-saved set on its trapping path, which
+    // is the opposite of clobbering it -- the values come from `_err_ctx` and
+    // are main's, and the path ends in a jump to the handler rather than a
+    // return, so there is no caller left to preserve anything for.
+    const PRIVATE_CONVENTION: &[&str] = &["_rt_random_prepare", "_rt_error"];
 
     let mut problems = Vec::new();
 

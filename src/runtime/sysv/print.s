@@ -106,10 +106,88 @@ _rt_fmt_double:
 
 .Lfd_done:
     # sprintf and strlen both leave the length in rax.
+    #
+    # Reshape C's rendering into GW-BASIC's. Only registers that are volatile
+    # in *both* ABIs are used here, so this code is identical in both trees --
+    # note rsi and rdi are callee-saved on Win64 and so are avoided.
+
+    # A value below one drops its leading zero: 0.5 -> .5, -0.5 -> -.5
+    lea rcx, [rip + _num_buf]
+    xor edx, edx
+    cmp BYTE PTR [rcx], 45           # '-'
+    jne .Lfd_zero
+    mov edx, 1
+.Lfd_zero:
+    cmp BYTE PTR [rcx + rdx], 48     # '0'
+    jne .Lfd_exp
+    cmp BYTE PTR [rcx + rdx + 1], 46 # '.'
+    jne .Lfd_exp
+    # Shift the rest down over the zero, the NUL at [rax] included.
+.Lfd_shift:
+    mov r9b, BYTE PTR [rcx + rdx + 1]
+    mov BYTE PTR [rcx + rdx], r9b
+    inc rdx
+    cmp rdx, rax
+    jl .Lfd_shift
+    dec rax
+
+    # The exponent is spelled D for a double and E for a single, never C's
+    # lowercase e.
+.Lfd_exp:
+    xor edx, edx
+.Lfd_escan:
+    cmp rdx, rax
+    jge .Lfd_ret
+    cmp BYTE PTR [rcx + rdx], 101    # 'e'
+    je .Lfd_efound
+    inc rdx
+    jmp .Lfd_escan
+.Lfd_efound:
+    mov r9b, 68                      # 'D', a double
+    test r12d, r12d
+    jz .Lfd_eput
+    mov r9b, 69                      # 'E', a single
+.Lfd_eput:
+    mov BYTE PTR [rcx + rdx], r9b
+
+.Lfd_ret:
     add rsp, 16
     pop r12
     pop rbx
     pop rbp
+    ret
+
+# _rt_fmt_basic - Render a number the way BASIC writes it
+#
+# _rt_fmt_double gives the digits; this adds the blank that stands where a
+# minus sign would go. GW-BASIC puts one there for every non-negative number,
+# which is why `PRINT 1; 2` reads " 1  2 " and why STR$(5) is " 5" -- the
+# `MID$(STR$(N), 2)` idiom exists to strip exactly this blank.
+#
+# Not folded into _rt_fmt_double, because WRITE and PRINT USING render numbers
+# through that and must not gain the blank.
+#
+# Arguments: the same as _rt_fmt_double
+# Returns:   rax = length of the text in _num_buf
+.globl _rt_fmt_basic
+_rt_fmt_basic:
+    push rbp
+    mov rbp, rsp
+    call _rt_fmt_double
+    lea rcx, [rip + _num_buf]
+    cmp BYTE PTR [rcx], 45          # '-' already occupies the sign position
+    je .Lfb_done
+    # Shift right by one, the NUL at [rax] included, and blank the vacancy.
+    mov rdx, rax
+.Lfb_shift:
+    mov r9b, BYTE PTR [rcx + rdx]
+    mov BYTE PTR [rcx + rdx + 1], r9b
+    dec rdx
+    jns .Lfb_shift
+    mov BYTE PTR [rcx], 32          # ' '
+    inc rax
+.Lfb_done:
+    leave
     ret
 
 # _rt_end - Terminate the program normally (END / STOP)

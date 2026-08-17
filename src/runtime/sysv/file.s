@@ -307,6 +307,96 @@ _rt_file_print_single:
     leave
     ret
 
+# _rt_print_number - PRINT a DOUBLE, with the spacing PRINT gives a number
+#
+# A blank where the sign would go, and a blank after. WRITE renders numbers
+# through _rt_file_print_float instead, because WRITE pads nothing.
+#
+# Arguments: rdi = file number, xmm0 = value
+# Returns: nothing
+.globl _rt_print_number
+_rt_print_number:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, edi
+    lea rdi, [rip + _fmt_g_table]
+    xor esi, esi
+    call _rt_fmt_basic
+    jmp .Lprint_num_emit
+
+# _rt_print_number_single - The same for a SINGLE, whose shorter digit table
+# is the reason PRINT keeps two entry points at all.
+#
+# Arguments: rdi = file number, xmm0 = value already widened to double
+# Returns: nothing
+.globl _rt_print_number_single
+_rt_print_number_single:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, edi
+    lea rdi, [rip + _fmt_g_single_table]
+    mov esi, 1
+    call _rt_fmt_basic
+
+.Lprint_num_emit:
+    lea rsi, [rip + _num_buf]
+    mov BYTE PTR [rsi + rax], 32    # the trailing blank
+    inc rax
+    mov rdx, rax
+    mov edi, ebx
+    call _rt_file_print_string
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# PRINT lays a line out in zones this wide; a comma moves to the next one.
+.equ PRINT_ZONE, 14
+
+# _rt_print_zone - PRINT's comma: move to the start of the next print zone
+#
+# GW-BASIC lays a line out in 14-column zones and a comma moves to the next
+# one, padding with blanks. This used to emit a literal tab, which is whatever
+# width the terminal says and lines nothing up.
+#
+# Built on _rt_file_print_tab, which already pads to a column and starts a new
+# line when the cursor is past it -- which is also what a comma does past the
+# last zone.
+#
+# Arguments: rdi = file number
+# Returns: nothing
+.globl _rt_print_zone
+_rt_print_zone:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8
+
+    mov ebx, edi
+    lea rax, [rip + _file_col]
+    mov rax, QWORD PTR [rax + rbx*8]    # characters already on this line
+    xor edx, edx
+    mov rcx, PRINT_ZONE
+    div rcx
+    inc rax
+    imul rax, rax, PRINT_ZONE           # first column of the next zone, 0-based
+    inc rax                             # _rt_file_print_tab counts from 1
+    mov rsi, rax
+    mov edi, ebx
+    call _rt_file_print_tab
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
 # _rt_con_string - Write a string to the console
 # The console is file handle 0. This exists for the runtime's own messages and
 # for PRINT USING, which has no file form; generated code passes a handle like
@@ -896,6 +986,12 @@ _rt_file_open_random:
     test rdi, rdi
     jz .Lrandom_alloc
     call free
+    # Clear the slot before the allocation below can fail. A trapped
+    # `Out of memory` would otherwise leave the table holding the pointer just
+    # freed, and _rt_random_prepare tests that slot for NULL to decide "Bad
+    # file mode" -- so a dangling pointer passes and GET reads freed memory.
+    lea rax, [rip + _file_recbuf]
+    mov QWORD PTR [rax + rbx*8], 0
 
 .Lrandom_alloc:
     mov rdi, r14

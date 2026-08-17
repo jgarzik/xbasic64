@@ -17,7 +17,7 @@ X! = 3.14159: PRINT X!
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "123", "default vars");
     assert_eq!(lines[1], "32000", "integer suffix");
     assert_eq!(lines[2], "100000", "long suffix");
@@ -39,7 +39,7 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "6", "single add");
     assert_eq!(lines[1], "8.75", "single mul");
     assert_eq!(lines[2], "Hello World", "string concat");
@@ -64,7 +64,7 @@ PRINT "["; X$; "]"
 "#,
         )
         .unwrap();
-        let lines: Vec<&str> = output.trim().lines().collect();
+        let lines = crate::common::lines(&output);
         assert_eq!(lines, vec!["0", "0", "0", "0", "[]"], "unassigned defaults");
     }
 }
@@ -85,7 +85,7 @@ PRINT LEN(Z$)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "6", "0"]);
 }
 
@@ -103,10 +103,10 @@ PRINT LEN(A$); LEN(B$); LEN(C$)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "first/second/third");
     // LEN of "first", "second", "third", printed adjacently by `;`
-    assert_eq!(lines[1], "565");
+    assert_eq!(lines[1], "5  6  5");
 }
 
 /// A variable may be named after a keyword when it carries a type suffix:
@@ -126,8 +126,8 @@ fn test_keyword_named_variables() {
 #[test]
 fn test_leading_dot_literals() {
     let output = compile_and_run("PRINT .5\nPRINT .25 + .25\nPRINT .5E1\n").unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["0.5", "0.5", "5"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec![".5", ".5", "5"]);
 }
 
 /// LET accepts every assignment form the bare syntax does.
@@ -140,8 +140,8 @@ fn test_let_accepts_every_assignment_form() {
         "TYPE P\nX AS INTEGER\nEND TYPE\nDIM Q AS P\nDIM A(3)\nDIM R(3) AS P\nLET X = 5\nLET A(1) = 7\nLET Q.X = 3\nLET R(1).X = 4\nS$ = \"xxllo\"\nLET MID$(S$,1,2) = \"HE\"\nPRINT X; A(1); Q.X; R(1).X\nPRINT S$\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["5734", "HEllo"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["5  7  3  4", "HEllo"]);
 }
 
 /// A trailing `_` continues a statement on the next line.
@@ -161,7 +161,7 @@ IF X = 6 AND _
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["6", "ab", "both"]);
 }
 
@@ -195,7 +195,7 @@ PRINT D#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["7", "8", "9", "10"]);
 }
 
@@ -214,7 +214,7 @@ PRINT L
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["11", "12"]);
 }
 
@@ -244,8 +244,8 @@ PRINT I$; J$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["21", "43", "65", "87", "yx"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["2  1", "4  3", "6  5", "8  7", "yx"]);
 }
 
 /// SWAP between different numeric types converts, as an assignment would.
@@ -261,6 +261,6 @@ PRINT B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["2", "1"], "A% takes CINT(2.5), B# takes 1");
 }

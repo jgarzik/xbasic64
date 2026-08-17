@@ -50,7 +50,7 @@ Check "octal bare", STR$(&377), "255"
 Check "binary", STR$(&B1010), "10"
 Check "decimal", STR$(42), "42"
 Check "negative", STR$(-17), "-17"
-Check "leading dot", STR$(.5), "0.5"
+Check "leading dot", STR$(.5), ".5"
 Check "exponent", STR$(1E3), "1000"
 Check "double exp", STR$(2.5D3), "2500"
 
@@ -107,9 +107,9 @@ T$ = "text"
 Check "integer", STR$(I%), "300"
 Check "long", STR$(L&), "100000"
 Check "single", STR$(S!), "1.5"
-Check "double keeps its digits", STR$(D#), "0.3333333333333333"
+Check "double keeps its digits", STR$(D#), ".3333333333333333"
 Check "string", T$, "text"
-Check "unsuffixed is double", STR$(1 / 3), "0.3333333333333333"
+Check "unsuffixed is double", STR$(1 / 3), ".3333333333333333"
 Check "integer truncates on store", STR$(CINT(2.6)), "3"
 Check "widening in an expression", STR$(I% + S!), "301.5"
 Check "CLNG", STR$(CLNG(2.5)), "2"
@@ -503,7 +503,7 @@ Check "TIMER runs", TimerOK$, "positive"
 P = 1
 Q = 2
 SWAP P, Q
-Check "SWAP numbers", STR$(P) + STR$(Q), "21"
+Check "SWAP numbers", STR$(P) + STR$(Q), "2 1"
 DIM SwapMe(2)
 SwapMe(0) = 10
 SwapMe(1) = 20
@@ -713,8 +713,16 @@ DATA 777
 
 ' The harness. Comparing as text keeps every expectation independent of how
 ' PRINT spaces a number, and a failure names itself.
+'
+' The sign position is stripped from both sides. STR$ puts a blank there for a
+' non-negative number, as GW-BASIC does, and that blank is the business of
+' tests/print rather than of every expectation written down here.
 SUB Check(Name$, Got$, Want$)
-    IF Got$ = Want$ THEN
+    G$ = Got$
+    W$ = Want$
+    IF LEFT$(G$, 1) = " " THEN G$ = MID$(G$, 2)
+    IF LEFT$(W$, 1) = " " THEN W$ = MID$(W$, 2)
+    IF G$ = W$ THEN
         Passed = Passed + 1
     ELSE
         PRINT "FAIL "; Name$; " got["; Got$; "] want["; Want$; "]"

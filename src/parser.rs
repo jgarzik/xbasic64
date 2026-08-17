@@ -237,6 +237,13 @@ pub enum StmtKind {
     Beep,
     /// `ERASE a, b` -- release arrays so they can be dimensioned again.
     Erase(Vec<String>),
+    /// `ERROR n` -- raise the error GW-BASIC numbers `n`.
+    RaiseError(Expr),
+    /// `ON ERROR GOTO n` -- install an error handler; `None` is `GOTO 0`,
+    /// which removes it and puts the fatal path back.
+    OnError(Option<GotoTarget>),
+    /// `RESUME`, `RESUME NEXT`, `RESUME n` -- return from a handler.
+    Resume(ResumeTarget),
     /// `LOCATE [row][, col]` -- move the cursor.
     ///
     /// Either part may be omitted, in which case that coordinate is left where
@@ -407,6 +414,17 @@ pub struct LValue {
 pub struct ArrayDecl {
     pub name: String,
     pub dimensions: Vec<Expr>,
+}
+
+/// Where a `RESUME` goes back to.
+#[derive(Debug, Clone)]
+pub enum ResumeTarget {
+    /// Bare `RESUME`, and `RESUME 0`: retry the statement that failed.
+    Same,
+    /// `RESUME NEXT`: carry on at the statement after it.
+    Next,
+    /// `RESUME n`: carry on somewhere else entirely.
+    At(GotoTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -733,6 +751,7 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Locate => "LOCATE",
         Token::Color => "COLOR",
         Token::Randomize => "RANDOMIZE",
+        Token::Resume => "RESUME",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
         Token::Open => "OPEN",
@@ -981,6 +1000,27 @@ impl Parser {
     /// True if the token after the current one is any identifier.
     fn next_is_ident(&self) -> bool {
         matches!(self.peek_at(1), Token::Ident(_))
+    }
+
+    /// True if something follows the current token for it to take as an operand.
+    ///
+    /// `ERROR` is a statement only when a number follows it. Left contextual
+    /// rather than reserved so that a bare `ERROR` still reaches the
+    /// UNSUPPORTED table, which is what keeps `ON ERROR GOTO` refused with a
+    /// reason until it is written.
+    ///
+    /// Phrased as "the statement has not ended" rather than as a list of the
+    /// tokens an expression may start with. That list was written out once and
+    /// was already missing `NOT` and a string literal, so `ERROR NOT 0` --
+    /// a perfectly ordinary GW-BASIC expression -- was refused as though the
+    /// statement did not exist. This way anything else is handed to the
+    /// expression parser, which either accepts it or says what is wrong with
+    /// it, and a token added later needs no edit here.
+    fn next_is_an_operand(&self) -> bool {
+        !matches!(
+            self.peek_at(1),
+            Token::Newline | Token::Colon | Token::Eof | Token::Eq
+        )
     }
 
     /// Source line of the current token, or 0 when unknown (no line map).
@@ -1336,6 +1376,7 @@ impl Parser {
             Token::Locate => self.parse_locate(),
             Token::Color => self.parse_color(),
             Token::Randomize => self.parse_randomize(),
+            Token::Resume => self.parse_resume(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
                 self.advance();
@@ -1371,6 +1412,7 @@ impl Parser {
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
                     "ERASE" if self.next_is_ident() => self.parse_erase(),
+                    "ERROR" if self.next_is_an_operand() => self.parse_raise_error(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),
@@ -2329,6 +2371,24 @@ impl Parser {
     /// the one keyword and in whether the subroutine comes back.
     fn parse_on_goto(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ON
+
+        // `ON ERROR GOTO n` is a different statement that happens to share a
+        // first word. Recognised positionally, like ERASE and LSET, so ERROR
+        // stays available to the UNSUPPORTED table everywhere else.
+        if matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("ERROR")) {
+            self.advance(); // consume ERROR
+            if !matches!(self.advance(), Token::Goto) {
+                return err("ON ERROR must be followed by GOTO");
+            }
+            // GW-BASIC spells "stop trapping" as GOTO 0, and there is no line
+            // 0 to check against, so it is folded away here.
+            if matches!(self.peek(), Token::Integer(0)) {
+                self.advance();
+                return Ok(StmtKind::OnError(None));
+            }
+            return Ok(StmtKind::OnError(Some(self.parse_goto_target()?)));
+        }
+
         let expr = self.parse_expression()?;
         let is_gosub = match self.advance() {
             Token::Goto => false,
@@ -2650,6 +2710,33 @@ impl Parser {
     /// Contextual rather than reserved, like CALL above it: LANGREF's own
     /// `ON ... GOSUB Draw, Erase` example uses the word as a label, and a
     /// reserved ERASE would take that name away from every program.
+    /// `RESUME`, `RESUME NEXT`, `RESUME 0`, `RESUME <line|label>`.
+    fn parse_resume(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume RESUME
+        // GW-BASIC spells "retry the failing statement" as either a bare
+        // RESUME or RESUME 0, so the two are folded together here.
+        if matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            return Ok(StmtKind::Resume(ResumeTarget::Same));
+        }
+        if matches!(self.peek(), Token::Integer(0)) {
+            self.advance();
+            return Ok(StmtKind::Resume(ResumeTarget::Same));
+        }
+        if matches!(self.peek(), Token::Next) {
+            self.advance();
+            return Ok(StmtKind::Resume(ResumeTarget::Next));
+        }
+        Ok(StmtKind::Resume(ResumeTarget::At(
+            self.parse_goto_target()?,
+        )))
+    }
+
+    /// `ERROR n` -- raise an error by GW-BASIC's number for it.
+    fn parse_raise_error(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume ERROR
+        Ok(StmtKind::RaiseError(self.parse_expression()?))
+    }
+
     fn parse_erase(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ERASE
         let mut names = Vec::new();

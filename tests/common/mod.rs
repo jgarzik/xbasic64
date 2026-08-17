@@ -28,9 +28,15 @@ pub struct RunOutput {
 }
 
 impl RunOutput {
-    /// Lines of stdout, trimmed, for the common line-by-line assertion style.
+    /// Lines of stdout, each trimmed, for the common line-by-line style.
+    ///
+    /// Per line rather than once over the whole string, because a number
+    /// carries GW-BASIC's spacing: a blank where the sign would go and a blank
+    /// after, so `PRINT 42` writes " 42 ". A test asserting what a program
+    /// *computed* should not have to spell those out; the ones that assert on
+    /// the spacing itself read `stdout` directly, and say so.
     pub fn lines(&self) -> Vec<&str> {
-        self.stdout.trim().lines().collect()
+        lines(&self.stdout)
     }
 
     /// Panic unless the program ran to completion.
@@ -55,6 +61,14 @@ impl RunOutput {
             self.stderr
         );
     }
+}
+
+/// Lines of `text`, each trimmed, ignoring blank ones at the ends.
+///
+/// The counterpart of [`RunOutput::lines`] for the helpers that return a bare
+/// String. See there for why the trim is per line.
+pub fn lines(text: &str) -> Vec<&str> {
+    text.trim().lines().map(str::trim).collect()
 }
 
 /// A failure of the compiler itself (lexer, parser, sema, codegen, assembler, linker).
@@ -92,6 +106,35 @@ pub fn compile_only(source: &str) -> Result<(), CompileError> {
 
     let out = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
         .arg(&bas_file)
+        .arg("-o")
+        .arg(&exe_file)
+        .output()
+        .expect("failed to run compiler");
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(CompileError {
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            exit_code: out.status.code(),
+        })
+    }
+}
+
+/// Compile only, with extra compiler flags.
+///
+/// For the combinations a flag makes illegal -- `--unsafe` removes the checks
+/// `ON ERROR` exists to trap, so the two together are refused.
+pub fn compile_only_flags(source: &str, flags: &[&str]) -> Result<(), CompileError> {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let bas_file = tmp.path().join("test.bas");
+    let exe_file = tmp.path().join("test");
+    fs::write(&bas_file, source).expect("failed to write source");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas_file)
+        .args(flags)
         .arg("-o")
         .arg(&exe_file)
         .output()

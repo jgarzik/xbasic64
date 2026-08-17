@@ -30,7 +30,7 @@ PRINT Grid(0, 0), Grid(0, 1), Grid(0, 2), Grid(1, 0), Grid(1, 1), Grid(1, 2)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "10", "1d a(1)");
     assert_eq!(lines[1], "30", "1d a(3)");
     assert_eq!(lines[2], "15", "2d diagonal sum");
@@ -85,7 +85,7 @@ PRINT A%(0) + A%(2)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["3", "100000", "3.5", "3.5", "3", "5"],
@@ -114,9 +114,9 @@ PRINT ""
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines[0], "579");
-    assert_eq!(lines[1], "014916");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines[0], "5  7  9");
+    assert_eq!(lines[1], "0  1  4  9  16");
 }
 
 /// A fresh array reads as 0 / "": allocation is zeroed, which plain malloc
@@ -125,8 +125,8 @@ PRINT ""
 fn test_arrays_start_zeroed() {
     let output =
         compile_and_run("DIM A(5)\nDIM S$(2)\nPRINT A(0); A(3); A(5)\nPRINT LEN(S$(1))\n").unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["000", "0"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["0  0  0", "0"]);
 }
 
 /// REDIM resizes an existing array, reusing its descriptor, and clears it.
@@ -136,8 +136,8 @@ fn test_redim() {
         "DIM A(2)\nA(0) = 7\nREDIM A(5)\nPRINT A(0)\nA(5) = 9\nPRINT A(5); UBOUND(A)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["0", "95"], "contents cleared, bound updated");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["0", "9  5"], "contents cleared, bound updated");
 }
 
 /// REDIM PRESERVE keeps the existing elements and zeroes the new tail.
@@ -147,8 +147,8 @@ fn test_redim_preserve() {
         "DIM A(2)\nA(0) = 7\nA(1) = 8\nREDIM PRESERVE A(5)\nPRINT A(0); A(1); A(5)\nPRINT UBOUND(A)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["780", "5"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["7  8  0", "5"]);
 }
 
 /// Growing an array a step at a time, which is what PRESERVE is for.
@@ -158,7 +158,7 @@ fn test_redim_preserve_in_loop() {
         "DIM A(1)\nFOR I = 1 TO 3\nREDIM PRESERVE A(I)\nA(I) = I * 10\nNEXT I\nPRINT A(1); A(2); A(3)\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "102030");
+    assert_eq!(output.trim(), "10  20  30");
 }
 
 /// String arrays survive PRESERVE too.
@@ -168,14 +168,14 @@ fn test_redim_preserve_strings() {
         "DIM S$(1)\nS$(0) = \"keep\"\nREDIM PRESERVE S$(3)\nPRINT S$(0); LEN(S$(0))\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "keep4");
+    assert_eq!(output.trim(), "keep 4");
 }
 
 /// LBOUND and UBOUND take an array *name*, so a string array is fine.
 #[test]
 fn test_bounds_of_string_array() {
     let output = compile_and_run("DIM N$(5)\nPRINT LBOUND(N$); UBOUND(N$)\n").unwrap();
-    assert_eq!(output.trim(), "05");
+    assert_eq!(output.trim(), "0  5");
 }
 
 /// The dimension may be computed, not only written as a literal.
@@ -187,7 +187,7 @@ fn test_bounds_with_computed_dimension() {
         "DIM A(2,5)\nCONST D = 2\nK = 2\nPRINT UBOUND(A, K); UBOUND(A, D); UBOUND(A, 1)\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "552");
+    assert_eq!(output.trim(), "5  5  2");
 }
 
 /// An array behaves the same wherever its DIM is written.
@@ -211,7 +211,7 @@ PRINT A(1)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["7", "7"], "read before and after the DIM agree");
 }
 
@@ -230,7 +230,7 @@ PRINT Q
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "5", "the local array works");
     assert_eq!(lines[1], "0", "Q at module level is an untouched scalar");
 }

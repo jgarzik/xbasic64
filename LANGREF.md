@@ -368,11 +368,24 @@ Output to console:
 
 ```basic
 PRINT "Hello, World!"
-PRINT X; Y; Z             ' Semicolon: no space between
-PRINT A, B, C             ' Comma: tab-separated
+PRINT X; Y; Z             ' Semicolon: items adjoin
+PRINT A, B, C             ' Comma: next 14-column print zone
 PRINT "Value: "; X
 PRINT                     ' Print blank line
 ```
+
+**A number carries its own spacing**, as in GW-BASIC: a blank where the minus
+sign would go if it is not negative, and a blank after it. So `PRINT 1; 2; 3`
+writes ` 1  2  3 `, and `PRINT 1; -2; 3` writes ` 1 -2  3 ` -- the minus takes
+the leading blank's place. A string is written exactly as it is.
+
+A value below one drops its leading zero (`.5`, not `0.5`), and an exponent is
+spelled with `D` for a DOUBLE and `E` for a SINGLE: `1D+20`, `1.5E-10`.
+
+A comma moves to the start of the next 14-column zone, padding with blanks; if
+the line is already past the last zone it moves to the next line. `WRITE` and
+`PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
+meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
 
 Semicolon at end suppresses newline:
 ```basic
@@ -638,6 +651,91 @@ RETURN
 The selector is truncated to an integer. A value that matches nothing -- zero,
 negative, or past the end of the list -- runs no subroutine and continues with
 the next statement.
+
+### ON ERROR GOTO
+
+`ON ERROR GOTO n` installs an error handler. From then on a runtime error
+jumps to line `n` instead of stopping the program, with `ERR` holding the
+error's number and `ERL` the line it happened on.
+
+```basic
+10 ON ERROR GOTO 900
+20 OPEN "data.txt" FOR INPUT AS #1
+30 CLOSE #1
+40 PRINT "read it"
+50 END
+900 PRINT "cannot open it: error"; ERR; "at line"; ERL
+910 END
+```
+
+`ON ERROR GOTO 0` puts the fatal path back:
+
+```basic
+10 ON ERROR GOTO 900
+20 ON ERROR GOTO 0
+30 END
+900 END
+```
+
+The rules, which are GW-BASIC's:
+
+- An error raised **inside the handler** is not trapped -- it stops the
+  program. Without that, a handler that faults would call itself forever.
+- Trapping stays suspended while the handler runs. Executing an `ON ERROR`
+  statement again re-arms it, so a handler that ends in `GOTO` rather than
+  returning must re-arm to keep trapping.
+- The handler must be **module-level** code, and `ON ERROR` itself may not
+  appear inside a `SUB` or `FUNCTION`: a trapped error unwinds out of every
+  procedure before the handler runs.
+- A `GOSUB` in progress survives, so a handler can `RETURN` from a subroutine
+  the error interrupted. For the same reason a `GOSUB` *inside* a procedure is
+  refused in a program that traps -- its return address would point into a
+  frame the unwind discarded.
+- `--unsafe` and `ON ERROR` are refused together. `--unsafe` removes the checks
+  that raise most trappable errors, so the handler would look right and never
+  run.
+
+A program that never uses `ON ERROR` is compiled exactly as before, and pays
+nothing for the feature.
+
+### RESUME
+
+`RESUME` ends a handler and goes back to the program. Three forms:
+
+| Form           | Goes back to                                    |
+|----------------|-------------------------------------------------|
+| `RESUME`       | The statement that failed, to try it again      |
+| `RESUME NEXT`  | The statement after the one that failed         |
+| `RESUME n`     | Line `n`, or a named label                      |
+
+`RESUME 0` means the same as a bare `RESUME`.
+
+```basic
+10 ON ERROR GOTO 200
+20 Divisor = 0
+30 Tries = Tries + 1 : R = 100 / Divisor
+40 PRINT "took"; Tries; "tries, got"; R
+50 END
+200 Divisor = 4
+210 RESUME
+```
+
+The statement, not the line: on line 30 above, `RESUME` returns to
+`R = 100 / Divisor` and leaves `Tries` alone, and `RESUME NEXT` would carry on
+at line 40. Where the failing statement is the last in a `FOR` or `WHILE` body,
+`RESUME NEXT` continues the loop rather than leaving it.
+
+Two rules follow from where a handler runs:
+
+- `RESUME` must be module-level code, like the handler it ends.
+- After an error raised **inside a `SUB` or `FUNCTION`**, a bare `RESUME` or
+  `RESUME NEXT` stops the program with `RESUME cannot return into a SUB or
+  FUNCTION`: the unwind discarded that frame, so there is nothing to go back
+  to. `RESUME n` still works, and is the way out.
+
+`RESUME` outside a handler stops the program with `RESUME without error`.
+Neither of these two is trappable -- a handler that caught its own failing
+`RESUME` would be re-entered by it forever.
 
 ### DIM
 
@@ -952,7 +1050,7 @@ nobody to ask, so it takes the clock.
 | `ASC(s$)`             | ASCII code of first character                  |
 | `CHR$(n)`             | Character from ASCII code                      |
 | `VAL(s$)`             | Convert string to number                       |
-| `STR$(x)`             | Convert number to string                       |
+| `STR$(x)`             | The number as PRINT writes it, less the trailing blank |
 | `SPACE$(n)`           | A string of n spaces                           |
 | `STRING$(n, c)`       | n copies of a character (code or first of c$)  |
 | `LTRIM$(s$)`          | Drop leading spaces                            |
@@ -971,6 +1069,20 @@ length never changes:
 A$ = "hello"
 MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 ```
+
+### Error Functions
+
+| Function | Returns                                                      |
+|----------|--------------------------------------------------------------|
+| `ERR`    | The number of the trapped error, 0 before any is trapped      |
+| `ERL`    | The line it happened on, 0 if the program has no line numbers |
+
+Both are only meaningful inside an `ON ERROR` handler. `ERL` reports the BASIC
+line number, as the error messages do.
+
+`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
+is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
+it.
 
 ### Type Conversion Functions
 
@@ -1312,6 +1424,11 @@ line it happened on to standard error, and exits with status 1:
 ?Subscript out of range in 42
 ```
 
+The number is the **BASIC line number**, as in GW-BASIC -- the number the
+listing itself branches to. A program written without line numbers has none to
+quote, so it reports the source line instead, which is the only number its
+author can act on. A statement ahead of the first line number does the same.
+
 Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
 run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
@@ -1321,21 +1438,38 @@ allocation failure, a random-access operation on a file not opened `FOR
 RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
 few bytes, and a `LOCK` another process already holds.
 
-The message names the fault:
+The message names the fault, and each carries GW-BASIC's number for it:
 
-| Message                  | Cause                                            |
-|--------------------------|--------------------------------------------------|
-| `Subscript out of range` | A subscript outside a dimension's bounds         |
-| `Array used before DIM`  | An array reached before its `DIM` ran            |
-| `Division by zero`       | A zero divisor in `/`, `\` or `MOD`              |
-| `Overflow`               | A `\` or `MOD` whose quotient does not fit       |
-| `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive     |
-| `Bad file number`        | A file number outside 1 to 15                    |
-| `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth     |
-| `Out of memory`          | A string or array allocation that failed         |
-| `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file     |
-| `FIELD overflow`         | `FIELD` widths exceeding the record length       |
-| `Permission denied`      | A `LOCK` someone else already holds              |
+| No. | Message                  | Cause                                        |
+|-----|--------------------------|----------------------------------------------|
+| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive |
+| 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
+| 7   | `Out of memory`          | A string or array allocation that failed     |
+| 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
+| 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
+| 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
+| 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
+| 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
+| 52  | `Bad file number`        | A file number outside 1 to 15                |
+| 53  | `File not found`         | Opening a file that is not there             |
+| 54  | `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file |
+| 55  | `File already open`      | `OPEN` on a file number already in use       |
+| 62  | `Input past end of file` | Reading past the end of an input file        |
+| 70  | `Permission denied`      | A `LOCK` someone else already holds          |
+
+### ERROR
+
+`ERROR n` raises the error numbered `n`, exactly as if the runtime had raised
+it. The number must be 1 to 255; one the table above does not list is raised as
+`Unprintable error`, which is GW-BASIC's own wording.
+
+```basic
+10 IF Total < 0 THEN ERROR 5
+20 PRINT "fine"
+```
+
+Two numbers appear twice above. `ERROR 7` and `ERROR 9` raise the first message
+listed for each -- `Out of memory` and `Subscript out of range`.
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:
@@ -1361,8 +1495,7 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
-- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
+- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
 

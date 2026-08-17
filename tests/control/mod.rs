@@ -16,7 +16,7 @@ FOR I = 3 TO 1 STEP -1: PRINT I: NEXT I
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..3], &["1", "2", "3"], "for basic");
     assert_eq!(&lines[3..7], &["0", "2", "4", "6"], "for step+");
     assert_eq!(&lines[7..10], &["3", "2", "1"], "for step-");
@@ -40,7 +40,7 @@ FOR D# = 1 TO 3: PRINT D#: NEXT D#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..3], &["1", "2", "3"], "INTEGER counter");
     assert_eq!(&lines[3..6], &["1", "2", "3"], "LONG counter");
     assert_eq!(&lines[6..9], &["1", "2", "3"], "SINGLE counter");
@@ -60,7 +60,7 @@ FOR F = 5 TO 7: PRINT F: NEXT F
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..3], &["1", "2", "3"], "AS INTEGER counter");
     assert_eq!(&lines[3..6], &["5", "6", "7"], "AS LONG counter");
 }
@@ -79,11 +79,11 @@ FOR I! = 0 TO 1 STEP 0.5: PRINT I!: NEXT I!
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..4], &["0", "2", "4", "6"], "INTEGER step +2");
     assert_eq!(&lines[4..7], &["3", "2", "1"], "INTEGER step -1");
     assert_eq!(&lines[7..9], &["1", "4"], "INTEGER computed bounds");
-    assert_eq!(&lines[9..12], &["0", "0.5", "1"], "SINGLE fractional step");
+    assert_eq!(&lines[9..12], &["0", ".5", "1"], "SINGLE fractional step");
 }
 
 /// A step that is only known at run time still picks the right direction.
@@ -107,10 +107,10 @@ PRINT "done"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..4], &["0", "2", "4", "6"], "runtime step +2");
     assert_eq!(&lines[4..7], &["3", "2", "1"], "runtime step -1");
-    assert_eq!(&lines[7..10], &["0", "0.5", "1"], "runtime DOUBLE step");
+    assert_eq!(&lines[7..10], &["0", ".5", "1"], "runtime DOUBLE step");
     assert_eq!(lines[10], "done", "a backwards step ran zero times");
 }
 
@@ -129,7 +129,7 @@ PRINT J%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "value after a completed loop");
     assert_eq!(lines[1], "3", "value after EXIT FOR");
 }
@@ -172,7 +172,7 @@ PRINT J%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "60", "(1+2+3) * (1+2+3+4)");
     assert_eq!(lines[1], "4", "outer counter after the loop");
     assert_eq!(lines[2], "5", "inner counter after the loop");
@@ -190,7 +190,7 @@ WEND
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "2", "3"]);
 }
 
@@ -217,7 +217,7 @@ LOOP WHILE X <= 3
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(&lines[0..3], &["1", "2", "3"], "do while");
     assert_eq!(&lines[3..6], &["1", "2", "3"], "do until");
     assert_eq!(&lines[6..9], &["1", "2", "3"], "do...loop while");
@@ -253,7 +253,7 @@ END IF
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "big", "if true");
     assert_eq!(lines[1], "small", "if false");
     assert_eq!(lines[2], "two", "elseif");
@@ -285,7 +285,7 @@ fn test_goto_gosub() {
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "A", "before goto");
     assert_eq!(lines[1], "C", "after goto");
     assert_eq!(lines[2], "in sub", "gosub");
@@ -321,7 +321,7 @@ END SELECT
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "two", "case match");
     assert_eq!(lines[1], "other", "case else");
 }
@@ -382,7 +382,7 @@ RETURN
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "500", "many gosub");
     assert_eq!(
         &lines[1..7],
@@ -409,7 +409,7 @@ PRINT "unreachable"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["start", "before"], "END ends the program");
 }
 
@@ -428,7 +428,7 @@ PRINT Half(8)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["start", "computing"], "STOP ends the program");
 }
 
@@ -465,7 +465,7 @@ RETURN
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["start", "in helper", "back"]);
 }
 
@@ -483,7 +483,7 @@ Greet : PRINT "after"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["called", "after"]);
 }
 
@@ -496,8 +496,8 @@ fn test_swap() {
         "A = 1\nB = 2\nSWAP A, B\nPRINT A; B\nX$ = \"x\"\nY$ = \"yy\"\nSWAP X$, Y$\nPRINT X$; Y$\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["21", "yyx"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["2  1", "yyx"]);
 }
 
 /// SWAP in anger: a sort that exchanges array elements.
@@ -507,7 +507,7 @@ fn test_swap_array_elements() {
         "DIM A(4)\nA(0)=5\nA(1)=3\nA(2)=4\nA(3)=1\nA(4)=2\nFOR I = 0 TO 3\nFOR J = 0 TO 3 - I\nIF A(J) > A(J+1) THEN SWAP A(J), A(J+1)\nNEXT J\nNEXT I\nFOR I = 0 TO 4\nPRINT A(I);\nNEXT I\nPRINT \"\"\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "12345");
+    assert_eq!(output.trim(), "1  2  3  4  5");
 }
 
 /// CONST is folded at compile time and substituted wherever the name is used,
@@ -518,7 +518,7 @@ fn test_const() {
         "CONST MAX = 10\nCONST HALF = MAX / 2\nCONST NAME$ = \"hi\"\nPRINT MAX\nPRINT HALF\nPRINT NAME$\nDIM A(MAX)\nA(MAX) = 7\nPRINT A(10)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["10", "5", "hi", "7"]);
 }
 
@@ -532,7 +532,7 @@ fn test_swap_record_fields() {
         "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A AS P\nA.X = 7\nA.Y = 3\nSWAP A.X, A.Y\nPRINT A.X; A.Y\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "37");
+    assert_eq!(output.trim(), "3  7");
 }
 
 /// The same for a string field, whose type comes from the field rather than
@@ -556,14 +556,14 @@ fn test_swap_array_record_fields() {
         "TYPE P\nX AS INTEGER\nEND TYPE\nDIM A(3) AS P\nA(0).X = 1\nA(1).X = 2\nSWAP A(0).X, A(1).X\nPRINT A(0).X; A(1).X\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "21");
+    assert_eq!(output.trim(), "2  1");
 }
 
 /// WRITE separates values with commas and quotes strings.
 #[test]
 fn test_write() {
     let output = compile_and_run("WRITE \"a\", 1, \"b\"\nWRITE 1, 2.5\n").unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["\"a\",1,\"b\"", "1,2.5"]);
 }
 
@@ -574,8 +574,8 @@ fn test_lbound_ubound() {
         "DIM A(5)\nDIM M(3,7)\nPRINT LBOUND(A); UBOUND(A)\nPRINT UBOUND(M, 1); UBOUND(M, 2)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["05", "37"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["0  5", "3  7"]);
 }
 
 /// EXIT leaves the innermost matching loop, or returns from a procedure.
@@ -585,7 +585,7 @@ fn test_exit_statements() {
         "FOR I = 1 TO 10\nIF I = 3 THEN EXIT FOR\nNEXT I\nPRINT I\nJ = 0\nDO\nJ = J + 1\nIF J = 4 THEN EXIT DO\nLOOP\nPRINT J\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["3", "4"]);
 }
 
@@ -596,7 +596,7 @@ fn test_exit_sub() {
         "SUB T(N)\nIF N = 0 THEN EXIT SUB\nPRINT N\nEND SUB\nT(0)\nT(5)\nPRINT \"done\"\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["5", "done"], "the N=0 call printed nothing");
 }
 
@@ -607,10 +607,10 @@ fn test_exit_leaves_innermost_matching_loop() {
         "FOR I = 1 TO 2\nFOR J = 1 TO 10\nIF J = 2 THEN EXIT FOR\nNEXT J\nPRINT I; J\nNEXT I\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        vec!["12", "22"],
+        vec!["1  2", "2  2"],
         "inner loop exited, outer continued"
     );
 }
@@ -633,7 +633,7 @@ fn test_case_lists() {
         "FOR G = 1 TO 5\nSELECT CASE G\nCASE 1, 2\nPRINT \"low\";\nCASE 3, 4\nPRINT \"mid\";\nCASE ELSE\nPRINT \"hi\";\nEND SELECT\nNEXT G\nPRINT \"\"\nG = 7\nSELECT CASE G\nCASE 1, 5 TO 9, 20\nPRINT \"in\"\nCASE ELSE\nPRINT \"out\"\nEND SELECT\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["lowlowmidmidhi", "in"]);
 }
 
@@ -654,7 +654,7 @@ fn test_case_on_strings() {
         "S$ = \"b\"\nSELECT CASE S$\nCASE \"a\"\nPRINT \"is a\"\nCASE \"b\"\nPRINT \"is b\"\nEND SELECT\nT$ = \"cat\"\nSELECT CASE T$\nCASE \"a\" TO \"m\"\nPRINT \"first half\"\nCASE ELSE\nPRINT \"second half\"\nEND SELECT\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["is b", "first half"]);
 }
 
@@ -691,7 +691,7 @@ RETURN
     )
     .unwrap();
     assert_eq!(
-        output.trim().lines().collect::<Vec<_>>(),
+        crate::common::lines(&output),
         vec!["one/back", "two/back", "three/back"]
     );
 }
@@ -719,7 +719,7 @@ RETURN
     )
     .unwrap();
     assert_eq!(
-        output.trim().lines().collect::<Vec<_>>(),
+        crate::common::lines(&output),
         vec!["none", "none", "none", "ran"]
     );
 }
@@ -796,7 +796,7 @@ RETURN
     )
     .unwrap();
     assert_eq!(
-        output.trim().lines().collect::<Vec<_>>(),
+        crate::common::lines(&output),
         vec!["two", "one"],
         "4/2 selects the second; 1.9 truncates to 1"
     );
@@ -821,10 +821,7 @@ RETURN
 "#,
     )
     .unwrap();
-    assert_eq!(
-        output.trim().lines().collect::<Vec<_>>(),
-        vec!["line", "label"]
-    );
+    assert_eq!(crate::common::lines(&output), vec!["line", "label"]);
 }
 
 /// A subroutine reached by ON ... GOSUB may itself GOSUB, so the two share one
@@ -893,7 +890,7 @@ IF X = 1 THEN PRINT "C" : PRINT "D"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["done", "C", "D"], "the whole tail is conditional");
 }
 
@@ -911,7 +908,7 @@ NEXT I
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["two", "x"], "only the matching iteration prints");
 }
 
@@ -950,7 +947,7 @@ fn test_if_then_else_line_numbers() {
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["else", "done"],
@@ -973,7 +970,7 @@ PRINT "end"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["c", "d", "end"], "the ELSE branch takes the tail");
 }
 
@@ -1023,8 +1020,8 @@ PRINT "done"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["11", "12", "21", "22", "done"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["1  1", "1  2", "2  1", "2  2", "done"]);
 }
 
 /// One `NEXT` may close several loops, innermost name first.
@@ -1046,8 +1043,8 @@ PRINT T
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["11", "12", "21", "22", "done", "8"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["1  1", "1  2", "2  1", "2  2", "done", "8"]);
 }
 
 /// The names in a multi-loop `NEXT` are checked in order, and a name with no
@@ -1083,7 +1080,7 @@ PRINT "after"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["in", "after"]);
 }
 
@@ -1124,7 +1121,7 @@ PRINT A(9)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["7", "0", "5"],
@@ -1155,7 +1152,7 @@ PRINT A(9)
 "#,
     )
     .unwrap();
-    assert_eq!(output.trim().lines().collect::<Vec<_>>(), &["7", "5"]);
+    assert_eq!(crate::common::lines(&output), &["7", "5"]);
 }
 
 /// ERASE of something that is not an array is a mistake, not a no-op.

@@ -121,7 +121,7 @@ fn main() {
 
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
-    let (symbols, diagnostics) = sema::analyze(&mut program);
+    let (symbols, diagnostics) = sema::analyze(&mut program, !args.no_checks);
     if !diagnostics.is_empty() {
         report(
             input_file,

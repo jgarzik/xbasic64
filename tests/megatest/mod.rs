@@ -36,8 +36,15 @@ fn test_megatest_passes_every_check() {
         failures.join("\n")
     );
 
-    assert!(
-        output.contains("FAILED0"),
+    // `PRINT "FAILED"; Failed` writes "FAILED 0 ": a number carries a blank
+    // where its sign would go, and another after.
+    let failed: usize = output
+        .lines()
+        .find_map(|l| l.strip_prefix("FAILED"))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the megatest must report its tally");
+    assert_eq!(
+        failed, 0,
         "the program's own tally disagrees; output was:\n{}",
         output
     );

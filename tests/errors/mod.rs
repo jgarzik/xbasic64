@@ -424,6 +424,217 @@ fn test_runtime_error_reports_line() {
     );
 }
 
+/// `ERROR n` raises the numbered error, with GW-BASIC's own numbering.
+///
+/// The numbers are the interface: a listing writes `IF ERR = 53 THEN` and
+/// means "file not found". Raising by number is the half of that which works
+/// without a handler, and it is what pins the table.
+#[test]
+fn test_error_statement_raises_by_number() {
+    for (source, message) in [
+        ("ERROR 5\n", "Illegal function call"),
+        ("ERROR 6\n", "Overflow"),
+        ("ERROR 7\n", "Out of memory"),
+        ("ERROR 9\n", "Subscript out of range"),
+        ("ERROR 11\n", "Division by zero"),
+        ("ERROR 50\n", "FIELD overflow"),
+        ("ERROR 52\n", "Bad file number"),
+        ("ERROR 53\n", "File not found"),
+        ("ERROR 54\n", "Bad file mode"),
+        ("ERROR 55\n", "File already open"),
+        ("ERROR 62\n", "Input past end of file"),
+        ("ERROR 70\n", "Permission denied"),
+    ] {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert!(
+            run.stderr.contains(message),
+            "ERROR should raise {message:?}, got {:?}",
+            run.stderr
+        );
+        assert_eq!(run.exit_code, Some(1), "a raised error still aborts");
+    }
+}
+
+/// A number the table does not know is still an error, and says so.
+#[test]
+fn test_error_statement_with_an_unknown_number() {
+    let run = compile_and_run_raw("ERROR 200\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Unprintable error"),
+        "GW-BASIC's own wording for a code it has no message for: {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// The raised error carries the line, like any other.
+#[test]
+fn test_error_statement_reports_its_line() {
+    let run = compile_and_run_raw("10 PRINT \"x\"\n20 ERROR 11\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 20"),
+        "expected the BASIC line, got {:?}",
+        run.stderr
+    );
+}
+
+/// The operand is evaluated, not just a literal.
+#[test]
+fn test_error_statement_takes_an_expression() {
+    let run = compile_and_run_raw("N = 50\nERROR N + 3\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("File not found"),
+        "53 should come out of the expression: {:?}",
+        run.stderr
+    );
+}
+
+/// GW-BASIC restricts the code to 1..255, and so does this.
+#[test]
+fn test_error_statement_rejects_a_code_out_of_range() {
+    for source in ["ERROR 0\n", "ERROR 256\n", "ERROR -1\n"] {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{source:?} should be refused at run time, got {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// A bad numeric operand is diagnosed, not a compiler panic.
+///
+/// `check_stmt` has a wildcard, so nothing forced an arm for a new statement
+/// and the operands of four of them were never checked at all. `ERROR
+/// NoSuchFn(1)` reached the codegen line that asserts "sema checked the array
+/// is declared" -- it had not -- and `LOCATE A$, 1` reached the
+/// implicit-String-conversion panic. A builtin's arguments were always
+/// checked, which is why `SQR(A$)` says so properly; a statement's were not.
+/// Turning panics into diagnostics is the point of that pass.
+#[test]
+fn test_numeric_operands_are_checked_not_panicked_on() {
+    for (source, expect) in [
+        ("A$ = \"x\"\nERROR A$\n", "ERROR needs a number"),
+        ("ERROR \"boom\"\n", "ERROR needs a number"),
+        ("ERROR NoSuchFn(1)\n", "unknown function or array"),
+        // The same hole, and the same fix, for every statement that takes a
+        // bare numeric operand. All four were added in the last two batches.
+        ("A$ = \"x\"\nLOCATE A$, 1\n", "LOCATE needs a number"),
+        ("A$ = \"x\"\nCOLOR 1, A$\n", "COLOR needs a number"),
+        ("A$ = \"x\"\nRANDOMIZE A$\n", "RANDOMIZE needs a number"),
+        ("LOCATE NoSuchFn(1), 1\n", "unknown function or array"),
+        ("RANDOMIZE NoSuchFn(1)\n", "unknown function or array"),
+    ] {
+        let err =
+            compile_only(source).expect_err(&format!("{} must be refused", source.escape_debug()));
+        assert!(
+            err.is_clean_rejection(),
+            "must be diagnosed, not panic: {}",
+            err.stderr
+        );
+        assert!(
+            err.contains(expect),
+            "expected {expect:?} in the diagnostic, got: {}",
+            err.stderr
+        );
+    }
+}
+
+/// Any expression may be the error number, including one that starts with NOT.
+///
+/// The token test that decides whether `ERROR` leads a statement listed the
+/// tokens an expression can start with, and missed `NOT` and a string literal.
+/// `ERROR NOT 0` was then refused as though the statement did not exist.
+#[test]
+fn test_error_statement_accepts_any_expression_shape() {
+    // NOT 0 is -1, which is out of the 1..255 range, so the run reports the
+    // range rather than the parse -- which is the point: it parsed.
+    let run = compile_and_run_raw("ERROR NOT 0\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "NOT 0 should reach the range check, got {:?}",
+        run.stderr
+    );
+
+    let run = compile_and_run_raw("N = 10\nERROR NOT N\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "{:?}",
+        run.stderr
+    );
+
+    let run = compile_and_run_raw("ERROR (5)\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+/// `ERROR` is still not a value, and `ON ERROR` is still refused.
+#[test]
+fn test_error_is_a_statement_not_a_name() {
+    // It stays in the UNSUPPORTED table for exactly this: recognised as a
+    // statement only when an operand follows it, so every other mention still
+    // gets a reason rather than becoming a variable that reads as zero.
+    for source in ["PRINT ERROR\n", "ERROR\n", "X = ERROR + 1\n"] {
+        let err = compile_only(source).expect_err("ERROR is not a value");
+        assert!(
+            err.contains("not supported"),
+            "{source:?} got: {}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// A line-numbered listing reports its BASIC line number, not the source line.
+///
+/// These are two different numbering systems and the error path used the wrong
+/// one: `current_line` is the lexer's physical line, while the `_line_NNN`
+/// labels a program branches to come from `StmtKind::Label(n)`. A listing whose
+/// line 110 failed said "in 4", so the number in the message named nothing the
+/// programmer could see, and disagreed with LANGREF's own example.
+#[test]
+fn test_error_reports_the_basic_line_number() {
+    let run = compile_and_run_raw(
+        "REM a header comment\nREM and another\n100 DIM A(3)\n110 PRINT A(99)\n",
+        "",
+    )
+    .expect("should compile");
+    assert!(
+        run.stderr.contains("in 110"),
+        "expected the BASIC line 110, got {:?}",
+        run.stderr
+    );
+}
+
+/// A program written without line numbers still reports its source line.
+///
+/// GW-BASIC has nothing else to say here and reports nothing; a source line is
+/// what a programmer can act on, and it is the style everything in examples/
+/// is written in.
+#[test]
+fn test_error_reports_the_source_line_without_line_numbers() {
+    let run = compile_and_run_raw("DIM A(2)\nPRINT \"x\"\nA(9) = 1\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 3"),
+        "expected the source line 3, got {:?}",
+        run.stderr
+    );
+}
+
+/// A statement ahead of the first line number has no BASIC line to report.
+#[test]
+fn test_error_before_the_first_line_number() {
+    let run = compile_and_run_raw("DIM A(2)\nA(9) = 1\n100 END\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 2"),
+        "nothing numbered has run yet, so the source line stands: {:?}",
+        run.stderr
+    );
+}
+
 /// Runtime diagnostics go to stderr, leaving the program's own output clean.
 #[test]
 fn test_runtime_errors_go_to_stderr() {
@@ -794,8 +1005,8 @@ fn test_unsafe_flag_still_produces_correct_programs() {
     let checked = compile_and_run_raw(source, "").unwrap();
     let unchecked = compile_and_run_flags(source, "", &["--unsafe"]).unwrap();
 
-    let expected: Vec<&str> = vec!["925", "3"];
-    assert_eq!(checked.stdout.trim().lines().collect::<Vec<_>>(), expected);
+    let expected: Vec<&str> = vec!["9  25", "3"];
+    assert_eq!(checked.lines(), expected);
     assert_eq!(
         unchecked.stdout.trim(),
         checked.stdout.trim(),
@@ -857,8 +1068,6 @@ fn test_zero_arg_builtins_are_not_assignable() {
 fn test_unimplemented_gwbasic_names_are_diagnosed() {
     let cases = [
         ("A$ = INKEY$\n", "INKEY$"),
-        ("PRINT ERR\n", "ERR"),
-        ("PRINT ERL\n", "ERL"),
         ("PRINT CSRLIN\n", "CSRLIN"),
         ("A$ = INPUT$(3)\n", "INPUT$"),
         ("PRINT PEEK(0)\n", "PEEK"),
@@ -887,16 +1096,19 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
     }
 }
 
-/// `ON ERROR GOTO` is the dangerous one: it parses as a computed GOTO on a
-/// variable named ERROR, which is always zero, so the handler never runs and
-/// nothing says so.
+/// `ON ERROR GOTO` still cannot fall through silently.
+///
+/// It once parsed as a computed GOTO on a variable named ERROR, which is
+/// always zero, so the handler never ran and nothing said so. It is a real
+/// statement now, and the property that mattered is unchanged: a handler
+/// naming a line the program does not have is refused, not ignored.
 #[test]
-fn test_on_error_goto_is_refused() {
-    let err = compile_only("ON ERROR GOTO 100\nPRINT \"x\"\nEND\n100 END\n")
-        .expect_err("ON ERROR GOTO must be refused rather than falling through");
+fn test_on_error_goto_a_missing_line_is_refused() {
+    let err = compile_only("ON ERROR GOTO 100\nPRINT \"x\"\nEND\n")
+        .expect_err("a handler must name a line that exists");
     assert!(
-        err.contains("not supported"),
-        "expected an explanation, got: {}",
+        err.contains("ON ERROR GOTO"),
+        "expected the statement named, got: {}",
         err.stderr
     );
     assert!(err.is_clean_rejection());
@@ -942,6 +1154,38 @@ fn test_unsupported_diagnostics_explain_themselves() {
             "a deferred feature should say so: {}",
             err.stderr
         );
+    }
+}
+
+/// A `DEF*` default must not rename a name the compiler refuses.
+///
+/// `apply_default_types` rewrites every unsuffixed name a `DEF*` range covers,
+/// and `unsupported_reason` matches the unsuffixed spelling -- so under
+/// `DEFINT A-Z` the table was consulted for `ERROR%` and missed. That is not a
+/// cosmetic gap: `ON ERROR GOTO 100` went back to compiling as a computed GOTO
+/// on a variable that is always zero, which is the precise silent
+/// fall-through the table was written to prevent, restored by a feature added
+/// four commits later.
+#[test]
+fn test_a_def_type_does_not_defeat_the_refusals() {
+    // Every shape the refusal is reached through: a bare name in an
+    // expression, a statement-position call, and the ON ERROR special case.
+    let cases = [
+        ("DEFINT A-Z\nPRINT ERROR\n", "ERROR"),
+        ("DEFINT A-Z\nPRINT CSRLIN\n", "CSRLIN"),
+        ("DEFSTR A-Z\nPRINT INKEY$\n", "INKEY$"),
+        ("DEFLNG A-Z\nPRINT CSRLIN\n", "CSRLIN"),
+    ];
+
+    for (source, name) in cases {
+        let err = compile_only(source)
+            .expect_err(&format!("{} must stay refused under a DEF* default", name));
+        assert!(
+            err.contains("not supported"),
+            "{name} was accepted under a DEF* default: {}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
     }
 }
 
@@ -1529,7 +1773,7 @@ PRINT ASC("A")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
 }
 
@@ -1562,8 +1806,8 @@ PRINT 0 ^ 0
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["-8", "4", "2", "0.25", "1"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["-8", "4", "2", ".25", "1"]);
 }
 
 /// CHR$, SPACE$ and STRING$ refuse counts and codes they cannot represent.
@@ -1605,7 +1849,7 @@ PRINT HEX$(255)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["0", "255", "65", "[]", "[   ]", "[]", "[xxx]", "FF"]
@@ -1625,4 +1869,493 @@ fn test_dim_suffix_must_agree_with_its_as_clause() {
     // Agreeing, and unsuffixed, are both fine.
     compile_only("DIM X% AS INTEGER\nDIM Y AS DOUBLE\nDIM S$ AS STRING * 4\nDIM N AS LONG\n")
         .expect("a suffix that agrees, or none at all, is legal");
+}
+
+// ---------------------------------------------------------------------------
+// Error trapping: ON ERROR GOTO, ERR, ERL
+//
+// The mechanism is a longjmp in all but name. `_rt_error` never returned, and
+// is reached from thirteen places inside each runtime tree with live frames --
+// some two deep, some holding a lock structure on the stack. Trapping abandons
+// all of them, so what the handler starts with has to be captured up front.
+
+/// The handler runs, and ERR and ERL say what happened and where.
+#[test]
+fn test_on_error_traps_and_reports() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 PRINT "before"
+30 PRINT 1 / 0
+40 PRINT "not reached"
+50 END
+100 PRINT "handled"; ERR; ERL
+110 END
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["before", "handled 11  30"]);
+}
+
+/// An error raised from deep inside a runtime helper is trapped too.
+///
+/// This is the case the whole design is for: `ON ERROR` round an `OPEN` is the
+/// commonest vintage idiom, and those errors come from hand-written assembly
+/// several frames down, not from a codegen trampoline.
+#[test]
+fn test_on_error_traps_an_error_raised_inside_a_helper() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 OPEN "no-such-file-here.txt" FOR INPUT AS #1
+30 PRINT "not reached"
+40 END
+100 PRINT "trapped"; ERR
+110 END
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "trapped 53");
+}
+
+/// `ERROR n` is trapped like any other error, which is how a program tests its
+/// own handler.
+#[test]
+fn test_on_error_traps_the_error_statement() {
+    let out =
+        compile_and_run("10 ON ERROR GOTO 100\n20 ERROR 62\n30 END\n100 PRINT ERR\n110 END\n")
+            .unwrap();
+    assert_eq!(out.trim(), "62");
+}
+
+/// `ON ERROR GOTO 0` puts the fatal path back.
+#[test]
+fn test_on_error_goto_zero_disarms() {
+    let run = compile_and_run_raw(
+        "10 ON ERROR GOTO 100\n20 ON ERROR GOTO 0\n30 PRINT 1 / 0\n40 END\n100 PRINT \"no\"\n110 END\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "disarmed, so the error is fatal");
+    assert!(run.stderr.contains("Division by zero"), "{:?}", run.stderr);
+    assert!(!run.stdout.contains("no"), "the handler must not run");
+}
+
+/// An error inside the handler is fatal rather than looping through it.
+#[test]
+fn test_error_inside_the_handler_is_fatal() {
+    let run = compile_and_run_raw(
+        "10 ON ERROR GOTO 100\n20 PRINT 1 / 0\n30 END\n100 PRINT \"in handler\"\n110 PRINT 1 / 0\n120 END\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stdout.contains("in handler"),
+        "the handler did run once"
+    );
+    assert!(run.stderr.contains("Division by zero"));
+}
+
+/// The handler can carry on with the program, and the variables it reads are
+/// the ones the program actually wrote.
+///
+/// The unwind abandons every intervening frame, so anything the compiler was
+/// holding in a register has to be back in memory by then.
+#[test]
+fn test_state_survives_the_unwind() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 T = 0
+30 FOR I = 1 TO 5
+40   T = T + I
+50 NEXT I
+60 PRINT 1 / 0
+70 END
+200 PRINT "T="; T; "I="; I
+210 END
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.trim(),
+        "T= 15 I= 6",
+        "the loop's own variables are intact"
+    );
+}
+
+/// An error inside a SUB unwinds to the module-level handler.
+#[test]
+fn test_error_inside_a_procedure_is_trapped() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 CALL Boom
+30 PRINT "not reached"
+40 END
+100 PRINT "trapped"; ERR
+110 END
+SUB Boom
+  PRINT 1 / 0
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "trapped 11");
+}
+
+/// A program that never traps carries none of the machinery.
+#[test]
+fn test_no_cost_without_on_error() {
+    let asm = crate::common::compile_to_asm("PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n").unwrap();
+    for symbol in [
+        "_err_handler",
+        "_err_ctx",
+        "_err_line",
+        "_rt_trap_capture",
+        "_err_stmt",
+        "_err_depth",
+        "_resume_at",
+        "_resume_next",
+    ] {
+        assert!(
+            !asm.contains(symbol),
+            "{symbol} should not appear in a program with no ON ERROR"
+        );
+    }
+}
+
+/// `--unsafe` removes the checks a handler exists to catch, so the pair is
+/// refused rather than leaving a handler that looks right and never runs.
+#[test]
+fn test_on_error_with_unsafe_is_refused() {
+    let err = crate::common::compile_only_flags(
+        "10 ON ERROR GOTO 100\n20 PRINT 1 / 0\n30 END\n100 END\n",
+        &["--unsafe"],
+    )
+    .expect_err("ON ERROR plus --unsafe must be refused");
+    assert!(
+        err.contains("--unsafe"),
+        "expected the reason, got: {}",
+        err.stderr
+    );
+    assert!(err.is_clean_rejection());
+}
+
+/// The handler must be module-level code, not a line inside a procedure.
+#[test]
+fn test_on_error_scope_is_checked() {
+    let err = compile_only("SUB S\n10 ON ERROR GOTO 20\n20 END\nEND SUB\nCALL S\n")
+        .expect_err("ON ERROR inside a procedure must be refused");
+    assert!(err.is_clean_rejection(), "got: {}", err.stderr);
+
+    let err = compile_only("10 ON ERROR GOTO 900\n20 END\nSUB S\n900 PRINT 1\nEND SUB\n")
+        .expect_err("a handler inside a procedure must be refused");
+    assert!(err.is_clean_rejection(), "got: {}", err.stderr);
+}
+
+/// A GOSUB interrupted by a trapped error still returns correctly.
+///
+/// The GOSUB stack is a separate software stack, independent of `rsp`, so the
+/// unwind does not disturb it -- deliberately, because that is what lets a
+/// handler carry on from a subroutine the error interrupted, as GW-BASIC does.
+#[test]
+fn test_gosub_survives_a_trap() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 GOSUB 100
+30 PRINT "back"
+40 END
+100 PRINT "in sub"
+110 PRINT 1 / 0
+120 RETURN
+200 PRINT "trapped"
+210 RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["in sub", "trapped", "back"],
+        "the handler's RETURN goes back to the statement after the GOSUB"
+    );
+}
+
+/// ...but a GOSUB inside a procedure cannot, so it is refused.
+///
+/// Its return address is a label in a frame the unwind discards, so a later
+/// RETURN would jump into dead code with main's frame pointer.
+#[test]
+fn test_gosub_inside_a_procedure_is_refused_when_trapping() {
+    let src = "10 ON ERROR GOTO 100\n20 CALL S\n30 END\n100 END\n\
+               SUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
+    let err = compile_only(src).expect_err("GOSUB in a procedure must be refused when trapping");
+    assert!(err.contains("GOSUB inside"), "got: {}", err.stderr);
+    assert!(err.is_clean_rejection());
+
+    // The same program without ON ERROR is fine: nothing unwinds.
+    let ok = "10 CALL S\n20 END\nSUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
+    compile_only(ok).expect("a GOSUB in a procedure is fine when nothing traps");
+}
+
+/// A trapping program keeps its loop variables in memory.
+///
+/// FOR-loop register promotion is switched off when a program traps, and that
+/// is load-bearing rather than a concession: a promoted counter's register is
+/// gone after the unwind and its memory copy is written back only at the
+/// loop's exit label, so a handler would read a stale value. The promotion's
+/// stack saves are also the one thing that moves `rsp` across a statement
+/// boundary, which is what lets the trap restore a single captured `rsp`.
+#[test]
+fn test_trapping_disables_register_promotion() {
+    let hot = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
+    let plain = crate::common::compile_to_asm(hot).unwrap();
+    assert!(
+        plain.contains("save a counter register"),
+        "the loop should promote when nothing traps"
+    );
+
+    let trapping =
+        crate::common::compile_to_asm(&format!("10 ON ERROR GOTO 100\n{hot}90 END\n100 END\n"))
+            .unwrap();
+    assert!(
+        !trapping.contains("save a counter register"),
+        "a trapping program must keep its counter in memory"
+    );
+}
+
+/// `RESUME` retries the statement that failed.
+///
+/// The handler fixes the cause, so the retry succeeds. `N` proves it re-entered
+/// at the failing statement rather than at the head of its line.
+#[test]
+fn test_resume_retries_the_failing_statement() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 N = N + 1 : X = 1 / D
+40 PRINT N; X
+50 END
+100 D = 2
+110 RESUME
+"#,
+    )
+    .unwrap();
+    // "1" then "0.5": this compiler prints a leading zero where
+    // GW-BASIC does not, and numbers carry no padding.
+    assert_eq!(
+        out.trim(),
+        "1  .5",
+        "N stayed 1 and the division then worked"
+    );
+}
+
+/// `RESUME NEXT` continues at the statement after the one that failed, even
+/// when that is mid-line.
+///
+/// This is the case per-statement resume points exist for: `A=1 : B=2` on one
+/// line is how listings saved memory, and resuming at the head of the line
+/// would re-run work and loop forever here.
+#[test]
+fn test_resume_next_is_exact_mid_line() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 C = 9
+30 N = N + 1 : B = 1 / 0 : C = 3
+40 PRINT N; B; C
+50 END
+100 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1  0  3", "N=1, B=0, C=3");
+}
+
+/// `RESUME NEXT` from the last statement of a FOR body continues the loop.
+///
+/// Nothing special makes this work: `_rn` sits where the next code does, and
+/// the next code after a body's last statement is the increment and the
+/// back-jump.
+#[test]
+fn test_resume_next_continues_a_loop() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 FOR I = 1 TO 3
+30   T = T + 1
+40   X = 1 / (I - 2)
+50 NEXT I
+60 PRINT T; I
+70 END
+100 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.trim(),
+        "3  4",
+        "all three iterations ran; falling out would give 2"
+    );
+}
+
+/// `RESUME <line>` jumps, and skips whatever lies between.
+#[test]
+fn test_resume_at_a_line() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 PRINT 1 / 0
+30 PRINT "skipped"
+40 PRINT "landed"
+50 END
+100 RESUME 40
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "landed");
+}
+
+/// The classic retry loop: try, fail, fix, try again.
+#[test]
+fn test_resume_retry_loop() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 Tries = 0
+30 Divisor = 0
+40 Tries = Tries + 1
+50 R = 100 / Divisor
+60 PRINT "took"; Tries; "tries, got"; R
+70 END
+200 Divisor = Divisor + 4
+210 RESUME
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "took 1 tries, got 25");
+}
+
+/// `RESUME` with no error active is refused at run time, and is not itself
+/// trappable -- trapping it would loop through the handler forever.
+#[test]
+fn test_resume_without_an_error_is_fatal() {
+    let run = compile_and_run_raw(
+        "10 ON ERROR GOTO 100\n20 GOTO 100\n30 END\n100 RESUME\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("RESUME without error"),
+        "got: {:?}",
+        run.stderr
+    );
+}
+
+/// A bare `RESUME` after an error raised inside a procedure fails cleanly.
+///
+/// The unwind discarded that frame, so there is nothing to go back to. The
+/// diagnosis is the point: guessing would resume at the CALL, which looks
+/// plausible and is wrong.
+#[test]
+fn test_resume_after_a_procedure_error_is_refused() {
+    let src = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"no\"\n40 END\n\
+               100 RESUME\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+    let run = compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(run.stderr.contains("RESUME"), "got: {:?}", run.stderr);
+    assert!(!run.stdout.contains("no"), "it must not resume anywhere");
+
+    // `RESUME <line>` needs no failing statement, so it is allowed.
+    let ok = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"skipped\"\n40 PRINT \"landed\"\n50 END\n\
+              100 RESUME 40\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+    assert_eq!(compile_and_run(ok).unwrap().trim(), "landed");
+}
+
+/// A statement that continues after a call returns is still resumable.
+///
+/// `X = F(1) / D` divides after `F` comes back, so the error belongs to the
+/// module-level statement even though a procedure ran inside it.
+#[test]
+fn test_resume_after_a_call_that_returned() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 X = F(1) / D
+40 PRINT X
+50 END
+100 D = 4
+110 RESUME
+FUNCTION F(N)
+  F = N + 7
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "2");
+}
+
+/// `RESUME` needs a handler to return from, and belongs at module level.
+#[test]
+fn test_resume_is_checked_at_compile_time() {
+    let err = compile_only("10 PRINT 1\n20 RESUME\n").expect_err("RESUME needs an ON ERROR");
+    assert!(err.contains("RESUME"), "got: {}", err.stderr);
+    assert!(err.is_clean_rejection());
+
+    let err =
+        compile_only("10 ON ERROR GOTO 100\n20 CALL B\n30 END\n100 END\nSUB B\nRESUME\nEND SUB\n")
+            .expect_err("RESUME inside a procedure must be refused");
+    assert!(err.is_clean_rejection(), "got: {}", err.stderr);
+
+    let err = compile_only("10 ON ERROR GOTO 100\n20 PRINT 1\n30 END\n100 RESUME 999\n")
+        .expect_err("RESUME must name a line that exists");
+    assert!(err.contains("RESUME"), "got: {}", err.stderr);
+}
+
+/// `RESUME NEXT` is exact however deeply the failing statement is nested.
+///
+/// The resume point is a position in the emitted code, so an IF inside a FOR
+/// inside a WHILE needs nothing special -- which is the claim this checks.
+#[test]
+fn test_resume_next_from_a_deeply_nested_statement() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 W = 0
+30 WHILE W < 2
+40   FOR I = 1 TO 3
+50     IF I = 2 THEN T = T + 1 : X = 1 / 0 : T = T + 10
+60     V = V + 1
+70   NEXT I
+80   W = W + 1
+90 WEND
+100 PRINT T; V; W
+110 END
+200 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    // Two passes of the loop; on I=2 the divide fails and RESUME NEXT lands on
+    // `T = T + 10`, then the loop and the WHILE both carry on normally.
+    assert_eq!(out.trim(), "22  6  2", "T=22, V=6, W=2");
+}
+
+/// `RESUME NEXT` from the last statement of the program just ends it.
+///
+/// The handler is put ahead of the failure on purpose, so that the statement
+/// that fails really is the last one emitted and `_rn` for it is main's
+/// epilogue.
+#[test]
+fn test_resume_next_off_the_end() {
+    let run = compile_and_run_raw(
+        "10 GOTO 30\n20 RESUME NEXT\n30 ON ERROR GOTO 20\n40 PRINT 1 / 0\n",
+        "",
+    )
+    .expect("should compile");
+    run.assert_ran_to_completion("RESUME NEXT past the last statement");
 }
