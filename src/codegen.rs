@@ -3473,6 +3473,18 @@ impl CodeGen {
             // reads as undimensioned again and a later DIM allocates afresh.
             // free(NULL) is defined, so erasing an array that was never
             // dimensioned is harmless.
+            // `ERROR n` -- raise the error GW-BASIC numbers n. The range is
+            // GW-BASIC's: 0 and 256 are not error numbers, and a code the
+            // table does not know still raises, as "Unprintable error".
+            StmtKind::RaiseError(expr) => {
+                self.gen_expr_to_long(expr);
+                self.emit("    movsxd r10, eax");
+                self.emit_arg_range_check("r10", 1, Some(255));
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_imm(1, self.report_line() as i64);
+                self.emit("    call _rt_error_num");
+            }
+
             StmtKind::Erase(names) => {
                 for name in names {
                     let Some(loc) = self.lookup_array(name).map(|i| i.loc.clone()) else {

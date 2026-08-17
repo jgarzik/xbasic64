@@ -1326,21 +1326,38 @@ allocation failure, a random-access operation on a file not opened `FOR
 RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
 few bytes, and a `LOCK` another process already holds.
 
-The message names the fault:
+The message names the fault, and each carries GW-BASIC's number for it:
 
-| Message                  | Cause                                            |
-|--------------------------|--------------------------------------------------|
-| `Subscript out of range` | A subscript outside a dimension's bounds         |
-| `Array used before DIM`  | An array reached before its `DIM` ran            |
-| `Division by zero`       | A zero divisor in `/`, `\` or `MOD`              |
-| `Overflow`               | A `\` or `MOD` whose quotient does not fit       |
-| `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive     |
-| `Bad file number`        | A file number outside 1 to 15                    |
-| `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth     |
-| `Out of memory`          | A string or array allocation that failed         |
-| `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file     |
-| `FIELD overflow`         | `FIELD` widths exceeding the record length       |
-| `Permission denied`      | A `LOCK` someone else already holds              |
+| No. | Message                  | Cause                                        |
+|-----|--------------------------|----------------------------------------------|
+| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive |
+| 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
+| 7   | `Out of memory`          | A string or array allocation that failed     |
+| 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
+| 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
+| 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
+| 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
+| 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
+| 52  | `Bad file number`        | A file number outside 1 to 15                |
+| 53  | `File not found`         | Opening a file that is not there             |
+| 54  | `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file |
+| 55  | `File already open`      | `OPEN` on a file number already in use       |
+| 62  | `Input past end of file` | Reading past the end of an input file        |
+| 70  | `Permission denied`      | A `LOCK` someone else already holds          |
+
+### ERROR
+
+`ERROR n` raises the error numbered `n`, exactly as if the runtime had raised
+it. The number must be 1 to 255; one the table above does not list is raised as
+`Unprintable error`, which is GW-BASIC's own wording.
+
+```basic
+10 IF Total < 0 THEN ERROR 5
+20 PRINT "fine"
+```
+
+Two numbers appear twice above. `ERROR 7` and `ERROR 9` raise the first message
+listed for each -- `Out of memory` and `Subscript out of range`.
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:

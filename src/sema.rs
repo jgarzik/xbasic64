@@ -559,6 +559,9 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
                     }
                 }
             }
+            // The operand is an expression, which `for_each_expr_mut` reaches;
+            // there is no name of its own to rename.
+            StmtKind::RaiseError(_) => {}
             StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
                 vars.iter_mut().for_each(|v| lvalue(v, table, procs))
             }
@@ -733,6 +736,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             bg.iter_mut().for_each(&mut *f);
         }
         StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
+        StmtKind::RaiseError(e) => f(e),
         StmtKind::Const { value, .. } => f(value),
         StmtKind::FieldAssign { target, value } => {
             lvalue(target, f);

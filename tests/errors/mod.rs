@@ -424,6 +424,93 @@ fn test_runtime_error_reports_line() {
     );
 }
 
+/// `ERROR n` raises the numbered error, with GW-BASIC's own numbering.
+///
+/// The numbers are the interface: a listing writes `IF ERR = 53 THEN` and
+/// means "file not found". Raising by number is the half of that which works
+/// without a handler, and it is what pins the table.
+#[test]
+fn test_error_statement_raises_by_number() {
+    for (source, message) in [
+        ("ERROR 5\n", "Illegal function call"),
+        ("ERROR 6\n", "Overflow"),
+        ("ERROR 7\n", "Out of memory"),
+        ("ERROR 9\n", "Subscript out of range"),
+        ("ERROR 11\n", "Division by zero"),
+        ("ERROR 50\n", "FIELD overflow"),
+        ("ERROR 52\n", "Bad file number"),
+        ("ERROR 53\n", "File not found"),
+        ("ERROR 54\n", "Bad file mode"),
+        ("ERROR 55\n", "File already open"),
+        ("ERROR 62\n", "Input past end of file"),
+        ("ERROR 70\n", "Permission denied"),
+    ] {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert!(
+            run.stderr.contains(message),
+            "ERROR should raise {message:?}, got {:?}",
+            run.stderr
+        );
+        assert_eq!(run.exit_code, Some(1), "a raised error still aborts");
+    }
+}
+
+/// A number the table does not know is still an error, and says so.
+#[test]
+fn test_error_statement_with_an_unknown_number() {
+    let run = compile_and_run_raw("ERROR 200\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Unprintable error"),
+        "GW-BASIC's own wording for a code it has no message for: {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// The raised error carries the line, like any other.
+#[test]
+fn test_error_statement_reports_its_line() {
+    let run = compile_and_run_raw("10 PRINT \"x\"\n20 ERROR 11\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("in 20"),
+        "expected the BASIC line, got {:?}",
+        run.stderr
+    );
+}
+
+/// The operand is evaluated, not just a literal.
+#[test]
+fn test_error_statement_takes_an_expression() {
+    let run = compile_and_run_raw("N = 50\nERROR N + 3\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("File not found"),
+        "53 should come out of the expression: {:?}",
+        run.stderr
+    );
+}
+
+/// GW-BASIC restricts the code to 1..255, and so does this.
+#[test]
+fn test_error_statement_rejects_a_code_out_of_range() {
+    for source in ["ERROR 0\n", "ERROR 256\n", "ERROR -1\n"] {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{source:?} should be refused at run time, got {:?}",
+            run.stderr
+        );
+    }
+}
+
+/// `ERROR` is still not a value, and `ON ERROR` is still refused.
+#[test]
+fn test_error_is_a_statement_not_a_name() {
+    let err = compile_only("PRINT ERROR\n").expect_err("ERROR is not a value");
+    assert!(err.contains("not supported"), "got: {}", err.stderr);
+    let err = compile_only("ON ERROR GOTO 100\nEND\n100 END\n").expect_err("not implemented yet");
+    assert!(err.contains("not supported"), "got: {}", err.stderr);
+}
+
 /// A line-numbered listing reports its BASIC line number, not the source line.
 ///
 /// These are two different numbering systems and the error path used the wrong

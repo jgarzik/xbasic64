@@ -237,6 +237,8 @@ pub enum StmtKind {
     Beep,
     /// `ERASE a, b` -- release arrays so they can be dimensioned again.
     Erase(Vec<String>),
+    /// `ERROR n` -- raise the error GW-BASIC numbers `n`.
+    RaiseError(Expr),
     /// `LOCATE [row][, col]` -- move the cursor.
     ///
     /// Either part may be omitted, in which case that coordinate is left where
@@ -983,6 +985,24 @@ impl Parser {
         matches!(self.peek_at(1), Token::Ident(_))
     }
 
+    /// True if the token after the current one could begin an expression.
+    ///
+    /// `ERROR` is a statement only when something follows it to be the error
+    /// number. Left contextual rather than reserved so that a bare `ERROR`
+    /// still reaches the UNSUPPORTED table, which is what keeps
+    /// `ON ERROR GOTO` refused with a reason until it is written.
+    fn next_starts_a_value(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Token::Integer(_)
+                | Token::Float(_)
+                | Token::Ident(_)
+                | Token::LParen
+                | Token::Minus
+                | Token::Plus
+        )
+    }
+
     /// Source line of the current token, or 0 when unknown (no line map).
     fn cur_line(&self) -> u32 {
         self.lines.get(self.pos).copied().unwrap_or(0)
@@ -1371,6 +1391,7 @@ impl Parser {
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
                     "ERASE" if self.next_is_ident() => self.parse_erase(),
+                    "ERROR" if self.next_starts_a_value() => self.parse_raise_error(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),
@@ -2650,6 +2671,12 @@ impl Parser {
     /// Contextual rather than reserved, like CALL above it: LANGREF's own
     /// `ON ... GOSUB Draw, Erase` example uses the word as a label, and a
     /// reserved ERASE would take that name away from every program.
+    /// `ERROR n` -- raise an error by GW-BASIC's number for it.
+    fn parse_raise_error(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume ERROR
+        Ok(StmtKind::RaiseError(self.parse_expression()?))
+    }
+
     fn parse_erase(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ERASE
         let mut names = Vec::new();
