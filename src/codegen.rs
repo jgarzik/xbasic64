@@ -268,6 +268,8 @@ enum Builtin {
 static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| {
     HashMap::from([
         ("TIMER", Builtin::Call0("_rt_timer")),
+        ("DATE$", Builtin::Call0("_rt_date")),
+        ("TIME$", Builtin::Call0("_rt_time")),
         ("VAL", Builtin::CallStr("_rt_val")),
         ("LTRIM$", Builtin::CallStr("_rt_ltrim")),
         ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
@@ -904,6 +906,15 @@ impl CodeGen {
         self.gen_coercion(ty, DataType::Double);
     }
 
+    /// Evaluate `expr` and leave it in `eax` as a Long.
+    ///
+    /// The counterpart of `gen_expr_to_double` for the statements whose
+    /// arguments are screen coordinates and colours.
+    fn gen_expr_to_long(&mut self, expr: &Expr) {
+        let ty = self.gen_expr(expr);
+        self.gen_coercion(ty, DataType::Long);
+    }
+
     /// Evaluate `expr` into the working register for `ct`, coerced.
     ///
     /// Routes a Double target through the pooled path and everything else
@@ -1186,7 +1197,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
-            "EOF" | "LBOUND" | "UBOUND" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" | "POS" | "FRE" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -1229,7 +1240,10 @@ impl CodeGen {
         // in EAX while every consumer read xmm0 and found the *left operand*
         // still there: `A = 12 : B = 10 : PRINT A AND B` printed 12. Literal
         // operands are folded before reaching here, which is why it hid.
-        if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor) {
+        if matches!(
+            op,
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor | BinaryOp::Eqv | BinaryOp::Imp
+        ) {
             return DataType::Long;
         }
 
@@ -3386,6 +3400,75 @@ impl CodeGen {
                 self.emit("    call _rt_cls");
             }
 
+            // DEF* is consumed by sema, which rewrites the names it affects;
+            // nothing is left to emit.
+            StmtKind::DefType { .. } => {}
+
+            // An omitted coordinate means "leave it alone", which the escape
+            // sequence has no way to say -- so the current value is supplied.
+            // The column tracker knows the column; the row is not tracked, so
+            // an omitted row asks the terminal for line 1, which is the one
+            // divergence here and is documented.
+            StmtKind::Locate { row, col } => {
+                match row {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    mov eax, 1"),
+                }
+                self.emit("    movsxd r10, eax");
+                match col {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    call _rt_pos"),
+                }
+                self.emit("    movsxd r11, eax");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                self.emit("    call _rt_locate");
+            }
+
+            StmtKind::Color { fg, bg } => {
+                match fg {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    mov eax, 7"), // the usual default
+                }
+                self.emit("    movsxd r10, eax");
+                match bg {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    xor eax, eax"),
+                }
+                self.emit("    movsxd r11, eax");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                self.emit("    call _rt_color");
+            }
+
+            StmtKind::Beep => self.emit("    call _rt_beep"),
+
+            // ERASE releases the storage and nulls the descriptor, so the array
+            // reads as undimensioned again and a later DIM allocates afresh.
+            // free(NULL) is defined, so erasing an array that was never
+            // dimensioned is harmless.
+            StmtKind::Erase(names) => {
+                for name in names {
+                    let Some(loc) = self.lookup_array(name).map(|i| i.loc.clone()) else {
+                        continue; // sema has already complained
+                    };
+                    emit!(self, "    mov {}, {}", Self::arg_reg(0), loc.q(0));
+                    self.emit_call_libc("free");
+                    emit!(self, "    mov {}, 0", loc.q(0));
+                }
+            }
+
+            StmtKind::Randomize(seed) => {
+                // With no seed, take the clock: GW-BASIC prompts the operator
+                // for one, and a compiled program has nobody to ask. TIMER
+                // already returns fractional seconds, so it is the clock.
+                match seed {
+                    Some(e) => self.gen_expr_to_double(e),
+                    None => self.emit("    call _rt_timer"),
+                }
+                self.emit("    call _rt_randomize");
+            }
+
             StmtKind::SelectCase { expr, cases } => {
                 let end_label = self.new_label("endselect");
 
@@ -4005,6 +4088,20 @@ impl CodeGen {
                     _ => unreachable!(),
                 };
                 emit!(self, "    {} eax, ecx", instr);
+            }
+
+            // EQV is NOT (a XOR b); IMP is (NOT a) OR b. Both are bitwise, so
+            // they are built from the instructions already here rather than
+            // given any of their own.
+            BinaryOp::Eqv => {
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    xor eax, ecx");
+                self.emit("    not eax");
+            }
+            BinaryOp::Imp => {
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    not eax");
+                self.emit("    or eax, ecx");
             }
         }
 
@@ -5602,7 +5699,13 @@ impl CodeGen {
                 self.emit("    cvtsi2sd xmm0, eax");
             }
             "RND" => {
-                if !args.is_empty() {
+                if args.is_empty() {
+                    // A bare RND means "next value", which _rt_rnd spells as a
+                    // positive argument. This used to leave whatever happened to
+                    // be in xmm0 -- harmless only while the argument was ignored.
+                    let one = self.f64_operand(1.0);
+                    emit!(self, "    movsd xmm0, {}", one);
+                } else {
                     self.gen_expr_to_double(&args[0]);
                 }
                 self.emit("    call _rt_rnd");
@@ -5752,6 +5855,19 @@ impl CodeGen {
                 self.emit("    pop rbx");
                 // Result is in rax
                 self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
+            }
+            "FRE" => {
+                // A compiled program has no BASIC string heap to run out of, so
+                // this answers a plausible figure rather than pretending to.
+                // Listings use it as `IF FRE(0) < n THEN`, which then passes.
+                self.gen_expr(&args[0]);
+                self.emit("    mov eax, 65535");
+            }
+            "POS" => {
+                // The argument is ignored, as in GW-BASIC: POS(0) is the idiom
+                // and any value means the same thing.
+                self.gen_expr(&args[0]);
+                self.emit("    call _rt_pos");
             }
             "ASC" => {
                 self.gen_expr(&args[0]);

@@ -276,3 +276,113 @@ fn seconds_since_midnight_utc() -> f64 {
         .expect("the clock is after 1970");
     (now.as_secs() % 86_400) as f64 + f64::from(now.subsec_millis()) / 1000.0
 }
+
+/// `RANDOMIZE` reseeds, so a program does not replay the same numbers forever.
+///
+/// The generator's state was a hardcoded constant and `_rt_rnd` ignored its
+/// argument outright, so every run of every program produced the identical
+/// sequence — three runs of the same three-dice program printed `939913` each
+/// time. A dice game, a shuffle and a maze were all the same on every play, and
+/// no statement existed to change that.
+#[test]
+fn test_randomize_timer_differs_between_runs() {
+    let source = "RANDOMIZE TIMER\nFOR I = 1 TO 5\nPRINT INT(RND * 1000);\nNEXT I\n";
+    let a = compile_and_run(source).unwrap();
+    let b = compile_and_run(source).unwrap();
+    assert_ne!(a.trim(), b.trim(), "RANDOMIZE TIMER must reseed");
+}
+
+/// A named seed is reproducible, which is what makes a program debuggable.
+#[test]
+fn test_randomize_with_a_seed_is_reproducible() {
+    let source = "RANDOMIZE 42\nFOR I = 1 TO 5\nPRINT INT(RND * 1000);\nNEXT I\n";
+    let a = compile_and_run(source).unwrap();
+    let b = compile_and_run(source).unwrap();
+    assert_eq!(a.trim(), b.trim(), "the same seed must give the same run");
+
+    let other =
+        compile_and_run("RANDOMIZE 7\nFOR I = 1 TO 5\nPRINT INT(RND * 1000);\nNEXT I\n").unwrap();
+    assert_ne!(a.trim(), other.trim(), "a different seed must differ");
+}
+
+/// GW-BASIC's `RND` argument selects between three behaviours.
+#[test]
+fn test_rnd_argument_semantics() {
+    let output = compile_and_run(
+        r#"
+RANDOMIZE 1
+A = RND
+B = RND(0)
+C = RND(0)
+D = RND(1)
+IF A = B THEN PRINT "zero-repeats" ELSE PRINT "zero-advanced"
+IF B = C THEN PRINT "zero-stable" ELSE PRINT "zero-moved"
+IF A = D THEN PRINT "positive-stuck" ELSE PRINT "positive-advances"
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["zero-repeats", "zero-stable", "positive-advances"],
+        "RND(0) repeats the last value; RND(positive) and bare RND advance"
+    );
+}
+
+/// A negative argument reseeds from that value, so it is reproducible without
+/// RANDOMIZE — the idiom `X = RND(-1)` at the top of a listing.
+#[test]
+fn test_rnd_negative_reseeds() {
+    let source = "X = RND(-1)\nFOR I = 1 TO 3\nPRINT INT(RND * 1000);\nNEXT I\n";
+    let a = compile_and_run(source).unwrap();
+    let b = compile_and_run(source).unwrap();
+    assert_eq!(a.trim(), b.trim(), "the same negative seed replays");
+
+    let other =
+        compile_and_run("X = RND(-99)\nFOR I = 1 TO 3\nPRINT INT(RND * 1000);\nNEXT I\n").unwrap();
+    assert_ne!(a.trim(), other.trim(), "a different negative seed differs");
+}
+
+/// Values stay in [0, 1) whichever form is used.
+#[test]
+fn test_rnd_stays_in_range() {
+    let output = compile_and_run(
+        r#"
+RANDOMIZE 5
+BAD = 0
+FOR I = 1 TO 200
+  R = RND
+  IF R < 0 OR R >= 1 THEN BAD = BAD + 1
+NEXT I
+PRINT BAD
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "0", "every value must be in [0, 1)");
+}
+
+/// `DATE$` and `TIME$` report the date and time in GW-BASIC's shapes.
+#[test]
+fn test_date_and_time_strings() {
+    let output =
+        compile_and_run("PRINT DATE$\nPRINT TIME$\nPRINT LEN(DATE$); LEN(TIME$)\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    let date = lines[0];
+    let time = lines[1];
+    assert_eq!(date.len(), 10, "DATE$ is MM-DD-YYYY: {date:?}");
+    assert_eq!(&date[2..3], "-", "separators at 3 and 6: {date:?}");
+    assert_eq!(&date[5..6], "-", "separators at 3 and 6: {date:?}");
+    assert_eq!(time.len(), 8, "TIME$ is HH:MM:SS: {time:?}");
+    assert_eq!(&time[2..3], ":", "separators at 3 and 6: {time:?}");
+    assert_eq!(&time[5..6], ":", "separators at 3 and 6: {time:?}");
+    assert_eq!(lines[2], "108", "and LEN sees them as strings: 10 and 8");
+}
+
+/// `FRE` reports free memory. A compiled program has no BASIC heap limit, so
+/// it answers a large number rather than pretending to run out.
+#[test]
+fn test_fre_returns_something_plausible() {
+    let output =
+        compile_and_run("IF FRE(0) > 1000 THEN PRINT \"plenty\" ELSE PRINT \"tight\"\n").unwrap();
+    assert_eq!(output.trim(), "plenty");
+}

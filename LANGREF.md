@@ -144,7 +144,24 @@ xbasic64 supports five data types, indicated by suffix characters:
 
 ### Default Type
 
-**Unsuffixed numeric variables default to DOUBLE (`#`).**
+**Unsuffixed numeric variables default to DOUBLE (`#`)** unless a `DEF*`
+statement says otherwise.
+
+### DEFINT, DEFLNG, DEFSNG, DEFDBL, DEFSTR
+
+These set the default type for names beginning with the given letters, so a
+listing need not suffix every variable:
+
+```basic
+DEFINT A-Z          ' every unsuffixed name is an INTEGER
+DEFSTR S            ' except those starting with S, which are strings
+DEFINT A, C-E       ' single letters and ranges, comma separated
+```
+
+A suffix always wins over the default, and the two spellings of one name are
+the same variable: after `DEFINT A`, `A` and `A%` share storage. The default
+applies to the whole program rather than from the statement onwards, which is
+where these are written in practice.
 
 ```basic
 X = 3.14159       ' X is Double
@@ -269,6 +286,8 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `OR`     | Bitwise/logical OR    |
 | `XOR`    | Bitwise/logical XOR   |
 | `NOT`    | Bitwise/logical NOT   |
+| `EQV`    | Bitwise equivalence   |
+| `IMP`    | Bitwise implication   |
 
 These operate bitwise on integers, allowing both logical tests and bit
 manipulation. Their operands are converted to integers first, and the result is
@@ -302,6 +321,8 @@ From highest to lowest:
 6. `NOT`
 7. `AND`
 8. `OR`, `XOR`
+9. `EQV`
+10. `IMP`
 
 Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
 
@@ -663,6 +684,46 @@ Clear screen:
 CLS
 ```
 
+### BEEP, ERASE and SYSTEM
+
+```basic
+BEEP                  ' Ring the terminal bell
+DIM Scores(10)
+ERASE Scores          ' Release it, so it may be DIMed again
+DIM Scores(50)
+SYSTEM                ' End the program, as END does
+```
+
+`ERASE` is recognised only before a name, so `Erase` remains usable as a label
+or a variable elsewhere. Its argument must be an array that is DIMed somewhere
+-- a name that is not one is a mistake, not a statement that does nothing.
+
+### LOCATE and COLOR
+
+Console control, written as ANSI escape sequences:
+
+```basic
+CLS
+LOCATE 5, 10          ' Row 5, column 10; both count from 1
+LOCATE 3              ' Row only; the column is left alone
+LOCATE , 20           ' Column only
+COLOR 14, 1           ' Bright yellow on blue
+COLOR 7               ' Foreground only
+PRINT "positioned"
+```
+
+Colours are GW-BASIC's 0-15, where 8-15 are the bright half. GW-BASIC's third
+`COLOR` argument sets the border, which a terminal has no equivalent for, and is
+refused rather than ignored. `LOCATE` with no row asks for row 1, since the row
+is not tracked the way the column is.
+
+`POS(0)` gives the column the next character will be written to, counting from 1:
+
+```basic
+PRINT "abc";
+PRINT POS(0)          ' 4
+```
+
 ### SWAP
 
 Exchange two values of the same type, including array elements:
@@ -847,23 +908,41 @@ STOP    ' Terminate (historically for debugging)
 | `EXP(x)`   | e raised to power x                      |
 | `LOG(x)`   | Natural logarithm                        |
 | `RND`      | Random number 0 ≤ r < 1                  |
+| `FRE(x)`   | Free memory; a large constant here       |
 
 **Numeric output:** `PRINT` writes the shortest decimal that reads back as the
 same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
 `0.3333333333333333`) and a `SINGLE` shows only the ~7 digits it carries.
 
-**RND behavior:**
+**RND behavior:** the argument selects between three behaviours.
+
 ```basic
 X = RND           ' Next random number
-X = RND(0)        ' Same as RND
-X = RND(-1)       ' Reseed with system time (implementation-defined)
+X = RND(1)        ' Next random number; any positive value does this
+X = RND(0)        ' The previous number again
+X = RND(-7)       ' Reseed from -7, then return the next number
 ```
+
+The generator starts from a fixed seed, so a program that never reseeds replays
+the same numbers on every run -- which is useful while debugging and wrong for a
+game. `RANDOMIZE` is how a program chooses:
+
+```basic
+RANDOMIZE            ' Seed from the clock: a different run every time
+RANDOMIZE TIMER      ' The same thing, written out
+RANDOMIZE 42         ' A fixed seed: the same run every time
+```
+
+GW-BASIC's bare `RANDOMIZE` asks the operator for a seed. A compiled program has
+nobody to ask, so it takes the clock.
 
 ### String Functions
 
 | Function              | Description                                    |
 |-----------------------|------------------------------------------------|
 | `LEN(s$)`             | Length of string                               |
+| `DATE$`               | Current date, as `MM-DD-YYYY`                  |
+| `TIME$`               | Current time, as `HH:MM:SS`                    |
 | `LEFT$(s$, n)`        | Leftmost n characters                          |
 | `RIGHT$(s$, n)`       | Rightmost n characters                         |
 | `MID$(s$, start, len)`| Substring (1-based index)                      |
@@ -1283,20 +1362,30 @@ Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
 - **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
-- **Console control** -- `LOCATE`, `COLOR`, `WIDTH`, `CSRLIN`, `POS`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
-- **Date and time** -- `DATE$`, `TIME$`
+- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Odds and ends** -- `RANDOMIZE`, `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
-- **`DEFINT` and friends** -- `DEFINT`, `DEFLNG`, `DEFSNG`, `DEFDBL`, `DEFSTR`; use a
-  type suffix or `DIM ... AS`
+- **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
 
-### Never
+### Out of scope
 
-Graphics, sound, joysticks, light pens, direct memory access, port I/O, the
-line printer, and the interpreter's own commands (`RUN`, `LIST`, `CHAIN`, ...)
-are permanent non-goals: they describe a machine and a way of working that a
-compiled 64-bit program does not have. **[NONGOALS.md](NONGOALS.md)** gives the
-full list and the reasoning.
+**Graphics** -- `SCREEN`, `PSET`, `PRESET`, `LINE` in its graphics form,
+`CIRCLE`, `DRAW`, `PAINT`, `POINT`, `VIEW`, `WINDOW`, `PALETTE`, `PMAP`. These
+need a display this compiler does not provide.
+
+**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`, `USR`,
+`INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`. There is no fixed address worth naming
+in a 64-bit hosted program: the video buffer is not memory, addresses are
+randomised, and the pages are protected. A `POKE` that appeared to work would be
+the worst outcome available, so these are refused rather than emulated.
+
+**Commands to the interpreter** -- `RUN`, `LIST`, `LOAD`, `SAVE`, `MERGE`,
+`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `TRON`, `TROFF`, `CLEAR`.
+These operate on program text that a compiled program no longer has.
+
+**Program chaining** -- `CHAIN` and `COMMON` need separate compilation.
+
+Everything else GW-BASIC provides that is missing here is listed above as not
+yet implemented. Each refused name says which of the two it is.
 
 ### Structural
 

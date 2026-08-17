@@ -72,13 +72,20 @@ Integration tests organized by feature area:
 - **Runtime checks on by default**: `--unsafe` removes them
 - **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
   the same `.globl` names; a new helper must be added to both
+- **Two assemblers, not just two runtimes**: `main.rs` assembles with GNU `as`
+  on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
+  assembler no test here runs. They disagree about `.equ len, . - label`: GNU
+  `as` folds it to an immediate, and an assembler that cannot prove the symbol
+  absolute assembles `mov reg, len` as a *load from that address* instead.
+  `CLS` did that on every Windows run. Bracket data with an `_end` label and
+  subtract at run time
 - **A runtime helper takes at most four arguments**: Win64 passes only four in
   registers, so `arg_reg(4)` panics there while System V accepts six. A helper
   that needs a fifth is invisible on Linux and breaks every Windows compile;
   fold an argument away instead (see `_rt_file_open_random`)
 - **Unsupported GW-BASIC names are refused, not ignored**: an unrecognised name
   is otherwise just a new variable, so `UNSUPPORTED` in `sema.rs` names the
-  keywords this compiler does not provide and why. See [NONGOALS.md](NONGOALS.md)
+  keywords this compiler does not provide and why
 - **String builtins returning a static buffer must copy**: two calls in one
   expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
   `_rt_oct` and `_rt_mk` end in `_rt_strdup`

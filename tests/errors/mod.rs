@@ -856,18 +856,11 @@ fn test_zero_arg_builtins_are_not_assignable() {
 #[test]
 fn test_unimplemented_gwbasic_names_are_diagnosed() {
     let cases = [
-        ("PRINT DATE$\n", "DATE$"),
-        ("PRINT TIME$\n", "TIME$"),
         ("A$ = INKEY$\n", "INKEY$"),
         ("PRINT ERR\n", "ERR"),
         ("PRINT ERL\n", "ERL"),
         ("PRINT CSRLIN\n", "CSRLIN"),
-        ("PRINT FRE(0)\n", "FRE"),
         ("A$ = INPUT$(3)\n", "INPUT$"),
-        ("LOCATE 1, 1\n", "LOCATE"),
-        ("COLOR 7\n", "COLOR"),
-        ("RANDOMIZE 5\n", "RANDOMIZE"),
-        ("DEFINT A-Z\n", "DEFINT"),
         ("PRINT PEEK(0)\n", "PEEK"),
         ("POKE 0, 1\n", "POKE"),
         ("SCREEN 13\n", "SCREEN"),
@@ -910,11 +903,17 @@ fn test_on_error_goto_is_refused() {
 }
 
 /// Assigning to one of these names is a GW-BASIC statement, not the creation
-/// of a variable that happens to be called DATE$.
+/// of a variable that happens to be called TIME$ or INKEY$.
 #[test]
 fn test_assignment_to_an_unimplemented_name_is_refused() {
-    let err = compile_only("DATE$ = \"01-01-2026\"\n").expect_err("DATE$ = ... must be refused");
+    // Still unimplemented: the refusal explains itself.
+    let err = compile_only("INKEY$ = \"x\"\n").expect_err("INKEY$ = ... must be refused");
     assert!(err.contains("not supported"), "got: {}", err.stderr);
+
+    // Implemented as a function: GW-BASIC's `DATE$ = ...` sets the system
+    // clock, which this does not do, so it is refused for a different reason.
+    let err = compile_only("DATE$ = \"01-01-2026\"\n").expect_err("DATE$ = ... must be refused");
+    assert!(err.contains("built-in function"), "got: {}", err.stderr);
 }
 
 /// The diagnostic says why, and distinguishes "not yet" from "not ever".
@@ -927,12 +926,44 @@ fn test_unsupported_diagnostics_explain_themselves() {
         err.stderr
     );
 
-    let err = compile_only("RANDOMIZE 5\n").expect_err("RANDOMIZE must be refused");
+    let err = compile_only("PRINT INKEY$\n").expect_err("INKEY$ must be refused");
     assert!(
         err.contains("not implemented yet"),
         "a planned feature should say so: {}",
         err.stderr
     );
+
+    // Sound was once refused as "not supported", which read as a decision
+    // rather than a queue position. These are deferred, not declined.
+    for source in ["SOUND 440, 5\n", "PLAY \"cde\"\n", "LPRINT \"x\"\n"] {
+        let err = compile_only(source).expect_err("must still be refused");
+        assert!(
+            err.contains("not implemented yet"),
+            "a deferred feature should say so: {}",
+            err.stderr
+        );
+    }
+}
+
+/// `NAME` was documented as unimplemented but missing from the table, so it
+/// fell through to "unknown subroutine" -- the generic message the table exists
+/// to replace. Nothing else distinguishes a name this compiler knows about and
+/// has not written from one the program simply misspelled.
+#[test]
+fn test_documented_unimplemented_names_are_all_in_the_table() {
+    for source in ["NAME \"a\"\n", "KILL \"a\"\n", "FILES\n", "SHELL \"ls\"\n"] {
+        let err = compile_only(source).expect_err("must be refused");
+        assert!(
+            err.contains("not implemented yet"),
+            "expected the table's message, got: {}",
+            err.stderr
+        );
+        assert!(
+            !err.contains("unknown subroutine"),
+            "fell through to the generic message: {}",
+            err.stderr
+        );
+    }
 }
 
 /// A name cannot be both an array and a procedure, or an array and a builtin.

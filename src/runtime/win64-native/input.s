@@ -171,7 +171,8 @@ _rt_input_number:
 
 .Linput_num_redo:
     lea rcx, [rip + _redo_msg]
-    mov rdx, _redo_msg_len
+    lea rdx, [rip + _redo_msg_end]
+    sub rdx, rcx            # length, from the data's own labels
     call _rt_con_string
     jmp .Linput_num_try
 

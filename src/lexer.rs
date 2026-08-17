@@ -73,6 +73,16 @@ fn keyword(s: &str) -> Option<Token> {
         "END" => Some(Token::End),
         "STOP" => Some(Token::Stop),
         "READ" => Some(Token::Read),
+        "DEFINT" => Some(Token::DefType(DataTypeWord::Integer)),
+        "DEFLNG" => Some(Token::DefType(DataTypeWord::Long)),
+        "DEFSNG" => Some(Token::DefType(DataTypeWord::Single)),
+        "DEFDBL" => Some(Token::DefType(DataTypeWord::Double)),
+        "DEFSTR" => Some(Token::DefType(DataTypeWord::String)),
+        "BEEP" => Some(Token::Beep),
+        "SYSTEM" => Some(Token::System),
+        "LOCATE" => Some(Token::Locate),
+        "COLOR" => Some(Token::Color),
+        "RANDOMIZE" => Some(Token::Randomize),
         "RESTORE" => Some(Token::Restore),
         "CLS" => Some(Token::Cls),
         "OPEN" => Some(Token::Open),
@@ -84,6 +94,8 @@ fn keyword(s: &str) -> Option<Token> {
         "OR" => Some(Token::Or),
         "NOT" => Some(Token::Not),
         "XOR" => Some(Token::Xor),
+        "EQV" => Some(Token::Eqv),
+        "IMP" => Some(Token::Imp),
         "MOD" => Some(Token::Mod),
         "USING" => Some(Token::Using),
         "SWAP" => Some(Token::Swap),
@@ -99,6 +111,19 @@ fn keyword(s: &str) -> Option<Token> {
         "ENDTYPE" => Some(Token::EndType),
         _ => None,
     }
+}
+
+/// The type a `DEF*` statement names.
+///
+/// Spelled out here rather than reusing the parser's `DataType` so the lexer
+/// keeps no dependency on the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataTypeWord {
+    Integer,
+    Long,
+    Single,
+    Double,
+    String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +173,13 @@ pub enum Token {
     /// See `Lexer::read_data_text` for why it is not tokenized.
     DataText(String),
     Read,
+    /// `DEFINT`/`DEFLNG`/`DEFSNG`/`DEFDBL`/`DEFSTR`, carrying which one.
+    DefType(DataTypeWord),
+    Beep,
+    System,
+    Locate,
+    Color,
+    Randomize,
     Restore,
     Cls,
     Open,
@@ -159,6 +191,8 @@ pub enum Token {
     Or,
     Not,
     Xor,
+    Eqv,
+    Imp,
     Mod,
     Using,
     Swap,

@@ -138,3 +138,134 @@ fn test_tab_and_spc() {
         "TAB accounts for text already printed"
     );
 }
+
+/// `LOCATE` positions the cursor, and `COLOR` sets the colours.
+///
+/// Both are written as ANSI escapes, which is the model `CLS` already uses on
+/// both platforms. The test reads the escape bytes out of stdout rather than
+/// looking at a terminal.
+#[test]
+fn test_locate_and_color_emit_escapes() {
+    let out = crate::common::compile_and_run_raw(
+        "LOCATE 5, 10\nPRINT \"x\";\nCOLOR 14, 1\nPRINT \"y\";\n",
+        "",
+    )
+    .expect("should compile");
+    out.assert_ran_to_completion("LOCATE then COLOR");
+    assert!(
+        out.stdout.contains("\u{1b}[5;10H"),
+        "LOCATE 5,10 should home the cursor there: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains('x') && out.stdout.contains('y'),
+        "the text still prints: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("\u{1b}[") && out.stdout.contains('m'),
+        "COLOR should emit an SGR sequence: {:?}",
+        out.stdout
+    );
+}
+
+/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does.
+#[test]
+fn test_locate_row_only() {
+    let out = crate::common::compile_and_run_raw("LOCATE 7\n", "").expect("should compile");
+    out.assert_ran_to_completion("LOCATE with a row only");
+    assert!(
+        out.stdout.contains("\u{1b}[7;"),
+        "row given, column preserved: {:?}",
+        out.stdout
+    );
+}
+
+/// `POS(0)` reports the column the next character will go to, counting from 1.
+#[test]
+fn test_pos_reports_the_column() {
+    let output = compile_and_run(
+        r#"
+PRINT POS(0)
+PRINT "abc";
+PRINT POS(0)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "1", "a fresh line starts at column 1");
+    assert!(
+        lines[1].ends_with('4'),
+        "after \"abc\" the column is 4: {lines:?}"
+    );
+}
+
+/// `CLS` puts the cursor at home, so the column tracker must agree.
+///
+/// It did not: after clearing, `TAB` still believed the column it had before
+/// and emitted a spurious newline to reach a column already passed.
+#[test]
+fn test_cls_resets_the_column() {
+    let out = crate::common::compile_and_run_raw(
+        "PRINT \"0123456789012345678901234567890123456789\";\nCLS\nPRINT TAB(5); \"X\"\n",
+        "",
+    )
+    .expect("should compile");
+    // Before this line the test could not fail on a crash: a program that died
+    // in CLS left nothing after the escape, which is exactly what the
+    // assertion below wants to see.
+    out.assert_ran_to_completion("PRINT then CLS then TAB");
+    let after_cls = out.stdout.rsplit("\u{1b}[H").next().unwrap_or("");
+    assert!(
+        !after_cls.starts_with('\n'),
+        "TAB after CLS must not wrap to a new line: {:?}",
+        out.stdout
+    );
+}
+
+/// Every console statement's program runs to completion.
+///
+/// Blunt on purpose. These helpers are written twice, and the Win64 half is
+/// the one no developer runs -- CI is the only place it executes at all. The
+/// tests above read what each statement *wrote*, which a crash can satisfy by
+/// writing nothing; this one only asks whether the program survived, which a
+/// crash cannot.
+#[test]
+fn test_console_statements_run_to_completion() {
+    for (what, source) in [
+        ("CLS", "CLS\n"),
+        ("CLS after PRINT", "PRINT \"x\"\nCLS\n"),
+        ("CLS twice", "CLS\nCLS\n"),
+        ("LOCATE", "LOCATE 2, 5\n"),
+        ("LOCATE row only", "LOCATE 3\n"),
+        ("LOCATE column only", "LOCATE , 8\n"),
+        ("COLOR", "COLOR 14, 1\n"),
+        ("POS", "PRINT POS(0)\n"),
+        ("BEEP", "BEEP\n"),
+        ("TIMER", "PRINT TIMER\n"),
+        ("RANDOMIZE", "RANDOMIZE 42\n"),
+        ("RANDOMIZE TIMER", "RANDOMIZE TIMER\n"),
+        ("RND", "PRINT RND\n"),
+        ("DATE$ and TIME$", "PRINT DATE$\nPRINT TIME$\n"),
+        ("FRE", "PRINT FRE(0)\n"),
+        (
+            "the lot together",
+            "CLS\nCOLOR 14, 1\nLOCATE 2, 5\nPRINT \"x\"; POS(0)\n",
+        ),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "")
+            .unwrap_or_else(|e| panic!("{what} should compile: {e}"));
+        run.assert_ran_to_completion(what);
+    }
+}
+
+/// `LOCATE` also sets the column the tracker believes, for the same reason.
+#[test]
+fn test_locate_sets_the_column() {
+    let output = compile_and_run("LOCATE 3, 12\nPRINT POS(0)\n").unwrap();
+    // The escape sequence LOCATE wrote precedes the number on the same line.
+    assert!(
+        output.trim().ends_with("12"),
+        "POS should follow LOCATE: {output:?}"
+    );
+}

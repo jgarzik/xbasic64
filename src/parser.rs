@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::lexer::Token;
+use crate::lexer::{DataTypeWord, Token};
 use std::collections::{HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
@@ -16,28 +16,32 @@ use std::collections::{HashSet, VecDeque};
 /// Returns (precedence, BinaryOp) or None if not a binary operator
 fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
     match token {
-        // Precedence 1: logical OR and XOR (lowest), which share a level
-        Token::Or => Some((1, BinaryOp::Or)),
-        Token::Xor => Some((1, BinaryOp::Xor)),
-        // Precedence 2: logical AND
-        Token::And => Some((2, BinaryOp::And)),
-        // Precedence 3 is NOT, a prefix operator; see `parse_prec_inner`.
-        // Precedence 4: comparison
+        // Precedence 1: implication (lowest)
+        Token::Imp => Some((1, BinaryOp::Imp)),
+        // Precedence 2: equivalence
+        Token::Eqv => Some((2, BinaryOp::Eqv)),
+        // Precedence 3: logical OR and XOR, which share a level
+        Token::Or => Some((3, BinaryOp::Or)),
+        Token::Xor => Some((3, BinaryOp::Xor)),
+        // Precedence 4: logical AND
+        Token::And => Some((4, BinaryOp::And)),
+        // Precedence 5 is NOT, a prefix operator; see `parse_prec_inner`.
+        // Precedence 6: comparison
         Token::Eq => Some((CMP_PREC, BinaryOp::Eq)),
         Token::Ne => Some((CMP_PREC, BinaryOp::Ne)),
         Token::Lt => Some((CMP_PREC, BinaryOp::Lt)),
         Token::Gt => Some((CMP_PREC, BinaryOp::Gt)),
         Token::Le => Some((CMP_PREC, BinaryOp::Le)),
         Token::Ge => Some((CMP_PREC, BinaryOp::Ge)),
-        // Precedence 5: additive
-        Token::Plus => Some((5, BinaryOp::Add)),
-        Token::Minus => Some((5, BinaryOp::Sub)),
-        // Precedence 6: multiplicative
-        Token::Star => Some((6, BinaryOp::Mul)),
-        Token::Slash => Some((6, BinaryOp::Div)),
-        Token::Backslash => Some((6, BinaryOp::IntDiv)),
-        Token::Mod => Some((6, BinaryOp::Mod)),
-        // Precedence 7: power
+        // Precedence 7: additive
+        Token::Plus => Some((7, BinaryOp::Add)),
+        Token::Minus => Some((7, BinaryOp::Sub)),
+        // Precedence 8: multiplicative
+        Token::Star => Some((8, BinaryOp::Mul)),
+        Token::Slash => Some((8, BinaryOp::Div)),
+        Token::Backslash => Some((8, BinaryOp::IntDiv)),
+        Token::Mod => Some((8, BinaryOp::Mod)),
+        // Precedence 9: power
         Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
@@ -48,10 +52,10 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
 /// Named because `NOT` sits directly below it: `NOT` takes an operand at this
 /// level, which is what makes `NOT A = B` group as `NOT (A = B)` while
 /// `NOT A AND B` groups as `(NOT A) AND B`.
-const CMP_PREC: u8 = 4;
+const CMP_PREC: u8 = 6;
 
 /// Precedence of `^`, the tightest-binding binary operator.
-const POWER_PREC: u8 = 7;
+const POWER_PREC: u8 = 9;
 
 /// How deeply expressions and blocks may nest before the parser gives up.
 ///
@@ -221,6 +225,37 @@ pub enum StmtKind {
     },
     Data(Vec<Literal>),
     Read(Vec<LValue>),
+    /// `DEFINT A-Z` and friends -- the default type for unsuffixed names whose
+    /// first letter falls in one of the ranges.
+    ///
+    /// Held as (first, last) inclusive letter pairs, already upper-cased.
+    DefType {
+        ty: DataType,
+        ranges: Vec<(char, char)>,
+    },
+    /// `BEEP` -- ring the terminal bell.
+    Beep,
+    /// `ERASE a, b` -- release arrays so they can be dimensioned again.
+    Erase(Vec<String>),
+    /// `LOCATE [row][, col]` -- move the cursor.
+    ///
+    /// Either part may be omitted, in which case that coordinate is left where
+    /// it is; GW-BASIC also takes cursor-shape arguments, which have no meaning
+    /// on a terminal and are refused.
+    Locate {
+        row: Option<Expr>,
+        col: Option<Expr>,
+    },
+    /// `COLOR fg[, bg]` -- set the text colours.
+    Color {
+        fg: Option<Expr>,
+        bg: Option<Expr>,
+    },
+    /// `RANDOMIZE [expr]` -- reseed the random number generator.
+    ///
+    /// GW-BASIC prompts for a seed when none is given; a compiled program has
+    /// nobody to prompt, so `None` means "seed from the clock".
+    Randomize(Option<Expr>),
     Restore(Option<GotoTarget>),
     Cls,
     SelectCase {
@@ -439,6 +474,10 @@ pub enum BinaryOp {
     And,
     Or,
     Xor,
+    /// Bitwise equivalence: `NOT (a XOR b)`.
+    Eqv,
+    /// Bitwise implication: `(NOT a) OR b`.
+    Imp,
 }
 
 /// BASIC data types following GW-BASIC/QuickBASIC conventions
@@ -682,6 +721,18 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Stop => "STOP",
         Token::DataText(_) => "DATA",
         Token::Read => "READ",
+        Token::DefType(w) => match w {
+            DataTypeWord::Integer => "DEFINT",
+            DataTypeWord::Long => "DEFLNG",
+            DataTypeWord::Single => "DEFSNG",
+            DataTypeWord::Double => "DEFDBL",
+            DataTypeWord::String => "DEFSTR",
+        },
+        Token::Beep => "BEEP",
+        Token::System => "SYSTEM",
+        Token::Locate => "LOCATE",
+        Token::Color => "COLOR",
+        Token::Randomize => "RANDOMIZE",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
         Token::Open => "OPEN",
@@ -693,6 +744,8 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Or => "OR",
         Token::Not => "NOT",
         Token::Xor => "XOR",
+        Token::Eqv => "EQV",
+        Token::Imp => "IMP",
         Token::Mod => "MOD",
         Token::Using => "USING",
         Token::Swap => "SWAP",
@@ -1270,6 +1323,19 @@ impl Parser {
             Token::Function => self.parse_function(),
             Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
+            Token::DefType(w) => self.parse_def_type(w),
+            Token::Beep => {
+                self.advance();
+                Ok(StmtKind::Beep)
+            }
+            // SYSTEM ends the program, which is what END already means.
+            Token::System => {
+                self.advance();
+                Ok(StmtKind::End)
+            }
+            Token::Locate => self.parse_locate(),
+            Token::Color => self.parse_color(),
+            Token::Randomize => self.parse_randomize(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
                 self.advance();
@@ -1304,6 +1370,7 @@ impl Parser {
                     "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
+                    "ERASE" if self.next_is_ident() => self.parse_erase(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),
@@ -2576,6 +2643,149 @@ impl Parser {
         }
 
         Ok(StmtKind::Read(vars))
+    }
+
+    /// `ERASE A, B` -- one or more array names.
+    ///
+    /// Contextual rather than reserved, like CALL above it: LANGREF's own
+    /// `ON ... GOSUB Draw, Erase` example uses the word as a label, and a
+    /// reserved ERASE would take that name away from every program.
+    fn parse_erase(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume ERASE
+        let mut names = Vec::new();
+        loop {
+            let Token::Ident(name) = self.advance() else {
+                return err("ERASE needs an array name");
+            };
+            names.push(name);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(StmtKind::Erase(names))
+    }
+
+    /// `LOCATE row, col`, `LOCATE row`, `LOCATE , col`.
+    fn parse_locate(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume LOCATE
+        let (row, col) = self.parse_two_optional_args()?;
+        if row.is_none() && col.is_none() {
+            return err("LOCATE needs a row, a column, or both");
+        }
+        Ok(StmtKind::Locate { row, col })
+    }
+
+    /// `COLOR fg, bg`, `COLOR fg`, `COLOR , bg`.
+    fn parse_color(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume COLOR
+        let (fg, bg) = self.parse_two_optional_args()?;
+        if fg.is_none() && bg.is_none() {
+            return err("COLOR needs a foreground, a background, or both");
+        }
+        // GW-BASIC's third argument is the border colour, which a terminal has
+        // no equivalent for.
+        if matches!(self.peek(), Token::Comma) {
+            return err("COLOR takes a foreground and a background; a terminal has no border");
+        }
+        Ok(StmtKind::Color { fg, bg })
+    }
+
+    /// `a, b` where either side may be left out -- the shape LOCATE and COLOR
+    /// share.
+    fn parse_two_optional_args(&mut self) -> PResult<(Option<Expr>, Option<Expr>)> {
+        let ends = |t: &Token| matches!(t, Token::Newline | Token::Colon | Token::Eof);
+        let first = if matches!(self.peek(), Token::Comma) || ends(self.peek()) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        let second = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            if ends(self.peek()) {
+                None
+            } else {
+                Some(self.parse_expression()?)
+            }
+        } else {
+            None
+        };
+        Ok((first, second))
+    }
+
+    /// `DEFINT A-Z`, `DEFSTR S`, `DEFINT A, C-E`.
+    ///
+    /// Each clause is a single letter or an inclusive range of them. The lexer
+    /// has already upper-cased the identifiers, so `a-z` and `A-Z` arrive the
+    /// same.
+    fn parse_def_type(&mut self, word: DataTypeWord) -> PResult<StmtKind> {
+        self.advance(); // consume DEFINT/DEFLNG/...
+        let ty = match word {
+            DataTypeWord::Integer => DataType::Integer,
+            DataTypeWord::Long => DataType::Long,
+            DataTypeWord::Single => DataType::Single,
+            DataTypeWord::Double => DataType::Double,
+            DataTypeWord::String => DataType::String,
+        };
+
+        let mut ranges = Vec::new();
+        loop {
+            let first = self.def_type_letter()?;
+            let last = if matches!(self.peek(), Token::Minus) {
+                self.advance();
+                self.def_type_letter()?
+            } else {
+                first
+            };
+            if last < first {
+                return err(format!(
+                    "the letter range {}-{} runs backwards",
+                    first, last
+                ));
+            }
+            ranges.push((first, last));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(StmtKind::DefType { ty, ranges })
+    }
+
+    /// One letter of a `DEF*` range.
+    ///
+    /// A single letter lexes as an identifier, so this checks the length here
+    /// rather than trusting the token.
+    fn def_type_letter(&mut self) -> PResult<char> {
+        let tok = self.advance();
+        if let Token::Ident(name) = &tok {
+            let mut chars = name.chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                if c.is_ascii_alphabetic() {
+                    return Ok(c);
+                }
+            }
+        }
+        err(format!(
+            "expected a single letter in the range, got {}",
+            describe_token(&tok)
+        ))
+    }
+
+    /// `RANDOMIZE`, `RANDOMIZE n`, `RANDOMIZE TIMER`.
+    ///
+    /// `TIMER` needs no special case: it is an ordinary builtin, so the general
+    /// expression form covers it.
+    fn parse_randomize(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume RANDOMIZE
+        let seed = if matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        Ok(StmtKind::Randomize(seed))
     }
 
     fn parse_restore(&mut self) -> PResult<StmtKind> {

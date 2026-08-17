@@ -28,7 +28,12 @@ _fmt_input_str: .asciz "%1023[^\n]"
 _fmt_hex: .asciz "%llX"
 _fmt_oct: .asciz "%llo"
 _rng_state: .quad 0x12345678DEADBEEF
+_rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .asciz "\033[2J\033[H"
+_locate_fmt: .asciz "\033[%d;%dH"
+_date_fmt: .asciz "%m-%d-%Y"
+_time_fmt: .asciz "%H:%M:%S"
+_color_fmt: .asciz "\033[%d;%dm"
 _redo_msg: .asciz "?Redo from start\n"
 
 # Scratch buffers. These start as zeros, so they belong in .bss: in .data

@@ -32,6 +32,29 @@ impl RunOutput {
     pub fn lines(&self) -> Vec<&str> {
         self.stdout.trim().lines().collect()
     }
+
+    /// Panic unless the program ran to completion.
+    ///
+    /// [`compile_and_run_raw`] deliberately returns `Ok` whatever the program
+    /// did, which makes a crash look like truncated output -- and an assertion
+    /// phrased as "this must not appear" then passes *because* the program
+    /// died. The CLS test was written that way and stayed green on Windows
+    /// while the program it ran was aborting with an access violation.
+    ///
+    /// Any test that reads stdout for what a statement produced wants this
+    /// too. The exit code is printed in hex: Windows says what went wrong in
+    /// it, and 0xC0000005 is not a number the compiler ever chooses.
+    pub fn assert_ran_to_completion(&self, what: &str) {
+        assert_eq!(
+            self.exit_code,
+            Some(0),
+            "{what} did not run to completion: exit {:?} (0x{:08X}), stdout {:?}, stderr {:?}",
+            self.exit_code,
+            self.exit_code.unwrap_or(-1),
+            self.stdout,
+            self.stderr
+        );
+    }
 }
 
 /// A failure of the compiler itself (lexer, parser, sema, codegen, assembler, linker).

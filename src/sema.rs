@@ -73,6 +73,10 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("MKL$", 1, 1),
     ("MKS$", 1, 1),
     ("OCT$", 1, 1),
+    ("POS", 1, 1),
+    ("DATE$", 0, 0),
+    ("TIME$", 0, 0),
+    ("FRE", 1, 1),
     ("RIGHT$", 2, 2),
     ("RTRIM$", 1, 1),
     ("RND", 0, 1),
@@ -109,26 +113,15 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("ERL", "error trapping is not implemented yet"),
     ("ERROR", "error trapping is not implemented yet"),
     ("RESUME", "error trapping is not implemented yet"),
-    ("DATE$", "DATE$ is not implemented yet"),
-    ("TIME$", "TIME$ is not implemented yet"),
     (
         "INKEY$",
         "INKEY$ needs raw console input, which is not implemented yet",
     ),
     ("INPUT$", "INPUT$ is not implemented yet"),
-    ("LOCATE", "console cursor control is not implemented yet"),
-    ("COLOR", "console colour control is not implemented yet"),
     ("WIDTH", "console width control is not implemented yet"),
     ("CSRLIN", "console cursor position is not implemented yet"),
-    ("POS", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
-    ("BEEP", "BEEP is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
-    ("RANDOMIZE", "RANDOMIZE is not implemented yet"),
-    (
-        "ERASE",
-        "ERASE is not implemented yet; REDIM clears an array",
-    ),
     (
         "SHARED",
         "SHARED is not implemented; module-level names are already global",
@@ -137,32 +130,15 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("SHELL", "SHELL is not implemented yet"),
     ("ENVIRON$", "ENVIRON$ is not implemented yet"),
     ("KILL", "KILL is not implemented yet"),
+    ("NAME", "NAME is not implemented yet"),
     ("FILES", "FILES is not implemented yet"),
     ("CHDIR", "CHDIR is not implemented yet"),
     ("MKDIR", "MKDIR is not implemented yet"),
     ("RMDIR", "RMDIR is not implemented yet"),
-    ("FRE", "FRE is not implemented yet"),
-    (
-        "DEFINT",
-        "DEFINT is not supported; use a type suffix or DIM ... AS",
-    ),
-    (
-        "DEFLNG",
-        "DEFLNG is not supported; use a type suffix or DIM ... AS",
-    ),
-    (
-        "DEFSNG",
-        "DEFSNG is not supported; use a type suffix or DIM ... AS",
-    ),
-    (
-        "DEFDBL",
-        "DEFDBL is not supported; use a type suffix or DIM ... AS",
-    ),
-    (
-        "DEFSTR",
-        "DEFSTR is not supported; use a type suffix or DIM ... AS",
-    ),
-    // Permanent non-goals: these describe a machine xbasic64 does not target.
+    // Refused for now with a reason, rather than a promise about the future.
+    // Some of these describe a machine xbasic64 does not target -- the 8086's
+    // memory map, its I/O ports, its display adapters -- and some are simply
+    // not written yet.
     (
         "PEEK",
         "direct memory access has no meaning in a 64-bit hosted program",
@@ -187,26 +163,23 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("BLOAD", "memory images are tied to the 8086 memory map"),
     ("BSAVE", "memory images are tied to the 8086 memory map"),
     ("SCREEN", "graphics modes are not supported"),
-    ("PSET", "graphics is not supported"),
-    ("PRESET", "graphics is not supported"),
-    ("CIRCLE", "graphics is not supported"),
-    ("PAINT", "graphics is not supported"),
-    ("DRAW", "graphics is not supported"),
-    ("PALETTE", "graphics is not supported"),
-    ("WINDOW", "graphics is not supported"),
-    ("PMAP", "graphics is not supported"),
-    ("POINT", "graphics is not supported"),
-    ("SOUND", "sound is not supported"),
-    ("PLAY", "sound is not supported"),
+    ("PSET", "graphics is not supported by this compiler"),
+    ("PRESET", "graphics is not supported by this compiler"),
+    ("CIRCLE", "graphics is not supported by this compiler"),
+    ("PAINT", "graphics is not supported by this compiler"),
+    ("DRAW", "graphics is not supported by this compiler"),
+    ("PALETTE", "graphics is not supported by this compiler"),
+    ("WINDOW", "graphics is not supported by this compiler"),
+    ("PMAP", "graphics is not supported by this compiler"),
+    ("POINT", "graphics is not supported by this compiler"),
+    ("SOUND", "SOUND is not implemented yet"),
+    ("PLAY", "PLAY is not implemented yet"),
     ("PEN", "light-pen input is not supported"),
     ("STICK", "joystick input is not supported"),
     ("STRIG", "joystick input is not supported"),
-    ("KEY", "soft function keys are not supported"),
-    (
-        "LPRINT",
-        "there is no line printer; PRINT to a file instead",
-    ),
-    ("LPOS", "there is no line printer"),
+    ("KEY", "KEY is not implemented yet"),
+    ("LPRINT", "LPRINT is not implemented yet"),
+    ("LPOS", "LPOS is not implemented yet"),
     (
         "CHAIN",
         "a compiled program cannot load another program's code",
@@ -394,13 +367,266 @@ pub struct Diagnostic {
 /// which meant the same source produced a different AST depending on whether
 /// its DIM came earlier or later in the file, and ignored scope entirely.
 pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
+    apply_default_types(program);
+
     let mut a = Analyzer::default();
+    walk_stmts(&program.statements, &mut |stmt| {
+        if let StmtKind::Erase(names) = &stmt.kind {
+            a.erased.extend(names.iter().cloned());
+        }
+    });
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
+}
+
+/// Give every unsuffixed name the suffix its `DEF*` statement implies.
+///
+/// `DEFINT A-Z` makes `X` an INTEGER. Rather than teach the nineteen places that
+/// ask "what type is this name" to consult a table -- `DataType::from_suffix` in
+/// thirteen of them and `is_string_var` in six more -- this rewrites `X` to `X%`
+/// once, up front, and every one of them then answers correctly without
+/// changing. Two oracles disagreeing is exactly the bug shape that made
+/// `LEN(S)` fail on a `DIM S AS STRING * 4`, and `DEFSTR` would have recreated
+/// it precisely.
+///
+/// Merging is the correct reading, not a side effect: in GW-BASIC `DEFINT A`
+/// makes `A` and `A%` the same variable, and rewriting the first to the second
+/// is what makes them share storage here.
+///
+/// Two kinds of name are left alone. A builtin is not a variable, so `DEFSTR
+/// A-Z` must not turn `LEN` into `LEN$`. A procedure is not one either, and its
+/// name has to read the same at its definition and at every call, so both are
+/// excluded together rather than half-rewritten.
+fn apply_default_types(program: &mut Program) {
+    let table = collect_def_types(&program.statements);
+    if table.iter().all(|t| *t == DataType::Double) {
+        return; // no DEF* in the program, or all of them redundant
+    }
+    let procs = procedure_names(&program.statements);
+    rewrite_names(&mut program.statements, &table, &procs);
+}
+
+/// The default type for each initial letter, `A` first.
+///
+/// GW-BASIC applies a `DEF*` from where it appears onwards; this applies it to
+/// the whole program. In practice these sit on a listing's first line, and a
+/// name whose type changed halfway through a program would be a different
+/// variable in every place that reads it.
+fn collect_def_types(stmts: &[Stmt]) -> [DataType; 26] {
+    let mut table = [DataType::Double; 26];
+    walk_stmts(stmts, &mut |stmt| {
+        if let StmtKind::DefType { ty, ranges } = &stmt.kind {
+            for (first, last) in ranges {
+                for c in *first..=*last {
+                    table[(c as u8 - b'A') as usize] = *ty;
+                }
+            }
+        }
+    });
+    table
+}
+
+/// Every SUB and FUNCTION name in the program, upper-cased.
+fn procedure_names(stmts: &[Stmt]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    walk_stmts(stmts, &mut |stmt| match &stmt.kind {
+        StmtKind::Sub { name, .. } | StmtKind::Function { name, .. } => {
+            names.insert(name.clone());
+        }
+        _ => {}
+    });
+    names
+}
+
+/// The suffix `name` should carry, or `None` to leave it alone.
+fn defaulted(name: &str, table: &[DataType; 26], procs: &HashSet<String>) -> Option<String> {
+    if name.ends_with(['%', '&', '!', '#', '$']) {
+        return None; // an explicit suffix always wins
+    }
+    if procs.contains(name) || builtin(name).is_some() {
+        return None;
+    }
+    let first = name.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    let suffix = match table[(first as u8 - b'A') as usize] {
+        DataType::Integer => '%',
+        DataType::Long => '&',
+        DataType::Single => '!',
+        DataType::String => '$',
+        DataType::Double => return None, // already the default
+    };
+    Some(format!("{}{}", name, suffix))
+}
+
+/// Rewrite every name that denotes a variable or an array.
+///
+/// Record field names and TYPE names are deliberately absent: a field's type
+/// comes from its own `AS` clause, and a TYPE name is not a value at all.
+fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<String>) {
+    fn expr(e: &mut Expr, table: &[DataType; 26], procs: &HashSet<String>) {
+        match e {
+            Expr::Variable(name) | Expr::ArrayAccess { name, .. } | Expr::FnCall { name, .. } => {
+                if let Some(renamed) = defaulted(name, table, procs) {
+                    *name = renamed;
+                }
+            }
+            _ => {}
+        }
+        match e {
+            Expr::Unary { operand, .. } => expr(operand, table, procs),
+            Expr::Binary { left, right, .. } => {
+                expr(left, table, procs);
+                expr(right, table, procs);
+            }
+            Expr::Field { base, .. } => expr(base, table, procs),
+            Expr::ArrayAccess { indices, .. } => {
+                indices.iter_mut().for_each(|i| expr(i, table, procs))
+            }
+            Expr::FnCall { args, .. } => args.iter_mut().for_each(|a| expr(a, table, procs)),
+            Expr::Literal(_) | Expr::Variable(_) => {}
+        }
+    }
+
+    fn lvalue(lv: &mut LValue, table: &[DataType; 26], procs: &HashSet<String>) {
+        if let Some(renamed) = defaulted(&lv.name, table, procs) {
+            lv.name = renamed;
+        }
+    }
+
+    for stmt in stmts.iter_mut() {
+        // Every expression the statement holds, including those inside the
+        // LValues it owns -- `for_each_expr_mut` already visits both.
+        for_each_expr_mut(stmt, &mut |e| expr(e, table, procs));
+
+        // The names a statement carries outside an expression, including the
+        // LValues `for_each_expr_mut` does not reach.
+        //
+        // Deliberately without a wildcard, like `for_each_expr_mut` and
+        // `gen_stmt`: a statement kind that carries a name and is missing here
+        // keeps the name the program wrote, while every other mention of it is
+        // renamed, so the two stop matching and the statement silently does
+        // nothing. `ERASE` did exactly that -- it sat in the wildcard, went on
+        // naming `A` after `DEFINT A-Z` had made the array `A%`, and erased
+        // nothing. A new variant is now a compile error until it says which it
+        // is.
+        match &mut stmt.kind {
+            StmtKind::Let { name, .. } | StmtKind::Const { name, .. } => {
+                if let Some(renamed) = defaulted(name, table, procs) {
+                    *name = renamed;
+                }
+            }
+            StmtKind::For { var, .. } => {
+                if let Some(renamed) = defaulted(var, table, procs) {
+                    *var = renamed;
+                }
+            }
+            StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+                for d in decls.iter_mut() {
+                    // A declarator with an `AS` clause states its own type.
+                    if d.ty.is_none() {
+                        if let Some(renamed) = defaulted(&d.name, table, procs) {
+                            d.name = renamed;
+                        }
+                    }
+                }
+            }
+            StmtKind::Sub { params, .. } | StmtKind::Function { params, .. } => {
+                for p in params.iter_mut() {
+                    if p.ty.is_none() {
+                        if let Some(renamed) = defaulted(&p.name, table, procs) {
+                            p.name = renamed;
+                        }
+                    }
+                }
+            }
+            StmtKind::Erase(names) => {
+                for name in names.iter_mut() {
+                    if let Some(renamed) = defaulted(name, table, procs) {
+                        *name = renamed;
+                    }
+                }
+            }
+            StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
+                vars.iter_mut().for_each(|v| lvalue(v, table, procs))
+            }
+            StmtKind::LineInput { var, .. } => lvalue(var, table, procs),
+            StmtKind::Swap(a, b) => {
+                lvalue(a, table, procs);
+                lvalue(b, table, procs);
+            }
+            StmtKind::MidAssign { target, .. }
+            | StmtKind::FieldAssign { target, .. }
+            | StmtKind::SetField { target, .. } => lvalue(target, table, procs),
+            StmtKind::Field { fields, .. } => fields
+                .iter_mut()
+                .for_each(|f| lvalue(&mut f.target, table, procs)),
+
+            // Nothing outside an expression to rename. A procedure call names
+            // a procedure, a GOTO names a label, and neither is a variable.
+            StmtKind::Label(_)
+            | StmtKind::LabelName(_)
+            | StmtKind::Print { .. }
+            | StmtKind::If { .. }
+            | StmtKind::While { .. }
+            | StmtKind::DoLoop { .. }
+            | StmtKind::Goto(_)
+            | StmtKind::Gosub(_)
+            | StmtKind::Return
+            | StmtKind::OnGoto { .. }
+            | StmtKind::OnGosub { .. }
+            | StmtKind::Call { .. }
+            | StmtKind::ExitLoop { .. }
+            | StmtKind::ExitProc
+            | StmtKind::OptionBase(_)
+            | StmtKind::TypeDef { .. }
+            | StmtKind::Data(_)
+            | StmtKind::DefType { .. }
+            | StmtKind::Beep
+            | StmtKind::Locate { .. }
+            | StmtKind::Color { .. }
+            | StmtKind::Randomize(_)
+            | StmtKind::Restore(_)
+            | StmtKind::Cls
+            | StmtKind::SelectCase { .. }
+            | StmtKind::End
+            | StmtKind::Stop
+            | StmtKind::Open { .. }
+            | StmtKind::Close { .. }
+            | StmtKind::GetPut { .. }
+            | StmtKind::Lock { .. } => {}
+        }
+
+        // Nested bodies.
+        match &mut stmt.kind {
+            StmtKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                rewrite_names(then_branch, table, procs);
+                if let Some(eb) = else_branch {
+                    rewrite_names(eb, table, procs);
+                }
+            }
+            StmtKind::SelectCase { cases, .. } => {
+                for (_, body) in cases.iter_mut() {
+                    rewrite_names(body, table, procs);
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::While { body, .. }
+            | StmtKind::DoLoop { body, .. }
+            | StmtKind::Sub { body, .. }
+            | StmtKind::Function { body, .. } => rewrite_names(body, table, procs),
+            _ => {}
+        }
+    }
 }
 
 /// Call `f` for every statement in `stmts`, nested bodies included.
@@ -491,6 +717,15 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             lvalue(a, f);
             lvalue(b, f);
         }
+        StmtKind::Locate { row, col } => {
+            row.iter_mut().for_each(&mut *f);
+            col.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Color { fg, bg } => {
+            fg.iter_mut().for_each(&mut *f);
+            bg.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
         StmtKind::Const { value, .. } => f(value),
         StmtKind::FieldAssign { target, value } => {
             lvalue(target, f);
@@ -562,6 +797,9 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::ExitProc
         | StmtKind::OptionBase(_)
         | StmtKind::TypeDef { .. }
+        | StmtKind::DefType { .. }
+        | StmtKind::Beep
+        | StmtKind::Erase(_)
         | StmtKind::Data(_)
         | StmtKind::Restore(_)
         | StmtKind::Cls
@@ -573,6 +811,8 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
 #[derive(Default)]
 struct Analyzer {
     symbols: Symbols,
+    /// Arrays the program ERASEs somewhere, which may therefore be DIMed again.
+    erased: HashSet<String>,
     diagnostics: Vec<Diagnostic>,
     /// Enclosing loops, innermost last: true for FOR, false for WHILE/DO.
     loops: Vec<bool>,
@@ -749,7 +989,7 @@ impl Analyzer {
                             );
                         }
                         if let Some(prev) = self.symbols.arrays.get(&key) {
-                            if !is_redim {
+                            if !is_redim && !self.erased.contains(&key.1) {
                                 self.error(
                                     stmt.line,
                                     format!("array '{}' is already declared", decl.name),
@@ -1381,6 +1621,21 @@ impl Analyzer {
                     self.check_expr(start, scope, line);
                     if let Some(e) = end {
                         self.check_expr(e, scope, line);
+                    }
+                }
+            }
+            // Codegen skips an ERASE name it cannot resolve, on the grounds
+            // that sema has already complained. It had not: this arm did not
+            // exist, so `ERASE TOTLA` for `ERASE TOTAL` compiled clean and
+            // erased nothing. The lookup is the one every array use gets --
+            // the enclosing procedure first, then the module.
+            StmtKind::Erase(names) => {
+                for name in names {
+                    if self.symbols.lookup_array(scope, name).is_none() {
+                        self.error(
+                            line,
+                            format!("ERASE needs an array, and '{name}' is not a declared array"),
+                        );
                     }
                 }
             }
@@ -2114,6 +2369,8 @@ fn op_name(op: BinaryOp) -> &'static str {
         BinaryOp::Div => "/",
         BinaryOp::IntDiv => "\\",
         BinaryOp::Mod => "MOD",
+        BinaryOp::Eqv => "EQV",
+        BinaryOp::Imp => "IMP",
         BinaryOp::Pow => "^",
         BinaryOp::Eq => "=",
         BinaryOp::Ne => "<>",
