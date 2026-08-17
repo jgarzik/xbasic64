@@ -502,6 +502,75 @@ fn test_error_statement_rejects_a_code_out_of_range() {
     }
 }
 
+/// A bad numeric operand is diagnosed, not a compiler panic.
+///
+/// `check_stmt` has a wildcard, so nothing forced an arm for a new statement
+/// and the operands of four of them were never checked at all. `ERROR
+/// NoSuchFn(1)` reached the codegen line that asserts "sema checked the array
+/// is declared" -- it had not -- and `LOCATE A$, 1` reached the
+/// implicit-String-conversion panic. A builtin's arguments were always
+/// checked, which is why `SQR(A$)` says so properly; a statement's were not.
+/// Turning panics into diagnostics is the point of that pass.
+#[test]
+fn test_numeric_operands_are_checked_not_panicked_on() {
+    for (source, expect) in [
+        ("A$ = \"x\"\nERROR A$\n", "ERROR needs a number"),
+        ("ERROR \"boom\"\n", "ERROR needs a number"),
+        ("ERROR NoSuchFn(1)\n", "unknown function or array"),
+        // The same hole, and the same fix, for every statement that takes a
+        // bare numeric operand. All four were added in the last two batches.
+        ("A$ = \"x\"\nLOCATE A$, 1\n", "LOCATE needs a number"),
+        ("A$ = \"x\"\nCOLOR 1, A$\n", "COLOR needs a number"),
+        ("A$ = \"x\"\nRANDOMIZE A$\n", "RANDOMIZE needs a number"),
+        ("LOCATE NoSuchFn(1), 1\n", "unknown function or array"),
+        ("RANDOMIZE NoSuchFn(1)\n", "unknown function or array"),
+    ] {
+        let err =
+            compile_only(source).expect_err(&format!("{} must be refused", source.escape_debug()));
+        assert!(
+            err.is_clean_rejection(),
+            "must be diagnosed, not panic: {}",
+            err.stderr
+        );
+        assert!(
+            err.contains(expect),
+            "expected {expect:?} in the diagnostic, got: {}",
+            err.stderr
+        );
+    }
+}
+
+/// Any expression may be the error number, including one that starts with NOT.
+///
+/// The token test that decides whether `ERROR` leads a statement listed the
+/// tokens an expression can start with, and missed `NOT` and a string literal.
+/// `ERROR NOT 0` was then refused as though the statement did not exist.
+#[test]
+fn test_error_statement_accepts_any_expression_shape() {
+    // NOT 0 is -1, which is out of the 1..255 range, so the run reports the
+    // range rather than the parse -- which is the point: it parsed.
+    let run = compile_and_run_raw("ERROR NOT 0\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "NOT 0 should reach the range check, got {:?}",
+        run.stderr
+    );
+
+    let run = compile_and_run_raw("N = 10\nERROR NOT N\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "{:?}",
+        run.stderr
+    );
+
+    let run = compile_and_run_raw("ERROR (5)\n", "").expect("should compile");
+    assert!(
+        run.stderr.contains("Illegal function call"),
+        "{:?}",
+        run.stderr
+    );
+}
+
 /// `ERROR` is still not a value, and `ON ERROR` is still refused.
 #[test]
 fn test_error_is_a_statement_not_a_name() {

@@ -985,21 +985,24 @@ impl Parser {
         matches!(self.peek_at(1), Token::Ident(_))
     }
 
-    /// True if the token after the current one could begin an expression.
+    /// True if something follows the current token for it to take as an operand.
     ///
-    /// `ERROR` is a statement only when something follows it to be the error
-    /// number. Left contextual rather than reserved so that a bare `ERROR`
-    /// still reaches the UNSUPPORTED table, which is what keeps
-    /// `ON ERROR GOTO` refused with a reason until it is written.
-    fn next_starts_a_value(&self) -> bool {
-        matches!(
+    /// `ERROR` is a statement only when a number follows it. Left contextual
+    /// rather than reserved so that a bare `ERROR` still reaches the
+    /// UNSUPPORTED table, which is what keeps `ON ERROR GOTO` refused with a
+    /// reason until it is written.
+    ///
+    /// Phrased as "the statement has not ended" rather than as a list of the
+    /// tokens an expression may start with. That list was written out once and
+    /// was already missing `NOT` and a string literal, so `ERROR NOT 0` --
+    /// a perfectly ordinary GW-BASIC expression -- was refused as though the
+    /// statement did not exist. This way anything else is handed to the
+    /// expression parser, which either accepts it or says what is wrong with
+    /// it, and a token added later needs no edit here.
+    fn next_is_an_operand(&self) -> bool {
+        !matches!(
             self.peek_at(1),
-            Token::Integer(_)
-                | Token::Float(_)
-                | Token::Ident(_)
-                | Token::LParen
-                | Token::Minus
-                | Token::Plus
+            Token::Newline | Token::Colon | Token::Eof | Token::Eq
         )
     }
 
@@ -1391,7 +1394,7 @@ impl Parser {
                     "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
                     "ERASE" if self.next_is_ident() => self.parse_erase(),
-                    "ERROR" if self.next_starts_a_value() => self.parse_raise_error(),
+                    "ERROR" if self.next_is_an_operand() => self.parse_raise_error(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     _ => self.parse_assignment_or_call(),

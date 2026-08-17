@@ -1640,6 +1640,22 @@ impl Analyzer {
             // exist, so `ERASE TOTLA` for `ERASE TOTAL` compiled clean and
             // erased nothing. The lookup is the one every array use gets --
             // the enclosing procedure first, then the module.
+            StmtKind::RaiseError(n) => self.check_numeric_operand(n, scope, line, "ERROR"),
+            StmtKind::Locate { row, col } => {
+                for e in row.iter().chain(col.iter()) {
+                    self.check_numeric_operand(e, scope, line, "LOCATE");
+                }
+            }
+            StmtKind::Color { fg, bg } => {
+                for e in fg.iter().chain(bg.iter()) {
+                    self.check_numeric_operand(e, scope, line, "COLOR");
+                }
+            }
+            StmtKind::Randomize(seed) => {
+                for e in seed.iter() {
+                    self.check_numeric_operand(e, scope, line, "RANDOMIZE");
+                }
+            }
             StmtKind::Erase(names) => {
                 for name in names {
                     if self.symbols.lookup_array(scope, name).is_none() {
@@ -2167,6 +2183,22 @@ impl Analyzer {
                     ),
                 );
             }
+        }
+    }
+
+    /// Check an expression a statement will use as a number.
+    ///
+    /// Two jobs, and both were missing for every statement that takes a bare
+    /// numeric operand. Without `check_expr` the operand's names are never
+    /// resolved, so `LOCATE NoSuchFn(1), 1` reached the codegen line that
+    /// says "sema checked the array is declared" -- it had not -- and panicked.
+    /// Without the string test, `LOCATE A$, 1` reached the implicit-conversion
+    /// panic instead. A builtin's arguments were always checked (`SQR(A$)`
+    /// says so properly); a statement's were not.
+    fn check_numeric_operand(&mut self, expr: &Expr, scope: &Scope, line: u32, what: &str) {
+        self.check_expr(expr, scope, line);
+        if self.expr_is_string(expr, scope) == Some(true) {
+            self.error(line, format!("{} needs a number, not a string", what));
         }
     }
 
