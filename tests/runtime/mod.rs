@@ -82,71 +82,109 @@ fn test_runtimes_export_the_same_helpers() {
     );
 }
 
-/// Message lengths must be computed by the assembler, never hand-counted --
-/// and computed where the data ends, not somewhere further down the file.
+/// A message length must not be an assembler constant.
 ///
-/// A hand-counted length was wrong by one and made WriteFile emit a stray
-/// byte; a commit "fixing" it changed the correct value to the incorrect one.
+/// `.equ len, . - label` reads as the safe way to avoid hand-counting, and it
+/// is -- under GNU as, which folds it to an immediate. This tree is assembled
+/// by GNU as on Linux and by clang on Windows, and where an assembler cannot
+/// prove the symbol absolute it assembles `mov reg, len` as a *memory load
+/// from that address* instead. `error.s` says so at the top: it hit this with
+/// forward references and now measures its messages at run time.
 ///
-/// `. - label` is only right while `.` is still just past the data: `.` means
-/// "here", so anything inserted in between is silently counted as part of the
-/// message. Four format strings and a scratch buffer were, and `CLS` on
-/// Windows wrote 75 bytes where it meant to write 7.
+/// `_cls_seq_len` was the same shape, so every `CLS` on Windows loaded from
+/// address 7 and died with an access violation, while Linux ran it as the
+/// immediate the source appears to say. Nothing else was wrong with the
+/// helper, which is why it took a table of exit codes to find.
+///
+/// Bracket the data with labels and subtract at run time instead. Two
+/// instructions, and the same answer whichever assembler ran.
 #[test]
-fn test_message_lengths_are_computed() {
+fn test_message_lengths_are_not_assembler_constants() {
+    let mut problems = Vec::new();
+
     for dir in ["src/runtime/sysv", "src/runtime/win64-native"] {
-        for entry in std::fs::read_dir(dir).expect("readable runtime directory") {
-            let path = entry.expect("readable directory entry").path();
-            if path.extension().is_none_or(|e| e != "s") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("readable .s file");
+        for (path, text) in runtime_sources(dir) {
             for (i, line) in text.lines().enumerate() {
-                // Both spellings of an assembler constant: `.equ N, v` and
-                // `N = v`. Only checking `.equ` let a hand-counted `=` through
-                // in the Win64 tree.
                 let trimmed = line.split('#').next().unwrap_or("").trim();
-                let name = match trimmed.strip_prefix(".equ ") {
-                    Some(rest) => rest.split(',').next().unwrap_or("").trim(),
+                // Both spellings of an assembler constant: `.equ N, v` and
+                // `N = v`. Only checking `.equ` let one through before.
+                let (name, value) = match trimmed.strip_prefix(".equ ") {
+                    Some(rest) => match rest.split_once(',') {
+                        Some((n, v)) => (n.trim(), v.trim()),
+                        None => continue,
+                    },
                     None => match trimmed.split_once('=') {
-                        Some((lhs, _)) if !lhs.trim().contains(char::is_whitespace) => lhs.trim(),
+                        Some((lhs, rhs)) if !lhs.trim().contains(char::is_whitespace) => {
+                            (lhs.trim(), rhs.trim())
+                        }
                         _ => continue,
                     },
                 };
-                if !name.ends_with("_len") {
+                // A plain number is fine: it is absolute to any assembler.
+                // Anything naming a label is not.
+                let symbolic = value
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+                    .any(|t| {
+                        !t.is_empty() && !t.chars().all(|c| c.is_ascii_hexdigit() || c == 'x')
+                    });
+                if symbolic || value.contains(". -") {
+                    problems.push(format!(
+                        "{path}:{}: `{trimmed}` measures {name} with the assembler. Bracket the \
+                         data with a `_end` label and subtract at run time: an assembler that \
+                         cannot prove this absolute turns `mov reg, {name}` into a memory load.",
+                        i + 1
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{} assembler-computed length(s):\n{}",
+        problems.len(),
+        problems.join("\n")
+    );
+}
+
+/// An `_end` label must sit directly after the data it bounds.
+///
+/// It is the run-time replacement for `. - label`, and it inherits the same
+/// hazard: anything inserted between the data and the label is measured as
+/// part of the message. Four format strings once were, and `CLS` wrote 75
+/// bytes where it meant to write 7.
+#[test]
+fn test_end_labels_bound_their_own_data() {
+    for dir in ["src/runtime/sysv", "src/runtime/win64-native"] {
+        for (path, text) in runtime_sources(dir) {
+            let lines: Vec<&str> = text
+                .lines()
+                .map(|l| l.split('#').next().unwrap_or("").trim())
+                .collect();
+            for (i, line) in lines.iter().enumerate() {
+                let Some(label) = line.strip_suffix(':') else {
+                    continue;
+                };
+                let Some(measured) = label.strip_suffix("_end") else {
+                    continue;
+                };
+                // Only labels that bound something. `.Lfile_past_end` is a
+                // branch target, and `_rt_end` is a helper whose name happens
+                // to split this way -- neither has a `_x:` data line to sit
+                // after.
+                let bounds_data = lines
+                    .iter()
+                    .any(|l| l.starts_with(&format!("{measured}: .")));
+                if !bounds_data {
                     continue;
                 }
+                let previous = lines[..i].iter().rev().find(|l| !l.is_empty());
                 assert!(
-                    trimmed.contains(". -"),
-                    "{}:{}: length should be computed with `. - label`, not hand-counted: {}",
-                    path.display(),
+                    previous.is_some_and(|p| p.starts_with(&format!("{measured}:"))),
+                    "{path}:{}: {label} must sit directly after {measured}'s data, but {:?} \
+                     intervenes -- everything between them is measured as part of the message",
                     i + 1,
-                    trimmed
-                );
-
-                // `. - label` measures from the label to *here*, so the only
-                // safe place for it is immediately after the label's data,
-                // with nothing but comments in between.
-                let label = trimmed
-                    .rsplit_once(". -")
-                    .map(|(_, rest)| rest.trim())
-                    .expect("just asserted the line computes `. - label`");
-                let previous = text
-                    .lines()
-                    .take(i)
-                    .map(|l| l.split('#').next().unwrap_or("").trim())
-                    .filter(|l| !l.is_empty())
-                    .last()
-                    .unwrap_or("");
-                assert!(
-                    previous.starts_with(&format!("{label}:")),
-                    "{}:{}: `{}` must sit directly after {}'s data, but {:?} intervenes -- \
-                     everything in between is counted as part of the message",
-                    path.display(),
-                    i + 1,
-                    trimmed,
-                    label,
-                    previous
+                    previous.copied().unwrap_or("")
                 );
             }
         }

@@ -29,7 +29,8 @@ _fmt_g9: .asciz "%.9g"
 .p2align 3
 _fmt_g_single_table: .quad _fmt_g6, _fmt_g7, _fmt_g8, _fmt_g9, 0
 _redo_msg: .ascii "?Redo from start\r\n"
-.equ _redo_msg_len, . - _redo_msg
+# Bracketed rather than measured by the assembler; see _cls_seq in math.s.
+_redo_msg_end:
 
 # Error messages
 # Lengths are computed by the assembler (. - label), never hand-counted: a

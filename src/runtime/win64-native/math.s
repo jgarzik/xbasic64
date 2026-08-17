@@ -16,11 +16,12 @@
 _rng_state: .quad 0x12345678DEADBEEF
 _rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .ascii "\033[2J\033[H"
-# Directly after the data it measures, and nothing may be inserted between:
-# `.` is the current position, so a string added in the gap is counted as part
-# of the sequence. Four were, and CLS wrote 75 bytes instead of 7 -- the escape
-# followed by every format string below it and a scratch buffer.
-.equ _cls_seq_len, . - _cls_seq
+# The length is bracketed by labels and subtracted at run time rather than
+# computed by the assembler, because this tree has two assemblers: GNU as
+# builds it nowhere, and clang builds it on Windows, where `.equ len, . - lbl`
+# did not reach WriteFile as 7. Two instructions buy an answer that does not
+# depend on which one ran.
+_cls_seq_end:
 _locate_fmt: .asciz "\033[%d;%dH"
 _date_fmt: .asciz "%m-%d-%Y"
 _time_fmt: .asciz "%H:%M:%S"
@@ -410,7 +411,8 @@ _rt_cls:
     # WriteFile(handle, cls_seq, cls_seq_len, &bytesWritten, NULL)
     mov rcx, rax            # handle
     lea rdx, [rip + _cls_seq]
-    mov r8, _cls_seq_len
+    lea r8, [rip + _cls_seq_end]
+    sub r8, rdx             # length, from the data's own labels
     lea r9, [rip + _cls_bytes_written]
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
