@@ -299,7 +299,6 @@ const MAX_EXPR_DEPTH: u32 = 256;
 const GOSUB_STACK_SIZE: i32 = 524288;
 
 /// ASCII character codes
-const ASCII_TAB: i64 = 9;
 const ASCII_COMMA: i64 = 44;
 /// The console's file number. The runtime seeds handle 0 with standard
 /// output, so PRINT and PRINT # are the same helpers with a different handle.
@@ -2917,7 +2916,7 @@ impl CodeGen {
                                 }
                                 self.gen_write_expr(expr, &sink);
                             } else {
-                                self.gen_print_expr(expr, &sink);
+                                self.gen_print_expr(expr, &sink, true);
                             }
                             first = false;
                         }
@@ -2927,8 +2926,7 @@ impl CodeGen {
                             // tab as well wrote "10\t,20".
                             if !*write {
                                 self.emit_arg_file_num(0, &sink);
-                                self.emit_arg_imm(1, ASCII_TAB);
-                                self.emit("    call _rt_file_print_char");
+                                self.emit("    call _rt_print_zone");
                             }
                         }
                         PrintItem::Empty => {}
@@ -5747,19 +5745,22 @@ impl CodeGen {
         }
     }
 
-    /// Emit one WRITE value: strings are quoted, numbers printed as usual.
-    /// `WRITE` quotes a string; a number is written the same as by `PRINT`.
+    /// Emit one WRITE value: strings are quoted, numbers written bare.
+    ///
+    /// Bare is the difference from PRINT: `WRITE 1, -2` is `1,-2`, with none of
+    /// the sign position or trailing blank a number carries under PRINT. WRITE
+    /// exists to be read back by INPUT, which is why it pads nothing.
     fn gen_write_expr(&mut self, expr: &Expr, sink: &FileNum) {
         if self.expr_type(expr) == DataType::String {
             self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
             self.emit("    call _rt_file_print_char");
-            self.gen_print_expr(expr, sink);
+            self.gen_print_expr(expr, sink, false);
             self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
             self.emit("    call _rt_file_print_char");
         } else {
-            self.gen_print_expr(expr, sink);
+            self.gen_print_expr(expr, sink, false);
         }
     }
 
@@ -5769,7 +5770,9 @@ impl CodeGen {
     /// this replaced had missed both the TAB/SPC case and the SINGLE one, so
     /// `PRINT #1, A!` wrote digits a SINGLE does not carry and `PRINT #1,
     /// TAB(10)` positioned the console.
-    fn gen_print_expr(&mut self, expr: &Expr, sink: &FileNum) {
+    /// `padded` gives a number the spacing PRINT gives it -- a blank where the
+    /// sign would go and a blank after. WRITE passes false.
+    fn gen_print_expr(&mut self, expr: &Expr, sink: &FileNum, padded: bool) {
         // TAB() and SPC() position the cursor rather than producing a value,
         // so they are emitted for their effect and nothing is printed after.
         if let Expr::FnCall { name, args } = expr {
@@ -5795,11 +5798,13 @@ impl CodeGen {
             let expr_type = self.expr_type(expr);
             self.gen_expr_to_double(expr);
             self.emit_arg_file_num(0, sink);
-            if expr_type == DataType::Single {
-                self.emit("    call _rt_file_print_single");
-            } else {
-                self.emit("    call _rt_file_print_float");
-            }
+            let helper = match (expr_type == DataType::Single, padded) {
+                (true, true) => "_rt_print_number_single",
+                (true, false) => "_rt_file_print_single",
+                (false, true) => "_rt_print_number",
+                (false, false) => "_rt_file_print_float",
+            };
+            emit!(self, "    call {}", helper);
         }
     }
 

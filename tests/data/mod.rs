@@ -22,7 +22,7 @@ PRINT D
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "60", "data read sum");
     assert_eq!(lines[1], "10", "restore reads first data");
 }
@@ -43,8 +43,8 @@ PRINT X$; " "; Y$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines[0], "102030");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines[0], "10  20  30");
     assert_eq!(lines[1], "Hello World");
 }
 
@@ -61,9 +61,12 @@ PRINT LEN(P$); LEN(Q$); LEN(R$); LEN(S$)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "alpha/beta/gamma/");
-    assert_eq!(lines[1], "5450", "lengths of alpha, beta, gamma, empty");
+    assert_eq!(
+        lines[1], "5  4  5  0",
+        "lengths of alpha, beta, gamma, empty"
+    );
 }
 
 /// RESTORE must work with string DATA too.
@@ -96,7 +99,7 @@ PRINT D$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "two", "3.5", "four"]);
 }
 
@@ -108,7 +111,7 @@ fn test_restore_to_line() {
         "100 DATA 1, 2\n110 DATA 3, 4\n120 READ A\n130 READ B\n140 RESTORE 110\n150 READ C\n160 PRINT A; B; C\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "123");
+    assert_eq!(output.trim(), "1  2  3");
 }
 
 /// Bare RESTORE still restarts from the first DATA item.
@@ -118,7 +121,7 @@ fn test_restore_to_start() {
         "100 DATA 1, 2\n110 DATA 3, 4\n120 READ A\n130 READ B\n140 RESTORE\n150 READ C\n160 PRINT A; B; C\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "121");
+    assert_eq!(output.trim(), "1  2  1");
 }
 
 /// RESTORE also accepts a named label.
@@ -128,7 +131,7 @@ fn test_restore_to_label() {
         "DATA 1, 2\nLater:\nDATA 3, 4\nREAD A\nRESTORE Later\nREAD B\nPRINT A; B\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "13");
+    assert_eq!(output.trim(), "1  3");
 }
 
 /// DATA items need quotes only when they contain a comma, a colon, or
@@ -151,7 +154,7 @@ PRINT C$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["hello", "World", "MiXeD"], "case is preserved");
 }
 
@@ -170,7 +173,7 @@ PRINT D$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["[spaced]", "[  kept  ]", "a,b", "c:d"],
@@ -194,7 +197,7 @@ PRINT "["; D$; "]["; E$; "]"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "0", "3", "[][x]"]);
 }
 
@@ -210,7 +213,7 @@ PRINT A + B
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["after", "3"]);
 }
 
@@ -235,7 +238,7 @@ PRINT D$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["42", "3.5", "-7", "text"],
@@ -256,6 +259,6 @@ PRINT C
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["12", "3.5", "0"]);
 }

@@ -18,7 +18,7 @@ PRINT "C"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "Hello, World!", "string");
     assert_eq!(lines[1], "42", "number");
     assert_eq!(lines[2], "A", "multi-a");
@@ -36,7 +36,7 @@ fn test_using_overflow_does_not_corrupt_globals() {
         "A = 111\nB = 222\nC = 333\nPRINT USING \"##.##\"; 1D300\nPRINT A\nPRINT B\nPRINT C\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines.len(), 4);
     // Too wide for the field, so GW-BASIC's '%' marker precedes the full value.
     assert!(lines[0].starts_with('%'), "got {}", lines[0]);
@@ -192,7 +192,7 @@ PRINT POS(0)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "1", "a fresh line starts at column 1");
     assert!(
         lines[1].ends_with('4'),
@@ -268,4 +268,109 @@ fn test_locate_sets_the_column() {
         output.trim().ends_with("12"),
         "POS should follow LOCATE: {output:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// GW-BASIC number formatting
+//
+// A number carries its own spacing: a leading blank where the sign would go if
+// it is not negative, and a trailing blank always. Values below one drop the
+// leading zero. Without these a listing's output runs together -- `PRINT 1;2`
+// gave "12" -- and nothing lines up.
+
+/// Every number is written with a sign position and a trailing space.
+#[test]
+fn test_numbers_carry_their_own_spacing() {
+    let out = crate::common::compile_and_run_raw(
+        "PRINT 1\nPRINT -1\nPRINT 1; 2; 3\nPRINT 1; -2; 3\n",
+        "",
+    )
+    .expect("should compile");
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(
+        lines[0], " 1 ",
+        "a positive number is blank-signed and blank-followed"
+    );
+    assert_eq!(lines[1], "-1 ", "a negative one uses the sign position");
+    assert_eq!(
+        lines[2], " 1  2  3 ",
+        "two blanks between, one on each side"
+    );
+    assert_eq!(
+        lines[3], " 1 -2  3 ",
+        "the minus takes the leading blank's place"
+    );
+}
+
+/// A value below one drops the leading zero, as GW-BASIC does.
+#[test]
+fn test_no_leading_zero_below_one() {
+    let out = crate::common::compile_and_run_raw("PRINT 0.5\nPRINT -0.5\nPRINT 0.125\n", "")
+        .expect("should compile");
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines[0], " .5 ");
+    assert_eq!(lines[1], "-.5 ");
+    assert_eq!(lines[2], " .125 ");
+}
+
+/// Exponents use GW-BASIC's letters: D for double, E for single.
+#[test]
+fn test_exponent_letter() {
+    let out = crate::common::compile_and_run_raw("PRINT 1E20\nA! = 1.5E-10\nPRINT A!\n", "")
+        .expect("should compile");
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert!(lines[0].contains('D'), "a double uses D: {:?}", lines[0]);
+    assert!(
+        !lines[0].contains('e'),
+        "never C's lowercase e: {:?}",
+        lines[0]
+    );
+    assert!(lines[1].contains('E'), "a single uses E: {:?}", lines[1]);
+}
+
+/// `STR$` is what PRINT writes, without the trailing blank -- so it keeps the
+/// leading one. `MID$(STR$(N), 2)` is the idiom that depends on it.
+#[test]
+fn test_str_dollar_keeps_the_sign_position() {
+    let out = crate::common::compile_and_run_raw(
+        "PRINT \"[\"; STR$(5); \"]\"\nPRINT \"[\"; STR$(-5); \"]\"\nPRINT \"[\"; MID$(STR$(42), 2); \"]\"\n",
+        "",
+    )
+    .expect("should compile");
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    assert_eq!(lines[0], "[ 5]");
+    assert_eq!(lines[1], "[-5]");
+    assert_eq!(
+        lines[2], "[42]",
+        "MID$(...,2) strips the blank, not a digit"
+    );
+}
+
+/// A comma moves to the next 14-column print zone, padding with blanks.
+#[test]
+fn test_comma_print_zones() {
+    let out = crate::common::compile_and_run_raw("PRINT 1, 2\nPRINT \"ab\", \"cd\"\n", "")
+        .expect("should compile");
+    let lines: Vec<&str> = out.stdout.lines().collect();
+    // Zone two begins at column 15, and the second number's own sign blank
+    // sits there -- so its digit lands at 16, as in GW-BASIC.
+    assert_eq!(lines[0], " 1             2 ");
+    assert_eq!(lines[1], "ab            cd");
+    assert!(!out.stdout.contains('\t'), "zones are blanks, never a tab");
+}
+
+/// `WRITE` is not `PRINT`: its numbers carry no padding at all.
+#[test]
+fn test_write_numbers_are_unpadded() {
+    let out =
+        crate::common::compile_and_run_raw("WRITE 1, -2, \"x\"\n", "").expect("should compile");
+    assert_eq!(out.stdout.lines().next().unwrap(), "1,-2,\"x\"");
+}
+
+/// `PRINT USING` owns its own layout and gains nothing.
+#[test]
+fn test_print_using_is_unaffected() {
+    let out = crate::common::compile_and_run_raw("PRINT USING \"###.##\"; 3.5\n", "")
+        .expect("should compile");
+    assert_eq!(out.stdout.lines().next().unwrap(), "  3.50");
 }

@@ -61,9 +61,9 @@ PRINT A(3)
         "77\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // The promptless INPUT prints `? `, which lands on the first output line.
-    assert_eq!(lines, vec!["? 10", "text", "77"]);
+    assert_eq!(lines, vec!["?  10", "text", "77"]);
 }
 
 /// The separator after an INPUT prompt decides whether a question mark follows.
@@ -127,11 +127,11 @@ fn test_input_leading_semicolon_is_accepted() {
 #[test]
 fn test_input_into_narrow_scalars() {
     let out = compile_and_run_with_stdin("INPUT A%\nPRINT A%\n", "5\n").unwrap();
-    assert_eq!(out.trim(), "? 5");
+    assert_eq!(out.trim(), "?  5");
 
     let single = compile_and_run_with_stdin("INPUT A!\nPRINT A!\n", "6\n").unwrap();
-    assert_eq!(single.trim(), "? 6");
+    assert_eq!(single.trim(), "?  6");
 
     let long = compile_and_run_with_stdin("INPUT A&\nPRINT A&\n", "70000\n").unwrap();
-    assert_eq!(long.trim(), "? 70000");
+    assert_eq!(long.trim(), "?  70000");
 }

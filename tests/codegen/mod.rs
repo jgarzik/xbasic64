@@ -479,10 +479,16 @@ PRINT I%(3), L&(3), S!(3), D#(3), T$(3)
 PRINT I%(0), L&(4), D#(1)
 ";
     let out = crate::common::compile_and_run(src).expect("the program must run");
-    let got: Vec<&str> = out.lines().map(str::trim).collect();
+    // Split on the print zones rather than pinning their width: what this
+    // test is about is that every element type round-trips, and
+    // `test_comma_print_zones` owns the layout.
+    let got: Vec<Vec<&str>> = crate::common::lines(&out)
+        .iter()
+        .map(|l| l.split_whitespace().collect())
+        .collect();
     assert_eq!(got.len(), 2);
-    assert!(got[0].starts_with("6\t3000\t3\t1.5\tv"), "got {:?}", got[0]);
-    assert_eq!(got[1], "0\t4000\t0.5");
+    assert_eq!(got[0], ["6", "3000", "3", "1.5", "v"]);
+    assert_eq!(got[1], ["0", "4000", ".5"]);
 }
 
 /// Bounds checking still catches a subscript past the end.
@@ -652,7 +658,7 @@ PRINT I
 ";
     asserts_absent(src, &["xmm4"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
-    let lines: Vec<&str> = out.trim().lines().collect();
+    let lines = crate::common::lines(&out);
     assert_eq!(lines[0], "4", "the body ran four times");
     assert_eq!(lines[1], "13", "the body's own step took effect");
 }
@@ -665,7 +671,7 @@ fn test_exit_for_writes_a_promoted_counter_back() {
         "N# = 0\nFOR I = 1 TO 100\nN# = N# + 1\nIF I = 4 THEN EXIT FOR\nNEXT I\nPRINT N#\nPRINT I\n",
     )
     .expect("the program must run");
-    let lines: Vec<&str> = out.trim().lines().collect();
+    let lines = crate::common::lines(&out);
     assert_eq!(lines[0], "4", "the body ran four times");
     assert_eq!(lines[1], "4", "the counter survived EXIT FOR");
 }
@@ -873,7 +879,7 @@ PRINT D#
         assert!(!body.contains(name), "{} should be in a register", name);
     }
     let out = crate::common::compile_and_run(src).expect("must run");
-    let got: Vec<&str> = out.trim().lines().collect();
+    let got = crate::common::lines(&out);
     assert_eq!(got, vec!["4", "8", "12", "16"], "all four still accumulate");
 }
 
@@ -940,7 +946,7 @@ fn test_promoted_accumulator_does_not_change_the_limit() {
         "N = 3\nK# = 0\nFOR I = 1 TO N\nN = 100\nK# = K# + 1\nNEXT I\nPRINT K#\nPRINT N\n",
     )
     .expect("must run");
-    let got: Vec<&str> = out.trim().lines().collect();
+    let got = crate::common::lines(&out);
     assert_eq!(got, vec!["3", "100"]);
 }
 
@@ -1041,7 +1047,7 @@ PRINT T#
 ",
     )
     .expect("must run");
-    let got: Vec<&str> = out.trim().lines().collect();
+    let got = crate::common::lines(&out);
     assert_eq!(got, vec!["9", "23", "90"]);
 }
 

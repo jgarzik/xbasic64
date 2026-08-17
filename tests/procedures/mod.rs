@@ -23,7 +23,7 @@ PrintSum(10, 20)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "42", "function");
     assert_eq!(lines[1], "30", "sub with params");
 }
@@ -43,7 +43,7 @@ END SUB
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["Hello from sub", "done"]);
 }
 
@@ -70,7 +70,7 @@ PRINT Sum10(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "28", "7 params: 1+2+3+4+5+6+7");
     assert_eq!(lines[1], "36", "8 params: 1+..+8");
     assert_eq!(lines[2], "55", "10 params: 1+..+10");
@@ -98,7 +98,7 @@ PRINT AddThree(Mul(2, 3), Mul(4, 5), Mul(6, 7))
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "26", "nested: 2*3 + 4*5 = 6+20");
     assert_eq!(lines[1], "68", "nested three: 6+20+42");
 }
@@ -122,7 +122,7 @@ PRINT G
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["99", "100", "100", "101"], "shared storage");
 }
 
@@ -143,7 +143,7 @@ PRINT A(1)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["7", "8"], "array shared with procedure");
 }
 
@@ -164,7 +164,7 @@ PRINT X
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["42", "84", "1"], "parameter is local");
 }
 
@@ -185,7 +185,7 @@ Count
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["0", "1", "0", "1", "0", "1"], "fresh per call");
 }
 
@@ -204,7 +204,7 @@ PrintGreeting "Again"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["Hello, World!", "Hello, Again!"]);
 }
 
@@ -227,7 +227,7 @@ B(7, "world")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["hi", "42", "7", "world"]);
 }
 
@@ -248,8 +248,8 @@ M(1, "x", 2, "y", 3, "z")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["abc", "1x2y3z"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["abc", "1 x 2 y 3 z"]);
 }
 
 /// Parameters declared with a type suffix must arrive narrowed to that type.
@@ -267,7 +267,7 @@ T(3, 100000, 2.5, 1.25)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["3", "100000", "2.5", "1.25"]);
 }
 
@@ -289,7 +289,7 @@ PRINT "[" + Greet$("x") + "]"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["Hello, World", "abababab", "[Hello, x]"],
@@ -315,7 +315,7 @@ IF Name$ = "bob" THEN PRINT "eq" ELSE PRINT "ne"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["bob", "42", "eq"]);
 }
 
@@ -334,7 +334,7 @@ PRINT T$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["changed", "original"]);
 }
 
@@ -346,7 +346,7 @@ fn test_def_fn() {
         "DEF FNA(X) = X * 2\nDEF FNSUM(A, B) = A + B\nDEF FNPI = 3.14159\nDEF FNG$(N$) = \"hi \" + N$\nPRINT FNA(5)\nPRINT FNSUM(3, 4)\nPRINT FNPI\nPRINT FNG$(\"bob\")\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["10", "7", "3.14159", "hi bob"]);
 }
 
@@ -365,15 +365,15 @@ fn test_option_base_one() {
         "OPTION BASE 1\nDIM A(3)\nA(1) = 10\nA(3) = 30\nPRINT A(1); A(3)\nPRINT LBOUND(A); UBOUND(A)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["1030", "13"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["10  30", "1  3"]);
 }
 
 /// The default base is still 0.
 #[test]
 fn test_option_base_defaults_to_zero() {
     let output = compile_and_run("DIM A(3)\nA(0) = 5\nPRINT A(0); LBOUND(A)\n").unwrap();
-    assert_eq!(output.trim(), "50");
+    assert_eq!(output.trim(), "5  0");
 }
 
 /// `FUNCTION f(...) AS T` must actually give the result type T.
@@ -386,7 +386,7 @@ fn test_function_declared_return_type() {
         "FUNCTION F(X) AS INTEGER\nF = X / 2\nEND FUNCTION\nFUNCTION G(X) AS LONG\nG = X * 1000\nEND FUNCTION\nPRINT F(7)\nPRINT G(3)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["3", "3000"]);
 }
 
@@ -418,8 +418,8 @@ Greet 8
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["n=7", "plain", "n=8"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["n= 7", "plain", "n= 8"]);
 }
 
 /// CALL is recognised only in statement position before a name, so a program

@@ -28,9 +28,15 @@ pub struct RunOutput {
 }
 
 impl RunOutput {
-    /// Lines of stdout, trimmed, for the common line-by-line assertion style.
+    /// Lines of stdout, each trimmed, for the common line-by-line style.
+    ///
+    /// Per line rather than once over the whole string, because a number
+    /// carries GW-BASIC's spacing: a blank where the sign would go and a blank
+    /// after, so `PRINT 42` writes " 42 ". A test asserting what a program
+    /// *computed* should not have to spell those out; the ones that assert on
+    /// the spacing itself read `stdout` directly, and say so.
     pub fn lines(&self) -> Vec<&str> {
-        self.stdout.trim().lines().collect()
+        lines(&self.stdout)
     }
 
     /// Panic unless the program ran to completion.
@@ -55,6 +61,14 @@ impl RunOutput {
             self.stderr
         );
     }
+}
+
+/// Lines of `text`, each trimmed, ignoring blank ones at the ends.
+///
+/// The counterpart of [`RunOutput::lines`] for the helpers that return a bare
+/// String. See there for why the trim is per line.
+pub fn lines(text: &str) -> Vec<&str> {
+    text.trim().lines().map(str::trim).collect()
 }
 
 /// A failure of the compiler itself (lexer, parser, sema, codegen, assembler, linker).

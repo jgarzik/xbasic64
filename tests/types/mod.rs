@@ -17,7 +17,7 @@ Y# = CDBL(3): PRINT Y#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "cint rounds");
     assert_eq!(lines[1], "4", "clng rounds");
     assert_eq!(lines[2], "3", "csng");
@@ -41,7 +41,7 @@ A# = 3.7: B% = A#: PRINT B%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "3", "cint 3.1");
     assert_eq!(lines[1], "4", "cint 3.5");
     assert_eq!(lines[2], "4", "cint 3.9");
@@ -63,7 +63,7 @@ A% = 7: B% = 2: PRINT A% \ B%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "3.5", "division produces double");
     assert_eq!(lines[1], "3", "integer division");
 }
@@ -82,7 +82,7 @@ A! = 1.5: B# = 2.5: PRINT A! + B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "300", "int+long");
     assert_eq!(lines[1], "12.5", "int+single");
     assert_eq!(lines[2], "12.5", "int+double");
@@ -105,7 +105,7 @@ A! = 5.5: B# = 2.25: PRINT A! - B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "30", "int-long");
     assert_eq!(lines[1], "7.5", "int-single");
     assert_eq!(lines[2], "6.75", "int-double");
@@ -128,7 +128,7 @@ A! = 2.5: B# = 4.0: PRINT A! * B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "200", "int*long");
     assert_eq!(lines[1], "10", "int*single");
     assert_eq!(lines[2], "7.5", "int*double");
@@ -158,7 +158,7 @@ A! = 100.0: B# = 30.0: PRINT A! MOD B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "3.5", "int/long");
     assert_eq!(lines[1], "2.5", "int/single");
     assert_eq!(lines[2], "4.5", "long/single");
@@ -189,7 +189,7 @@ A% = 10: B& = 20: C! = 0.5: D# = 100.0: PRINT A% + B& * C! + D#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "256", "int^long");
     assert_eq!(lines[1], "2", "int^single");
     assert_eq!(lines[2], "8", "int^double");
@@ -206,13 +206,16 @@ fn test_type_records() {
         "TYPE Rec\nI AS INTEGER\nL AS LONG\nS AS SINGLE\nD AS DOUBLE\nN AS STRING * 20\nEND TYPE\nDIM R AS Rec\nPRINT R.I\nR.I = 7\nR.L = 100000\nR.S = 2.5\nR.D = 1.25\nR.N = \"hello\"\nPRINT R.I; R.L; R.S; R.D\nPRINT R.N; LEN(R.N)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "0", "a record starts zeroed");
-    assert_eq!(lines[1], "71000002.51.25", "each field keeps its own type");
+    assert_eq!(
+        lines[1], "7  100000  2.5  1.25",
+        "each field keeps its own type"
+    );
     // A `STRING * 20` field holds twenty characters whatever it is given, so
     // "hello" is space-padded and LEN is 20. This asserted "hello5" while
     // assignment stored the source verbatim and the declared width did nothing.
-    assert_eq!(lines[2], "hello               20");
+    assert_eq!(lines[2], "hello                20");
 }
 
 /// A TYPE may contain another TYPE, to any depth.
@@ -222,7 +225,7 @@ fn test_nested_records() {
         "TYPE Point\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nTYPE Rect\nTL AS Point\nBR AS Point\nEND TYPE\nDIM B AS Rect\nB.TL.X = 1\nB.TL.Y = 2\nB.BR.X = 9\nB.BR.Y = 8\nPRINT B.TL.X; B.TL.Y; B.BR.X; B.BR.Y\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "1298");
+    assert_eq!(output.trim(), "1  2  9  8");
 }
 
 /// Assigning one record to another copies it, rather than aliasing.
@@ -232,8 +235,8 @@ fn test_whole_record_assignment() {
         "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A AS P\nDIM B AS P\nB.X = 3\nB.Y = 4\nA = B\nPRINT A.X; A.Y\nB.X = 99\nPRINT A.X\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["34", "3"], "A kept its own copy");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["3  4", "3"], "A kept its own copy");
 }
 
 /// Arrays of records, including a nested field and a string field.
@@ -243,8 +246,8 @@ fn test_arrays_of_records() {
         "TYPE Person\nNM AS STRING * 20\nAGE AS INTEGER\nEND TYPE\nDIM P(2) AS Person\nP(0).NM = \"Alice\"\nP(0).AGE = 30\nP(1).NM = \"Bob\"\nP(1).AGE = 25\nPRINT P(0).NM; P(0).AGE\nPRINT P(1).NM; P(1).AGE\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["Alice30", "Bob25"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["Alice 30", "Bob 25"]);
 }
 
 /// A record array indexed by a loop variable.
@@ -254,7 +257,7 @@ fn test_record_array_in_loop() {
         "TYPE P\nN AS INTEGER\nEND TYPE\nDIM A(4) AS P\nFOR I = 0 TO 4\nA(I).N = I * I\nNEXT I\nFOR I = 0 TO 4\nPRINT A(I).N;\nNEXT I\nPRINT \"\"\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "014916");
+    assert_eq!(output.trim(), "0  1  4  9  16");
 }
 
 /// A module-level record is shared with procedures, like any other global.
@@ -274,7 +277,7 @@ fn test_local_record_is_fresh_each_call() {
         "TYPE P\nX AS INTEGER\nEND TYPE\nSUB T\nDIM L AS P\nPRINT L.X\nL.X = 9\nEND SUB\nT\nT\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["0", "0"]);
 }
 
@@ -300,7 +303,7 @@ fn test_local_records_in_sibling_procedures() {
         "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB A(Z AS P)\nPRINT Z.X\nEND SUB\nSUB B\nDIM Z AS P\nZ.X = 5\nZ.Y = 6\nPRINT Z.X; Z.Y\nEND SUB\nB\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "56");
+    assert_eq!(output.trim(), "5  6");
 }
 
 /// A record is passed to a procedure by value: the callee gets the address of
@@ -311,8 +314,8 @@ fn test_record_parameters() {
         "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["78", "7"], "the caller's record is unchanged");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["7  8", "7"], "the caller's record is unchanged");
 }
 
 /// A record parameter mixed with ordinary ones, and a nested record.
@@ -322,7 +325,7 @@ fn test_record_parameter_mixed_and_nested() {
         "TYPE Pt\nX AS INTEGER\nEND TYPE\nTYPE Bx\nTL AS Pt\nEND TYPE\nSUB T(A, V AS Bx, B)\nPRINT A; V.TL.X; B\nEND SUB\nDIM Q AS Bx\nQ.TL.X = 5\nT(1, Q, 2)\n",
     )
     .unwrap();
-    assert_eq!(output.trim(), "152");
+    assert_eq!(output.trim(), "1  5  2");
 }
 
 /// `AS` also gives a plain variable or parameter a declared type.
@@ -332,9 +335,9 @@ fn test_as_typed_variables() {
         "DIM N AS INTEGER\nDIM S AS STRING * 10\nN = 42\nS = \"hi\"\nPRINT N; S\nPRINT N * 2\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // `S` is `STRING * 10`, so "hi" is padded to ten characters.
-    assert_eq!(lines, vec!["42hi        ", "84"]);
+    assert_eq!(lines, vec!["42 hi", "84"]);
 }
 
 /// A typed parameter, and a FUNCTION with a declared result type.
@@ -344,8 +347,8 @@ fn test_as_typed_parameters_and_result() {
         "SUB T(N AS INTEGER, S AS STRING * 10)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["7hi", "42"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["7 hi", "42"]);
 }
 
 /// A record variable may be assigned from an array element, whose address is
@@ -356,8 +359,8 @@ fn test_record_assignment_from_array_element() {
         "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nDIM A(2) AS P\nDIM One AS P\nA(1).X = 3\nA(1).Y = 4\nOne = A(1)\nPRINT One.X; One.Y\nA(1).X = 99\nPRINT One.X\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["34", "3"], "the copy is independent");
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["3  4", "3"], "the copy is independent");
 }
 
 /// A record argument may be any record lvalue, not only a plain variable.
@@ -370,7 +373,7 @@ fn test_record_argument_from_array_element() {
         "TYPE P\nX AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X\nEND SUB\nDIM A(3) AS P\nA(1).X = 9\nA(2).X = 4\nShow A(1)\nShow A(2)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["9", "4"]);
 }
 
@@ -413,7 +416,7 @@ PRINT LEN(P.N)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &[
@@ -436,7 +439,7 @@ PRINT LEN(S)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["[xy  ]", "-1", "4"]);
 }
 
@@ -457,7 +460,7 @@ PRINT Y
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // Assignment to an integer truncates here; LANGREF records that as a
     // deliberate divergence from GW-BASIC, which rounds.
     assert_eq!(lines, &["3", "3"], "7/2 and 3.7 both truncate to 3");
@@ -476,7 +479,7 @@ PRINT X#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["3", "3.7"], "X is INTEGER, X# is DOUBLE");
 }
 
@@ -504,12 +507,12 @@ PRINT LEN(T)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "3", "DEFINT");
     assert_eq!(lines[1], "100000", "DEFLNG");
-    assert_eq!(lines[2], "0.33333334", "DEFSNG carries ~7 digits");
+    assert_eq!(lines[2], ".33333334", "DEFSNG carries ~7 digits");
     assert_eq!(
-        lines[3], "0.3333333333333333",
+        lines[3], ".3333333333333333",
         "DEFDBL carries full precision"
     );
     assert_eq!(lines[4], "text", "DEFSTR");
@@ -530,7 +533,7 @@ PRINT A
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["5", "9"]);
 }
 
@@ -551,7 +554,7 @@ PRINT A; B; C; E; F
     .unwrap();
     assert_eq!(
         output.trim(),
-        "11.7111.7",
+        "1  1.7  1  1  1.7",
         "A, C and E are INTEGER; B and F stay DOUBLE"
     );
 }
@@ -572,7 +575,7 @@ Show 4.6
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["9", "4"],
@@ -592,6 +595,6 @@ PRINT MID$("hello", 2, 3)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["4", "4", "ell"]);
 }

@@ -368,11 +368,24 @@ Output to console:
 
 ```basic
 PRINT "Hello, World!"
-PRINT X; Y; Z             ' Semicolon: no space between
-PRINT A, B, C             ' Comma: tab-separated
+PRINT X; Y; Z             ' Semicolon: items adjoin
+PRINT A, B, C             ' Comma: next 14-column print zone
 PRINT "Value: "; X
 PRINT                     ' Print blank line
 ```
+
+**A number carries its own spacing**, as in GW-BASIC: a blank where the minus
+sign would go if it is not negative, and a blank after it. So `PRINT 1; 2; 3`
+writes ` 1  2  3 `, and `PRINT 1; -2; 3` writes ` 1 -2  3 ` -- the minus takes
+the leading blank's place. A string is written exactly as it is.
+
+A value below one drops its leading zero (`.5`, not `0.5`), and an exponent is
+spelled with `D` for a DOUBLE and `E` for a SINGLE: `1D+20`, `1.5E-10`.
+
+A comma moves to the start of the next 14-column zone, padding with blanks; if
+the line is already past the last zone it moves to the next line. `WRITE` and
+`PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
+meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
 
 Semicolon at end suppresses newline:
 ```basic
@@ -1037,7 +1050,7 @@ nobody to ask, so it takes the clock.
 | `ASC(s$)`             | ASCII code of first character                  |
 | `CHR$(n)`             | Character from ASCII code                      |
 | `VAL(s$)`             | Convert string to number                       |
-| `STR$(x)`             | Convert number to string                       |
+| `STR$(x)`             | The number as PRINT writes it, less the trailing blank |
 | `SPACE$(n)`           | A string of n spaces                           |
 | `STRING$(n, c)`       | n copies of a character (code or first of c$)  |
 | `LTRIM$(s$)`          | Drop leading spaces                            |
@@ -1066,6 +1079,10 @@ MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 
 Both are only meaningful inside an `ON ERROR` handler. `ERL` reports the BASIC
 line number, as the error messages do.
+
+`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
+is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
+it.
 
 ### Type Conversion Functions
 

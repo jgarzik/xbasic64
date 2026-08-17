@@ -74,7 +74,7 @@ _rt_str:
     sub rsp, 32             # shadow space
     lea rcx, [rip + _fmt_g_table]
     xor edx, edx
-    call _rt_fmt_double
+    call _rt_fmt_basic              # includes the sign position's blank
     lea rcx, [rip + _num_buf]
     mov rdx, rax            # length
     add rsp, 32
@@ -95,7 +95,7 @@ _rt_str_single:
     sub rsp, 32             # shadow space
     lea rcx, [rip + _fmt_g_single_table]
     mov edx, 1
-    call _rt_fmt_double
+    call _rt_fmt_basic
     lea rcx, [rip + _num_buf]
     mov rdx, rax
     add rsp, 32

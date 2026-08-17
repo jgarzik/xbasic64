@@ -31,7 +31,7 @@ PRINT G$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "hello", "the source of a plain assignment");
     assert_eq!(lines[1], "Jello");
     assert_eq!(lines[2], "hello", "the source of a LEFT$ slice");
@@ -66,7 +66,7 @@ PRINT K$
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "hello!", "a concatenation is not aliased by E$");
     assert_eq!(lines[1], "Qello!");
     assert_eq!(
@@ -97,7 +97,7 @@ PRINT A$(3)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "Zbabab", "the accumulator, first byte edited");
     assert_eq!(lines[1], "ab");
     assert_eq!(lines[2], "abab");
@@ -121,7 +121,7 @@ PRINT INSTR("Hello World", "World")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "5", "len");
     assert_eq!(lines[1], "He", "left$");
     assert_eq!(lines[2], "lo", "right$");
@@ -154,7 +154,7 @@ PRINT MID$("ABCDEF", GetStart(), GetLen())
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "HELLO", "left$ with len()");
     assert_eq!(lines[1], "WORLD", "right$ with len()");
     assert_eq!(lines[2], "BCD", "mid$ with functions");
@@ -195,7 +195,7 @@ PRINT ("abc" >= "abc")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["-1", "0", "0", "-1", "-1", "0", "-1", "0", "-1", "-1"],
@@ -218,7 +218,7 @@ IF "ab" + "c" = "abc" THEN PRINT "concat-eq" ELSE PRINT "concat-bad"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec![
@@ -258,7 +258,7 @@ NEXT I
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["apple", "banana", "cherry", "fig", "pear"],
@@ -274,7 +274,7 @@ fn test_string_builders() {
         "PRINT \"[\"; SPACE$(3); \"]\"\nPRINT STRING$(5, 42)\nPRINT STRING$(3, \"x\")\nPRINT LEN(SPACE$(4))\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["[   ]", "*****", "xxx", "4"]);
 }
 
@@ -285,7 +285,7 @@ fn test_string_trim_and_case() {
         "PRINT \"[\"; LTRIM$(\"   abc\"); \"]\"\nPRINT \"[\"; RTRIM$(\"abc   \"); \"]\"\nPRINT UCASE$(\"Hello, World!\")\nPRINT LCASE$(\"Hello, World!\")\nA$ = \"  Mixed  \"\nPRINT \"[\" + LTRIM$(RTRIM$(A$)) + \"]\"\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec![
@@ -305,7 +305,7 @@ fn test_case_conversion_does_not_mutate_source() {
     let output =
         compile_and_run("A$ = \"abc\"\nB$ = UCASE$(A$)\nPRINT A$\nPRINT B$\nPRINT \"abc\"\n")
             .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["abc", "ABC", "abc"]);
 }
 
@@ -313,7 +313,7 @@ fn test_case_conversion_does_not_mutate_source() {
 #[test]
 fn test_hex_and_oct() {
     let output = compile_and_run("PRINT HEX$(255)\nPRINT OCT$(15)\nPRINT HEX$(16)\n").unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["FF", "17", "10"]);
 }
 
@@ -326,7 +326,7 @@ fn test_string_assignment_copies() {
         "A$ = \"HELLO\"\nB$ = A$\nMID$(A$,1,1) = \"J\"\nPRINT A$\nPRINT B$\nPRINT \"HELLO\"\nC$ = \"HELLO\"\nPRINT C$\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["JELLO", "HELLO", "HELLO", "HELLO"],
@@ -342,7 +342,7 @@ fn test_mid_assignment() {
         "A$ = \"hello\"\nMID$(A$,1,1) = \"J\"\nPRINT A$\nB$ = \"hello\"\nMID$(B$,2) = \"XY\"\nPRINT B$\nC$ = \"abc\"\nMID$(C$,2) = \"ZZZZZ\"\nPRINT C$\nPRINT LEN(C$)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["Jello", "hXYlo", "aZZ", "3"]);
 }
 
@@ -377,7 +377,7 @@ PRINT STR$(A) = STR$(A)
     let output = compile_and_run(source).unwrap();
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        vec!["21", "AB", "AB", "1011", "0", "-1"]
+        vec![" 2 1", "AB", "AB", "1011", " 0 ", "-1 "]
     );
 }
 
@@ -398,12 +398,12 @@ PRINT STR$(X!)
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
         vec![
-            "123456789.125",
-            "0.3333333333333333",
-            "-1",
-            "0.30000000000000004",
+            " 123456789.125",
+            " .3333333333333333",
+            "-1 ",
+            " .30000000000000004",
             // A SINGLE carries ~7 digits, and STR$ respects that as PRINT does.
-            "3.14159",
+            " 3.14159",
         ]
     );
 }
@@ -430,7 +430,7 @@ PRINT INSTR(2, "", "x")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["0", "0", "3", "1", "0", "0"]);
 }
 

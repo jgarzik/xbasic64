@@ -23,7 +23,7 @@ PRINT "done"
     if file_path.exists() {
         let file_contents = fs::read_to_string(&file_path).unwrap();
         let lines: Vec<&str> = file_contents.lines().collect();
-        assert_eq!(lines, vec!["Hello, File!", "42"]);
+        assert_eq!(lines, vec!["Hello, File!", " 42 "]);
     }
 }
 
@@ -144,18 +144,19 @@ PRINT "bytes:"; LOF(1)
 CLOSE #1
 "#;
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "one");
     assert_eq!(lines[1], "two");
     assert_eq!(lines[2], "three");
-    assert_eq!(lines[3], "lines:3");
+    assert_eq!(lines[3], "lines: 3");
 
     // Text files carry the host's line terminator, so LOF counts CRLF on
     // Windows and LF elsewhere: 11 characters of text plus three terminators.
     let terminator = if cfg!(windows) { 2 } else { 1 };
     assert_eq!(
         lines[4],
-        format!("bytes:{}", 11 + 3 * terminator),
+        // `PRINT "bytes:"; N` -- the number brings its own leading blank.
+        format!("bytes: {}", 11 + 3 * terminator),
         "3 lines plus their {} terminators",
         if terminator == 2 { "CRLF" } else { "LF" }
     );
@@ -188,7 +189,7 @@ fn test_input_file_multiple_fields() {
     )
     .unwrap()
     .0;
-    assert_eq!(output.trim(), "10/20/30");
+    assert_eq!(output.trim(), "10 / 20 / 30");
 }
 
 /// A quoted field may contain the delimiter, and blanks around a field are
@@ -215,7 +216,7 @@ fn test_write_file_round_trip() {
     )
     .unwrap()
     .0;
-    assert_eq!(output.trim(), "1020[ab]");
+    assert_eq!(output.trim(), "10  20 [ab]");
 }
 
 /// LINE INPUT # still takes the whole line, commas and all.
@@ -246,9 +247,9 @@ fn test_crlf_file_reads_without_stray_carriage_returns() {
     )
     .unwrap()
     .0;
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "[one][two][three]");
-    assert_eq!(lines[1], "335", "no line may keep its carriage return");
+    assert_eq!(lines[1], "3  3  5", "no line may keep its carriage return");
 }
 
 /// A SINGLE written to a file reads back the way the console prints it.
@@ -265,7 +266,7 @@ fn test_print_file_single_matches_console() {
     )
     .unwrap()
     .0;
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines[0], lines[1],
         "a SINGLE must render the same to a file as to the console"
@@ -322,7 +323,7 @@ fn test_crlf_numeric_fields() {
     )
     .unwrap()
     .0;
-    assert_eq!(output.trim(), "10/20/30");
+    assert_eq!(output.trim(), "10 / 20 / 30");
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +357,7 @@ CLOSE #1
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        vec!["Alice/30/50000.5", "Bob/45/61234.25"]
+        vec!["Alice/ 30 / 50000.5 ", "Bob/ 45 / 61234.25 "]
     );
 }
 
@@ -421,7 +422,7 @@ PRINT LEN(A$)
 CLOSE #1
 "#;
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
-    assert_eq!(output.lines().collect::<Vec<_>>(), vec!["515", "5"]);
+    assert_eq!(output.lines().collect::<Vec<_>>(), vec![" 5  15 ", " 5 "]);
 }
 
 /// GET refreshes every field variable at once, because they all point into the
@@ -463,7 +464,7 @@ PRINT RTRIM$(NM$); "/"; CVI(AG$)
 CLOSE #1
 "#;
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
-    assert_eq!(output.trim(), "Alicia/30");
+    assert_eq!(output.trim(), "Alicia/ 30");
 }
 
 /// GET and PUT without a record number walk forward one record at a time.
@@ -489,7 +490,7 @@ CLOSE #1
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        vec!["aa1", "bb2", "cc3"]
+        vec!["aa 1 ", "bb 2 ", "cc 3 "]
     );
 }
 
@@ -506,7 +507,12 @@ PRINT CVS(MKS$(3.5)); CVD(MKD$(2.25))
     let output = crate::common::compile_and_run(source).unwrap();
     assert_eq!(
         output.lines().collect::<Vec<_>>(),
-        vec!["2448", "32767-327680", "2147483647-2147483647", "3.52.25"]
+        vec![
+            " 2  4  4  8 ",
+            " 32767 -32768  0 ",
+            " 2147483647 -2147483647 ",
+            " 3.5  2.25 "
+        ]
     );
 }
 
@@ -541,7 +547,7 @@ PRINT CVD(S$); LEN(S$)
 CLOSE #1
 "#;
     let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
-    assert_eq!(output.trim(), "08");
+    assert_eq!(output.trim(), "0  8");
 }
 
 /// LOCK and UNLOCK are accepted in all their forms and leave the file usable.

@@ -18,7 +18,7 @@ A# = 2.25: PRINT SQR(A#)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "sqr literal");
     assert_eq!(lines[1], "5", "sqr integer");
     assert_eq!(lines[2], "100", "sqr long");
@@ -39,7 +39,7 @@ A# = -3.14159: PRINT ABS(A#)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "42", "abs literal");
     assert_eq!(lines[1], "42", "abs integer");
     assert_eq!(lines[2], "100000", "abs long");
@@ -61,7 +61,7 @@ A# = -3.7: PRINT FIX(A#)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "3", "int literal");
     assert_eq!(lines[1], "3", "int single");
     assert_eq!(lines[2], "3", "int double");
@@ -85,7 +85,7 @@ A# = -2.5: PRINT SGN(A#)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "-1", "sgn neg");
     assert_eq!(lines[1], "0", "sgn zero");
     assert_eq!(lines[2], "1", "sgn pos");
@@ -112,7 +112,7 @@ A# = 0.0: PRINT INT(COS(A#) * 100)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     let values: Vec<&str> = lines[0].split_whitespace().collect();
     assert_eq!(values, vec!["0", "100"], "sin/cos literals");
     assert_eq!(lines[1], "0", "sin integer");
@@ -138,7 +138,7 @@ A# = 0.0: PRINT INT(ATN(A#) * 100)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     let values: Vec<&str> = lines[0].split_whitespace().collect();
     assert_eq!(values, vec!["0", "0"], "tan/atn literals");
     assert_eq!(lines[1], "0", "tan single");
@@ -162,7 +162,7 @@ A# = 1.0: PRINT INT(LOG(A#))
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     let values: Vec<&str> = lines[0].split_whitespace().collect();
     assert_eq!(values, vec!["1", "0"], "exp/log literals");
     assert_eq!(lines[1], "1", "exp integer");
@@ -186,7 +186,7 @@ IF X <> Y THEN PRINT "advances"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "rnd-ok");
     assert_eq!(
         lines[1], "bare-rnd-ok",
@@ -212,7 +212,7 @@ A! = 3.5: B# = CDBL(A!): PRINT B#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "42", "cint integer");
     assert_eq!(lines[1], "12345", "cint long");
     assert_eq!(lines[2], "4", "cint single");
@@ -237,8 +237,9 @@ fn test_timer_matches_the_host_clock() {
     let output = compile_and_run("PRINT TIMER\nPRINT TIMER(0)\n").unwrap();
     let after = seconds_since_midnight_utc();
 
-    for (i, line) in output.trim().lines().enumerate() {
-        // TIMER counts fractional seconds, as GW-BASIC's does.
+    for (i, line) in crate::common::lines(&output).iter().enumerate() {
+        // TIMER counts fractional seconds, as GW-BASIC's does. The line is
+        // trimmed first: a number carries a blank on each side.
         let t: f64 = line
             .parse()
             .unwrap_or_else(|e| panic!("TIMER printed {line:?}: {e}"));
@@ -265,7 +266,7 @@ fn test_timer_does_not_go_backwards() {
         "A = TIMER\nFOR I = 1 TO 2000000\nX = X + 1\nNEXT I\nB = TIMER\nPRINT (B >= A)\nPRINT (B - A < 60)\n",
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["-1", "-1"]);
 }
 
@@ -321,7 +322,7 @@ IF A = D THEN PRINT "positive-stuck" ELSE PRINT "positive-advances"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["zero-repeats", "zero-stable", "positive-advances"],
@@ -366,7 +367,7 @@ PRINT BAD
 fn test_date_and_time_strings() {
     let output =
         compile_and_run("PRINT DATE$\nPRINT TIME$\nPRINT LEN(DATE$); LEN(TIME$)\n").unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     let date = lines[0];
     let time = lines[1];
     assert_eq!(date.len(), 10, "DATE$ is MM-DD-YYYY: {date:?}");
@@ -375,7 +376,7 @@ fn test_date_and_time_strings() {
     assert_eq!(time.len(), 8, "TIME$ is HH:MM:SS: {time:?}");
     assert_eq!(&time[2..3], ":", "separators at 3 and 6: {time:?}");
     assert_eq!(&time[5..6], ":", "separators at 3 and 6: {time:?}");
-    assert_eq!(lines[2], "108", "and LEN sees them as strings: 10 and 8");
+    assert_eq!(lines[2], "10  8", "and LEN sees them as strings: 10 and 8");
 }
 
 /// `FRE` reports free memory. A compiled program has no BASIC heap limit, so

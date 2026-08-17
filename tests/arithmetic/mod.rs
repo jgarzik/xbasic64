@@ -20,7 +20,7 @@ PRINT 2 ^ 10
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "15", "add");
     assert_eq!(lines[1], "7", "sub");
     assert_eq!(lines[2], "42", "mul");
@@ -41,7 +41,7 @@ PRINT -5 + 10
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "14", "precedence");
     assert_eq!(lines[1], "20", "parentheses");
     assert_eq!(lines[2], "5", "negative");
@@ -75,7 +75,7 @@ IF 0 XOR 0 THEN PRINT "xor-d"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec![
@@ -113,7 +113,7 @@ PRINT NOT D%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["-13", "-13", "-13", "-1", "0", "-2", "-256"],
@@ -134,7 +134,7 @@ IF 5 <> 6 THEN PRINT "ok6"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines.len(), 6);
 }
 
@@ -154,7 +154,7 @@ A% = 42: PRINT -A%
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "150", "int add");
     assert_eq!(lines[1], "70", "int sub");
     assert_eq!(lines[2], "60", "int mul");
@@ -181,7 +181,7 @@ A& = 12345: PRINT -A&
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "150000", "long add");
     assert_eq!(lines[1], "70000", "long sub");
     assert_eq!(lines[2], "500000", "long mul");
@@ -206,7 +206,7 @@ A! = 3.14: PRINT -A!
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "single add");
     assert_eq!(lines[1], "3.25", "single sub");
     assert_eq!(lines[2], "10", "single mul");
@@ -229,7 +229,7 @@ A# = 2.71828: PRINT -A#
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "double add");
     assert_eq!(lines[1], "50.5", "double sub");
     assert_eq!(lines[2], "7", "double mul");
@@ -255,7 +255,7 @@ PRINT 1 - -2
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["-4", "-8", "4", "-4", "-9", "-6", "3"],
@@ -278,7 +278,7 @@ PRINT &H10 + &H10
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["255", "15", "10", "15", "-1", "32"],
@@ -299,7 +299,7 @@ PRINT -2147483648
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec![
@@ -327,17 +327,17 @@ PRINT 123456789.123456
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec![
-            "0.3333333333333333",
-            "0.6666666666666666",
+            ".3333333333333333",
+            ".6666666666666666",
             "3.141592653589793",
             "1.4142135623730951",
             // Values that are exact at fewer digits keep their short form.
             "3.14159",
-            "0.1",
+            ".1",
             "123456789.123456",
         ]
     );
@@ -359,8 +359,8 @@ PRINT CSNG(1 / 3)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, vec!["3.14159", "0.1", "3.14", "0.33333334"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["3.14159", ".1", "3.14", ".33333334"]);
 }
 
 /// The bitwise operators must work on Double operands, which is what an
@@ -386,7 +386,7 @@ PRINT A XOR B
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["8", "14", "6"], "AND/OR/XOR over Double");
 }
 
@@ -409,7 +409,7 @@ IF (E AND F) = 8 THEN PRINT "cond-ok" ELSE PRINT "cond-bad"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         vec!["8", "8", "8", "8", "cond-ok"],
@@ -433,7 +433,7 @@ PRINT A > B
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "2", "22", "1.2", "0", "-1"]);
 }
 
@@ -457,7 +457,7 @@ PRINT 12 XOR 10 AND 6
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // NOT binds tighter than AND, so the first two agree.
     assert_eq!(&lines[0..2], &["0", "0"], "NOT binds tighter than AND");
     // OR and XOR share a level and associate left to right, so these agree too.
@@ -479,7 +479,7 @@ IF NOT A < B THEN PRINT "not-less" ELSE PRINT "less"
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // NOT (A = B): A <> B, so NOT 0 = -1, true.
     assert_eq!(
         lines[0], "not-equal",
@@ -506,10 +506,10 @@ PRINT 2 ^ 3 ^ 2 ^ 1
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "64", "(2^3)^2, not 2^(3^2)");
     assert_eq!(lines[1], "-4", "^ binds tighter than unary minus");
-    assert_eq!(lines[2], "0.25", "a negative exponent still parses");
+    assert_eq!(lines[2], ".25", "a negative exponent still parses");
     assert_eq!(lines[3], "85", "subtraction is left to right");
     assert_eq!(lines[4], "2", "division is left to right");
     assert_eq!(lines[5], "64", "((2^3)^2)^1");
@@ -535,7 +535,7 @@ PRINT 0 IMP 0
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // EQV is bitwise equivalence: NOT (a XOR b).
     assert_eq!(&lines[0..4], &["-1", "0", "-1", "-7"], "EQV");
     // IMP is implication: (NOT a) OR b.
@@ -555,7 +555,7 @@ PRINT -1 IMP 0 EQV 0
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     // OR binds tighter, so the first two disagree and the first matches the third.
     assert_eq!(lines[0], lines[2], "OR binds tighter than EQV");
     // -1 IMP (0 EQV 0) = -1 IMP -1 = -1

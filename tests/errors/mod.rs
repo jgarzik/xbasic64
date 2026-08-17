@@ -1005,8 +1005,8 @@ fn test_unsafe_flag_still_produces_correct_programs() {
     let checked = compile_and_run_raw(source, "").unwrap();
     let unchecked = compile_and_run_flags(source, "", &["--unsafe"]).unwrap();
 
-    let expected: Vec<&str> = vec!["925", "3"];
-    assert_eq!(checked.stdout.trim().lines().collect::<Vec<_>>(), expected);
+    let expected: Vec<&str> = vec!["9  25", "3"];
+    assert_eq!(checked.lines(), expected);
     assert_eq!(
         unchecked.stdout.trim(),
         checked.stdout.trim(),
@@ -1773,7 +1773,7 @@ PRINT ASC("A")
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
 }
 
@@ -1806,8 +1806,8 @@ PRINT 0 ^ 0
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
-    assert_eq!(lines, &["-8", "4", "2", "0.25", "1"]);
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, &["-8", "4", "2", ".25", "1"]);
 }
 
 /// CHR$, SPACE$ and STRING$ refuse counts and codes they cannot represent.
@@ -1849,7 +1849,7 @@ PRINT HEX$(255)
 "#,
     )
     .unwrap();
-    let lines: Vec<&str> = output.trim().lines().collect();
+    let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
         &["0", "255", "65", "[]", "[   ]", "[]", "[xxx]", "FF"]
@@ -1894,10 +1894,7 @@ fn test_on_error_traps_and_reports() {
 "#,
     )
     .unwrap();
-    assert_eq!(
-        out.trim().lines().collect::<Vec<_>>(),
-        &["before", "handled1130"]
-    );
+    assert_eq!(crate::common::lines(&out), &["before", "handled 11  30"]);
 }
 
 /// An error raised from deep inside a runtime helper is trapped too.
@@ -1918,7 +1915,7 @@ fn test_on_error_traps_an_error_raised_inside_a_helper() {
 "#,
     )
     .unwrap();
-    assert_eq!(out.trim(), "trapped53");
+    assert_eq!(out.trim(), "trapped 53");
 }
 
 /// `ERROR n` is trapped like any other error, which is how a program tests its
@@ -1981,7 +1978,11 @@ fn test_state_survives_the_unwind() {
 "#,
     )
     .unwrap();
-    assert_eq!(out.trim(), "T=15I=6", "the loop's own variables are intact");
+    assert_eq!(
+        out.trim(),
+        "T= 15 I= 6",
+        "the loop's own variables are intact"
+    );
 }
 
 /// An error inside a SUB unwinds to the module-level handler.
@@ -2001,7 +2002,7 @@ END SUB
 "#,
     )
     .unwrap();
-    assert_eq!(out.trim(), "trapped11");
+    assert_eq!(out.trim(), "trapped 11");
 }
 
 /// A program that never traps carries none of the machinery.
@@ -2076,7 +2077,7 @@ fn test_gosub_survives_a_trap() {
     )
     .unwrap();
     assert_eq!(
-        out.trim().lines().collect::<Vec<_>>(),
+        crate::common::lines(&out),
         &["in sub", "trapped", "back"],
         "the handler's RETURN goes back to the statement after the GOSUB"
     );
@@ -2147,7 +2148,7 @@ fn test_resume_retries_the_failing_statement() {
     // GW-BASIC does not, and numbers carry no padding.
     assert_eq!(
         out.trim(),
-        "10.5",
+        "1  .5",
         "N stayed 1 and the division then worked"
     );
 }
@@ -2171,7 +2172,7 @@ fn test_resume_next_is_exact_mid_line() {
 "#,
     )
     .unwrap();
-    assert_eq!(out.trim(), "103", "N=1, B=0, C=3");
+    assert_eq!(out.trim(), "1  0  3", "N=1, B=0, C=3");
 }
 
 /// `RESUME NEXT` from the last statement of a FOR body continues the loop.
@@ -2196,7 +2197,7 @@ fn test_resume_next_continues_a_loop() {
     .unwrap();
     assert_eq!(
         out.trim(),
-        "34",
+        "3  4",
         "all three iterations ran; falling out would give 2"
     );
 }
@@ -2235,7 +2236,7 @@ fn test_resume_retry_loop() {
 "#,
     )
     .unwrap();
-    assert_eq!(out.trim(), "took1tries, got25");
+    assert_eq!(out.trim(), "took 1 tries, got 25");
 }
 
 /// `RESUME` with no error active is refused at run time, and is not itself
@@ -2341,7 +2342,7 @@ fn test_resume_next_from_a_deeply_nested_statement() {
     .unwrap();
     // Two passes of the loop; on I=2 the divide fails and RESUME NEXT lands on
     // `T = T + 10`, then the loop and the WHILE both carry on normally.
-    assert_eq!(out.trim(), "2262", "T=22, V=6, W=2");
+    assert_eq!(out.trim(), "22  6  2", "T=22, V=6, W=2");
 }
 
 /// `RESUME NEXT` from the last statement of the program just ends it.
