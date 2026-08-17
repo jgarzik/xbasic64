@@ -695,7 +695,8 @@ SYSTEM                ' End the program, as END does
 ```
 
 `ERASE` is recognised only before a name, so `Erase` remains usable as a label
-or a variable elsewhere.
+or a variable elsewhere. Its argument must be an array that is DIMed somewhere
+-- a name that is not one is a mistake, not a statement that does nothing.
 
 ### LOCATE and COLOR
 

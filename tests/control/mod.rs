@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_only};
 
 #[test]
 fn test_for_loops() {
@@ -1129,4 +1129,75 @@ PRINT A(9)
         &["7", "0", "5"],
         "the new array starts zeroed and is larger"
     );
+}
+
+/// The same, under `DEFINT A-Z`.
+///
+/// The default-type pass renames every unsuffixed name that a DEF* range
+/// covers, so `DIM A(3)` declares `A%` -- but ERASE carried its names outside
+/// an expression and outside the list of statements the pass rewrote, so it
+/// went on naming `A`. Nothing matched, ERASE quietly did nothing, and the
+/// second DIM was rejected as a redeclaration of an array the program had
+/// just asked to be rid of.
+#[test]
+fn test_erase_under_a_def_type_default() {
+    let output = compile_and_run(
+        r#"
+DEFINT A-Z
+DIM A(3)
+A(1) = 7
+PRINT A(1)
+ERASE A
+DIM A(10)
+A(9) = 5
+PRINT A(9)
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim().lines().collect::<Vec<_>>(), &["7", "5"]);
+}
+
+/// ERASE of something that is not an array is a mistake, not a no-op.
+///
+/// Codegen skips a name it cannot resolve to an array, on the grounds that
+/// sema has already complained -- which sema did not do, so `ERASE TOTLA` for
+/// `ERASE TOTAL` compiled clean and erased nothing.
+#[test]
+fn test_erase_of_a_non_array_is_diagnosed() {
+    for source in [
+        "ERASE NOSUCH\n",
+        "X = 5\nERASE X\n",
+        "DIM A(3)\nERASE A, B\n",
+    ] {
+        let err = compile_only(source).expect_err("ERASE of a non-array must be refused");
+        assert!(
+            err.contains("not a declared array"),
+            "expected an explanation, got: {}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// A procedure's own array is erasable, and a module-level one stays visible
+/// from inside a procedure -- the same two-step lookup every array use gets.
+#[test]
+fn test_erase_resolves_like_any_other_array_use() {
+    let output = compile_and_run(
+        r#"
+DIM G(3)
+SUB Wipe
+  DIM L(2)
+  L(0) = 1
+  ERASE L
+  ERASE G
+  DIM L(4)
+  DIM G(9)
+  PRINT "ok"
+END SUB
+CALL Wipe
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "ok");
 }

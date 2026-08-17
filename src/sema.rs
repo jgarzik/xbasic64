@@ -504,7 +504,17 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
         // LValues it owns -- `for_each_expr_mut` already visits both.
         for_each_expr_mut(stmt, &mut |e| expr(e, table, procs));
 
-        // The names a statement carries outside an expression.
+        // The names a statement carries outside an expression, including the
+        // LValues `for_each_expr_mut` does not reach.
+        //
+        // Deliberately without a wildcard, like `for_each_expr_mut` and
+        // `gen_stmt`: a statement kind that carries a name and is missing here
+        // keeps the name the program wrote, while every other mention of it is
+        // renamed, so the two stop matching and the statement silently does
+        // nothing. `ERASE` did exactly that -- it sat in the wildcard, went on
+        // naming `A` after `DEFINT A-Z` had made the array `A%`, and erased
+        // nothing. A new variant is now a compile error until it says which it
+        // is.
         match &mut stmt.kind {
             StmtKind::Let { name, .. } | StmtKind::Const { name, .. } => {
                 if let Some(renamed) = defaulted(name, table, procs) {
@@ -535,11 +545,13 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
                     }
                 }
             }
-            _ => {}
-        }
-
-        // The LValues that are not reached as expressions.
-        match &mut stmt.kind {
+            StmtKind::Erase(names) => {
+                for name in names.iter_mut() {
+                    if let Some(renamed) = defaulted(name, table, procs) {
+                        *name = renamed;
+                    }
+                }
+            }
             StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
                 vars.iter_mut().for_each(|v| lvalue(v, table, procs))
             }
@@ -554,7 +566,40 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             StmtKind::Field { fields, .. } => fields
                 .iter_mut()
                 .for_each(|f| lvalue(&mut f.target, table, procs)),
-            _ => {}
+
+            // Nothing outside an expression to rename. A procedure call names
+            // a procedure, a GOTO names a label, and neither is a variable.
+            StmtKind::Label(_)
+            | StmtKind::LabelName(_)
+            | StmtKind::Print { .. }
+            | StmtKind::If { .. }
+            | StmtKind::While { .. }
+            | StmtKind::DoLoop { .. }
+            | StmtKind::Goto(_)
+            | StmtKind::Gosub(_)
+            | StmtKind::Return
+            | StmtKind::OnGoto { .. }
+            | StmtKind::OnGosub { .. }
+            | StmtKind::Call { .. }
+            | StmtKind::ExitLoop { .. }
+            | StmtKind::ExitProc
+            | StmtKind::OptionBase(_)
+            | StmtKind::TypeDef { .. }
+            | StmtKind::Data(_)
+            | StmtKind::DefType { .. }
+            | StmtKind::Beep
+            | StmtKind::Locate { .. }
+            | StmtKind::Color { .. }
+            | StmtKind::Randomize(_)
+            | StmtKind::Restore(_)
+            | StmtKind::Cls
+            | StmtKind::SelectCase { .. }
+            | StmtKind::End
+            | StmtKind::Stop
+            | StmtKind::Open { .. }
+            | StmtKind::Close { .. }
+            | StmtKind::GetPut { .. }
+            | StmtKind::Lock { .. } => {}
         }
 
         // Nested bodies.
@@ -1576,6 +1621,21 @@ impl Analyzer {
                     self.check_expr(start, scope, line);
                     if let Some(e) = end {
                         self.check_expr(e, scope, line);
+                    }
+                }
+            }
+            // Codegen skips an ERASE name it cannot resolve, on the grounds
+            // that sema has already complained. It had not: this arm did not
+            // exist, so `ERASE TOTLA` for `ERASE TOTAL` compiled clean and
+            // erased nothing. The lookup is the one every array use gets --
+            // the enclosing procedure first, then the module.
+            StmtKind::Erase(names) => {
+                for name in names {
+                    if self.symbols.lookup_array(scope, name).is_none() {
+                        self.error(
+                            line,
+                            format!("ERASE needs an array, and '{name}' is not a declared array"),
+                        );
                     }
                 }
             }
