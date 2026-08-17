@@ -904,6 +904,15 @@ impl CodeGen {
         self.gen_coercion(ty, DataType::Double);
     }
 
+    /// Evaluate `expr` and leave it in `eax` as a Long.
+    ///
+    /// The counterpart of `gen_expr_to_double` for the statements whose
+    /// arguments are screen coordinates and colours.
+    fn gen_expr_to_long(&mut self, expr: &Expr) {
+        let ty = self.gen_expr(expr);
+        self.gen_coercion(ty, DataType::Long);
+    }
+
     /// Evaluate `expr` into the working register for `ct`, coerced.
     ///
     /// Routes a Double target through the pooled path and everything else
@@ -1186,7 +1195,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
-            "EOF" | "LBOUND" | "UBOUND" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" | "POS" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -3389,6 +3398,43 @@ impl CodeGen {
             // DEF* is consumed by sema, which rewrites the names it affects;
             // nothing is left to emit.
             StmtKind::DefType { .. } => {}
+
+            // An omitted coordinate means "leave it alone", which the escape
+            // sequence has no way to say -- so the current value is supplied.
+            // The column tracker knows the column; the row is not tracked, so
+            // an omitted row asks the terminal for line 1, which is the one
+            // divergence here and is documented.
+            StmtKind::Locate { row, col } => {
+                match row {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    mov eax, 1"),
+                }
+                self.emit("    movsxd r10, eax");
+                match col {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    call _rt_pos"),
+                }
+                self.emit("    movsxd r11, eax");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                self.emit("    call _rt_locate");
+            }
+
+            StmtKind::Color { fg, bg } => {
+                match fg {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    mov eax, 7"), // the usual default
+                }
+                self.emit("    movsxd r10, eax");
+                match bg {
+                    Some(e) => self.gen_expr_to_long(e),
+                    None => self.emit("    xor eax, eax"),
+                }
+                self.emit("    movsxd r11, eax");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                self.emit("    call _rt_color");
+            }
 
             StmtKind::Randomize(seed) => {
                 // With no seed, take the clock: GW-BASIC prompts the operator
@@ -5773,6 +5819,12 @@ impl CodeGen {
                 self.emit("    pop rbx");
                 // Result is in rax
                 self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
+            }
+            "POS" => {
+                // The argument is ignored, as in GW-BASIC: POS(0) is the idiom
+                // and any value means the same thing.
+                self.gen_expr(&args[0]);
+                self.emit("    call _rt_pos");
             }
             "ASC" => {
                 self.gen_expr(&args[0]);

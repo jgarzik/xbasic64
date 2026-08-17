@@ -11,6 +11,7 @@
 
 # Win32 API Constants
 .equ STD_OUTPUT_HANDLE, -11
+.equ ENABLE_VIRTUAL_TERMINAL_PROCESSING, 4
 
 # I/O size constants
 .equ SINGLE_BYTE, 1
@@ -47,6 +48,28 @@ _rt_platform_init:
     call GetStdHandle
     lea rcx, [rip + _file_handles]
     mov [rcx], rax
+
+    # Turn on VT processing, so the escape sequences CLS, LOCATE and COLOR
+    # write are acted on rather than printed literally. CLS has emitted them
+    # since it was written and simply assumed this was already set; on a
+    # console where it is not, it printed "^[[2J^[[H" and cleared nothing.
+    #
+    # Best effort: a failure here means the handle is not a console -- output
+    # redirected to a file, say -- and the escapes are then just bytes in the
+    # file, which is what any terminal program does.
+    mov rcx, [rcx]                      # the handle just stored
+    lea rdx, [rip + _console_mode]
+    call GetConsoleMode
+    test eax, eax
+    jz .Lplatform_no_console
+    lea rax, [rip + _console_mode]
+    mov ecx, DWORD PTR [rax]
+    or ecx, ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    mov edx, ecx
+    lea rcx, [rip + _file_handles]
+    mov rcx, [rcx]
+    call SetConsoleMode
+.Lplatform_no_console:
 
     call _rt_init_input
 

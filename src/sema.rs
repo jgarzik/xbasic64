@@ -73,6 +73,7 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("MKL$", 1, 1),
     ("MKS$", 1, 1),
     ("OCT$", 1, 1),
+    ("POS", 1, 1),
     ("RIGHT$", 2, 2),
     ("RTRIM$", 1, 1),
     ("RND", 0, 1),
@@ -116,11 +117,8 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "INKEY$ needs raw console input, which is not implemented yet",
     ),
     ("INPUT$", "INPUT$ is not implemented yet"),
-    ("LOCATE", "console cursor control is not implemented yet"),
-    ("COLOR", "console colour control is not implemented yet"),
     ("WIDTH", "console width control is not implemented yet"),
     ("CSRLIN", "console cursor position is not implemented yet"),
-    ("POS", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
     ("BEEP", "BEEP is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
@@ -672,6 +670,14 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         StmtKind::Swap(a, b) => {
             lvalue(a, f);
             lvalue(b, f);
+        }
+        StmtKind::Locate { row, col } => {
+            row.iter_mut().for_each(&mut *f);
+            col.iter_mut().for_each(&mut *f);
+        }
+        StmtKind::Color { fg, bg } => {
+            fg.iter_mut().for_each(&mut *f);
+            bg.iter_mut().for_each(&mut *f);
         }
         StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
         StmtKind::Const { value, .. } => f(value),

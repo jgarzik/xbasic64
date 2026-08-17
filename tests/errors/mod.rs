@@ -864,8 +864,6 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
         ("PRINT CSRLIN\n", "CSRLIN"),
         ("PRINT FRE(0)\n", "FRE"),
         ("A$ = INPUT$(3)\n", "INPUT$"),
-        ("LOCATE 1, 1\n", "LOCATE"),
-        ("COLOR 7\n", "COLOR"),
         ("PRINT PEEK(0)\n", "PEEK"),
         ("POKE 0, 1\n", "POKE"),
         ("SCREEN 13\n", "SCREEN"),

@@ -680,6 +680,32 @@ Clear screen:
 CLS
 ```
 
+### LOCATE and COLOR
+
+Console control, written as ANSI escape sequences:
+
+```basic
+CLS
+LOCATE 5, 10          ' Row 5, column 10; both count from 1
+LOCATE 3              ' Row only; the column is left alone
+LOCATE , 20           ' Column only
+COLOR 14, 1           ' Bright yellow on blue
+COLOR 7               ' Foreground only
+PRINT "positioned"
+```
+
+Colours are GW-BASIC's 0-15, where 8-15 are the bright half. GW-BASIC's third
+`COLOR` argument sets the border, which a terminal has no equivalent for, and is
+refused rather than ignored. `LOCATE` with no row asks for row 1, since the row
+is not tracked the way the column is.
+
+`POS(0)` gives the column the next character will be written to, counting from 1:
+
+```basic
+PRINT "abc";
+PRINT POS(0)          ' 4
+```
+
 ### SWAP
 
 Exchange two values of the same type, including array elements:
@@ -1315,7 +1341,7 @@ Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
 - **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
-- **Console control** -- `LOCATE`, `COLOR`, `WIDTH`, `CSRLIN`, `POS`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
+- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
 - **Date and time** -- `DATE$`, `TIME$`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`

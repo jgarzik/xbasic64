@@ -131,6 +131,104 @@ _rt_randomize:
     leave
     ret
 
+# _rt_pos - POS(n): the column the next character will be written to
+#
+# The tracker counts characters already on the line, and BASIC columns start at
+# one, so this is that count plus one.
+#
+# Arguments: none
+# Returns: eax = column (1-based)
+.globl _rt_pos
+_rt_pos:
+    push rbp
+    mov rbp, rsp
+    lea rax, [rip + _file_col]
+    mov rax, QWORD PTR [rax]
+    inc rax
+    leave
+    ret
+
+# _rt_locate - LOCATE row, col: move the cursor
+#
+# Written as an ANSI escape, the same way _rt_cls clears the screen. The column
+# tracker is updated to match, so that a following TAB or PRINT zone counts from
+# where the cursor actually is.
+#
+# Arguments: rdi = row (1-based), rsi = column (1-based)
+# Returns: nothing
+.globl _rt_locate
+_rt_locate:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8              # keep rsp 16-byte aligned across the call
+
+    mov rbx, rsi            # remember the column
+    mov rdx, rsi
+    mov rsi, rdi
+    lea rdi, [rip + _locate_fmt]
+    xor eax, eax
+    call printf
+
+    # The tracker counts characters before the cursor, so column 1 is 0.
+    dec rbx
+    lea rax, [rip + _file_col]
+    mov QWORD PTR [rax], rbx
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
+# _rt_color - COLOR foreground, background
+#
+# GW-BASIC numbers 0-15 with 8-15 as the bright half; ANSI splits that into two
+# ranges, 30-37 and 90-97 for the foreground and 40-47 and 100-107 for the
+# background. Values outside 0-15 are left to the terminal.
+#
+# Arguments: rdi = foreground, rsi = background
+# Returns: nothing
+.globl _rt_color
+_rt_color:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8              # keep rsp 16-byte aligned across the call
+
+    # Foreground: 0-7 -> 30-37, 8-15 -> 90-97
+    mov rax, rdi
+    cmp rax, 8
+    jl .Lcolor_fg_normal
+    sub rax, 8
+    add rax, 90
+    jmp .Lcolor_fg_done
+.Lcolor_fg_normal:
+    add rax, 30
+.Lcolor_fg_done:
+    mov rbx, rax
+
+    # Background: 0-7 -> 40-47, 8-15 -> 100-107
+    mov rax, rsi
+    cmp rax, 8
+    jl .Lcolor_bg_normal
+    sub rax, 8
+    add rax, 100
+    jmp .Lcolor_bg_done
+.Lcolor_bg_normal:
+    add rax, 40
+.Lcolor_bg_done:
+
+    mov rdx, rax
+    mov rsi, rbx
+    lea rdi, [rip + _color_fmt]
+    xor eax, eax
+    call printf
+
+    add rsp, 8
+    pop rbx
+    leave
+    ret
+
 # _rt_timer - TIMER: seconds since midnight, UTC
 # GW-BASIC's TIMER counts fractional seconds since midnight, so this uses
 # gettimeofday rather than time(): whole seconds alone made a program that
@@ -183,6 +281,11 @@ _rt_timer:
 _rt_cls:
     push rbp
     mov rbp, rsp
+    # Home the column tracker too. The cursor is at column 1 after this, and a
+    # later TAB that believed the old column emitted a newline to reach a
+    # column it had already passed.
+    lea rax, [rip + _file_col]
+    mov QWORD PTR [rax], 0
     lea rdi, [rip + _cls_seq]   # ANSI escape sequence
     xor eax, eax                # no vector args
     call printf

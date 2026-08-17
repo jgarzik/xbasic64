@@ -138,3 +138,92 @@ fn test_tab_and_spc() {
         "TAB accounts for text already printed"
     );
 }
+
+/// `LOCATE` positions the cursor, and `COLOR` sets the colours.
+///
+/// Both are written as ANSI escapes, which is the model `CLS` already uses on
+/// both platforms. The test reads the escape bytes out of stdout rather than
+/// looking at a terminal.
+#[test]
+fn test_locate_and_color_emit_escapes() {
+    let out = crate::common::compile_and_run_raw(
+        "LOCATE 5, 10\nPRINT \"x\";\nCOLOR 14, 1\nPRINT \"y\";\n",
+        "",
+    )
+    .expect("should compile");
+    assert!(
+        out.stdout.contains("\u{1b}[5;10H"),
+        "LOCATE 5,10 should home the cursor there: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains('x') && out.stdout.contains('y'),
+        "the text still prints: {:?}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("\u{1b}[") && out.stdout.contains('m'),
+        "COLOR should emit an SGR sequence: {:?}",
+        out.stdout
+    );
+}
+
+/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does.
+#[test]
+fn test_locate_row_only() {
+    let out = crate::common::compile_and_run_raw("LOCATE 7\n", "").expect("should compile");
+    assert!(
+        out.stdout.contains("\u{1b}[7;"),
+        "row given, column preserved: {:?}",
+        out.stdout
+    );
+}
+
+/// `POS(0)` reports the column the next character will go to, counting from 1.
+#[test]
+fn test_pos_reports_the_column() {
+    let output = compile_and_run(
+        r#"
+PRINT POS(0)
+PRINT "abc";
+PRINT POS(0)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(lines[0], "1", "a fresh line starts at column 1");
+    assert!(
+        lines[1].ends_with('4'),
+        "after \"abc\" the column is 4: {lines:?}"
+    );
+}
+
+/// `CLS` puts the cursor at home, so the column tracker must agree.
+///
+/// It did not: after clearing, `TAB` still believed the column it had before
+/// and emitted a spurious newline to reach a column already passed.
+#[test]
+fn test_cls_resets_the_column() {
+    let out = crate::common::compile_and_run_raw(
+        "PRINT \"0123456789012345678901234567890123456789\";\nCLS\nPRINT TAB(5); \"X\"\n",
+        "",
+    )
+    .expect("should compile");
+    let after_cls = out.stdout.rsplit("\u{1b}[H").next().unwrap_or("");
+    assert!(
+        !after_cls.starts_with('\n'),
+        "TAB after CLS must not wrap to a new line: {:?}",
+        out.stdout
+    );
+}
+
+/// `LOCATE` also sets the column the tracker believes, for the same reason.
+#[test]
+fn test_locate_sets_the_column() {
+    let output = compile_and_run("LOCATE 3, 12\nPRINT POS(0)\n").unwrap();
+    // The escape sequence LOCATE wrote precedes the number on the same line.
+    assert!(
+        output.trim().ends_with("12"),
+        "POS should follow LOCATE: {output:?}"
+    );
+}

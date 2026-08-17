@@ -45,4 +45,5 @@ _redo_msg: .ascii "?Redo from start\r\n"
 .bss
 .p2align 3
 _num_buf: .skip 64
+_console_mode: .skip 4          # GetConsoleMode's output, for the VT enable
 

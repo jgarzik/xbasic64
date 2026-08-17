@@ -229,6 +229,20 @@ pub enum StmtKind {
         ty: DataType,
         ranges: Vec<(char, char)>,
     },
+    /// `LOCATE [row][, col]` -- move the cursor.
+    ///
+    /// Either part may be omitted, in which case that coordinate is left where
+    /// it is; GW-BASIC also takes cursor-shape arguments, which have no meaning
+    /// on a terminal and are refused.
+    Locate {
+        row: Option<Expr>,
+        col: Option<Expr>,
+    },
+    /// `COLOR fg[, bg]` -- set the text colours.
+    Color {
+        fg: Option<Expr>,
+        bg: Option<Expr>,
+    },
     /// `RANDOMIZE [expr]` -- reseed the random number generator.
     ///
     /// GW-BASIC prompts for a seed when none is given; a compiled program has
@@ -702,6 +716,8 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
             DataTypeWord::Double => "DEFDBL",
             DataTypeWord::String => "DEFSTR",
         },
+        Token::Locate => "LOCATE",
+        Token::Color => "COLOR",
         Token::Randomize => "RANDOMIZE",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
@@ -1292,6 +1308,8 @@ impl Parser {
             Token::DataText(text) => self.parse_data(&text),
             Token::Read => self.parse_read(),
             Token::DefType(w) => self.parse_def_type(w),
+            Token::Locate => self.parse_locate(),
+            Token::Color => self.parse_color(),
             Token::Randomize => self.parse_randomize(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
@@ -2599,6 +2617,53 @@ impl Parser {
         }
 
         Ok(StmtKind::Read(vars))
+    }
+
+    /// `LOCATE row, col`, `LOCATE row`, `LOCATE , col`.
+    fn parse_locate(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume LOCATE
+        let (row, col) = self.parse_two_optional_args()?;
+        if row.is_none() && col.is_none() {
+            return err("LOCATE needs a row, a column, or both");
+        }
+        Ok(StmtKind::Locate { row, col })
+    }
+
+    /// `COLOR fg, bg`, `COLOR fg`, `COLOR , bg`.
+    fn parse_color(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume COLOR
+        let (fg, bg) = self.parse_two_optional_args()?;
+        if fg.is_none() && bg.is_none() {
+            return err("COLOR needs a foreground, a background, or both");
+        }
+        // GW-BASIC's third argument is the border colour, which a terminal has
+        // no equivalent for.
+        if matches!(self.peek(), Token::Comma) {
+            return err("COLOR takes a foreground and a background; a terminal has no border");
+        }
+        Ok(StmtKind::Color { fg, bg })
+    }
+
+    /// `a, b` where either side may be left out -- the shape LOCATE and COLOR
+    /// share.
+    fn parse_two_optional_args(&mut self) -> PResult<(Option<Expr>, Option<Expr>)> {
+        let ends = |t: &Token| matches!(t, Token::Newline | Token::Colon | Token::Eof);
+        let first = if matches!(self.peek(), Token::Comma) || ends(self.peek()) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        let second = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            if ends(self.peek()) {
+                None
+            } else {
+                Some(self.parse_expression()?)
+            }
+        } else {
+            None
+        };
+        Ok((first, second))
     }
 
     /// `DEFINT A-Z`, `DEFSTR S`, `DEFINT A, C-E`.

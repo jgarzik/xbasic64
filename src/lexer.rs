@@ -78,6 +78,8 @@ fn keyword(s: &str) -> Option<Token> {
         "DEFSNG" => Some(Token::DefType(DataTypeWord::Single)),
         "DEFDBL" => Some(Token::DefType(DataTypeWord::Double)),
         "DEFSTR" => Some(Token::DefType(DataTypeWord::String)),
+        "LOCATE" => Some(Token::Locate),
+        "COLOR" => Some(Token::Color),
         "RANDOMIZE" => Some(Token::Randomize),
         "RESTORE" => Some(Token::Restore),
         "CLS" => Some(Token::Cls),
@@ -169,6 +171,8 @@ pub enum Token {
     Read,
     /// `DEFINT`/`DEFLNG`/`DEFSNG`/`DEFDBL`/`DEFSTR`, carrying which one.
     DefType(DataTypeWord),
+    Locate,
+    Color,
     Randomize,
     Restore,
     Cls,
