@@ -1100,6 +1100,7 @@ fn test_system_ends_the_program() {
 #[test]
 fn test_beep_rings_the_bell() {
     let run = crate::common::compile_and_run_raw("BEEP\n", "").expect("should compile");
+    run.assert_ran_to_completion("BEEP");
     assert!(
         run.stdout.contains('\u{7}'),
         "BEEP writes BEL: {:?}",

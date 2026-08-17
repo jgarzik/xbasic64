@@ -151,6 +151,7 @@ fn test_locate_and_color_emit_escapes() {
         "",
     )
     .expect("should compile");
+    out.assert_ran_to_completion("LOCATE then COLOR");
     assert!(
         out.stdout.contains("\u{1b}[5;10H"),
         "LOCATE 5,10 should home the cursor there: {:?}",
@@ -172,6 +173,7 @@ fn test_locate_and_color_emit_escapes() {
 #[test]
 fn test_locate_row_only() {
     let out = crate::common::compile_and_run_raw("LOCATE 7\n", "").expect("should compile");
+    out.assert_ran_to_completion("LOCATE with a row only");
     assert!(
         out.stdout.contains("\u{1b}[7;"),
         "row given, column preserved: {:?}",
@@ -209,12 +211,52 @@ fn test_cls_resets_the_column() {
         "",
     )
     .expect("should compile");
+    // Before this line the test could not fail on a crash: a program that died
+    // in CLS left nothing after the escape, which is exactly what the
+    // assertion below wants to see.
+    out.assert_ran_to_completion("PRINT then CLS then TAB");
     let after_cls = out.stdout.rsplit("\u{1b}[H").next().unwrap_or("");
     assert!(
         !after_cls.starts_with('\n'),
         "TAB after CLS must not wrap to a new line: {:?}",
         out.stdout
     );
+}
+
+/// Every console statement's program runs to completion.
+///
+/// Blunt on purpose. These helpers are written twice, and the Win64 half is
+/// the one no developer runs -- CI is the only place it executes at all. The
+/// tests above read what each statement *wrote*, which a crash can satisfy by
+/// writing nothing; this one only asks whether the program survived, which a
+/// crash cannot.
+#[test]
+fn test_console_statements_run_to_completion() {
+    for (what, source) in [
+        ("CLS", "CLS\n"),
+        ("CLS after PRINT", "PRINT \"x\"\nCLS\n"),
+        ("CLS twice", "CLS\nCLS\n"),
+        ("LOCATE", "LOCATE 2, 5\n"),
+        ("LOCATE row only", "LOCATE 3\n"),
+        ("LOCATE column only", "LOCATE , 8\n"),
+        ("COLOR", "COLOR 14, 1\n"),
+        ("POS", "PRINT POS(0)\n"),
+        ("BEEP", "BEEP\n"),
+        ("TIMER", "PRINT TIMER\n"),
+        ("RANDOMIZE", "RANDOMIZE 42\n"),
+        ("RANDOMIZE TIMER", "RANDOMIZE TIMER\n"),
+        ("RND", "PRINT RND\n"),
+        ("DATE$ and TIME$", "PRINT DATE$\nPRINT TIME$\n"),
+        ("FRE", "PRINT FRE(0)\n"),
+        (
+            "the lot together",
+            "CLS\nCOLOR 14, 1\nLOCATE 2, 5\nPRINT \"x\"; POS(0)\n",
+        ),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "")
+            .unwrap_or_else(|e| panic!("{what} should compile: {e}"));
+        run.assert_ran_to_completion(what);
+    }
 }
 
 /// `LOCATE` also sets the column the tracker believes, for the same reason.

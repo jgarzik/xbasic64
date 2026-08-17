@@ -80,11 +80,11 @@ jobs:
             # a different defect, and none of the three can be reproduced on
             # the Linux job.
             if ($LASTEXITCODE -ne 0) {
-              # Widen before masking: -band on two int32s stays int32, so the
-              # cast of a negative status threw and hid the number it was
-              # printed to reveal.
-              $code = [uint32]([int64]$LASTEXITCODE -band 0xFFFFFFFF)
-              throw ("run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $code)
+              # `-f` with X8 renders a negative Int32 as its two's-complement
+              # hex on its own. Masking first needed no cast and got one: in
+              # PowerShell 0xFFFFFFFF is Int32 -1, so the -band was a no-op and
+              # [uint32] then threw on the very value it was there to show.
+              throw ("run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $LASTEXITCODE)
             }
           }
 
@@ -102,6 +102,9 @@ jobs:
         run: |
           $probes = [ordered]@{
             'CLS'             = 'CLS'
+            'CLS after PRINT' = "PRINT `"x`"`nCLS"
+            'CLS twice'       = "CLS`nCLS"
+            'PRINT alone'     = 'PRINT "x"'
             'COLOR'           = 'COLOR 14, 1'
             'LOCATE'          = 'LOCATE 2, 5'
             'LOCATE row only' = 'LOCATE 3'
@@ -125,14 +128,13 @@ jobs:
             Set-Content -Path probe.bas -Value $p.Value
             & ./target/release/xbasic64.exe probe.bas -o probe.exe | Out-Null
             if ($LASTEXITCODE -ne 0) {
-              Write-Host ("{0,-16} DID NOT COMPILE" -f $p.Key)
+              Write-Host ("{0,-20} DID NOT COMPILE" -f $p.Key)
               $failed += $p.Key
               continue
             }
             & ./probe.exe | Out-Null
             $code = $LASTEXITCODE
-            $hex = [uint32]([int64]$code -band 0xFFFFFFFF)
-            Write-Host ("{0,-16} exit {1} (0x{2:X8})" -f $p.Key, $code, $hex)
+            Write-Host ("{0,-20} exit {1} (0x{2:X8})" -f $p.Key, $code, $code)
             if ($code -ne 0) { $failed += $p.Key }
           }
           if ($failed.Count -gt 0) { throw "crashed: $($failed -join ', ')" }
