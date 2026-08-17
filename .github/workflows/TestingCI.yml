@@ -129,6 +129,9 @@ jobs:
             'ON ERROR in file'= "10 ON ERROR GOTO 100`n20 OPEN `"nope.txt`" FOR INPUT AS #1`n30 END`n100 PRINT ERR`n110 END"
             'ON ERROR in proc'= "10 ON ERROR GOTO 100`n20 CALL B`n30 END`n100 PRINT ERR`n110 END`nSUB B`nPRINT 1 / 0`nEND SUB"
             'ON ERROR GOTO 0' = "10 ON ERROR GOTO 100`n20 ON ERROR GOTO 0`n30 END`n100 END"
+            'RESUME'          = "10 ON ERROR GOTO 100`n20 D = 0`n30 X = 1 / D`n40 END`n100 D = 2`n110 RESUME"
+            'RESUME NEXT'     = "10 ON ERROR GOTO 100`n20 X = 1 / 0`n30 PRINT `"ok`"`n40 END`n100 RESUME NEXT"
+            'RESUME line'     = "10 ON ERROR GOTO 100`n20 X = 1 / 0`n30 END`n100 RESUME 30"
           }
           $failed = @()
           foreach ($p in $probes.GetEnumerator()) {

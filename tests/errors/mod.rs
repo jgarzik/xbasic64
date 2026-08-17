@@ -2008,7 +2008,16 @@ END SUB
 #[test]
 fn test_no_cost_without_on_error() {
     let asm = crate::common::compile_to_asm("PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n").unwrap();
-    for symbol in ["_err_handler", "_err_ctx", "_err_line", "_rt_trap_capture"] {
+    for symbol in [
+        "_err_handler",
+        "_err_ctx",
+        "_err_line",
+        "_rt_trap_capture",
+        "_err_stmt",
+        "_err_depth",
+        "_resume_at",
+        "_resume_next",
+    ] {
         assert!(
             !asm.contains(symbol),
             "{symbol} should not appear in a program with no ON ERROR"
@@ -2114,4 +2123,238 @@ fn test_trapping_disables_register_promotion() {
         !trapping.contains("save a counter register"),
         "a trapping program must keep its counter in memory"
     );
+}
+
+/// `RESUME` retries the statement that failed.
+///
+/// The handler fixes the cause, so the retry succeeds. `N` proves it re-entered
+/// at the failing statement rather than at the head of its line.
+#[test]
+fn test_resume_retries_the_failing_statement() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 N = N + 1 : X = 1 / D
+40 PRINT N; X
+50 END
+100 D = 2
+110 RESUME
+"#,
+    )
+    .unwrap();
+    // "1" then "0.5": this compiler prints a leading zero where
+    // GW-BASIC does not, and numbers carry no padding.
+    assert_eq!(
+        out.trim(),
+        "10.5",
+        "N stayed 1 and the division then worked"
+    );
+}
+
+/// `RESUME NEXT` continues at the statement after the one that failed, even
+/// when that is mid-line.
+///
+/// This is the case per-statement resume points exist for: `A=1 : B=2` on one
+/// line is how listings saved memory, and resuming at the head of the line
+/// would re-run work and loop forever here.
+#[test]
+fn test_resume_next_is_exact_mid_line() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 C = 9
+30 N = N + 1 : B = 1 / 0 : C = 3
+40 PRINT N; B; C
+50 END
+100 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "103", "N=1, B=0, C=3");
+}
+
+/// `RESUME NEXT` from the last statement of a FOR body continues the loop.
+///
+/// Nothing special makes this work: `_rn` sits where the next code does, and
+/// the next code after a body's last statement is the increment and the
+/// back-jump.
+#[test]
+fn test_resume_next_continues_a_loop() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 FOR I = 1 TO 3
+30   T = T + 1
+40   X = 1 / (I - 2)
+50 NEXT I
+60 PRINT T; I
+70 END
+100 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out.trim(),
+        "34",
+        "all three iterations ran; falling out would give 2"
+    );
+}
+
+/// `RESUME <line>` jumps, and skips whatever lies between.
+#[test]
+fn test_resume_at_a_line() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 PRINT 1 / 0
+30 PRINT "skipped"
+40 PRINT "landed"
+50 END
+100 RESUME 40
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "landed");
+}
+
+/// The classic retry loop: try, fail, fix, try again.
+#[test]
+fn test_resume_retry_loop() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 Tries = 0
+30 Divisor = 0
+40 Tries = Tries + 1
+50 R = 100 / Divisor
+60 PRINT "took"; Tries; "tries, got"; R
+70 END
+200 Divisor = Divisor + 4
+210 RESUME
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "took1tries, got25");
+}
+
+/// `RESUME` with no error active is refused at run time, and is not itself
+/// trappable -- trapping it would loop through the handler forever.
+#[test]
+fn test_resume_without_an_error_is_fatal() {
+    let run = compile_and_run_raw(
+        "10 ON ERROR GOTO 100\n20 GOTO 100\n30 END\n100 RESUME\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("RESUME without error"),
+        "got: {:?}",
+        run.stderr
+    );
+}
+
+/// A bare `RESUME` after an error raised inside a procedure fails cleanly.
+///
+/// The unwind discarded that frame, so there is nothing to go back to. The
+/// diagnosis is the point: guessing would resume at the CALL, which looks
+/// plausible and is wrong.
+#[test]
+fn test_resume_after_a_procedure_error_is_refused() {
+    let src = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"no\"\n40 END\n\
+               100 RESUME\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+    let run = compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert!(run.stderr.contains("RESUME"), "got: {:?}", run.stderr);
+    assert!(!run.stdout.contains("no"), "it must not resume anywhere");
+
+    // `RESUME <line>` needs no failing statement, so it is allowed.
+    let ok = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"skipped\"\n40 PRINT \"landed\"\n50 END\n\
+              100 RESUME 40\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+    assert_eq!(compile_and_run(ok).unwrap().trim(), "landed");
+}
+
+/// A statement that continues after a call returns is still resumable.
+///
+/// `X = F(1) / D` divides after `F` comes back, so the error belongs to the
+/// module-level statement even though a procedure ran inside it.
+#[test]
+fn test_resume_after_a_call_that_returned() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 X = F(1) / D
+40 PRINT X
+50 END
+100 D = 4
+110 RESUME
+FUNCTION F(N)
+  F = N + 7
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "2");
+}
+
+/// `RESUME` needs a handler to return from, and belongs at module level.
+#[test]
+fn test_resume_is_checked_at_compile_time() {
+    let err = compile_only("10 PRINT 1\n20 RESUME\n").expect_err("RESUME needs an ON ERROR");
+    assert!(err.contains("RESUME"), "got: {}", err.stderr);
+    assert!(err.is_clean_rejection());
+
+    let err =
+        compile_only("10 ON ERROR GOTO 100\n20 CALL B\n30 END\n100 END\nSUB B\nRESUME\nEND SUB\n")
+            .expect_err("RESUME inside a procedure must be refused");
+    assert!(err.is_clean_rejection(), "got: {}", err.stderr);
+
+    let err = compile_only("10 ON ERROR GOTO 100\n20 PRINT 1\n30 END\n100 RESUME 999\n")
+        .expect_err("RESUME must name a line that exists");
+    assert!(err.contains("RESUME"), "got: {}", err.stderr);
+}
+
+/// `RESUME NEXT` is exact however deeply the failing statement is nested.
+///
+/// The resume point is a position in the emitted code, so an IF inside a FOR
+/// inside a WHILE needs nothing special -- which is the claim this checks.
+#[test]
+fn test_resume_next_from_a_deeply_nested_statement() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 200
+20 W = 0
+30 WHILE W < 2
+40   FOR I = 1 TO 3
+50     IF I = 2 THEN T = T + 1 : X = 1 / 0 : T = T + 10
+60     V = V + 1
+70   NEXT I
+80   W = W + 1
+90 WEND
+100 PRINT T; V; W
+110 END
+200 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    // Two passes of the loop; on I=2 the divide fails and RESUME NEXT lands on
+    // `T = T + 10`, then the loop and the WHILE both carry on normally.
+    assert_eq!(out.trim(), "2262", "T=22, V=6, W=2");
+}
+
+/// `RESUME NEXT` from the last statement of the program just ends it.
+///
+/// The handler is put ahead of the failure on purpose, so that the statement
+/// that fails really is the last one emitted and `_rn` for it is main's
+/// epilogue.
+#[test]
+fn test_resume_next_off_the_end() {
+    let run = compile_and_run_raw(
+        "10 GOTO 30\n20 RESUME NEXT\n30 ON ERROR GOTO 20\n40 PRINT 1 / 0\n",
+        "",
+    )
+    .expect("should compile");
+    run.assert_ran_to_completion("RESUME NEXT past the last statement");
 }

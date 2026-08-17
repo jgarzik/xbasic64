@@ -685,6 +685,45 @@ The rules, which are GW-BASIC's:
 A program that never uses `ON ERROR` is compiled exactly as before, and pays
 nothing for the feature.
 
+### RESUME
+
+`RESUME` ends a handler and goes back to the program. Three forms:
+
+| Form           | Goes back to                                    |
+|----------------|-------------------------------------------------|
+| `RESUME`       | The statement that failed, to try it again      |
+| `RESUME NEXT`  | The statement after the one that failed         |
+| `RESUME n`     | Line `n`, or a named label                      |
+
+`RESUME 0` means the same as a bare `RESUME`.
+
+```basic
+10 ON ERROR GOTO 200
+20 Divisor = 0
+30 Tries = Tries + 1 : R = 100 / Divisor
+40 PRINT "took"; Tries; "tries, got"; R
+50 END
+200 Divisor = 4
+210 RESUME
+```
+
+The statement, not the line: on line 30 above, `RESUME` returns to
+`R = 100 / Divisor` and leaves `Tries` alone, and `RESUME NEXT` would carry on
+at line 40. Where the failing statement is the last in a `FOR` or `WHILE` body,
+`RESUME NEXT` continues the loop rather than leaving it.
+
+Two rules follow from where a handler runs:
+
+- `RESUME` must be module-level code, like the handler it ends.
+- After an error raised **inside a `SUB` or `FUNCTION`**, a bare `RESUME` or
+  `RESUME NEXT` stops the program with `RESUME cannot return into a SUB or
+  FUNCTION`: the unwind discarded that frame, so there is nothing to go back
+  to. `RESUME n` still works, and is the way out.
+
+`RESUME` outside a handler stops the program with `RESUME without error`.
+Neither of these two is trappable -- a handler that caught its own failing
+`RESUME` would be re-entered by it forever.
+
 ### DIM
 
 Declare arrays:
@@ -1439,7 +1478,6 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Error trapping** -- `RESUME`, `RESUME NEXT` (`ON ERROR GOTO`, `ERR`, `ERL` and `ERROR` are implemented)
 - **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`

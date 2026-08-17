@@ -115,7 +115,6 @@ const BUILTINS: &[(&str, usize, usize)] = &[
 const UNSUPPORTED: &[(&str, &str)] = &[
     // Planned: implementable on both platforms, not written yet.
     ("ERROR", "error trapping is not implemented yet"),
-    ("RESUME", "error trapping is not implemented yet"),
     (
         "INKEY$",
         "INKEY$ needs raw console input, which is not implemented yet",
@@ -395,6 +394,7 @@ pub fn analyze(program: &mut Program, checks: bool) -> (Symbols, Vec<Diagnostic>
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
     a.check_gosub_scope_when_trapping(&program.statements);
+    a.check_resume_has_a_handler(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
@@ -581,7 +581,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             StmtKind::RaiseError(_) => {}
             // A handler is a branch target, and a label is not a variable --
             // the same reason GOTO and GOSUB are left alone here.
-            StmtKind::OnError(_) => {}
+            StmtKind::OnError(_) | StmtKind::Resume(_) => {}
             StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
                 vars.iter_mut().for_each(|v| lvalue(v, table, procs))
             }
@@ -757,7 +757,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         }
         StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
         StmtKind::RaiseError(e) => f(e),
-        StmtKind::OnError(_) => {}
+        StmtKind::OnError(_) | StmtKind::Resume(_) => {}
         StmtKind::Const { value, .. } => f(value),
         StmtKind::FieldAssign { target, value } => {
             lvalue(target, f);
@@ -1161,6 +1161,29 @@ impl Analyzer {
                 "RETURN without GOSUB".to_string(),
                 "RETURN ends a GOSUB; use EXIT SUB or EXIT FUNCTION to leave a procedure"
                     .to_string(),
+            );
+        }
+    }
+
+    /// RESUME needs an ON ERROR to return from.
+    ///
+    /// Modelled on `check_return_has_a_gosub`, and for the same reason: on its
+    /// own a RESUME compiles to a jump through a table that a non-trapping
+    /// program never emits, so the failure would be a link error rather than a
+    /// diagnosis.
+    fn check_resume_has_a_handler(&mut self, stmts: &[Stmt]) {
+        let mut has_handler = false;
+        let mut first_resume = None;
+        walk_stmts(stmts, &mut |stmt| match &stmt.kind {
+            StmtKind::OnError(_) => has_handler = true,
+            StmtKind::Resume(_) if first_resume.is_none() => first_resume = Some(stmt.line),
+            _ => {}
+        });
+        if let (false, Some(line)) = (has_handler, first_resume) {
+            self.error_with_note(
+                line,
+                "RESUME without an error handler".to_string(),
+                "RESUME ends an ON ERROR handler; this program has no ON ERROR".to_string(),
             );
         }
     }
@@ -1718,6 +1741,32 @@ impl Analyzer {
             // erased nothing. The lookup is the one every array use gets --
             // the enclosing procedure first, then the module.
             StmtKind::RaiseError(n) => self.check_numeric_operand(n, scope, line, "ERROR"),
+            StmtKind::Resume(target) => {
+                // A trapped error unwinds to main's frame, so the handler --
+                // and the RESUME that ends it -- are module-level code.
+                if let Scope::Proc(name) = scope {
+                    self.error_with_note(
+                        line,
+                        format!("RESUME is not allowed inside '{}'", name),
+                        "RESUME ends an ON ERROR handler, which is module-level code".to_string(),
+                    );
+                }
+                if let ResumeTarget::At(t) = target {
+                    self.check_target(t, line, "RESUME");
+                    let at_module_scope = match t {
+                        GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
+                        GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                    };
+                    if !at_module_scope {
+                        self.error_with_note(
+                            line,
+                            "a RESUME target must be at module level".to_string(),
+                            "it is reached after the error has unwound out of every procedure"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             StmtKind::OnError(target) => {
                 // `--unsafe` removes the checks that raise most of what a
                 // handler exists to catch, so the pair would leave a handler

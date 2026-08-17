@@ -397,6 +397,10 @@ enum RtError {
     OutOfMemory,
     GosubOverflow,
     BadFileNum,
+    /// RESUME with nothing to return from.
+    ResumeNoError,
+    /// RESUME after an error raised inside a procedure, whose frame is gone.
+    ResumeInProc,
 }
 
 impl RtError {
@@ -411,7 +415,17 @@ impl RtError {
             RtError::OutOfMemory => "_err_memory",
             RtError::GosubOverflow => "_err_gosub",
             RtError::BadFileNum => "_err_badfile",
+            RtError::ResumeNoError => "_err_resnoerr",
+            RtError::ResumeInProc => "_err_resproc",
         }
+    }
+
+    /// Whether an `ON ERROR` handler may catch this.
+    ///
+    /// RESUME's own two failures may not: the handler would be re-entered by
+    /// the very RESUME that failed, and would never stop.
+    fn trappable(self) -> bool {
+        !matches!(self, RtError::ResumeNoError | RtError::ResumeInProc)
     }
 
     /// Short tag used to build a unique trampoline label.
@@ -425,6 +439,8 @@ impl RtError {
             RtError::OutOfMemory => "mem",
             RtError::GosubOverflow => "gosub",
             RtError::BadFileNum => "badfile",
+            RtError::ResumeNoError => "resnoerr",
+            RtError::ResumeInProc => "resproc",
         }
     }
 }
@@ -630,6 +646,11 @@ pub struct CodeGen {
     /// Array descriptors currently held in registers, innermost loop last.
     hoisted_arrays: Vec<HoistedArray>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
+    /// One entry per module-level statement, in emission order, when trapping.
+    ///
+    /// Only the count matters -- the labels are `_rs_<i>` and `_rn_<i>` -- but
+    /// keeping the vector makes the table emission read as what it is.
+    resume_points: Vec<usize>,
     /// Whether the program contains `ON ERROR`, and so pays for trapping.
     ///
     /// Everything trapping costs is behind this: the context capture, the
@@ -2461,7 +2482,12 @@ impl CodeGen {
             let sym = kind.symbol();
             emit!(self, "    lea {}, [rip + {}]", Self::arg_reg(0), sym);
             emit!(self, "    mov {}, {}", Self::arg_reg(1), line);
-            self.emit("    call _rt_error");
+            let entry = if kind.trappable() {
+                "_rt_error"
+            } else {
+                "_rt_fatal"
+            };
+            emit!(self, "    call {}", entry);
         }
     }
 
@@ -2626,6 +2652,14 @@ impl CodeGen {
             );
         }
 
+        // An error raised in here is trapped like any other, but there is
+        // nothing for a bare RESUME to return to once the unwind has discarded
+        // this frame. The counter is what the trap reads to know that; it
+        // needs no unwinding of its own, because the trap resets it.
+        if self.traps {
+            self.emit("    inc QWORD PTR [rip + _err_depth]");
+        }
+
         // Generate body
         let exit_label = format!(".Lproc_exit_{}", mangle(name));
         let saved_exit = self.proc_exit_label.replace(exit_label.clone());
@@ -2636,6 +2670,12 @@ impl CodeGen {
         self.loop_stack = saved_loops;
         self.proc_exit_label = saved_exit;
         self.emit_label(&exit_label);
+        // Every route out passes here, EXIT SUB included, so one decrement
+        // matches the increment above. A trapped error skips it, which is
+        // exactly right: the trap resets the counter instead.
+        if self.traps {
+            self.emit("    dec QWORD PTR [rip + _err_depth]");
+        }
 
         // Return - load return value into appropriate register based on type
         if is_function {
@@ -2681,7 +2721,39 @@ impl CodeGen {
         self.stack_offset = old_stack_offset;
     }
 
+    /// Compile one statement, bracketed by its resume points when trapping.
+    ///
+    /// A wrapper rather than code at the top and bottom of `gen_stmt_inner`,
+    /// because several of its arms `return` early and would skip the closing
+    /// label -- which is the one RESUME NEXT needs.
+    ///
+    /// The two labels are all RESUME needs, because the emitted layout already
+    /// says what runs next: after the last statement of a FOR body comes the
+    /// increment and the back-jump, after the last statement of an IF branch
+    /// comes that branch's exit jump, and after the last statement of the
+    /// program comes main's epilogue. Every awkward case falls out of that.
     fn gen_stmt(&mut self, stmt: &Stmt) {
+        // Module level only. A statement inside a procedure has no resume
+        // point: the unwind discards its frame, so there is nothing to go back
+        // to, and `_err_depth` is what tells the trap so.
+        let point = if self.traps && self.current_proc.is_none() {
+            let idx = self.resume_points.len();
+            self.resume_points.push(idx);
+            self.emit_label(&format!("_rs_{}", idx));
+            emit!(self, "    mov QWORD PTR [rip + _err_stmt], {}", idx);
+            Some(idx)
+        } else {
+            None
+        };
+
+        self.gen_stmt_inner(stmt);
+
+        if let Some(idx) = point {
+            self.emit_label(&format!("_rn_{}", idx));
+        }
+    }
+
+    fn gen_stmt_inner(&mut self, stmt: &Stmt) {
         if stmt.line != 0 {
             self.current_line = stmt.line;
         }
@@ -3514,6 +3586,40 @@ impl CodeGen {
             // reads as undimensioned again and a later DIM allocates afresh.
             // free(NULL) is defined, so erasing an array that was never
             // dimensioned is harmless.
+            // RESUME returns from a handler. Its own two failures are
+            // untrappable, or the handler would be re-entered by the RESUME
+            // that failed and would never stop -- so the branches are emitted
+            // whatever `--unsafe` says, and their trampolines call the fatal
+            // path directly.
+            StmtKind::Resume(target) => {
+                let no_error = self.error_label(RtError::ResumeNoError);
+                self.emit("    mov rax, QWORD PTR [rip + _err_active]");
+                self.emit("    test rax, rax");
+                emit!(self, "    jz {}", no_error);
+
+                match target {
+                    ResumeTarget::At(t) => {
+                        let label = Self::branch_label(t);
+                        self.emit("    mov QWORD PTR [rip + _err_active], 0");
+                        emit!(self, "    jmp {}", label);
+                    }
+                    ResumeTarget::Same | ResumeTarget::Next => {
+                        let in_proc = self.error_label(RtError::ResumeInProc);
+                        self.emit("    mov rax, QWORD PTR [rip + _err_resume]");
+                        self.emit("    test rax, rax");
+                        emit!(self, "    js {}", in_proc);
+                        self.emit("    mov QWORD PTR [rip + _err_active], 0");
+                        let table = match target {
+                            ResumeTarget::Next => "_resume_next",
+                            _ => "_resume_at",
+                        };
+                        emit!(self, "    lea rcx, [rip + {}]", table);
+                        self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
+                        self.emit("    jmp rax");
+                    }
+                }
+            }
+
             // `ON ERROR GOTO n` arms the handler; `GOTO 0` disarms it. Both
             // clear the in-handler flag, so re-arming is also how a program
             // that left its handler by GOTO starts trapping again.
@@ -6705,6 +6811,24 @@ impl CodeGen {
 
         // DATA pointer
         self.emit("_data_ptr: .quad 0");
+
+        // Where RESUME and RESUME NEXT go, one entry per module-level
+        // statement. Two tables rather than one plus arithmetic, because
+        // "the statement after this one" is a position in the emitted code,
+        // not the next index -- a nested body's last statement is followed by
+        // its loop's increment, not by whatever the parser called next.
+        if self.traps {
+            self.emit("");
+            self.emit(".p2align 3");
+            self.emit("_resume_at:");
+            for i in &self.resume_points {
+                emit!(self, "    .quad _rs_{}", i);
+            }
+            self.emit("_resume_next:");
+            for i in &self.resume_points {
+                emit!(self, "    .quad _rn_{}", i);
+            }
+        }
 
         // GOSUB return stack pointer
         if self.gosub_used {

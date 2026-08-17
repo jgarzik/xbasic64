@@ -242,6 +242,8 @@ pub enum StmtKind {
     /// `ON ERROR GOTO n` -- install an error handler; `None` is `GOTO 0`,
     /// which removes it and puts the fatal path back.
     OnError(Option<GotoTarget>),
+    /// `RESUME`, `RESUME NEXT`, `RESUME n` -- return from a handler.
+    Resume(ResumeTarget),
     /// `LOCATE [row][, col]` -- move the cursor.
     ///
     /// Either part may be omitted, in which case that coordinate is left where
@@ -412,6 +414,17 @@ pub struct LValue {
 pub struct ArrayDecl {
     pub name: String,
     pub dimensions: Vec<Expr>,
+}
+
+/// Where a `RESUME` goes back to.
+#[derive(Debug, Clone)]
+pub enum ResumeTarget {
+    /// Bare `RESUME`, and `RESUME 0`: retry the statement that failed.
+    Same,
+    /// `RESUME NEXT`: carry on at the statement after it.
+    Next,
+    /// `RESUME n`: carry on somewhere else entirely.
+    At(GotoTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -738,6 +751,7 @@ fn token_spelling(tok: &Token) -> Option<&'static str> {
         Token::Locate => "LOCATE",
         Token::Color => "COLOR",
         Token::Randomize => "RANDOMIZE",
+        Token::Resume => "RESUME",
         Token::Restore => "RESTORE",
         Token::Cls => "CLS",
         Token::Open => "OPEN",
@@ -1362,6 +1376,7 @@ impl Parser {
             Token::Locate => self.parse_locate(),
             Token::Color => self.parse_color(),
             Token::Randomize => self.parse_randomize(),
+            Token::Resume => self.parse_resume(),
             Token::Restore => self.parse_restore(),
             Token::Cls => {
                 self.advance();
@@ -2695,6 +2710,27 @@ impl Parser {
     /// Contextual rather than reserved, like CALL above it: LANGREF's own
     /// `ON ... GOSUB Draw, Erase` example uses the word as a label, and a
     /// reserved ERASE would take that name away from every program.
+    /// `RESUME`, `RESUME NEXT`, `RESUME 0`, `RESUME <line|label>`.
+    fn parse_resume(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume RESUME
+        // GW-BASIC spells "retry the failing statement" as either a bare
+        // RESUME or RESUME 0, so the two are folded together here.
+        if matches!(self.peek(), Token::Newline | Token::Colon | Token::Eof) {
+            return Ok(StmtKind::Resume(ResumeTarget::Same));
+        }
+        if matches!(self.peek(), Token::Integer(0)) {
+            self.advance();
+            return Ok(StmtKind::Resume(ResumeTarget::Same));
+        }
+        if matches!(self.peek(), Token::Next) {
+            self.advance();
+            return Ok(StmtKind::Resume(ResumeTarget::Next));
+        }
+        Ok(StmtKind::Resume(ResumeTarget::At(
+            self.parse_goto_target()?,
+        )))
+    }
+
     /// `ERROR n` -- raise an error by GW-BASIC's number for it.
     fn parse_raise_error(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ERROR

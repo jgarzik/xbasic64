@@ -34,6 +34,10 @@ _err_alreadyopen: .asciz "File already open"
 _err_pastend: .asciz "Input past end of file"
 
 _err_unprintable: .asciz "Unprintable error"
+# RESUME's own failures. Never trapped -- a handler that trapped them would be
+# re-entered by its own RESUME, forever.
+_err_resnoerr: .asciz "RESUME without error"
+_err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 
 # GW-BASIC's own error numbers, so that a listing's `IF ERR = 53` means what it
 # meant in 1983. Pairs of (message, number), terminated by a zero message.
@@ -76,6 +80,9 @@ _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
 _err_line:    .skip 8       # the line now running; codegen stores it per statement
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
+_err_stmt:    .skip 8       # index of the module-level statement now running
+_err_resume:  .skip 8       # _err_stmt as it was when trapped; -1 = not resumable
+_err_depth:   .skip 8       # procedure nesting, so an error inside one is known
 # rsp, rbx, rbp, r12, r13, r14, r15 -- and rdi, rsi on Win64, where they are
 # callee-saved too. Sized the same in both trees so the offsets agree.
 _err_ctx:     .skip 80
@@ -163,9 +170,9 @@ _rt_error:
     # what stops handler -> error -> handler from looping forever.
     mov rax, QWORD PTR [rip + _err_handler]
     test rax, rax
-    jz .Lerr_fatal
+    jz _rt_fatal
     cmp QWORD PTR [rip + _err_active], 0
-    jne .Lerr_fatal
+    jne _rt_fatal
 
     # ERR is the number this message carries. Unknown text reports 0 rather
     # than inventing a code.
@@ -190,6 +197,18 @@ _rt_error:
     # measured: a handler on line 100 reported ERL 100 for an error on line 30.
     mov rdx, QWORD PTR [rip + _err_line]
     mov QWORD PTR [rip + _err_erl], rdx
+
+    # And what RESUME would go back to. The handler is ordinary module-level
+    # code, so its own statements overwrite _err_stmt the moment it starts;
+    # -1 when the error came from inside a procedure, whose frame the unwind
+    # below discards, leaving nothing for a bare RESUME to return to.
+    mov rdx, QWORD PTR [rip + _err_stmt]
+    cmp QWORD PTR [rip + _err_depth], 0
+    je .Ltrap_resumable
+    mov rdx, -1
+.Ltrap_resumable:
+    mov QWORD PTR [rip + _err_resume], rdx
+    mov QWORD PTR [rip + _err_depth], 0
     mov QWORD PTR [rip + _err_active], 1
 
     # Abandon every frame between here and main. ERL is already set: codegen
@@ -205,7 +224,16 @@ _rt_error:
     mov rsp, QWORD PTR [rip + _err_ctx + 0]
     jmp rax
 
-.Lerr_fatal:
+# _rt_fatal - Report and exit, without consulting the handler
+#
+# Today's whole behaviour, and still what happens when nothing is trapping.
+# Called directly for the errors that must never be trapped: a handler
+# re-entered by its own failing RESUME would never stop.
+#
+# Arguments: the same as _rt_error.
+# Returns: never (exit code 1)
+.globl _rt_fatal
+_rt_fatal:
     push rbp
     mov rbp, rsp
     push rbx
