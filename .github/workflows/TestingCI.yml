@@ -73,5 +73,14 @@ jobs:
             & ./target/release/xbasic64.exe $_.FullName -o example.exe
             if ($LASTEXITCODE -ne 0) { throw "compile failed: $($_.Name)" }
             & ./example.exe | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "run failed: $($_.Name)" }
+            # Report the code, not just the failure. Windows says what went
+            # wrong in it, and nothing else here can: 1 is the compiler's own
+            # diagnosed abort, while 0xC0000005 (access violation), 0xC0000409
+            # (stack buffer overrun) and 0xC0000374 (heap corruption) each name
+            # a different defect, and none of the three can be reproduced on
+            # the Linux job.
+            if ($LASTEXITCODE -ne 0) {
+              $code = [uint32]($LASTEXITCODE -band 0xFFFFFFFF)
+              throw ("run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $code)
+            }
           }

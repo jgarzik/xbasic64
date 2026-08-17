@@ -16,12 +16,16 @@
 _rng_state: .quad 0x12345678DEADBEEF
 _rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .ascii "\033[2J\033[H"
+# Directly after the data it measures, and nothing may be inserted between:
+# `.` is the current position, so a string added in the gap is counted as part
+# of the sequence. Four were, and CLS wrote 75 bytes instead of 7 -- the escape
+# followed by every format string below it and a scratch buffer.
+.equ _cls_seq_len, . - _cls_seq
 _locate_fmt: .asciz "\033[%d;%dH"
 _date_fmt: .asciz "%m-%d-%Y"
 _time_fmt: .asciz "%H:%M:%S"
 _color_fmt: .asciz "\033[%d;%dm"
 _esc_buf: .skip 32
-.equ _cls_seq_len, . - _cls_seq
 
 # Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
 # .text below restores the section for the code that follows.

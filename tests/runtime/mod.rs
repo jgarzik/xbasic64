@@ -82,10 +82,16 @@ fn test_runtimes_export_the_same_helpers() {
     );
 }
 
-/// Message lengths must be computed by the assembler, never hand-counted.
+/// Message lengths must be computed by the assembler, never hand-counted --
+/// and computed where the data ends, not somewhere further down the file.
 ///
 /// A hand-counted length was wrong by one and made WriteFile emit a stray
 /// byte; a commit "fixing" it changed the correct value to the incorrect one.
+///
+/// `. - label` is only right while `.` is still just past the data: `.` means
+/// "here", so anything inserted in between is silently counted as part of the
+/// message. Four format strings and a scratch buffer were, and `CLS` on
+/// Windows wrote 75 bytes where it meant to write 7.
 #[test]
 fn test_message_lengths_are_computed() {
     for dir in ["src/runtime/sysv", "src/runtime/win64-native"] {
@@ -116,6 +122,31 @@ fn test_message_lengths_are_computed() {
                     path.display(),
                     i + 1,
                     trimmed
+                );
+
+                // `. - label` measures from the label to *here*, so the only
+                // safe place for it is immediately after the label's data,
+                // with nothing but comments in between.
+                let label = trimmed
+                    .rsplit_once(". -")
+                    .map(|(_, rest)| rest.trim())
+                    .expect("just asserted the line computes `. - label`");
+                let previous = text
+                    .lines()
+                    .take(i)
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
+                    .last()
+                    .unwrap_or("");
+                assert!(
+                    previous.starts_with(&format!("{label}:")),
+                    "{}:{}: `{}` must sit directly after {}'s data, but {:?} intervenes -- \
+                     everything in between is counted as part of the message",
+                    path.display(),
+                    i + 1,
+                    trimmed,
+                    label,
+                    previous
                 );
             }
         }
