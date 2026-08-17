@@ -131,6 +131,64 @@ _rt_randomize:
     leave
     ret
 
+# _rt_beep - BEEP: ring the terminal bell
+#
+# Arguments: none      Returns: nothing
+.globl _rt_beep
+_rt_beep:
+    push rbp
+    mov rbp, rsp
+    mov edi, 7                  # BEL
+    call putchar
+    leave
+    ret
+
+# _rt_date - DATE$: the date as MM-DD-YYYY, GW-BASIC's shape
+#
+# Arguments: none
+# Returns: rax = pointer, rdx = length
+.globl _rt_date
+_rt_date:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    lea rdi, [rsp]
+    call time
+    lea rdi, [rsp]
+    call localtime
+    mov rcx, rax                # struct tm *
+    lea rdi, [rip + _num_buf]
+    mov rsi, 64
+    lea rdx, [rip + _date_fmt]
+    call strftime
+    lea rdi, [rip + _num_buf]
+    mov rsi, rax
+    leave
+    jmp _rt_strdup              # the caller may hold another such result
+
+# _rt_time - TIME$: the time as HH:MM:SS
+#
+# Arguments: none
+# Returns: rax = pointer, rdx = length
+.globl _rt_time
+_rt_time:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 16
+    lea rdi, [rsp]
+    call time
+    lea rdi, [rsp]
+    call localtime
+    mov rcx, rax                # struct tm *
+    lea rdi, [rip + _num_buf]
+    mov rsi, 64
+    lea rdx, [rip + _time_fmt]
+    call strftime
+    lea rdi, [rip + _num_buf]
+    mov rsi, rax
+    leave
+    jmp _rt_strdup              # the caller may hold another such result
+
 # _rt_pos - POS(n): the column the next character will be written to
 #
 # The tracker counts characters already on the line, and BASIC columns start at

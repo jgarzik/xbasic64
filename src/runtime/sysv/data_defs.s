@@ -31,6 +31,8 @@ _rng_state: .quad 0x12345678DEADBEEF
 _rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .asciz "\033[2J\033[H"
 _locate_fmt: .asciz "\033[%d;%dH"
+_date_fmt: .asciz "%m-%d-%Y"
+_time_fmt: .asciz "%H:%M:%S"
 _color_fmt: .asciz "\033[%d;%dm"
 _redo_msg: .asciz "?Redo from start\n"
 

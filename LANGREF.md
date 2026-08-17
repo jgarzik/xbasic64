@@ -286,6 +286,8 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `OR`     | Bitwise/logical OR    |
 | `XOR`    | Bitwise/logical XOR   |
 | `NOT`    | Bitwise/logical NOT   |
+| `EQV`    | Bitwise equivalence   |
+| `IMP`    | Bitwise implication   |
 
 These operate bitwise on integers, allowing both logical tests and bit
 manipulation. Their operands are converted to integers first, and the result is
@@ -319,6 +321,8 @@ From highest to lowest:
 6. `NOT`
 7. `AND`
 8. `OR`, `XOR`
+9. `EQV`
+10. `IMP`
 
 Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
 
@@ -680,6 +684,19 @@ Clear screen:
 CLS
 ```
 
+### BEEP, ERASE and SYSTEM
+
+```basic
+BEEP                  ' Ring the terminal bell
+DIM Scores(10)
+ERASE Scores          ' Release it, so it may be DIMed again
+DIM Scores(50)
+SYSTEM                ' End the program, as END does
+```
+
+`ERASE` is recognised only before a name, so `Erase` remains usable as a label
+or a variable elsewhere.
+
 ### LOCATE and COLOR
 
 Console control, written as ANSI escape sequences:
@@ -890,6 +907,7 @@ STOP    ' Terminate (historically for debugging)
 | `EXP(x)`   | e raised to power x                      |
 | `LOG(x)`   | Natural logarithm                        |
 | `RND`      | Random number 0 ≤ r < 1                  |
+| `FRE(x)`   | Free memory; a large constant here       |
 
 **Numeric output:** `PRINT` writes the shortest decimal that reads back as the
 same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
@@ -922,6 +940,8 @@ nobody to ask, so it takes the clock.
 | Function              | Description                                    |
 |-----------------------|------------------------------------------------|
 | `LEN(s$)`             | Length of string                               |
+| `DATE$`               | Current date, as `MM-DD-YYYY`                  |
+| `TIME$`               | Current time, as `HH:MM:SS`                    |
 | `LEFT$(s$, n)`        | Leftmost n characters                          |
 | `RIGHT$(s$, n)`       | Rightmost n characters                         |
 | `MID$(s$, start, len)`| Substring (1-based index)                      |
@@ -1342,9 +1362,8 @@ written. Programs using them are refused today.
 
 - **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
 - **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
-- **Date and time** -- `DATE$`, `TIME$`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Odds and ends** -- `ERASE`, `INPUT$`, `FRE`, `SHARED`, `STATIC`
+- **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
 
 ### Never
 

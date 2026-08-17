@@ -74,6 +74,9 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("MKS$", 1, 1),
     ("OCT$", 1, 1),
     ("POS", 1, 1),
+    ("DATE$", 0, 0),
+    ("TIME$", 0, 0),
+    ("FRE", 1, 1),
     ("RIGHT$", 2, 2),
     ("RTRIM$", 1, 1),
     ("RND", 0, 1),
@@ -110,8 +113,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("ERL", "error trapping is not implemented yet"),
     ("ERROR", "error trapping is not implemented yet"),
     ("RESUME", "error trapping is not implemented yet"),
-    ("DATE$", "DATE$ is not implemented yet"),
-    ("TIME$", "TIME$ is not implemented yet"),
     (
         "INKEY$",
         "INKEY$ needs raw console input, which is not implemented yet",
@@ -120,12 +121,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("WIDTH", "console width control is not implemented yet"),
     ("CSRLIN", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
-    ("BEEP", "BEEP is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
-    (
-        "ERASE",
-        "ERASE is not implemented yet; REDIM clears an array",
-    ),
     (
         "SHARED",
         "SHARED is not implemented; module-level names are already global",
@@ -138,7 +134,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("CHDIR", "CHDIR is not implemented yet"),
     ("MKDIR", "MKDIR is not implemented yet"),
     ("RMDIR", "RMDIR is not implemented yet"),
-    ("FRE", "FRE is not implemented yet"),
     // Permanent non-goals: these describe a machine xbasic64 does not target.
     (
         "PEEK",
@@ -374,6 +369,11 @@ pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
     apply_default_types(program);
 
     let mut a = Analyzer::default();
+    walk_stmts(&program.statements, &mut |stmt| {
+        if let StmtKind::Erase(names) = &stmt.kind {
+            a.erased.extend(names.iter().cloned());
+        }
+    });
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
@@ -752,6 +752,8 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::OptionBase(_)
         | StmtKind::TypeDef { .. }
         | StmtKind::DefType { .. }
+        | StmtKind::Beep
+        | StmtKind::Erase(_)
         | StmtKind::Data(_)
         | StmtKind::Restore(_)
         | StmtKind::Cls
@@ -763,6 +765,8 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
 #[derive(Default)]
 struct Analyzer {
     symbols: Symbols,
+    /// Arrays the program ERASEs somewhere, which may therefore be DIMed again.
+    erased: HashSet<String>,
     diagnostics: Vec<Diagnostic>,
     /// Enclosing loops, innermost last: true for FOR, false for WHILE/DO.
     loops: Vec<bool>,
@@ -939,7 +943,7 @@ impl Analyzer {
                             );
                         }
                         if let Some(prev) = self.symbols.arrays.get(&key) {
-                            if !is_redim {
+                            if !is_redim && !self.erased.contains(&key.1) {
                                 self.error(
                                     stmt.line,
                                     format!("array '{}' is already declared", decl.name),
@@ -2304,6 +2308,8 @@ fn op_name(op: BinaryOp) -> &'static str {
         BinaryOp::Div => "/",
         BinaryOp::IntDiv => "\\",
         BinaryOp::Mod => "MOD",
+        BinaryOp::Eqv => "EQV",
+        BinaryOp::Imp => "IMP",
         BinaryOp::Pow => "^",
         BinaryOp::Eq => "=",
         BinaryOp::Ne => "<>",

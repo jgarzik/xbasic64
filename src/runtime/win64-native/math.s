@@ -17,6 +17,8 @@ _rng_state: .quad 0x12345678DEADBEEF
 _rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .ascii "\033[2J\033[H"
 _locate_fmt: .asciz "\033[%d;%dH"
+_date_fmt: .asciz "%m-%d-%Y"
+_time_fmt: .asciz "%H:%M:%S"
 _color_fmt: .asciz "\033[%d;%dm"
 _esc_buf: .skip 32
 .equ _cls_seq_len, . - _cls_seq
@@ -104,6 +106,68 @@ _rt_rnd:
 
     leave
     ret
+
+# _rt_beep - BEEP: ring the terminal bell
+#
+# Arguments: none      Returns: nothing
+.globl _rt_beep
+_rt_beep:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 32
+    mov ecx, 7                  # BEL
+    call putchar
+    add rsp, 32
+    leave
+    ret
+
+# _rt_date - DATE$: the date as MM-DD-YYYY, GW-BASIC's shape
+#
+# Arguments: none
+# Returns: rax = pointer, rdx = length
+.globl _rt_date
+_rt_date:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48                 # shadow space + a time_t
+    lea rcx, [rsp + 32]
+    call time
+    lea rcx, [rsp + 32]
+    call localtime
+    mov r9, rax                 # struct tm *
+    lea rcx, [rip + _num_buf]
+    mov rdx, 64
+    lea r8, [rip + _date_fmt]
+    call strftime
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax
+    add rsp, 48
+    leave
+    jmp _rt_strdup              # the caller may hold another such result
+
+# _rt_time - TIME$: the time as HH:MM:SS
+#
+# Arguments: none
+# Returns: rax = pointer, rdx = length
+.globl _rt_time
+_rt_time:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 48                 # shadow space + a time_t
+    lea rcx, [rsp + 32]
+    call time
+    lea rcx, [rsp + 32]
+    call localtime
+    mov r9, rax                 # struct tm *
+    lea rcx, [rip + _num_buf]
+    mov rdx, 64
+    lea r8, [rip + _time_fmt]
+    call strftime
+    lea rcx, [rip + _num_buf]
+    mov rdx, rax
+    add rsp, 48
+    leave
+    jmp _rt_strdup              # the caller may hold another such result
 
 # _rt_pos - POS(n): the column the next character will be written to
 #

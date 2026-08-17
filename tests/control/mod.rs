@@ -1086,3 +1086,47 @@ PRINT "after"
     let lines: Vec<&str> = output.trim().lines().collect();
     assert_eq!(lines, &["in", "after"]);
 }
+
+/// `SYSTEM` ends the program, as `END` does.
+#[test]
+fn test_system_ends_the_program() {
+    let run = crate::common::compile_and_run_raw("PRINT \"before\"\nSYSTEM\nPRINT \"after\"\n", "")
+        .expect("should compile");
+    assert_eq!(run.lines(), vec!["before"], "SYSTEM stops the program");
+    assert_eq!(run.exit_code, Some(0));
+}
+
+/// `BEEP` writes the bell character.
+#[test]
+fn test_beep_rings_the_bell() {
+    let run = crate::common::compile_and_run_raw("BEEP\n", "").expect("should compile");
+    assert!(
+        run.stdout.contains('\u{7}'),
+        "BEEP writes BEL: {:?}",
+        run.stdout
+    );
+}
+
+/// `ERASE` releases an array so it can be dimensioned again.
+#[test]
+fn test_erase_allows_a_second_dim() {
+    let output = compile_and_run(
+        r#"
+DIM A(3)
+A(1) = 7
+PRINT A(1)
+ERASE A
+DIM A(10)
+PRINT A(1)
+A(9) = 5
+PRINT A(9)
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    assert_eq!(
+        lines,
+        &["7", "0", "5"],
+        "the new array starts zeroed and is larger"
+    );
+}

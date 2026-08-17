@@ -268,6 +268,8 @@ enum Builtin {
 static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| {
     HashMap::from([
         ("TIMER", Builtin::Call0("_rt_timer")),
+        ("DATE$", Builtin::Call0("_rt_date")),
+        ("TIME$", Builtin::Call0("_rt_time")),
         ("VAL", Builtin::CallStr("_rt_val")),
         ("LTRIM$", Builtin::CallStr("_rt_ltrim")),
         ("RTRIM$", Builtin::CallStr("_rt_rtrim")),
@@ -1195,7 +1197,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
-            "EOF" | "LBOUND" | "UBOUND" | "POS" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" | "POS" | "FRE" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -1238,7 +1240,10 @@ impl CodeGen {
         // in EAX while every consumer read xmm0 and found the *left operand*
         // still there: `A = 12 : B = 10 : PRINT A AND B` printed 12. Literal
         // operands are folded before reaching here, which is why it hid.
-        if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor) {
+        if matches!(
+            op,
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor | BinaryOp::Eqv | BinaryOp::Imp
+        ) {
             return DataType::Long;
         }
 
@@ -3436,6 +3441,23 @@ impl CodeGen {
                 self.emit("    call _rt_color");
             }
 
+            StmtKind::Beep => self.emit("    call _rt_beep"),
+
+            // ERASE releases the storage and nulls the descriptor, so the array
+            // reads as undimensioned again and a later DIM allocates afresh.
+            // free(NULL) is defined, so erasing an array that was never
+            // dimensioned is harmless.
+            StmtKind::Erase(names) => {
+                for name in names {
+                    let Some(loc) = self.lookup_array(name).map(|i| i.loc.clone()) else {
+                        continue; // sema has already complained
+                    };
+                    emit!(self, "    mov {}, {}", Self::arg_reg(0), loc.q(0));
+                    self.emit_call_libc("free");
+                    emit!(self, "    mov {}, 0", loc.q(0));
+                }
+            }
+
             StmtKind::Randomize(seed) => {
                 // With no seed, take the clock: GW-BASIC prompts the operator
                 // for one, and a compiled program has nobody to ask. TIMER
@@ -4066,6 +4088,20 @@ impl CodeGen {
                     _ => unreachable!(),
                 };
                 emit!(self, "    {} eax, ecx", instr);
+            }
+
+            // EQV is NOT (a XOR b); IMP is (NOT a) OR b. Both are bitwise, so
+            // they are built from the instructions already here rather than
+            // given any of their own.
+            BinaryOp::Eqv => {
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    xor eax, ecx");
+                self.emit("    not eax");
+            }
+            BinaryOp::Imp => {
+                self.emit_cvt_float_to_int(work_type);
+                self.emit("    not eax");
+                self.emit("    or eax, ecx");
             }
         }
 
@@ -5819,6 +5855,13 @@ impl CodeGen {
                 self.emit("    pop rbx");
                 // Result is in rax
                 self.emit("    mov eax, eax"); // zero-extend/truncate to 32-bit
+            }
+            "FRE" => {
+                // A compiled program has no BASIC string heap to run out of, so
+                // this answers a plausible figure rather than pretending to.
+                // Listings use it as `IF FRE(0) < n THEN`, which then passes.
+                self.gen_expr(&args[0]);
+                self.emit("    mov eax, 65535");
             }
             "POS" => {
                 // The argument is ignored, as in GW-BASIC: POS(0) is the idiom

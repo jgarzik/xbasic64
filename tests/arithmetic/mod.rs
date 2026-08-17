@@ -514,3 +514,50 @@ PRINT 2 ^ 3 ^ 2 ^ 1
     assert_eq!(lines[4], "2", "division is left to right");
     assert_eq!(lines[5], "64", "((2^3)^2)^1");
 }
+
+/// `EQV` and `IMP` are the two remaining logical operators.
+///
+/// Neither was a keyword, so `PRINT 1 EQV 1` printed `101` -- the items `1`,
+/// an undefined variable named EQV, and `1`. A wrong answer with no
+/// diagnostic, in the same family as the bitwise bugs.
+#[test]
+fn test_eqv_and_imp() {
+    let output = compile_and_run(
+        r#"
+PRINT -1 EQV -1
+PRINT -1 EQV 0
+PRINT 0 EQV 0
+PRINT 12 EQV 10
+PRINT -1 IMP -1
+PRINT -1 IMP 0
+PRINT 0 IMP -1
+PRINT 0 IMP 0
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    // EQV is bitwise equivalence: NOT (a XOR b).
+    assert_eq!(&lines[0..4], &["-1", "0", "-1", "-7"], "EQV");
+    // IMP is implication: (NOT a) OR b.
+    assert_eq!(&lines[4..8], &["-1", "0", "-1", "-1"], "IMP");
+}
+
+/// They sit below OR and XOR, and IMP below EQV, as GW-BASIC orders them.
+#[test]
+fn test_eqv_and_imp_precedence() {
+    let output = compile_and_run(
+        r#"
+A% = 0 : B% = 0
+PRINT A% EQV B% OR B%
+PRINT (A% EQV B%) OR B%
+PRINT A% EQV (B% OR B%)
+PRINT -1 IMP 0 EQV 0
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    // OR binds tighter, so the first two disagree and the first matches the third.
+    assert_eq!(lines[0], lines[2], "OR binds tighter than EQV");
+    // -1 IMP (0 EQV 0) = -1 IMP -1 = -1
+    assert_eq!(lines[3], "-1", "EQV binds tighter than IMP");
+}

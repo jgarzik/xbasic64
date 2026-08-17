@@ -360,3 +360,29 @@ PRINT BAD
     .unwrap();
     assert_eq!(output.trim(), "0", "every value must be in [0, 1)");
 }
+
+/// `DATE$` and `TIME$` report the date and time in GW-BASIC's shapes.
+#[test]
+fn test_date_and_time_strings() {
+    let output =
+        compile_and_run("PRINT DATE$\nPRINT TIME$\nPRINT LEN(DATE$); LEN(TIME$)\n").unwrap();
+    let lines: Vec<&str> = output.trim().lines().collect();
+    let date = lines[0];
+    let time = lines[1];
+    assert_eq!(date.len(), 10, "DATE$ is MM-DD-YYYY: {date:?}");
+    assert_eq!(&date[2..3], "-", "separators at 3 and 6: {date:?}");
+    assert_eq!(&date[5..6], "-", "separators at 3 and 6: {date:?}");
+    assert_eq!(time.len(), 8, "TIME$ is HH:MM:SS: {time:?}");
+    assert_eq!(&time[2..3], ":", "separators at 3 and 6: {time:?}");
+    assert_eq!(&time[5..6], ":", "separators at 3 and 6: {time:?}");
+    assert_eq!(lines[2], "108", "and LEN sees them as strings: 10 and 8");
+}
+
+/// `FRE` reports free memory. A compiled program has no BASIC heap limit, so
+/// it answers a large number rather than pretending to run out.
+#[test]
+fn test_fre_returns_something_plausible() {
+    let output =
+        compile_and_run("IF FRE(0) > 1000 THEN PRINT \"plenty\" ELSE PRINT \"tight\"\n").unwrap();
+    assert_eq!(output.trim(), "plenty");
+}
