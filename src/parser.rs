@@ -239,6 +239,9 @@ pub enum StmtKind {
     Erase(Vec<String>),
     /// `ERROR n` -- raise the error GW-BASIC numbers `n`.
     RaiseError(Expr),
+    /// `ON ERROR GOTO n` -- install an error handler; `None` is `GOTO 0`,
+    /// which removes it and puts the fatal path back.
+    OnError(Option<GotoTarget>),
     /// `LOCATE [row][, col]` -- move the cursor.
     ///
     /// Either part may be omitted, in which case that coordinate is left where
@@ -2353,6 +2356,24 @@ impl Parser {
     /// the one keyword and in whether the subroutine comes back.
     fn parse_on_goto(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume ON
+
+        // `ON ERROR GOTO n` is a different statement that happens to share a
+        // first word. Recognised positionally, like ERASE and LSET, so ERROR
+        // stays available to the UNSUPPORTED table everywhere else.
+        if matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("ERROR")) {
+            self.advance(); // consume ERROR
+            if !matches!(self.advance(), Token::Goto) {
+                return err("ON ERROR must be followed by GOTO");
+            }
+            // GW-BASIC spells "stop trapping" as GOTO 0, and there is no line
+            // 0 to check against, so it is folded away here.
+            if matches!(self.peek(), Token::Integer(0)) {
+                self.advance();
+                return Ok(StmtKind::OnError(None));
+            }
+            return Ok(StmtKind::OnError(Some(self.parse_goto_target()?)));
+        }
+
         let expr = self.parse_expression()?;
         let is_gosub = match self.advance() {
             Token::Goto => false,

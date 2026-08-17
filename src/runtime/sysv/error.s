@@ -64,7 +64,63 @@ _err_codes:
     .quad _err_permission,  70
     .quad 0, 0
 
+
+# Error-trapping state. Always defined, never conditional: _rt_error is
+# assembled into every program and its preamble reads these, so a program with
+# no ON ERROR would otherwise fail to link. Zero means "not trapping", which is
+# what .bss gives for free.
+.bss
+.p2align 3
+_err_handler: .skip 8       # where to jump, 0 = trapping off
+_err_active:  .skip 8       # nonzero while a handler runs
+_err_code:    .skip 8       # what ERR returns
+_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
+# rsp, rbx, rbp, r12, r13, r14, r15 -- and rdi, rsi on Win64, where they are
+# callee-saved too. Sized the same in both trees so the offsets agree.
+_err_ctx:     .skip 80
+
 .text
+
+# _rt_trap_capture - Record what a trapped error must restore
+#
+# Called once from main's prologue when the program contains ON ERROR. Taking
+# it here rather than in codegen keeps the register set -- which differs
+# between the ABIs -- in the tree that knows about it.
+#
+# The values saved are the ones the C runtime handed main, because main's
+# prologue has not touched a callee-saved register yet. Restoring them on a
+# trap therefore leaves main's eventual `leave; ret` exactly as clean as it is
+# without trapping.
+#
+# Arguments: none      Returns: nothing
+.globl _rt_trap_capture
+_rt_trap_capture:
+    lea rax, [rsp + 8]      # the caller's rsp, past our return address
+    mov QWORD PTR [rip + _err_ctx + 0], rax
+    mov QWORD PTR [rip + _err_ctx + 8], rbx
+    mov QWORD PTR [rip + _err_ctx + 16], rbp
+    mov QWORD PTR [rip + _err_ctx + 24], r12
+    mov QWORD PTR [rip + _err_ctx + 32], r13
+    mov QWORD PTR [rip + _err_ctx + 40], r14
+    mov QWORD PTR [rip + _err_ctx + 48], r15
+    ret
+
+# _rt_err - ERR: the number of the error that was trapped
+#
+# Arguments: none      Returns: eax = error number, 0 if none has been trapped
+.globl _rt_err
+_rt_err:
+    mov rax, QWORD PTR [rip + _err_code]
+    ret
+
+# _rt_erl - ERL: the line the trapped error happened on
+#
+# Arguments: none      Returns: eax = line number, 0 if none has been trapped
+.globl _rt_erl
+_rt_erl:
+    mov rax, QWORD PTR [rip + _err_erl]
+    ret
 
 # _rt_error_num - Raise the error with GW-BASIC number `n` (ERROR statement)
 #
@@ -97,9 +153,59 @@ _rt_error_num:
 #   rdi = message pointer (NUL-terminated)
 #   rsi = BASIC line number, or 0 when unknown
 #
-# Returns: never (exit code 1)
+# Returns: never unless a handler is armed, in which case it does not return
+# *here* either -- it abandons every frame between this one and main and jumps
+# to the handler.
 .globl _rt_error
 _rt_error:
+    # Trapping only when ON ERROR armed one and no handler is already running:
+    # GW-BASIC does not trap an error raised inside a handler, which is also
+    # what stops handler -> error -> handler from looping forever.
+    mov rax, QWORD PTR [rip + _err_handler]
+    test rax, rax
+    jz .Lerr_fatal
+    cmp QWORD PTR [rip + _err_active], 0
+    jne .Lerr_fatal
+
+    # ERR is the number this message carries. Unknown text reports 0 rather
+    # than inventing a code.
+    lea rcx, [rip + _err_codes]
+.Ltrap_scan:
+    mov rdx, QWORD PTR [rcx]
+    test rdx, rdx
+    jz .Ltrap_unknown
+    cmp rdx, rdi
+    je .Ltrap_found
+    add rcx, 16
+    jmp .Ltrap_scan
+.Ltrap_found:
+    mov rdx, QWORD PTR [rcx + 8]
+    jmp .Ltrap_store
+.Ltrap_unknown:
+    xor edx, edx
+.Ltrap_store:
+    mov QWORD PTR [rip + _err_code], rdx
+    # Snapshot the line as well. The handler is ordinary module-level code, so
+    # its own statements overwrite _err_line the moment it starts running --
+    # measured: a handler on line 100 reported ERL 100 for an error on line 30.
+    mov rdx, QWORD PTR [rip + _err_line]
+    mov QWORD PTR [rip + _err_erl], rdx
+    mov QWORD PTR [rip + _err_active], 1
+
+    # Abandon every frame between here and main. ERL is already set: codegen
+    # stores the line at each statement, which is the only way the file
+    # helpers can report one -- seven of their error sites have no line to
+    # pass and say so in their own comments.
+    mov rbx, QWORD PTR [rip + _err_ctx + 8]
+    mov rbp, QWORD PTR [rip + _err_ctx + 16]
+    mov r12, QWORD PTR [rip + _err_ctx + 24]
+    mov r13, QWORD PTR [rip + _err_ctx + 32]
+    mov r14, QWORD PTR [rip + _err_ctx + 40]
+    mov r15, QWORD PTR [rip + _err_ctx + 48]
+    mov rsp, QWORD PTR [rip + _err_ctx + 0]
+    jmp rax
+
+.Lerr_fatal:
     push rbp
     mov rbp, rsp
     push rbx

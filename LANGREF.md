@@ -639,6 +639,52 @@ The selector is truncated to an integer. A value that matches nothing -- zero,
 negative, or past the end of the list -- runs no subroutine and continues with
 the next statement.
 
+### ON ERROR GOTO
+
+`ON ERROR GOTO n` installs an error handler. From then on a runtime error
+jumps to line `n` instead of stopping the program, with `ERR` holding the
+error's number and `ERL` the line it happened on.
+
+```basic
+10 ON ERROR GOTO 900
+20 OPEN "data.txt" FOR INPUT AS #1
+30 CLOSE #1
+40 PRINT "read it"
+50 END
+900 PRINT "cannot open it: error"; ERR; "at line"; ERL
+910 END
+```
+
+`ON ERROR GOTO 0` puts the fatal path back:
+
+```basic
+10 ON ERROR GOTO 900
+20 ON ERROR GOTO 0
+30 END
+900 END
+```
+
+The rules, which are GW-BASIC's:
+
+- An error raised **inside the handler** is not trapped -- it stops the
+  program. Without that, a handler that faults would call itself forever.
+- Trapping stays suspended while the handler runs. Executing an `ON ERROR`
+  statement again re-arms it, so a handler that ends in `GOTO` rather than
+  returning must re-arm to keep trapping.
+- The handler must be **module-level** code, and `ON ERROR` itself may not
+  appear inside a `SUB` or `FUNCTION`: a trapped error unwinds out of every
+  procedure before the handler runs.
+- A `GOSUB` in progress survives, so a handler can `RETURN` from a subroutine
+  the error interrupted. For the same reason a `GOSUB` *inside* a procedure is
+  refused in a program that traps -- its return address would point into a
+  frame the unwind discarded.
+- `--unsafe` and `ON ERROR` are refused together. `--unsafe` removes the checks
+  that raise most trappable errors, so the handler would look right and never
+  run.
+
+A program that never uses `ON ERROR` is compiled exactly as before, and pays
+nothing for the feature.
+
 ### DIM
 
 Declare arrays:
@@ -971,6 +1017,16 @@ length never changes:
 A$ = "hello"
 MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 ```
+
+### Error Functions
+
+| Function | Returns                                                      |
+|----------|--------------------------------------------------------------|
+| `ERR`    | The number of the trapped error, 0 before any is trapped      |
+| `ERL`    | The line it happened on, 0 if the program has no line numbers |
+
+Both are only meaningful inside an `ON ERROR` handler. `ERL` reports the BASIC
+line number, as the error messages do.
 
 ### Type Conversion Functions
 
@@ -1383,8 +1439,8 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Error trapping** -- `ON ERROR GOTO`, `RESUME`, `RESUME NEXT`, `ERR`, `ERL`, `ERROR`
-- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `BEEP`, `SLEEP`
+- **Error trapping** -- `RESUME`, `RESUME NEXT` (`ON ERROR GOTO`, `ERR`, `ERL` and `ERROR` are implemented)
+- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
 

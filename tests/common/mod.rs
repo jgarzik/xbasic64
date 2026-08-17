@@ -108,6 +108,35 @@ pub fn compile_only(source: &str) -> Result<(), CompileError> {
     }
 }
 
+/// Compile only, with extra compiler flags.
+///
+/// For the combinations a flag makes illegal -- `--unsafe` removes the checks
+/// `ON ERROR` exists to trap, so the two together are refused.
+pub fn compile_only_flags(source: &str, flags: &[&str]) -> Result<(), CompileError> {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let bas_file = tmp.path().join("test.bas");
+    let exe_file = tmp.path().join("test");
+    fs::write(&bas_file, source).expect("failed to write source");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas_file)
+        .args(flags)
+        .arg("-o")
+        .arg(&exe_file)
+        .output()
+        .expect("failed to run compiler");
+
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(CompileError {
+            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+            exit_code: out.status.code(),
+        })
+    }
+}
+
 /// Compile and run, returning `Ok` **regardless of the program's exit status**.
 ///
 /// `Err` is reserved for compilation failure. This is the primitive the other

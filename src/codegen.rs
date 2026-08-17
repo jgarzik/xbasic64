@@ -268,6 +268,8 @@ enum Builtin {
 static RT_BUILTINS: LazyLock<HashMap<&'static str, Builtin>> = LazyLock::new(|| {
     HashMap::from([
         ("TIMER", Builtin::Call0("_rt_timer")),
+        ("ERR", Builtin::Call0("_rt_err")),
+        ("ERL", Builtin::Call0("_rt_erl")),
         ("DATE$", Builtin::Call0("_rt_date")),
         ("TIME$", Builtin::Call0("_rt_time")),
         ("VAL", Builtin::CallStr("_rt_val")),
@@ -628,7 +630,13 @@ pub struct CodeGen {
     /// Array descriptors currently held in registers, innermost loop last.
     hoisted_arrays: Vec<HoistedArray>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
-    expr_depth: u32,  // current expression nesting depth
+    /// Whether the program contains `ON ERROR`, and so pays for trapping.
+    ///
+    /// Everything trapping costs is behind this: the context capture, the
+    /// per-statement line store, and -- load-bearing rather than a
+    /// concession -- switching off FOR-loop register promotion.
+    traps: bool,
+    expr_depth: u32, // current expression nesting depth
 }
 
 impl CodeGen {
@@ -1204,7 +1212,7 @@ impl CodeGen {
         // Built-in functions that return integers
         match upper.as_str() {
             "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
-            "EOF" | "LBOUND" | "UBOUND" | "POS" | "FRE" => DataType::Long,
+            "EOF" | "LBOUND" | "UBOUND" | "POS" | "FRE" | "ERR" | "ERL" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
             "CSNG" => DataType::Single,
@@ -1455,6 +1463,16 @@ impl CodeGen {
         // on Windows. Both answer to the same call.
         self.emit("    call _rt_platform_init");
 
+        // Record what a trapped error has to restore. Taken here because the
+        // callee-saved registers still hold the C runtime's values, so putting
+        // them back leaves main's own `leave; ret` as clean as it is without
+        // trapping. The register set differs between the ABIs, so the saving
+        // lives in each runtime tree rather than here.
+        if self.traps {
+            self.emit("    # ON ERROR: what the handler starts from");
+            self.emit("    call _rt_trap_capture");
+        }
+
         // Generate main body
         for stmt in &program.statements {
             match stmt.kind {
@@ -1494,6 +1512,7 @@ impl CodeGen {
             // Both forms push a return address, so both need the GOSUB stack
             // emitted; without this, ON ... GOSUB alone failed to link.
             StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => self.gosub_used = true,
+            StmtKind::OnError(_) => self.traps = true,
             // Record where each label sits in the DATA stream, so RESTORE can
             // resume from it.
             StmtKind::Label(n) => {
@@ -1592,6 +1611,17 @@ impl CodeGen {
         self.emit("    cmp eax, -2147483648");
         self.emit_check("je", RtError::Overflow);
         self.emit_label(&skip);
+    }
+
+    /// The assembly label a branch target names.
+    ///
+    /// One place rather than the four that spelled it out, now that ON ERROR
+    /// is a fifth.
+    fn branch_label(target: &GotoTarget) -> String {
+        match target {
+            GotoTarget::Line(n) => format!("_line_{}", n),
+            GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
+        }
     }
 
     /// The line number a runtime diagnostic should quote.
@@ -1756,6 +1786,16 @@ impl CodeGen {
         end: &Expr,
         step: Option<&Expr>,
     ) -> bool {
+        // A trapped error abandons every frame between the failure and main,
+        // so a promoted counter's register is gone and its memory copy is
+        // stale -- it is written back only at the loop's exit label. The
+        // promotion's `sub rsp, 16` save slots are also the one thing in
+        // codegen that moves rsp across a statement boundary, which is what
+        // lets the trap restore a single captured rsp. Both reasons say the
+        // same thing: a program that traps keeps its loop variables in memory.
+        if self.traps {
+            return false;
+        }
         self.expr_is_call_free(start)
             && self.expr_is_call_free(end)
             && step.is_none_or(|s| self.expr_is_call_free(s))
@@ -2645,6 +2685,19 @@ impl CodeGen {
         if stmt.line != 0 {
             self.current_line = stmt.line;
         }
+        // ERL, recorded per statement rather than read from the line
+        // `_rt_error` is passed: seven of the file helpers' error sites have
+        // no line to pass and say so in their own comments, and those are
+        // exactly the errors ON ERROR is used to catch. Labels are skipped
+        // because they emit no code that could fail, and a store ahead of the
+        // label would be jumped over anyway.
+        if self.traps && !matches!(stmt.kind, StmtKind::Label(_) | StmtKind::LabelName(_)) {
+            emit!(
+                self,
+                "    mov QWORD PTR [rip + _err_line], {}",
+                self.report_line()
+            );
+        }
         match &stmt.kind {
             StmtKind::Label(n) => {
                 self.basic_line = *n;
@@ -3216,18 +3269,12 @@ impl CodeGen {
             }
 
             StmtKind::Goto(target) => {
-                let label = match target {
-                    GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
-                };
+                let label = Self::branch_label(target);
                 emit!(self, "    jmp {}", label);
             }
 
             StmtKind::Gosub(target) => {
-                let label = match target {
-                    GotoTarget::Line(n) => format!("_line_{}", n),
-                    GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
-                };
+                let label = Self::branch_label(target);
                 let ret_label = self.new_label("gosub_ret");
                 // Check for stack overflow before push
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
@@ -3262,10 +3309,7 @@ impl CodeGen {
                 }
                 // Create jump table
                 for (i, target) in targets.iter().enumerate() {
-                    let label = match target {
-                        GotoTarget::Line(n) => format!("_line_{}", n),
-                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
-                    };
+                    let label = Self::branch_label(target);
                     emit!(self, "    cmp rax, {}", i + 1);
                     emit!(self, "    je {}", label);
                 }
@@ -3309,10 +3353,7 @@ impl CodeGen {
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
 
                 for (i, target) in targets.iter().enumerate() {
-                    let label = match target {
-                        GotoTarget::Line(n) => format!("_line_{}", n),
-                        GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
-                    };
+                    let label = Self::branch_label(target);
                     emit!(self, "    cmp r8, {}", i + 1);
                     emit!(self, "    je {}", label);
                 }
@@ -3473,6 +3514,25 @@ impl CodeGen {
             // reads as undimensioned again and a later DIM allocates afresh.
             // free(NULL) is defined, so erasing an array that was never
             // dimensioned is harmless.
+            // `ON ERROR GOTO n` arms the handler; `GOTO 0` disarms it. Both
+            // clear the in-handler flag, so re-arming is also how a program
+            // that left its handler by GOTO starts trapping again.
+            StmtKind::OnError(target) => {
+                match target {
+                    Some(t) => {
+                        let label = Self::branch_label(t);
+                        // Through a register: an address as an immediate is an
+                        // absolute relocation against .text, which does not
+                        // survive a position-independent link. GOSUB's return
+                        // address is taken the same way.
+                        emit!(self, "    lea rax, [rip + {}]", label);
+                        self.emit("    mov QWORD PTR [rip + _err_handler], rax");
+                    }
+                    None => self.emit("    mov QWORD PTR [rip + _err_handler], 0"),
+                }
+                self.emit("    mov QWORD PTR [rip + _err_active], 0");
+            }
+
             // `ERROR n` -- raise the error GW-BASIC numbers n. The range is
             // GW-BASIC's: 0 and 256 are not error numbers, and a code the
             // table does not know still raises, as "Unprintable error".
@@ -6342,6 +6402,15 @@ impl CodeGen {
         }
 
         if self.opts.checks {
+            // The new bounds are already in the descriptor, so a *caught* Out
+            // of memory would leave them there beside the old element pointer:
+            // every later `A(I)` would then pass the bounds check and write
+            // past the end of the old block. Clearing the pointer first makes
+            // the undim check turn that into "Array used before DIM" instead.
+            // Only reachable once ON ERROR exists -- before that the error was
+            // fatal and nothing could observe the descriptor again.
+            emit!(self, "    mov {}, 0", loc.q(0));
+
             // A null result would otherwise be written into the descriptor and
             // dereferenced on first use.
             self.emit("    test rax, rax");

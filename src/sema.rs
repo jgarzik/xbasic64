@@ -92,6 +92,11 @@ const BUILTINS: &[(&str, usize, usize)] = &[
     ("UCASE$", 1, 1),
     ("TAN", 1, 1),
     ("TIMER", 0, 1),
+    // Both take no argument at all, so a bare mention of either is a call --
+    // see `is_zero_arg_builtin`, without which they would read as variables
+    // nobody ever wrote.
+    ("ERR", 0, 0),
+    ("ERL", 0, 0),
     ("VAL", 1, 1),
 ];
 
@@ -109,8 +114,6 @@ const BUILTINS: &[(&str, usize, usize)] = &[
 /// two are meant to be read together.
 const UNSUPPORTED: &[(&str, &str)] = &[
     // Planned: implementable on both platforms, not written yet.
-    ("ERR", "error trapping is not implemented yet"),
-    ("ERL", "error trapping is not implemented yet"),
     ("ERROR", "error trapping is not implemented yet"),
     ("RESUME", "error trapping is not implemented yet"),
     (
@@ -290,6 +293,16 @@ pub struct Symbols {
     pub labels: HashSet<String>,
     /// Numeric line-number labels available as branch targets.
     pub lines: HashSet<u32>,
+    /// The subset of both that sit at module level.
+    ///
+    /// `labels` and `lines` are one flat program-wide set, so a target inside
+    /// a `SUB` is indistinguishable from a module-level one. That is harmless
+    /// for `GOTO`, which cannot cross a frame boundary at run time anyway
+    /// because sema rejects it earlier -- but an `ON ERROR` handler is jumped
+    /// to *after* the unwind has restored main's frame, so a handler inside a
+    /// procedure would run with the wrong `rbp` and read main's locals.
+    pub module_labels: HashSet<String>,
+    pub module_lines: HashSet<u32>,
     /// CONST names and their folded values.
     pub consts: HashMap<String, Literal>,
     /// Lowest legal subscript, set by OPTION BASE. Defaults to 0.
@@ -366,10 +379,13 @@ pub struct Diagnostic {
 /// which. The parser used to guess from the DIM statements it had read so far,
 /// which meant the same source produced a different AST depending on whether
 /// its DIM came earlier or later in the file, and ignored scope entirely.
-pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
+pub fn analyze(program: &mut Program, checks: bool) -> (Symbols, Vec<Diagnostic>) {
     apply_default_types(program);
 
-    let mut a = Analyzer::default();
+    let mut a = Analyzer {
+        checks,
+        ..Default::default()
+    };
     walk_stmts(&program.statements, &mut |stmt| {
         if let StmtKind::Erase(names) = &stmt.kind {
             a.erased.extend(names.iter().cloned());
@@ -378,6 +394,7 @@ pub fn analyze(program: &mut Program) -> (Symbols, Vec<Diagnostic>) {
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
+    a.check_gosub_scope_when_trapping(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
     (a.symbols, a.diagnostics)
@@ -562,6 +579,9 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             // The operand is an expression, which `for_each_expr_mut` reaches;
             // there is no name of its own to rename.
             StmtKind::RaiseError(_) => {}
+            // A handler is a branch target, and a label is not a variable --
+            // the same reason GOTO and GOSUB are left alone here.
+            StmtKind::OnError(_) => {}
             StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
                 vars.iter_mut().for_each(|v| lvalue(v, table, procs))
             }
@@ -737,6 +757,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         }
         StmtKind::Randomize(seed) => seed.iter_mut().for_each(&mut *f),
         StmtKind::RaiseError(e) => f(e),
+        StmtKind::OnError(_) => {}
         StmtKind::Const { value, .. } => f(value),
         StmtKind::FieldAssign { target, value } => {
             lvalue(target, f);
@@ -829,6 +850,8 @@ struct Analyzer {
     loops: Vec<bool>,
     /// Whether the walk is currently inside a procedure body.
     in_proc: bool,
+    /// Whether runtime checks are compiled in (false under `--unsafe`).
+    checks: bool,
     /// Whether an OPTION BASE has already been seen.
     seen_option_base: bool,
 }
@@ -862,10 +885,16 @@ impl Analyzer {
             match &stmt.kind {
                 StmtKind::Label(n) => {
                     self.symbols.lines.insert(*n);
+                    if scope == &Scope::Module {
+                        self.symbols.module_lines.insert(*n);
+                    }
                 }
                 StmtKind::LabelName(name) => {
                     if !self.symbols.labels.insert(name.clone()) {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
+                    }
+                    if scope == &Scope::Module {
+                        self.symbols.module_labels.insert(name.clone());
                     }
                 }
                 StmtKind::TypeDef { name, fields } => {
@@ -1131,6 +1160,54 @@ impl Analyzer {
                 line,
                 "RETURN without GOSUB".to_string(),
                 "RETURN ends a GOSUB; use EXIT SUB or EXIT FUNCTION to leave a procedure"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// A trapping program may not GOSUB from inside a procedure.
+    ///
+    /// The GOSUB stack is deliberately left alone by a trap, because that is
+    /// what lets a handler -- and later RESUME -- return correctly from a
+    /// subroutine the error interrupted. That is right for a module-level
+    /// GOSUB and unsafe for one inside a procedure: its return address is a
+    /// label in a frame the unwind has discarded, so a later RETURN would jump
+    /// into dead code with main's `rbp`.
+    ///
+    /// Refused rather than worked around. Vintage listings, which are what
+    /// error trapping is for, have no procedures at all.
+    fn check_gosub_scope_when_trapping(&mut self, stmts: &[Stmt]) {
+        let mut traps = false;
+        walk_stmts(stmts, &mut |stmt| {
+            if matches!(stmt.kind, StmtKind::OnError(_)) {
+                traps = true;
+            }
+        });
+        if !traps {
+            return;
+        }
+        let mut offenders = Vec::new();
+        for stmt in stmts {
+            let (StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. }) =
+                &stmt.kind
+            else {
+                continue;
+            };
+            walk_stmts(body, &mut |s| {
+                if matches!(s.kind, StmtKind::Gosub(_) | StmtKind::OnGosub { .. }) {
+                    offenders.push((s.line, name.clone()));
+                }
+            });
+        }
+        for (line, name) in offenders {
+            self.error_with_note(
+                line,
+                format!(
+                    "GOSUB inside '{}' is not allowed in a program that uses ON ERROR",
+                    name
+                ),
+                "a trapped error unwinds out of the procedure, leaving the GOSUB's return \
+                 address pointing into a frame that no longer exists"
                     .to_string(),
             );
         }
@@ -1641,6 +1718,45 @@ impl Analyzer {
             // erased nothing. The lookup is the one every array use gets --
             // the enclosing procedure first, then the module.
             StmtKind::RaiseError(n) => self.check_numeric_operand(n, scope, line, "ERROR"),
+            StmtKind::OnError(target) => {
+                // `--unsafe` removes the checks that raise most of what a
+                // handler exists to catch, so the pair would leave a handler
+                // that looks right and never runs -- the silent wrong answer
+                // this compiler refuses everywhere else.
+                if !self.checks {
+                    self.error_with_note(
+                        line,
+                        "ON ERROR cannot be used with --unsafe".to_string(),
+                        "--unsafe removes the runtime checks the handler would trap".to_string(),
+                    );
+                }
+                // A trapped error unwinds to main's frame before it jumps, so
+                // both the statement and its handler have to belong to main.
+                if let Scope::Proc(name) = scope {
+                    self.error_with_note(
+                        line,
+                        format!("ON ERROR is not allowed inside '{}'", name),
+                        "a trapped error unwinds to module level, so the handler belongs there"
+                            .to_string(),
+                    );
+                }
+                let Some(target) = target else {
+                    return; // GOTO 0 names no line to check
+                };
+                self.check_target(target, line, "ON ERROR GOTO");
+                let at_module_scope = match target {
+                    GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
+                    GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                };
+                if !at_module_scope {
+                    self.error_with_note(
+                        line,
+                        "an ON ERROR handler must be at module level".to_string(),
+                        "the handler is entered after the error unwinds out of every procedure"
+                            .to_string(),
+                    );
+                }
+            }
             StmtKind::Locate { row, col } => {
                 for e in row.iter().chain(col.iter()) {
                     self.check_numeric_operand(e, scope, line, "LOCATE");

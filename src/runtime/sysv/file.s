@@ -896,6 +896,12 @@ _rt_file_open_random:
     test rdi, rdi
     jz .Lrandom_alloc
     call free
+    # Clear the slot before the allocation below can fail. A trapped
+    # `Out of memory` would otherwise leave the table holding the pointer just
+    # freed, and _rt_random_prepare tests that slot for NULL to decide "Bad
+    # file mode" -- so a dangling pointer passes and GET reads freed memory.
+    lea rax, [rip + _file_recbuf]
+    mov QWORD PTR [rax + rbx*8], 0
 
 .Lrandom_alloc:
     mov rdi, r14
