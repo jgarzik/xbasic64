@@ -9,8 +9,10 @@ use crate::lexer::normalized;
 impl FnGen<'_> {
     /// Lower `main`: the module-level statements.
     pub(super) fn gen_main(&mut self, program: &Program) {
-        // The handler reads and writes main's variables in memory.
-        self.ssa_enabled = !self.cg.traps;
+        // The handler reads and writes main's variables in memory, so what
+        // it mentions is kept there (`ssa::handler_names`); the rest of
+        // main's scalars are SSA values even in a trapping program.
+        self.ssa_enabled = true;
         self.branch_targets = ssa::branch_targets(&program.statements);
         self.reserve_array_descriptors();
         if self.cg.gosub_used {

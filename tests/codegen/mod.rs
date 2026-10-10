@@ -695,14 +695,14 @@ fn test_typed_scalars_live_in_registers() {
     assert!(uses_symbol(&clif, "_rec_K"), "{clif}");
 }
 
-/// ...and every scalar something else can reach stays in memory: under ON
-/// ERROR, whose handler is a function of its own; passed by reference to a
+/// ...and every scalar something else can reach stays in memory: read by an
+/// ON ERROR handler, a function of its own; passed by reference to a
 /// procedure; shared with one; or seen by a DEF FN.
 #[test]
 fn test_reachable_scalars_stay_in_memory() {
     let cases = [
         (
-            "10 ON ERROR GOTO 90\nS% = 1\nPRINT S%\nEND\n90 RESUME NEXT\n",
+            "10 ON ERROR GOTO 90\nS% = 1\nPRINT S%\nEND\n90 PRINT S%: RESUME NEXT\n",
             "_var_S_I",
         ),
         (
@@ -724,6 +724,40 @@ fn test_reachable_scalars_stay_in_memory() {
         let out = crate::common::compile_and_run(src).expect("must run");
         assert!(!out.trim().is_empty(), "{src}");
     }
+}
+
+/// Under ON ERROR, only what the handler can reach stays in memory: main's
+/// loop counter and total, which the handler never mentions, are SSA values
+/// in main, and the count the handler keeps is in its data object. The
+/// handler, main compiled a second time, keeps them all in memory, so only
+/// main's function is looked at.
+#[test]
+fn test_scalars_the_handler_cannot_reach_live_in_registers() {
+    let src = "ON ERROR GOTO H\nFOR I% = 1 TO 10\nS% = S% + 100 \\ (I% MOD 3)\nNEXT I%\n\
+               PRINT S%; N%\nEND\nH:\nN% = N% + 1: RESUME NEXT\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    let main = clif
+        .split_once("function u0:0(")
+        .and_then(|(_, f)| f.split_once("\n}\n"))
+        .map(|(f, _)| f)
+        .expect("main is in the IR");
+    let main_uses = |sym: &str| -> bool {
+        let Some(ext) = clif.lines().find_map(|l| {
+            let (ext, name) = l.strip_prefix("; ")?.split_once(" = ")?;
+            (name == sym).then_some(ext.to_string())
+        }) else {
+            return false;
+        };
+        main.lines().any(|l| {
+            l.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+                .any(|w| w == ext)
+        })
+    };
+    assert!(!main_uses("_var_I_I"), "{main}");
+    assert!(!main_uses("_var_S_I"), "{main}");
+    assert!(main_uses("_var_N_I"), "{main}");
+    let out = crate::common::compile_and_run(src).expect("must run");
+    assert_eq!(out.trim(), "550  3");
 }
 
 /// Scalars in SSA values keep BASIC's behaviour where control flow is least
