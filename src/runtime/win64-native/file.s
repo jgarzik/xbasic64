@@ -1200,7 +1200,7 @@ _file_pos: .skip 8
 #
 # Arguments:
 #   rcx = filename pointer, rdx = filename length
-#   r8  = file number, r9 = record length
+#   r8  = file number, r9 = record length, 1 to 32767
 .globl _rt_file_open_random
 _rt_file_open_random:
     push rbp
@@ -1217,6 +1217,13 @@ _rt_file_open_random:
     mov rsi, rdx            # filename len
     mov ebx, r8d            # file number
     mov r14, r9             # record length
+
+    # A record length outside 1..MAX_RECLEN is an Illegal function call,
+    # refused before anything is created; see the System V twin.
+    cmp r14, 1
+    jl .Lwrandom_badlen
+    cmp r14, MAX_RECLEN
+    jg .Lwrandom_badlen
 
     # The same refusals as a sequential OPEN. This one stored
     # INVALID_HANDLE_VALUE for a file it could not open, and silently
@@ -1269,15 +1276,6 @@ _rt_file_open_random:
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
 
-    # Clamp the record length into 1..MAX_RECLEN.
-    cmp r14, 1
-    jge .Lwrandom_len_ok
-    mov r14, 128
-.Lwrandom_len_ok:
-    cmp r14, MAX_RECLEN
-    jle .Lwrandom_len_set
-    mov r14, MAX_RECLEN
-.Lwrandom_len_set:
     lea rcx, [rip + _file_reclen]
     mov [rcx + rbx*8], r14
 
@@ -1329,6 +1327,12 @@ _rt_file_open_random:
 # epilogue with a harmless result.
 .Lwrandom_nomem:
     lea rcx, [rip + _err_memory]
+    xor edx, edx
+    call _rt_error
+    jmp .Lwrandom_open_done
+
+.Lwrandom_badlen:
+    lea rcx, [rip + _err_domain]
     xor edx, edx
     call _rt_error
     jmp .Lwrandom_open_done

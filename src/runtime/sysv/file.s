@@ -1178,7 +1178,7 @@ _mk_buf: .skip 16
 #
 # Arguments:
 #   rdi = filename pointer, rsi = filename length
-#   rdx = file number, rcx = record length
+#   rdx = file number, rcx = record length, 1 to 32767
 #
 # Returns: nothing
 .globl _rt_file_open_random
@@ -1194,6 +1194,16 @@ _rt_file_open_random:
     mov r13, rsi            # filename len
     mov ebx, edx            # file number
     mov r14, rcx            # record length
+
+    # A record length outside 1..MAX_RECLEN is an Illegal function call, as in
+    # GW-BASIC, refused before anything is created. It used to be fixed up
+    # silently -- 40000 cut to 32767, 0 or less made 128 -- so a program that
+    # computed its length wrongly ran on with records it never asked for. A
+    # missing LEN clause is not 0 here: codegen passes the default, 128.
+    cmp r14, 1
+    jl .Lrandom_badlen
+    cmp r14, MAX_RECLEN
+    jg .Lrandom_badlen
 
     # The same refusals as a sequential OPEN. This one stored a NULL handle
     # for a file it could not open, and silently replaced an open one.
@@ -1244,15 +1254,6 @@ _rt_file_open_random:
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
 
-    # Clamp the record length into 1..MAX_RECLEN.
-    cmp r14, 1
-    jge .Lrandom_len_ok
-    mov r14, 128
-.Lrandom_len_ok:
-    cmp r14, MAX_RECLEN
-    jle .Lrandom_len_set
-    mov r14, MAX_RECLEN
-.Lrandom_len_set:
     lea rcx, [rip + _file_reclen]
     mov [rcx + rbx*8], r14
 
@@ -1302,6 +1303,12 @@ _rt_file_open_random:
 # epilogue with a harmless result.
 .Lrandom_nomem:
     lea rdi, [rip + _err_memory]
+    xor esi, esi
+    call _rt_error
+    jmp .Lrandom_open_done
+
+.Lrandom_badlen:
+    lea rdi, [rip + _err_domain]
     xor esi, esi
     call _rt_error
     jmp .Lrandom_open_done

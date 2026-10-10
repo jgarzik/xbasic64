@@ -587,6 +587,52 @@ CLOSE #1
     assert_eq!(output.trim(), "128");
 }
 
+/// A record length outside 1 to 32767 is "Illegal function call" (5), as in
+/// GW-BASIC, raised before anything is opened or created.
+///
+/// It used to be fixed up silently: `LEN = 40000` was cut to 32767 and
+/// `LEN = 0` (or anything below 1) became 128, so a program whose record
+/// length was computed wrongly ran on with records of a size it never asked
+/// for. The limits themselves still work.
+#[test]
+fn test_record_length_out_of_range_is_refused() {
+    let (output, tmp) = compile_and_run_with_files(
+        r#"
+ON ERROR GOTO 100
+N = 0
+OPEN "a.dat" FOR RANDOM AS #1 LEN = 40000
+OPEN "b.dat" FOR RANDOM AS #1 LEN = 0
+OPEN "c.dat" FOR RANDOM AS #1 LEN = -1
+OPEN "d.dat" FOR RANDOM AS #1 LEN = N
+OPEN "e.dat" FOR RANDOM AS #1 LEN = 32767
+OPEN "f.dat" FOR RANDOM AS #2 LEN = 1
+FIELD #1, 32767 AS A$
+FIELD #2, 1 AS B$
+PRINT "opened"
+END
+100 PRINT ERR; ERL
+RESUME NEXT
+"#,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["5  4", "5  5", "5  6", "5  7", "opened"]
+    );
+    for name in ["a.dat", "b.dat", "c.dat", "d.dat"] {
+        assert!(!tmp.path().join(name).exists(), "{name} was created");
+    }
+
+    let run = compile_and_run_raw(
+        "10 PRINT \"x\"\n20 OPEN \"r.dat\" FOR RANDOM AS #1 LEN = 40000\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert_eq!(run.stderr.trim(), "?Illegal function call in 20");
+}
+
 /// A record buffer starts blank, so a field never written is spaces rather
 /// than whatever the allocator last held.
 #[test]
