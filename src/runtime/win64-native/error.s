@@ -36,6 +36,9 @@ _err_permission: .asciz "Permission denied"
 _err_notfound: .asciz "File not found"
 _err_alreadyopen: .asciz "File already open"
 _err_pastend: .asciz "Input past end of file"
+_err_badname: .asciz "Bad file name"
+_err_access: .asciz "Path/File access error"
+_err_pathnotfound: .asciz "Path not found"
 
 _err_unprintable: .asciz "Unprintable error"
 # RESUME's own failures. Never trapped -- a handler that trapped them would be
@@ -71,7 +74,10 @@ _err_codes:
     .quad _err_badmode,     54
     .quad _err_alreadyopen, 55
     .quad _err_pastend,     62
+    .quad _err_badname,     64
     .quad _err_permission,  70
+    .quad _err_access,      75
+    .quad _err_pathnotfound, 76
     .quad 0, 0
 
 # Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The

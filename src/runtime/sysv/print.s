@@ -25,6 +25,7 @@ _rt_platform_init:
     mov rax, QWORD PTR [rip + stdout@GOTPCREL]
     mov rax, QWORD PTR [rax]
     mov QWORD PTR [rip + _file_handles], rax
+    mov QWORD PTR [rip + _file_mode], 1     # the console is written to
     ret
 
 # _rt_fmt_double - Format a number into _num_buf

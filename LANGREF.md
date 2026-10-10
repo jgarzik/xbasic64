@@ -1462,7 +1462,8 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | No. | Message                  | Cause                                        |
 |-----|--------------------------|----------------------------------------------|
 | 3   | `RETURN without GOSUB`   | A `RETURN` no `GOSUB` of its scope is waiting for |
-| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive |
+| 4   | `Out of DATA`            | A `READ` after the last `DATA` item          |
+| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive, an argument out of range |
 | 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
 | 7   | `Out of memory`          | A string or array allocation that failed     |
 | 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
@@ -1470,12 +1471,15 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
 | 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
 | 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
-| 52  | `Bad file number`        | A file number outside 1 to 15                |
-| 53  | `File not found`         | Opening a file that is not there             |
-| 54  | `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file |
+| 52  | `Bad file number`        | A file number outside 1 to 15, or not open   |
+| 53  | `File not found`         | Opening a file for `INPUT` that is not there |
+| 54  | `Bad file mode`          | Writing a file opened for reading, reading one opened for writing, or `FIELD`, `GET` or `PUT` on a non-random file |
 | 55  | `File already open`      | `OPEN` on a file number already in use       |
 | 62  | `Input past end of file` | Reading past the end of an input file        |
-| 70  | `Permission denied`      | A `LOCK` someone else already holds          |
+| 64  | `Bad file name`          | `OPEN` of an empty or malformed name         |
+| 70  | `Permission denied`      | A file the program may not open that way, or a `LOCK` someone else holds |
+| 75  | `Path/File access error` | Any other `OPEN` failure, such as a directory |
+| 76  | `Path not found`         | Creating a file in a directory that is not there |
 
 ### ERROR
 

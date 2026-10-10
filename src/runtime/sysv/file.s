@@ -28,8 +28,10 @@
 #   For string input, fgets reads into _file_input_buf.
 #
 # Error Handling:
-#   Currently minimal - fopen failure results in NULL handle, which will
-#   cause subsequent operations to fail silently or crash.
+#   A failed OPEN raises GW-BASIC's error for the cause (53, 64, 70, 75, 76).
+#   _file_mode records how each number was opened, so PRINT # to a file
+#   opened FOR INPUT, or INPUT # from one opened for writing, is "Bad file
+#   mode" (54) rather than a write libc quietly refuses.
 
 # Data Section: File handle table and buffers
 .data
@@ -60,6 +62,8 @@ _file_fmt_input:   .asciz "%lf"     # Read double
 # File handle table: FILE* pointers indexed by BASIC file number (1-15)
 # Index 0 unused, indices 1-15 for BASIC files #1-#15
 _file_handles: .skip 128        # 16 * 8 bytes = 16 FILE* pointers
+# How each number was opened: 0 INPUT, 1 OUTPUT, 2 APPEND, 3 RANDOM.
+_file_mode: .skip 128
 
 # Temp buffer for null-terminated filename (BASIC strings aren't null-terminated)
 _file_name_buf: .skip 1024
@@ -110,6 +114,11 @@ _rt_file_open:
     call .Lopen_already
     jmp .Lopen_done
 .Lopen_free:
+    test r13, r13
+    jnz .Lopen_named
+    call .Lopen_badname     # "" names no file
+    jmp .Lopen_done
+.Lopen_named:
 
     # Copy filename to buffer and null-terminate
     # memcpy(_file_name_buf, filename_ptr, filename_len)
@@ -145,6 +154,7 @@ _rt_file_open:
     # every later use was a crash or silence.
     test rax, rax
     jnz .Lopen_ok
+    mov edi, r14d
     call .Lopen_failed
     jmp .Lopen_done
 .Lopen_ok:
@@ -152,6 +162,18 @@ _rt_file_open:
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
+    lea rcx, [rip + _file_mode]
+    mov [rcx + rbx*8], r14
+
+    # A record buffer left by an earlier OPEN ... FOR RANDOM on this number
+    # would make GET and PUT think this file is a random one.
+    lea rcx, [rip + _file_recbuf]
+    mov rdi, [rcx + rbx*8]
+    test rdi, rdi
+    jz .Lopen_no_recbuf
+    mov QWORD PTR [rcx + rbx*8], 0
+    call free
+.Lopen_no_recbuf:
 
     # A new file starts at column 1, whatever the last one on this number
     # left behind.
@@ -238,6 +260,8 @@ _rt_file_print_string:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_print_str_done
 .Lfile_print_str_open:
+    call .Lfile_check_writable
+    jc .Lfile_print_str_done
 
     # fprintf(file, "%.*s", len, ptr)
     lea rsi, [rip + _file_fmt_str]  # format → 2nd arg
@@ -519,6 +543,8 @@ _rt_file_print_char:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_char_done
 .Lfile_char_open:
+    call .Lfile_check_writable
+    jc .Lfile_char_done
     lea rsi, [rip + _file_fmt_char]
     mov rdx, r12            # char
     xor eax, eax
@@ -557,6 +583,8 @@ _rt_file_print_newline:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_newline_done
 .Lfile_newline_open:
+    call .Lfile_check_writable
+    jc .Lfile_newline_done
     mov edi, 10             # '\n' → edi (1st arg)
     call fputc
 
@@ -619,6 +647,17 @@ _rt_file_read_field:
 
     mov ebx, edi                # file number, reloaded before every read
     xor r12d, r12d              # length written so far
+
+    # INPUT # needs a file that is open, and open for reading. _rt_file_getc
+    # answers end-of-file for one that is not, so this read an empty field.
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rbx*8], 0
+    jne .Lfield_open
+    call .Lfile_not_open
+    jmp .Lfield_done
+.Lfield_open:
+    call .Lfile_check_readable
+    jc .Lfield_done
 
     # Skip leading blanks, tabs and line breaks.
 .Lfield_skip:
@@ -771,6 +810,12 @@ _rt_file_line_input:
     call .Lfile_not_open                # a number nobody OPENed is NULL here
     jmp .Lfile_input_string_empty
 .Lline_input_open:
+    call .Lfile_check_readable
+    jc .Lfile_input_string_empty
+    lea rdi, [rip + _file_input_buf]    # the check clobbered the arguments
+    mov rsi, 1023
+    lea rax, [rip + _file_handles]
+    mov rdx, [rax + rbx*8]
     call fgets
 
     # A read past the end used to answer with an empty string, so a loop
@@ -966,6 +1011,20 @@ _rt_file_open_random:
     mov ebx, edx            # file number
     mov r14, rcx            # record length
 
+    # The same refusals as a sequential OPEN. This one stored a NULL handle
+    # for a file it could not open, and silently replaced an open one.
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rbx*8], 0
+    je .Lrandom_free
+    call .Lopen_already
+    jmp .Lrandom_open_done
+.Lrandom_free:
+    test r13, r13
+    jnz .Lrandom_named
+    call .Lopen_badname
+    jmp .Lrandom_open_done
+.Lrandom_named:
+
     # Null-terminate the filename in the shared buffer.
     lea rdi, [rip + _file_name_buf]
     mov rsi, r12
@@ -984,10 +1043,17 @@ _rt_file_open_random:
     lea rdi, [rip + _file_name_buf]
     lea rsi, [rip + _mode_create]
     call fopen
+    test rax, rax
+    jnz .Lrandom_have_handle
+    mov edi, 3              # RANDOM
+    call .Lopen_failed
+    jmp .Lrandom_open_done
 
 .Lrandom_have_handle:
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
+    lea rcx, [rip + _file_mode]
+    mov QWORD PTR [rcx + rbx*8], 3
 
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
@@ -1734,13 +1800,8 @@ _rt_file_lof:
     xor esi, esi
     jmp _rt_error
 
-# OPEN failed. The line number is not passed to _rt_file_open, so these report
+# The line number is not passed to _rt_file_open, so the OPEN errors report
 # without one; _rt_error prints a bare message for 0.
-.Lopen_failed:
-    lea rdi, [rip + _err_notfound]
-    xor esi, esi
-    jmp _rt_error
-
 .Lopen_already:
     lea rdi, [rip + _err_alreadyopen]
     xor esi, esi
@@ -1750,3 +1811,81 @@ _rt_file_lof:
     lea rdi, [rip + _err_pastend]
     xor esi, esi
     jmp _rt_error
+
+.Lopen_badname:
+    lea rdi, [rip + _err_badname]
+    xor esi, esi
+    jmp _rt_error
+
+# OPEN failed: say why, from errno. Called with edi = the mode (0 INPUT, 1
+# OUTPUT, 2 APPEND, 3 RANDOM). A missing file is "File not found" when it was
+# to be read; when it was to be created, what is missing is the directory.
+.Lopen_failed:
+    push rbx                # aligns rsp for the call
+    mov ebx, edi
+    call __errno_location
+    mov eax, DWORD PTR [rax]
+    lea rdi, [rip + _err_access]        # 75, for anything not named below
+    cmp eax, 2                          # ENOENT
+    jne .Lopen_err_notdir
+    lea rdi, [rip + _err_notfound]
+    test ebx, ebx
+    jz .Lopen_err_go
+    lea rdi, [rip + _err_pathnotfound]
+    jmp .Lopen_err_go
+.Lopen_err_notdir:
+    cmp eax, 20                         # ENOTDIR
+    jne .Lopen_err_perm
+    lea rdi, [rip + _err_pathnotfound]
+    jmp .Lopen_err_go
+.Lopen_err_perm:
+    lea rdi, [rip + _err_permission]
+    cmp eax, 13                         # EACCES
+    je .Lopen_err_go
+    cmp eax, 1                          # EPERM
+    je .Lopen_err_go
+    cmp eax, 30                         # EROFS
+    je .Lopen_err_go
+    cmp eax, 26                         # ETXTBSY
+    je .Lopen_err_go
+    lea rdi, [rip + _err_badname]
+    cmp eax, 36                         # ENAMETOOLONG
+    je .Lopen_err_go
+    cmp eax, 22                         # EINVAL
+    je .Lopen_err_go
+    lea rdi, [rip + _err_access]
+.Lopen_err_go:
+    pop rbx
+    xor esi, esi
+    jmp _rt_error
+
+# Is the file open for writing? Called with rbx = file number, from a helper
+# whose stack is aligned. Carry set (and the error raised) when it is not.
+# PRINT # to a file opened FOR INPUT used to be a write libc quietly refused.
+.Lfile_check_writable:
+    lea rax, [rip + _file_mode]
+    mov rax, [rax + rbx*8]
+    cmp rax, 1              # OUTPUT
+    je .Lfile_mode_ok
+    cmp rax, 2              # APPEND
+    je .Lfile_mode_ok
+.Lfile_mode_bad:
+    sub rsp, 8              # aligns rsp for the call
+    lea rdi, [rip + _err_badmode]
+    xor esi, esi
+    call _rt_error
+    add rsp, 8
+    stc
+    ret
+.Lfile_mode_ok:
+    clc
+    ret
+
+# Is the file open for reading sequentially? The same, for INPUT # and
+# LINE INPUT #.
+.Lfile_check_readable:
+    lea rax, [rip + _file_mode]
+    cmp QWORD PTR [rax + rbx*8], 0      # INPUT
+    jne .Lfile_mode_bad
+    clc
+    ret

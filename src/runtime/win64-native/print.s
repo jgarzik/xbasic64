@@ -48,6 +48,8 @@ _rt_platform_init:
     call GetStdHandle
     lea rcx, [rip + _file_handles]
     mov [rcx], rax
+    lea rcx, [rip + _file_mode]
+    mov QWORD PTR [rcx], 1          # the console is written to
 
     # Turn on VT processing, so the escape sequences CLS, LOCATE and COLOR
     # write are acted on rather than printed literally. CLS has emitted them

@@ -732,3 +732,111 @@ PRINT A$; B$
     .unwrap();
     assert_eq!(crate::common::lines(&output), vec!["onetwo"]);
 }
+
+/// Each way an OPEN can fail is GW-BASIC's own error, not always 53.
+///
+/// Every failure used to be "File not found": a missing directory, a read-only
+/// file and an empty name all said the same, so a handler testing ERR could not
+/// tell them apart. A RANDOM open that failed stored a null handle and carried
+/// on without saying anything at all.
+#[test]
+fn test_open_failures_name_their_cause() {
+    let (output, _dir) = compile_and_run_with_files(
+        r#"
+ON ERROR GOTO 100
+OPEN "missing.txt" FOR INPUT AS #1
+OPEN "no-such-dir/x.txt" FOR OUTPUT AS #1
+OPEN "no-such-dir/x.txt" FOR APPEND AS #1
+OPEN "no-such-dir/x.dat" FOR RANDOM AS #1 LEN = 16
+OPEN "" FOR OUTPUT AS #1
+OPEN "" FOR RANDOM AS #1
+OPEN "readonly.txt" FOR OUTPUT AS #1
+OPEN "ok.dat" FOR RANDOM AS #2 LEN = 8
+OPEN "ok.dat" FOR RANDOM AS #2 LEN = 8
+END
+100 PRINT ERR
+RESUME NEXT
+"#,
+        |dir| {
+            let ro = dir.join("readonly.txt");
+            fs::write(&ro, "x").map_err(|e| e.to_string())?;
+            let mut perms = fs::metadata(&ro).map_err(|e| e.to_string())?.permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&ro, perms).map_err(|e| e.to_string())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["53", "76", "76", "76", "64", "64", "70", "55"]
+    );
+}
+
+/// A directory is not a file. Linux says EISDIR (75, Path/File access error);
+/// Windows says access denied (70). Either is right; "File not found" was not.
+#[test]
+fn test_open_of_a_directory_is_an_access_error() {
+    let output = compile_and_run(
+        "ON ERROR GOTO 100\nOPEN \".\" FOR OUTPUT AS #1\nEND\n100 PRINT ERR\nRESUME NEXT\n",
+    )
+    .unwrap();
+    let err = crate::common::lines(&output)[0].to_string();
+    assert!(err == "75" || err == "70", "ERR was {err}");
+}
+
+/// Reading a file opened for writing, or writing one opened for reading, is
+/// "Bad file mode" (54). PRINT # to an INPUT file used to be a write libc
+/// quietly refused, and INPUT # from an unopened number read an empty field.
+#[test]
+fn test_file_mode_is_checked() {
+    let output = compile_and_run(
+        r#"
+ON ERROR GOTO 100
+OPEN "f.txt" FOR OUTPUT AS #1
+PRINT #1, "data"
+INPUT #1, A$
+LINE INPUT #1, A$
+CLOSE #1
+OPEN "f.txt" FOR INPUT AS #1
+PRINT #1, "more"
+WRITE #1, 5
+INPUT #2, B$
+OPEN "r.dat" FOR RANDOM AS #3 LEN = 4
+PRINT #3, "x"
+LINE INPUT #1, C$
+PRINT C$
+END
+100 PRINT ERR
+RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["54", "54", "54", "54", "52", "54", "data"]
+    );
+}
+
+/// The checks do not get in the way of a file used the way it was opened,
+/// including a number reused for a different mode after CLOSE.
+#[test]
+fn test_reopened_numbers_take_their_new_mode() {
+    let output = compile_and_run(
+        r#"
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 4
+CLOSE #1
+OPEN "f.txt" FOR OUTPUT AS #1
+PRINT #1, "one"
+CLOSE #1
+OPEN "f.txt" FOR APPEND AS #1
+PRINT #1, "two"
+CLOSE #1
+OPEN "f.txt" FOR INPUT AS #1
+LINE INPUT #1, A$
+INPUT #1, B$
+PRINT A$; B$
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["onetwo"]);
+}

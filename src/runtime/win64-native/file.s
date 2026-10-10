@@ -56,6 +56,8 @@ _file_newline:     .ascii "\r\n"
 # preceding strings happened to leave, which is not something to rely on.
 .p2align 3
 _file_handles: .skip 128        # 16 * 8 bytes = 16 HANDLEs
+# How each number was opened: 0 INPUT, 1 OUTPUT, 2 APPEND, 3 RANDOM.
+_file_mode: .skip 128
 # Current output column per file number, so TAB(n) knows how far to advance.
 # Updated by the print helpers and reset by a newline. Slot 0 is the console,
 # which is file handle 0.
@@ -104,6 +106,11 @@ _rt_file_open:
     call .Lopen_already
     jmp .Lfile_open_done
 .Lopen_free:
+    test rsi, rsi
+    jnz .Lopen_named
+    call .Lopen_badname     # "" names no file
+    jmp .Lfile_open_done
+.Lopen_named:
 
     # Copy filename and null-terminate
     lea rcx, [rip + _file_name_buf]
@@ -151,6 +158,7 @@ _rt_file_open:
     # guards elsewhere would not have caught it.
     cmp rax, INVALID_HANDLE_VALUE
     jne .Lopen_ok
+    mov ecx, r14d
     call .Lopen_failed
     jmp .Lfile_open_done
 .Lopen_ok:
@@ -158,6 +166,20 @@ _rt_file_open:
     # Store HANDLE in handle table
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
+    lea rcx, [rip + _file_mode]
+    mov [rcx + rbx*8], r14
+    mov r12, rax            # the handle, for the seek below
+
+    # A record buffer left by an earlier OPEN ... FOR RANDOM on this number
+    # would make GET and PUT think this file is a random one.
+    lea rax, [rip + _file_recbuf]
+    mov rcx, [rax + rbx*8]
+    test rcx, rcx
+    jz .Lopen_no_recbuf
+    mov QWORD PTR [rax + rbx*8], 0
+    call free
+.Lopen_no_recbuf:
+    mov rax, r12
 
     # A new file starts at column 1, whatever the last one on this number
     # left behind.
@@ -256,6 +278,8 @@ _rt_file_print_string:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_print_str_done
 .Lfile_print_str_open:
+    call .Lfile_check_writable
+    jc .Lfile_print_str_done
 
     # WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped)
     mov rdx, rdi            # lpBuffer = string ptr
@@ -555,6 +579,8 @@ _rt_file_print_char:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_char_done
 .Lfile_char_open:
+    call .Lfile_check_writable
+    jc .Lfile_char_done
 
     # WriteFile(hFile, buffer, 1, &bytesWritten, NULL)
     lea rdx, [rip + _file_output_buf]
@@ -594,6 +620,8 @@ _rt_file_print_newline:
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_newline_done
 .Lfile_newline_open:
+    call .Lfile_check_writable
+    jc .Lfile_newline_done
 
     # WriteFile(hFile, "\r\n", CRLF_LEN, &bytesWritten, NULL)
     lea rdx, [rip + _file_newline]
@@ -672,6 +700,17 @@ _rt_file_read_field:
 
     mov ebx, ecx                # file number, reloaded before every read
     xor r12d, r12d              # length written so far
+
+    # INPUT # needs a file that is open, and open for reading. _rt_file_getc
+    # answers end-of-file for one that is not, so this read an empty field.
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rbx*8], 0
+    jne .Lfield_open
+    call .Lfile_not_open
+    jmp .Lfield_done
+.Lfield_open:
+    call .Lfile_check_readable
+    jc .Lfield_done
 
 .Lfield_skip:
     mov ecx, ebx
@@ -812,6 +851,17 @@ _rt_file_line_input:
     # Clear buffer
     lea rax, [rip + _file_input_buf]
     mov BYTE PTR [rax], 0
+
+    # An unopened number is caught in the loop below; a file opened for
+    # writing is caught here.
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rbx*8], 0
+    je .Lline_input_mode_ok
+    call .Lfile_check_readable
+    jnc .Lline_input_mode_ok
+    xor r12d, r12d          # an empty line when a handler traps it
+    jmp .Lfile_input_str_done
+.Lline_input_mode_ok:
 
     # Read one character at a time until newline or EOF
     xor r12d, r12d          # r12 = position in buffer
@@ -1019,6 +1069,21 @@ _rt_file_open_random:
     mov ebx, r8d            # file number
     mov r14, r9             # record length
 
+    # The same refusals as a sequential OPEN. This one stored
+    # INVALID_HANDLE_VALUE for a file it could not open, and silently
+    # replaced an open one.
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rbx*8], 0
+    je .Lwrandom_free
+    call .Lopen_already
+    jmp .Lwrandom_open_done
+.Lwrandom_free:
+    test rsi, rsi
+    jnz .Lwrandom_named
+    call .Lopen_badname
+    jmp .Lwrandom_open_done
+.Lwrandom_named:
+
     # Null-terminate the filename in the shared buffer.
     lea rcx, [rip + _file_name_buf]
     mov rdx, rdi
@@ -1038,9 +1103,17 @@ _rt_file_open_random:
     mov DWORD PTR [rsp + 40], FILE_ATTRIBUTE_NORMAL
     mov QWORD PTR [rsp + 48], 0
     call CreateFileA
+    cmp rax, INVALID_HANDLE_VALUE
+    jne .Lwrandom_have_handle
+    mov ecx, 3              # RANDOM
+    call .Lopen_failed
+    jmp .Lwrandom_open_done
+.Lwrandom_have_handle:
 
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
+    lea rcx, [rip + _file_mode]
+    mov QWORD PTR [rcx + rbx*8], 3
 
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
@@ -1804,12 +1877,87 @@ _rt_file_lof:
     xor edx, edx
     jmp _rt_error
 
-# OPEN failed. The line number is not passed to _rt_file_open, so these report
+# The line number is not passed to _rt_file_open, so the OPEN errors report
 # without one; _rt_error prints a bare message for 0.
-.Lopen_failed:
-    lea rcx, [rip + _err_notfound]
+.Lopen_badname:
+    lea rcx, [rip + _err_badname]
     xor edx, edx
     jmp _rt_error
+
+# OPEN failed: say why, from GetLastError. Called with ecx = the mode (0 INPUT,
+# 1 OUTPUT, 2 APPEND, 3 RANDOM). A missing file is "File not found" when it
+# was to be read; when it was to be created, what is missing is the directory.
+.Lopen_failed:
+    push rbx
+    sub rsp, 32             # shadow space; rsp is now 16-byte aligned
+    mov ebx, ecx
+    call GetLastError
+    add rsp, 32
+    lea rcx, [rip + _err_access]        # 75, for anything not named below
+    cmp eax, 2                          # ERROR_FILE_NOT_FOUND
+    jne .Lopen_err_path
+    lea rcx, [rip + _err_notfound]
+    test ebx, ebx
+    jz .Lopen_err_go
+    lea rcx, [rip + _err_pathnotfound]
+    jmp .Lopen_err_go
+.Lopen_err_path:
+    cmp eax, 3                          # ERROR_PATH_NOT_FOUND
+    jne .Lopen_err_perm
+    lea rcx, [rip + _err_pathnotfound]
+    jmp .Lopen_err_go
+.Lopen_err_perm:
+    lea rcx, [rip + _err_permission]
+    cmp eax, 5                          # ERROR_ACCESS_DENIED
+    je .Lopen_err_go
+    cmp eax, 32                         # ERROR_SHARING_VIOLATION
+    je .Lopen_err_go
+    cmp eax, 19                         # ERROR_WRITE_PROTECT
+    je .Lopen_err_go
+    lea rcx, [rip + _err_badname]
+    cmp eax, 123                        # ERROR_INVALID_NAME
+    je .Lopen_err_go
+    cmp eax, 161                        # ERROR_BAD_PATHNAME
+    je .Lopen_err_go
+    cmp eax, 206                        # ERROR_FILENAME_EXCED_RANGE
+    je .Lopen_err_go
+    lea rcx, [rip + _err_access]
+.Lopen_err_go:
+    pop rbx
+    xor edx, edx
+    jmp _rt_error
+
+# Is the file open for writing? Called with rbx = file number, from a helper
+# whose stack is aligned. Carry set (and the error raised) when it is not;
+# rcx, rdx, r8 and r9 survive when it is. PRINT # to a file opened FOR INPUT
+# used to be a WriteFile the OS quietly refused.
+.Lfile_check_writable:
+    lea rax, [rip + _file_mode]
+    mov rax, [rax + rbx*8]
+    cmp rax, 1              # OUTPUT
+    je .Lfile_mode_ok
+    cmp rax, 2              # APPEND
+    je .Lfile_mode_ok
+.Lfile_mode_bad:
+    sub rsp, 40             # shadow space; rsp is now 16-byte aligned
+    lea rcx, [rip + _err_badmode]
+    xor edx, edx
+    call _rt_error
+    add rsp, 40
+    stc
+    ret
+.Lfile_mode_ok:
+    clc
+    ret
+
+# Is the file open for reading sequentially? The same, for INPUT # and
+# LINE INPUT #.
+.Lfile_check_readable:
+    lea rax, [rip + _file_mode]
+    cmp QWORD PTR [rax + rbx*8], 0      # INPUT
+    jne .Lfile_mode_bad
+    clc
+    ret
 
 .Lopen_already:
     lea rcx, [rip + _err_alreadyopen]
