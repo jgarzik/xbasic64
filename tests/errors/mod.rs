@@ -1931,10 +1931,11 @@ fn test_dim_suffix_must_agree_with_its_as_clause() {
 // ---------------------------------------------------------------------------
 // Error trapping: ON ERROR GOTO, ERR, ERL
 //
-// The mechanism is a longjmp in all but name. `_rt_error` never returned, and
-// is reached from thirteen places inside each runtime tree with live frames --
-// some two deep, some holding a lock structure on the stack. Trapping abandons
-// all of them, so what the handler starts with has to be captured up front.
+// The mechanism is error-status propagation. A trapped `_rt_error` sets
+// `_err_pending` and returns; the runtime helper that raised it leaves through
+// its own epilogue, generated code tests the flag after every call that can
+// fail, a procedure leaves through its epilogue in turn, and main dispatches
+// to the handler. Nothing is abandoned, so nothing has to be captured.
 
 /// The handler runs, and ERR and ERL say what happened and where.
 #[test]
@@ -2017,7 +2018,7 @@ fn test_error_inside_the_handler_is_fatal() {
 /// The handler can carry on with the program, and the variables it reads are
 /// the ones the program actually wrote.
 ///
-/// The unwind abandons every intervening frame, so anything the compiler was
+/// The error leaves every intervening frame, so anything the compiler was
 /// holding in a register has to be back in memory by then.
 #[test]
 fn test_state_survives_the_unwind() {
@@ -2068,7 +2069,8 @@ fn test_no_cost_without_on_error() {
     let asm = crate::common::compile_to_asm("PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n").unwrap();
     for symbol in [
         "_err_handler",
-        "_err_ctx",
+        "_err_pending",
+        "_err_dispatch",
         "_err_line",
         "_rt_trap_capture",
         "_err_stmt",
@@ -2160,11 +2162,10 @@ fn test_gosub_inside_a_procedure_is_refused_when_trapping() {
 /// A trapping program keeps its loop variables in memory.
 ///
 /// FOR-loop register promotion is switched off when a program traps, and that
-/// is load-bearing rather than a concession: a promoted counter's register is
-/// gone after the unwind and its memory copy is written back only at the
-/// loop's exit label, so a handler would read a stale value. The promotion's
-/// stack saves are also the one thing that moves `rsp` across a statement
-/// boundary, which is what lets the trap restore a single captured `rsp`.
+/// is load-bearing rather than a concession: main's handler dispatch resets
+/// only `rsp`, so a promoted counter's register does not survive the trip to
+/// the handler and back, and its memory copy is written back only at the
+/// loop's exit label, so a handler would read a stale value.
 #[test]
 fn test_trapping_disables_register_promotion() {
     let hot = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
@@ -2415,4 +2416,148 @@ fn test_resume_next_off_the_end() {
     )
     .expect("should compile");
     run.assert_ran_to_completion("RESUME NEXT past the last statement");
+}
+
+/// An error two procedure frames deep reaches main's handler with the right
+/// ERR and ERL, and the program carries on from the handler. Inner has no
+/// line numbers, so ERL is the physical line of its ERROR, as the error
+/// message would say.
+#[test]
+fn test_error_two_procedures_deep_is_trapped() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 CALL Outer
+30 PRINT "not reached"
+40 END
+100 PRINT "trapped"; ERR; ERL
+110 PRINT "after"
+120 END
+SUB Outer
+  CALL Inner
+  PRINT "not reached either"
+END SUB
+SUB Inner
+  ERROR 6
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["trapped 6  14", "after"]);
+}
+
+/// An error raised mid-expression, trapped and resumed a million times, must
+/// leave the stack where it was each time.
+///
+/// Each expression has a temporary on the stack when its error is raised --
+/// one by an inline check, one inside a runtime helper. A trap that left the
+/// temporary there would leak 16 bytes per error and run out of stack long
+/// before the loop ends.
+#[test]
+fn test_trapping_mid_expression_does_not_leak_stack() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 100
+15 A$ = "abc"
+20 FOR I& = 1 TO 500000
+30 X# = I& + (Y# / Z#) * 2
+35 P& = I& + INSTR(Z%, A$, "b") * 2
+40 NEXT I&
+50 PRINT "done"; N&
+60 END
+100 N& = N& + 1
+110 RESUME NEXT
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("a million trapped errors");
+    assert_eq!(run.lines(), &["done 1000000"]);
+}
+
+/// Every runtime helper that can raise an error is trapped, resumed past,
+/// and leaves the program in a state that can carry on and exit cleanly.
+#[test]
+fn test_every_fallible_helper_traps_and_resumes() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 900
+20 OPEN "x.txt" FOR OUTPUT AS #1
+30 PRINT #1, "one line"
+40 OPEN "x.txt" FOR INPUT AS #1
+50 CLOSE #1
+60 OPEN "x.txt" FOR INPUT AS #1
+70 LINE INPUT #1, A$
+80 LINE INPUT #1, A$
+90 CLOSE #1
+100 OPEN "no-such-file.txt" FOR INPUT AS #2
+110 PRINT #3, "nowhere"
+120 PRINT #3, 1.5
+130 WRITE #3, 2
+140 LINE INPUT #3, B$
+150 GET #4, 1
+160 PUT #4, 1
+170 OPEN "r.dat" FOR RANDOM AS #5 LEN = 4
+180 FIELD #5, 8 AS F$
+190 OPEN "s.txt" FOR OUTPUT AS #6
+200 FIELD #6, 2 AS G$
+210 V% = CVI("x")
+220 P% = INSTR(0, "abc", "b")
+230 LOCK #7
+240 PRINT "codes"; C$
+250 PRINT "A$="; A$; " V%="; V%; " P%="; P%
+260 END
+900 C$ = C$ + STR$(ERR)
+910 RESUME NEXT
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("trapped helper errors");
+    assert_eq!(
+        run.lines(),
+        &[
+            "codes 55 62 53 52 52 52 52 52 52 50 54 5 5 52",
+            "A$=one line V%= 0  P%= 0"
+        ]
+    );
+}
+
+/// `ERROR n` inside a procedure is trapped by main's handler.
+#[test]
+fn test_error_statement_inside_a_procedure_is_trapped() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 CALL S\n30 END\n100 PRINT \"ERR\"; ERR\n110 END\n\
+         SUB S\n  ERROR 70\nEND SUB\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "ERR 70");
+}
+
+/// A procedure's error passed up through the middle of a call sequence that
+/// has saved registers on main's stack -- INSTR's arguments -- still lands
+/// in the handler with main's frame intact, half a million times over, and
+/// the program then exits cleanly to the C runtime.
+#[test]
+fn test_procedure_error_mid_call_sequence_resumes_by_line() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 100
+15 A$ = "abcdef"
+20 FOR I& = 1 TO 500000
+30 P& = INSTR(1, A$, MID$(A$, F%(0), 1))
+40 NEXT I&
+50 PRINT "done"; N&
+60 END
+100 N& = N& + 1
+110 RESUME 40
+FUNCTION F%(D%)
+  F% = 1 \ D%
+END FUNCTION
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("procedure errors resumed by line");
+    assert_eq!(run.lines(), &["done 500000"]);
 }

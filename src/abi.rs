@@ -24,6 +24,9 @@ pub trait Abi {
     /// or `xmm0` for the first argument, `rdx` or `xmm1` for the second, and
     /// so on, so only `pos` matters.
     fn float_arg_reg(pos: usize, nth_float: usize) -> &'static str;
+
+    /// General registers a function must preserve for its caller.
+    const CALLEE_SAVED: &'static [&'static str];
 }
 
 const XMM: [&str; 8] = [
@@ -44,6 +47,8 @@ impl Abi for SysV64 {
 
     const SHADOW_SPACE: i32 = 0;
 
+    const CALLEE_SAVED: &'static [&'static str] = &["rbx", "r12", "r13", "r14", "r15"];
+
     fn float_arg_reg(_pos: usize, nth_float: usize) -> &'static str {
         XMM[nth_float]
     }
@@ -57,6 +62,12 @@ pub struct Win64;
 impl Abi for Win64 {
     const INT_ARG_REGS: &'static [&'static str] = &["rcx", "rdx", "r8", "r9"];
     const SHADOW_SPACE: i32 = 32;
+
+    // xmm6-xmm15 are callee-saved here too. Nothing in a trapping program
+    // keeps a value in one: FOR-loop promotion, codegen's only user of them,
+    // is off when a program traps.
+    const CALLEE_SAVED: &'static [&'static str] =
+        &["rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"];
 
     fn float_arg_reg(pos: usize, _nth_float: usize) -> &'static str {
         XMM[pos]

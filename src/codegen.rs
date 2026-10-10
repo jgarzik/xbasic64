@@ -615,9 +615,14 @@ pub struct CodeGen {
     /// diagnostic has to quote and `ERL` has to return; reporting the physical
     /// line named something the programmer could not see.
     basic_line: u32,
-    /// Error trampolines needed so far, keyed by (error, line) so that sites
-    /// sharing both share one trampoline. Ordered for reproducible output.
-    error_sites: BTreeMap<(RtError, u32), String>,
+    /// Error trampolines needed so far, keyed by (error, line, where a
+    /// trapped error goes next) so that sites sharing all three share one
+    /// trampoline. The third is empty in a program that does not trap.
+    /// Ordered for reproducible output.
+    error_sites: BTreeMap<(RtError, u32, String), String>,
+    /// ON ERROR GOTO targets, numbered from 1 by position: `_err_handler`
+    /// holds the number, and main's dispatch jumps through this table.
+    err_handlers: Vec<String>,
     /// Enclosing loops, innermost last, so EXIT FOR / EXIT DO know where to
     /// jump. Each entry is (is_for, end label).
     loop_stack: Vec<(bool, String)>,
@@ -708,8 +713,11 @@ impl CodeGen {
     /// `rtsig`: every runtime call goes through here, so that table is
     /// complete by construction.
     fn call_rt(&mut self, name: &str) {
-        rtsig::lookup(name);
+        let helper = rtsig::lookup(name);
         emit!(self, "    call {}", name);
+        if helper.fallible {
+            self.emit_error_check();
+        }
     }
 
     /// Move the double in `xmm0` to where argument `pos`, the `nth_float`-th
@@ -1500,10 +1508,31 @@ impl CodeGen {
         // Main is rendered before the procedures but shares the field with
         // them, so each function starts again with no line number reached.
         self.basic_line = 0;
+
+        // A trapping program saves every callee-saved register in main's own
+        // frame and restores them on the way out. A trapped error leaves
+        // whatever it interrupted -- a helper's saved registers included --
+        // and the handler dispatch resets only rsp, so the registers' values
+        // in between are nobody's: no main code keeps a value in one across a
+        // statement when trapping, since FOR-loop promotion is off.
+        let saved: &[&str] = if self.traps {
+            PlatformAbi::CALLEE_SAVED
+        } else {
+            &[]
+        };
+        let save_bytes = (saved.len() as i32 * 8 + 15) & !15;
+        self.stack_offset = -save_bytes;
+
         self.reserve_array_descriptors(&SemaScope::Module);
         self.emit_label("main");
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
+        for reg in saved {
+            emit!(self, "    push {}", reg);
+        }
+        if save_bytes > saved.len() as i32 * 8 {
+            self.emit("    sub rsp, 8");
+        }
 
         // Reserve stack space (will patch later)
         self.emit("    sub rsp, 0         # STACK_RESERVE");
@@ -1524,16 +1553,6 @@ impl CodeGen {
         // on Windows. Both answer to the same call.
         self.call_rt("_rt_platform_init");
 
-        // Record what a trapped error has to restore. Taken here because the
-        // callee-saved registers still hold the C runtime's values, so putting
-        // them back leaves main's own `leave; ret` as clean as it is without
-        // trapping. The register set differs between the ABIs, so the saving
-        // lives in each runtime tree rather than here.
-        if self.traps {
-            self.emit("    # ON ERROR: what the handler starts from");
-            self.call_rt("_rt_trap_capture");
-        }
-
         // Generate main body
         self.begin_gosub_scope(&program.statements);
         for stmt in &program.statements {
@@ -1546,9 +1565,29 @@ impl CodeGen {
 
         // Exit
         self.emit("    xor eax, eax");
+        if !saved.is_empty() {
+            emit!(self, "    lea rsp, [rbp - {}]", saved.len() * 8);
+            for reg in saved.iter().rev() {
+                emit!(self, "    pop {}", reg);
+            }
+        }
         self.emit("    leave");
         self.emit("    ret");
         self.emit("");
+
+        // Where every trapped error in main, and every one a procedure passed
+        // up, goes: back to main's own frame, with rsp where it is between
+        // statements -- an error raised mid-expression leaves temporaries
+        // behind -- and on to the handler ON ERROR named, by number.
+        if self.traps {
+            self.emit_label("_err_dispatch");
+            self.emit("    lea rsp, [rbp - 0]         # MAIN_FRAME");
+            self.emit("    mov QWORD PTR [rip + _err_pending], 0");
+            self.emit("    mov rax, QWORD PTR [rip + _err_handler]");
+            self.emit("    lea rcx, [rip + _err_handlers]");
+            self.emit("    jmp QWORD PTR [rcx + rax*8 - 8]");
+            self.emit("");
+        }
 
         // Patch stack reserve
         // System V AMD64 ABI stack alignment rules:
@@ -1562,13 +1601,19 @@ impl CodeGen {
         // a procedure's placeholder -- note "# STACK_RESERVE" is a prefix of
         // "# STACK_RESERVE_PROC_<name>".
         let stack_needed = -self.stack_offset;
-        let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
+        let frame = (stack_needed + 15) & !15; // Round up to multiple of 16
+        let stack_size = frame - save_bytes; // the saves are already pushed
         let old = "    sub rsp, 0         # STACK_RESERVE";
         let new = format!("    sub rsp, {}        # STACK_RESERVE", stack_size);
         self.output = self.output.replace(old, &new);
+        if self.traps {
+            self.output = self.output.replace(
+                "    lea rsp, [rbp - 0]         # MAIN_FRAME",
+                &format!("    lea rsp, [rbp - {}]         # MAIN_FRAME", frame),
+            );
+        }
     }
 
-    /// Preprocess statement: collect DATA items and check for GOSUB usage
     /// Number of GOSUB return sites in `stmts`, not counting procedure bodies,
     /// which are scopes of their own. Each GOSUB and each ON ... GOSUB makes
     /// exactly one.
@@ -1637,6 +1682,7 @@ impl CodeGen {
         self.on_tables.push((table, labels));
     }
 
+    /// Preprocess statement: collect DATA items and check for GOSUB usage
     fn preprocess(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Data(values) => self.data_items.extend(values.clone()),
@@ -1773,10 +1819,44 @@ impl CodeGen {
     /// creating it if this is the first site to need it.
     fn error_label(&mut self, kind: RtError) -> String {
         let line = self.report_line();
+        let exit = if self.traps && kind.trappable() {
+            self.error_exit()
+        } else {
+            String::new()
+        };
+        // Main's trampolines keep the plain name; a procedure's say whose.
+        let label = match &self.current_proc {
+            Some(proc) if !exit.is_empty() => {
+                format!(".Lerr_{}_{}_{}", kind.tag(), line, mangle(proc))
+            }
+            _ => format!(".Lerr_{}_{}", kind.tag(), line),
+        };
         self.error_sites
-            .entry((kind, line))
-            .or_insert_with(|| format!(".Lerr_{}_{}", kind.tag(), line))
+            .entry((kind, line, exit))
+            .or_insert(label)
             .clone()
+    }
+
+    /// Where a trapped error goes from here: out through this procedure's
+    /// epilogue, so that its caller sees the error next, or -- in main -- to
+    /// the dispatch on to the handler.
+    fn error_exit(&self) -> String {
+        self.proc_exit_label
+            .clone()
+            .unwrap_or_else(|| "_err_dispatch".to_string())
+    }
+
+    /// In a program that traps, leave for the error exit if the call just
+    /// made raised an error a handler trapped.
+    ///
+    /// Right after the call, before anything the call sequence would restore:
+    /// a procedure leaves through `leave`, and main's dispatch resets rsp, so
+    /// neither depends on the sequence's own cleanup.
+    fn emit_error_check(&mut self) {
+        if self.traps {
+            self.emit("    cmp QWORD PTR [rip + _err_pending], 0");
+            emit!(self, "    jne {}", self.error_exit());
+        }
     }
 
     /// With `OPTION BASE 1`, subscript 0 is out of range too.
@@ -1917,13 +1997,14 @@ impl CodeGen {
         end: &Expr,
         step: Option<&Expr>,
     ) -> bool {
-        // A trapped error abandons every frame between the failure and main,
-        // so a promoted counter's register is gone and its memory copy is
-        // stale -- it is written back only at the loop's exit label. The
-        // promotion's `sub rsp, 16` save slots are also the one thing in
-        // codegen that moves rsp across a statement boundary, which is what
-        // lets the trap restore a single captured rsp. Both reasons say the
-        // same thing: a program that traps keeps its loop variables in memory.
+        // A trapped error leaves the loop for the handler, which RESUME can
+        // send back into the middle of it. A promoted counter's register does
+        // not survive that trip -- main keeps no value in a callee-saved
+        // register across a statement when trapping, which is what lets the
+        // dispatch reset only rsp -- and its memory copy is written back only
+        // at the loop's exit label. The promotion's `sub rsp, 16` save slots
+        // would also be discarded by that rsp reset. So a program that traps
+        // keeps its loop variables in memory.
         if self.traps {
             return false;
         }
@@ -2587,7 +2668,7 @@ impl CodeGen {
         }
         self.emit("");
         self.emit("# Runtime error trampolines (cold; never fall through)");
-        for ((kind, line), label) in sites {
+        for ((kind, line, exit), label) in sites {
             self.emit_label(&label);
             let sym = kind.symbol();
             emit!(self, "    lea {}, [rip + {}]", Self::arg_reg(0), sym);
@@ -2598,6 +2679,10 @@ impl CodeGen {
                 "_rt_fatal"
             };
             self.call_rt(entry);
+            // _rt_error returns only when a handler traps the error.
+            if !exit.is_empty() {
+                emit!(self, "    jmp {}", exit);
+            }
         }
     }
 
@@ -2763,9 +2848,8 @@ impl CodeGen {
         }
 
         // An error raised in here is trapped like any other, but there is
-        // nothing for a bare RESUME to return to once the unwind has discarded
-        // this frame. The counter is what the trap reads to know that; it
-        // needs no unwinding of its own, because the trap resets it.
+        // nothing for a bare RESUME to return to once the error has left this
+        // frame. The counter is what the trap reads to know that.
         if self.traps {
             self.emit("    inc QWORD PTR [rip + _err_depth]");
         }
@@ -2783,8 +2867,9 @@ impl CodeGen {
         self.proc_exit_label = saved_exit;
         self.emit_label(&exit_label);
         // Every route out passes here, EXIT SUB included, so one decrement
-        // matches the increment above. A trapped error skips it, which is
-        // exactly right: the trap resets the counter instead.
+        // matches the increment above -- a trapped error leaves through here
+        // too, which is what brings the counter back to 0 by the time main's
+        // dispatch reaches the handler.
         if self.traps {
             self.emit("    dec QWORD PTR [rip + _err_depth]");
         }
@@ -3722,13 +3807,17 @@ impl CodeGen {
             StmtKind::OnError(target) => {
                 match target {
                     Some(t) => {
+                        // The handler's number, not its address: main's
+                        // dispatch is a bounded jump through `_err_handlers`.
                         let label = Self::branch_label(t);
-                        // Through a register: an address as an immediate is an
-                        // absolute relocation against .text, which does not
-                        // survive a position-independent link. GOSUB's return
-                        // address is taken the same way.
-                        emit!(self, "    lea rax, [rip + {}]", label);
-                        self.emit("    mov QWORD PTR [rip + _err_handler], rax");
+                        let number = match self.err_handlers.iter().position(|h| *h == label) {
+                            Some(i) => i + 1,
+                            None => {
+                                self.err_handlers.push(label);
+                                self.err_handlers.len()
+                            }
+                        };
+                        emit!(self, "    mov QWORD PTR [rip + _err_handler], {}", number);
                     }
                     None => self.emit("    mov QWORD PTR [rip + _err_handler], 0"),
                 }
@@ -6387,6 +6476,7 @@ impl CodeGen {
         let mangled = mangle(&upper);
         if args.is_empty() {
             emit!(self, "    call _proc_{}", mangled);
+            self.emit_error_check();
             return;
         }
 
@@ -6485,6 +6575,7 @@ impl CodeGen {
         }
 
         emit!(self, "    call _proc_{}", mangled);
+        self.emit_error_check();
         emit!(self, "    add rsp, {}", stack_bytes + temp_bytes);
     }
 
@@ -6930,6 +7021,10 @@ impl CodeGen {
             self.emit("_resume_next:");
             for i in &self.resume_points {
                 emit!(self, "    .quad _rn_{}", i);
+            }
+            self.emit("_err_handlers:");
+            for label in std::mem::take(&mut self.err_handlers) {
+                emit!(self, "    .quad {}", label);
             }
         }
 

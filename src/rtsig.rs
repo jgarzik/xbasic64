@@ -84,13 +84,12 @@ const fn noreturn(mut helper: RtHelper) -> RtHelper {
 pub static HELPERS: &[RtHelper] = &[
     // Program lifetime and errors
     h("_rt_platform_init", &[], &[]),
-    h("_rt_trap_capture", &[], &[]),
     noreturn(h("_rt_end", &[], &[])),
     // (message, line). Returns only when a handler traps the error.
     h("_rt_error", &[I64, I64], &[]),
     noreturn(h("_rt_fatal", &[I64, I64], &[])),
-    // (error number, line)
-    h("_rt_error_num", &[I64, I64], &[]),
+    // (error number, line). Raises, so it returns only when a handler traps.
+    fallible(h("_rt_error_num", &[I64, I64], &[])),
     h("_rt_err", &[], &[I32]),
     h("_rt_erl", &[], &[I32]),
     // Console
@@ -307,7 +306,7 @@ mod tests {
             .map(|(tree, source)| (tree, control_flow(&source).0))
             .collect();
         for helper in HELPERS {
-            if helper.name.starts_with("_rt_error") || helper.name == "_rt_fatal" {
+            if helper.name == "_rt_error" || helper.name == "_rt_fatal" {
                 continue;
             }
             let reaching: Vec<&str> = trees

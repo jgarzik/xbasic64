@@ -77,7 +77,8 @@ _err_codes:
 # what .bss gives for free.
 .bss
 .p2align 3
-_err_handler: .skip 8       # where to jump, 0 = trapping off
+_err_handler: .skip 8       # which ON ERROR target, numbered from 1; 0 = trapping off
+_err_pending: .skip 8       # nonzero from a trapped error until the handler is entered
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
 _err_line:    .skip 8       # the line now running; codegen stores it per statement
@@ -85,35 +86,8 @@ _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
 _err_stmt:    .skip 8       # index of the module-level statement now running
 _err_resume:  .skip 8       # _err_stmt as it was when trapped; -1 = not resumable
 _err_depth:   .skip 8       # procedure nesting, so an error inside one is known
-# rsp, rbx, rbp, r12, r13, r14, r15 -- and rdi, rsi on Win64, where they are
-# callee-saved too. Sized the same in both trees so the offsets agree.
-_err_ctx:     .skip 80
 
 .text
-
-# _rt_trap_capture - Record what a trapped error must restore
-#
-# Called once from main's prologue when the program contains ON ERROR. Taking
-# it here rather than in codegen keeps the register set -- which differs
-# between the ABIs -- in the tree that knows about it.
-#
-# The values saved are the ones the C runtime handed main, because main's
-# prologue has not touched a callee-saved register yet. Restoring them on a
-# trap therefore leaves main's eventual `leave; ret` exactly as clean as it is
-# without trapping.
-#
-# Arguments: none      Returns: nothing
-.globl _rt_trap_capture
-_rt_trap_capture:
-    lea rax, [rsp + 8]      # the caller's rsp, past our return address
-    mov QWORD PTR [rip + _err_ctx + 0], rax
-    mov QWORD PTR [rip + _err_ctx + 8], rbx
-    mov QWORD PTR [rip + _err_ctx + 16], rbp
-    mov QWORD PTR [rip + _err_ctx + 24], r12
-    mov QWORD PTR [rip + _err_ctx + 32], r13
-    mov QWORD PTR [rip + _err_ctx + 40], r14
-    mov QWORD PTR [rip + _err_ctx + 48], r15
-    ret
 
 # _rt_err - ERR: the number of the error that was trapped
 #
@@ -162,11 +136,17 @@ _rt_error_num:
 #   rdi = message pointer (NUL-terminated)
 #   rsi = BASIC line number, or 0 when unknown
 #
-# Returns: never unless a handler is armed, in which case it does not return
-# *here* either -- it abandons every frame between this one and main and jumps
-# to the handler.
+# Returns: only when a handler traps the error, with _err_pending set.
+# Otherwise never (exit code 1).
 .globl _rt_error
 _rt_error:
+    # An error already on its way to the handler wins. Its helper may carry on
+    # to the end of what it was doing -- printing the rest of a number to the
+    # same unopened file, say -- and each step fails the same way; the first
+    # failure is the one the handler hears about.
+    cmp QWORD PTR [rip + _err_pending], 0
+    jne .Ltrap_return
+
     # Trapping only when ON ERROR armed one and no handler is already running:
     # GW-BASIC does not trap an error raised inside a handler, which is also
     # what stops handler -> error -> handler from looping forever.
@@ -202,29 +182,25 @@ _rt_error:
 
     # And what RESUME would go back to. The handler is ordinary module-level
     # code, so its own statements overwrite _err_stmt the moment it starts;
-    # -1 when the error came from inside a procedure, whose frame the unwind
-    # below discards, leaving nothing for a bare RESUME to return to.
+    # -1 when the error came from inside a procedure, whose frame is left on
+    # the way to the handler, leaving nothing for a bare RESUME to return to.
     mov rdx, QWORD PTR [rip + _err_stmt]
     cmp QWORD PTR [rip + _err_depth], 0
     je .Ltrap_resumable
     mov rdx, -1
 .Ltrap_resumable:
     mov QWORD PTR [rip + _err_resume], rdx
-    mov QWORD PTR [rip + _err_depth], 0
     mov QWORD PTR [rip + _err_active], 1
 
-    # Abandon every frame between here and main. ERL is already set: codegen
-    # stores the line at each statement, which is the only way the file
-    # helpers can report one -- seven of their error sites have no line to
-    # pass and say so in their own comments.
-    mov rbx, QWORD PTR [rip + _err_ctx + 8]
-    mov rbp, QWORD PTR [rip + _err_ctx + 16]
-    mov r12, QWORD PTR [rip + _err_ctx + 24]
-    mov r13, QWORD PTR [rip + _err_ctx + 32]
-    mov r14, QWORD PTR [rip + _err_ctx + 40]
-    mov r15, QWORD PTR [rip + _err_ctx + 48]
-    mov rsp, QWORD PTR [rip + _err_ctx + 0]
-    jmp rax
+    # Return to whoever raised it. Generated code tests _err_pending after
+    # every call that can fail and leaves for the handler: a procedure through
+    # its own epilogue -- which is what brings _err_depth back to 0 -- and main
+    # through a dispatch on _err_handler. A runtime helper that called this
+    # returns first, through its own epilogue. Nothing is abandoned, so there
+    # is no register state to restore.
+    mov QWORD PTR [rip + _err_pending], 1
+.Ltrap_return:
+    ret
 
 # _rt_fatal - Report and exit, without consulting the handler
 #
