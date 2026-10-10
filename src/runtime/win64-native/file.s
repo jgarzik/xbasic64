@@ -100,7 +100,10 @@ _rt_file_open:
     lea rax, [rip + _file_handles]
     mov rax, [rax + rbx*8]
     test rax, rax
-    jnz .Lopen_already
+    jz .Lopen_free
+    call .Lopen_already
+    jmp .Lfile_open_done
+.Lopen_free:
 
     # Copy filename and null-terminate
     lea rcx, [rip + _file_name_buf]
@@ -147,7 +150,10 @@ _rt_file_open:
     # INVALID_HANDLE_VALUE. Note this is -1 rather than NULL, so the NULL
     # guards elsewhere would not have caught it.
     cmp rax, INVALID_HANDLE_VALUE
-    je .Lopen_failed
+    jne .Lopen_ok
+    call .Lopen_failed
+    jmp .Lfile_open_done
+.Lopen_ok:
 
     # Store HANDLE in handle table
     lea rcx, [rip + _file_handles]
@@ -246,7 +252,10 @@ _rt_file_print_string:
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
     test rcx, rcx
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_print_str_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_print_str_done
+.Lfile_print_str_open:
 
     # WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped)
     mov rdx, rdi            # lpBuffer = string ptr
@@ -542,7 +551,10 @@ _rt_file_print_char:
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
     test rcx, rcx
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_char_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_char_done
+.Lfile_char_open:
 
     # WriteFile(hFile, buffer, 1, &bytesWritten, NULL)
     lea rdx, [rip + _file_output_buf]
@@ -554,6 +566,7 @@ _rt_file_print_char:
     lea rax, [rip + _file_col]
     inc QWORD PTR [rax + rbx*8]
 
+.Lfile_char_done:
     add rsp, 40
     pop rbx
     leave
@@ -577,7 +590,10 @@ _rt_file_print_newline:
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
     test rcx, rcx
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_newline_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_newline_done
+.Lfile_newline_open:
 
     # WriteFile(hFile, "\r\n", CRLF_LEN, &bytesWritten, NULL)
     lea rdx, [rip + _file_newline]
@@ -589,6 +605,7 @@ _rt_file_print_newline:
     lea rax, [rip + _file_col]
     mov QWORD PTR [rax + rbx*8], 0
 
+.Lfile_newline_done:
     add rsp, 40
     pop rbx
     leave
@@ -808,7 +825,11 @@ _rt_file_line_input:
     lea rax, [rip + _file_handles]
     mov rcx, [rax + rbx*8]  # hFile
     test rcx, rcx
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lline_input_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    xor r12d, r12d          # an empty line when a handler traps it
+    jmp .Lfile_input_str_done
+.Lline_input_open:
     lea rdx, [rip + _file_input_buf]
     add rdx, r12            # &buffer[pos]
     mov r8, SINGLE_BYTE
@@ -826,7 +847,8 @@ _rt_file_line_input:
     # "Input past end of file". A partial last line without a trailing newline
     # is not: that has characters in the buffer already.
     test r12d, r12d
-    jz .Lfile_past_end
+    jnz .Lfile_input_str_done
+    call .Lfile_past_end    # nothing read: r12 is already 0, an empty line
     jmp .Lfile_input_str_done
 .Lfile_input_str_have:
 
@@ -1067,6 +1089,7 @@ _rt_file_open_random:
     lea rax, [rip + _file_fieldoff]
     mov QWORD PTR [rax + rbx*8], 0
 
+.Lwrandom_open_done:
     add rsp, 64
     pop rsi
     pop rdi
@@ -1077,10 +1100,14 @@ _rt_file_open_random:
     leave
     ret
 
+# Each error tail below belongs to one helper. _rt_error returns only when a
+# handler traps the error, and then the tail leaves through that helper's own
+# epilogue with a harmless result.
 .Lwrandom_nomem:
     lea rcx, [rip + _err_memory]
     xor edx, edx
     call _rt_error
+    jmp .Lwrandom_open_done
 
 # _rt_field_reset - Start a fresh FIELD statement
 # Arguments: rcx = file number
@@ -1132,11 +1159,17 @@ _rt_field_next:
     lea rcx, [rip + _err_badmode]
     xor edx, edx
     call _rt_error
+    jmp .Lwfield_failed
 
 .Lwfield_overflow:
     lea rcx, [rip + _err_fieldovf]
     xor edx, edx
     call _rt_error
+.Lwfield_failed:
+    xor eax, eax                    # an empty field
+    xor edx, edx
+    leave
+    ret
 
 # _rt_lset - LSET: copy left-justified into a fixed-width field
 # Arguments:
@@ -1309,11 +1342,16 @@ _rt_random_prepare:
     lea rcx, [rip + _err_badfile]
     mov rdx, r14
     call _rt_error
+    jmp .Lwrandom_failed
 
 .Lwrandom_badmode:
     lea rcx, [rip + _err_badmode]
     mov rdx, r14
     call _rt_error
+.Lwrandom_failed:
+    xor eax, eax            # no handle: the caller does nothing more
+    leave
+    ret
 
 # _rt_file_get - GET #n[, rec]: read one record into the buffer
 # A record reaching past the end of the file is padded with NULs.
@@ -1333,6 +1371,8 @@ _rt_file_get:
     sub rsp, 40
 
     call _rt_random_prepare
+    test rax, rax
+    jz .Lwget_done          # a trapped error: no record to read
 
     # ReadFile(hFile, buffer, reclen, &bytesRead, NULL)
     mov rcx, r15
@@ -1381,6 +1421,8 @@ _rt_file_put:
     sub rsp, 40
 
     call _rt_random_prepare
+    test rax, rax
+    jz .Lwput_done          # a trapped error: no record to write
 
     # WriteFile(hFile, buffer, reclen, &bytesWritten, NULL)
     mov rcx, r15
@@ -1394,6 +1436,7 @@ _rt_file_put:
     mov rcx, r15
     call FlushFileBuffers
 
+.Lwput_done:
     add rsp, 40
     pop rsi
     pop rdi
@@ -1578,6 +1621,7 @@ _rt_unlock:
     test eax, eax
     jz .Lwlock_denied
 
+.Lwlock_done:
     add rsp, 80
     pop rsi
     pop rdi
@@ -1592,11 +1636,13 @@ _rt_unlock:
     lea rcx, [rip + _err_permission]
     mov rdx, r13
     call _rt_error
+    jmp .Lwlock_done
 
 .Lwlock_badfile:
     lea rcx, [rip + _err_badfile]
     mov rdx, r13
     call _rt_error
+    jmp .Lwlock_done
 
 # _rt_mk - MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string
 # Arguments: rcx = the value's bits, rdx = width in bytes (2, 4 or 8)
@@ -1682,6 +1728,9 @@ _rt_cvd:
     lea rcx, [rip + _err_domain]
     mov rdx, r8
     call _rt_error
+    xorps xmm0, xmm0        # 0 when a handler traps it
+    leave
+    ret
 
 # Gather r9 bytes of the string at rcx into rax, low byte first.
 .Lwcv_gather:
@@ -1746,24 +1795,28 @@ _rt_file_lof:
 # _rt_file_getc and _rt_file_eof already guarded and these did not. The line
 # number is unknown here (these helpers are not given one), and _rt_error
 # prints a bare message for 0.
+#
+# These four are reached by `call`, from inside helpers with different frames,
+# and tail-call _rt_error: when a handler traps the error, _rt_error returns
+# straight to the call site, which leaves through its own helper's epilogue.
 .Lfile_not_open:
     lea rcx, [rip + _err_badfile]
     xor edx, edx
-    call _rt_error
+    jmp _rt_error
 
 # OPEN failed. The line number is not passed to _rt_file_open, so these report
 # without one; _rt_error prints a bare message for 0.
 .Lopen_failed:
     lea rcx, [rip + _err_notfound]
     xor edx, edx
-    call _rt_error
+    jmp _rt_error
 
 .Lopen_already:
     lea rcx, [rip + _err_alreadyopen]
     xor edx, edx
-    call _rt_error
+    jmp _rt_error
 
 .Lfile_past_end:
     lea rcx, [rip + _err_pastend]
     xor edx, edx
-    call _rt_error
+    jmp _rt_error

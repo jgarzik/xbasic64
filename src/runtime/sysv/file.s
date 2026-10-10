@@ -106,7 +106,10 @@ _rt_file_open:
     lea rax, [rip + _file_handles]
     mov rax, [rax + rbx*8]
     test rax, rax
-    jnz .Lopen_already
+    jz .Lopen_free
+    call .Lopen_already
+    jmp .Lopen_done
+.Lopen_free:
 
     # Copy filename to buffer and null-terminate
     # memcpy(_file_name_buf, filename_ptr, filename_len)
@@ -141,7 +144,10 @@ _rt_file_open:
     # NULL handle: OPEN of a missing file "succeeded", EOF() answered -1, and
     # every later use was a crash or silence.
     test rax, rax
-    jz .Lopen_failed
+    jnz .Lopen_ok
+    call .Lopen_failed
+    jmp .Lopen_done
+.Lopen_ok:
 
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
@@ -152,6 +158,7 @@ _rt_file_open:
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
 
+.Lopen_done:
     pop r14
     pop r13
     pop r12
@@ -227,7 +234,10 @@ _rt_file_print_string:
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE* → 1st arg
     test rdi, rdi
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_print_str_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_print_str_done
+.Lfile_print_str_open:
 
     # fprintf(file, "%.*s", len, ptr)
     lea rsi, [rip + _file_fmt_str]  # format → 2nd arg
@@ -505,7 +515,10 @@ _rt_file_print_char:
     lea rax, [rip + _file_handles]
     mov rdi, [rax + rbx*8]  # FILE*
     test rdi, rdi
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_char_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_char_done
+.Lfile_char_open:
     lea rsi, [rip + _file_fmt_char]
     mov rdx, r12            # char
     xor eax, eax
@@ -514,6 +527,7 @@ _rt_file_print_char:
     lea rax, [rip + _file_col]
     inc QWORD PTR [rax + rbx*8]
 
+.Lfile_char_done:
     pop r12
     pop rbx
     leave
@@ -539,13 +553,17 @@ _rt_file_print_newline:
     lea rax, [rip + _file_handles]
     mov rsi, [rax + rbx*8]  # FILE* → rsi (2nd arg)
     test rsi, rsi
-    jz .Lfile_not_open      # a number nobody OPENed is NULL here
+    jnz .Lfile_newline_open
+    call .Lfile_not_open    # a number nobody OPENed is NULL here
+    jmp .Lfile_newline_done
+.Lfile_newline_open:
     mov edi, 10             # '\n' → edi (1st arg)
     call fputc
 
     lea rax, [rip + _file_col]
     mov QWORD PTR [rax + rbx*8], 0
 
+.Lfile_newline_done:
     add rsp, 8
     pop rbx
     leave
@@ -749,14 +767,20 @@ _rt_file_line_input:
     lea rax, [rip + _file_handles]
     mov rdx, [rax + rbx*8]              # FILE*
     test rdx, rdx
-    jz .Lfile_not_open                  # a number nobody OPENed is NULL here
+    jnz .Lline_input_open
+    call .Lfile_not_open                # a number nobody OPENed is NULL here
+    jmp .Lfile_input_string_empty
+.Lline_input_open:
     call fgets
 
     # A read past the end used to answer with an empty string, so a loop
     # missing its EOF() test ran on quietly forever instead of saying what was
     # wrong. GW-BASIC calls this "Input past end of file".
     test rax, rax
-    jz .Lfile_past_end
+    jnz .Lline_input_read
+    call .Lfile_past_end
+    jmp .Lfile_input_string_empty
+.Lline_input_read:
 
     # Calculate length using strlen
     lea rdi, [rip + _file_input_buf]
@@ -1013,6 +1037,7 @@ _rt_file_open_random:
     lea rax, [rip + _file_fieldoff]
     mov QWORD PTR [rax + rbx*8], 0
 
+.Lrandom_open_done:
     pop r14
     pop r13
     pop r12
@@ -1020,10 +1045,14 @@ _rt_file_open_random:
     leave
     ret
 
+# Each error tail below belongs to one helper. _rt_error returns only when a
+# handler traps the error, and then the tail leaves through that helper's own
+# epilogue with a harmless result.
 .Lrandom_nomem:
     lea rdi, [rip + _err_memory]
     xor esi, esi
     call _rt_error
+    jmp .Lrandom_open_done
 
 # _rt_field_reset - Start a fresh FIELD statement
 # Arguments: rdi = file number
@@ -1079,11 +1108,17 @@ _rt_field_next:
     lea rdi, [rip + _err_badmode]
     xor esi, esi
     call _rt_error
+    jmp .Lfield_failed
 
 .Lfield_overflow:
     lea rdi, [rip + _err_fieldovf]
     xor esi, esi
     call _rt_error
+.Lfield_failed:
+    xor eax, eax                    # an empty field
+    xor edx, edx
+    leave
+    ret
 
 # _rt_lset - LSET: copy left-justified into a fixed-width field
 # The destination keeps its address and width; only the bytes change. A short
@@ -1256,11 +1291,16 @@ _rt_random_prepare:
     lea rdi, [rip + _err_badfile]
     mov rsi, r14
     call _rt_error
+    jmp .Lrandom_failed
 
 .Lrandom_badmode:
     lea rdi, [rip + _err_badmode]
     mov rsi, r14
     call _rt_error
+.Lrandom_failed:
+    xor eax, eax            # no FILE*: the caller does nothing more
+    leave
+    ret
 
 # _rt_file_get - GET #n[, rec]: read one record into the buffer
 # A record reaching past the end of the file is padded with NULs, so a field
@@ -1280,6 +1320,8 @@ _rt_file_get:
     sub rsp, 8
 
     call _rt_random_prepare
+    test rax, rax
+    jz .Lget_done           # a trapped error: no record to read
 
     # fread(buffer, 1, reclen, file)
     mov rdi, r13
@@ -1321,6 +1363,8 @@ _rt_file_put:
     sub rsp, 8
 
     call _rt_random_prepare
+    test rax, rax
+    jz .Lput_done           # a trapped error: no record to write
 
     # fwrite(buffer, 1, reclen, file)
     mov rdi, r13
@@ -1333,6 +1377,7 @@ _rt_file_put:
     mov rdi, r15
     call fflush
 
+.Lput_done:
     add rsp, 8
     pop r15
     pop r14
@@ -1484,6 +1529,7 @@ _rt_unlock:
     test eax, eax
     js .Llock_denied
 
+.Llock_done:
     add rsp, 48
     pop r14
     pop r13
@@ -1496,11 +1542,13 @@ _rt_unlock:
     lea rdi, [rip + _err_permission]
     mov rsi, r13
     call _rt_error
+    jmp .Llock_done
 
 .Llock_badfile:
     lea rdi, [rip + _err_badfile]
     mov rsi, r13
     call _rt_error
+    jmp .Llock_done
 
 # _rt_mk - MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string
 # The value arrives as raw bits so one helper serves all four widths: the
@@ -1586,6 +1634,9 @@ _rt_cvd:
     lea rdi, [rip + _err_domain]
     mov rsi, rdx
     call _rt_error
+    xorps xmm0, xmm0        # 0 when a handler traps it
+    leave
+    ret
 
 # Gather rdx bytes of the string at rdi into rax, low byte first.
 .Lcv_gather:
@@ -1674,24 +1725,28 @@ _rt_file_lof:
 # no message, exit 139. _rt_file_getc and _rt_file_eof already guarded; these
 # did not. The line number is unknown here (these helpers are not given one),
 # and _rt_error prints a bare message for 0.
+#
+# These four are reached by `call`, from inside helpers with different frames,
+# and tail-call _rt_error: when a handler traps the error, _rt_error returns
+# straight to the call site, which leaves through its own helper's epilogue.
 .Lfile_not_open:
     lea rdi, [rip + _err_badfile]
     xor esi, esi
-    call _rt_error
+    jmp _rt_error
 
 # OPEN failed. The line number is not passed to _rt_file_open, so these report
 # without one; _rt_error prints a bare message for 0.
 .Lopen_failed:
     lea rdi, [rip + _err_notfound]
     xor esi, esi
-    call _rt_error
+    jmp _rt_error
 
 .Lopen_already:
     lea rdi, [rip + _err_alreadyopen]
     xor esi, esi
-    call _rt_error
+    jmp _rt_error
 
 .Lfile_past_end:
     lea rdi, [rip + _err_pastend]
     xor esi, esi
-    call _rt_error
+    jmp _rt_error

@@ -274,6 +274,8 @@ _rt_instr:
     lea rcx, [rip + _err_domain]
     xor edx, edx
     call _rt_error
+    xor eax, eax            # "not found" when a handler traps it
+    jmp .Linstr_done
 
 .Linstr_done:
     add rsp, 40

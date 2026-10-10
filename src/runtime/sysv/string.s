@@ -288,6 +288,8 @@ _rt_instr:
     lea rdi, [rip + _err_domain]
     xor esi, esi
     call _rt_error
+    xor eax, eax            # "not found" when a handler traps it
+    jmp .Linstr_done
 .Linstr_done:
     # Restore stack and callee-saved registers
     add rsp, 8              # Restore stack alignment
