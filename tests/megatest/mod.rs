@@ -63,9 +63,8 @@ fn test_megatest_passes_every_check() {
     );
 }
 
-/// PRINT USING has no file form -- `PRINT #n, USING` is rejected -- so the
-/// formatted output cannot be read back by the program itself and is checked
-/// here instead.
+/// PRINT USING output is checked here, line by line, rather than by the
+/// program itself: it is laid out text, and its spacing is the point.
 #[test]
 fn test_megatest_print_using_block() {
     let (output, _tmp) = compile_and_run_with_files(MEGA, |_| Ok(())).unwrap();

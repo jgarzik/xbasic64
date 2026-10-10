@@ -103,15 +103,16 @@ PRINT AddThree(Mul(2, 3), Mul(4, 5), Mul(6, 7))
     assert_eq!(lines[1], "68", "nested three: 6+20+42");
 }
 
-/// LANGREF documents module-level variables as "global by default: accessible
-/// everywhere". They used to read as 0 inside a procedure, because procedures
-/// were compiled before main and so allocated their own local instead.
+/// A module-level variable a procedure SHAREs is the same storage inside it.
+/// (They once read as 0 inside a procedure, because procedures were compiled
+/// before main and so allocated their own local instead.)
 #[test]
-fn test_module_variables_visible_in_procedures() {
+fn test_shared_module_variables_in_procedures() {
     let output = compile_and_run(
         r#"
 G = 99
 SUB Bump
+SHARED G
 PRINT G
 G = G + 1
 END SUB
@@ -132,7 +133,7 @@ PRINT G
 fn test_module_array_accessible_in_procedure() {
     let output = compile_and_run(
         r#"
-DIM A(5)
+DIM SHARED A(5)
 A(0) = 7
 SUB Touch
 PRINT A(0)
@@ -429,4 +430,109 @@ Greet 8
 fn test_call_is_not_reserved() {
     let output = compile_and_run("CALL = 5\nPRINT CALL\n").unwrap();
     assert_eq!(output.trim(), "5");
+}
+
+/// A procedure's names are its own unless shared, as in QuickBASIC: a module
+/// variable of the same name is a different variable inside it. Every name the
+/// module used used to be visible in every procedure.
+#[test]
+fn test_procedure_variables_are_local_unless_shared() {
+    let output = compile_and_run(
+        r#"
+X = 1: Y = 2
+DIM A(2): A(1) = 7
+SUB Show
+PRINT X; A(1)
+X = 50
+END SUB
+SUB ShowShared
+SHARED Y, A()
+PRINT Y; A(1)
+Y = 60
+END SUB
+Show
+ShowShared
+PRINT X; Y
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["0  0", "2  7", "1  60"]);
+}
+
+/// DIM SHARED at module level shares a variable, array or record with every
+/// procedure.
+#[test]
+fn test_dim_shared_reaches_every_procedure() {
+    let output = compile_and_run(
+        r#"
+TYPE P
+N AS INTEGER
+END TYPE
+DIM SHARED Total, Names$(3), R AS P
+SUB AddUp(N)
+Total = Total + N
+Names$(N) = "n" + STR$(N)
+R.N = R.N + 1
+END SUB
+AddUp 1
+AddUp 2
+PRINT Total; Names$(2); R.N
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "3 n 2 2");
+}
+
+/// STATIC keeps a procedure's variable from one call to the next; `SUB name
+/// STATIC` does that for every local. Recursion still gets a fresh ordinary
+/// local per call.
+#[test]
+fn test_static_locals_keep_their_values() {
+    let output = compile_and_run(
+        r#"
+FUNCTION Tick
+STATIC N
+N = N + 1
+Tick = N
+END FUNCTION
+SUB Every STATIC
+C = C + 1
+DIM Hist(3)
+PRINT C;
+END SUB
+PRINT Tick; Tick; Tick
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2  3");
+    let output = compile_and_run(
+        "SUB Count STATIC\nC = C + 1\nS$ = S$ + \"x\"\nPRINT C; S$\nEND SUB\nCount\nCount\nCount\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["1 x", "2 xx", "3 xxx"]);
+}
+
+/// SHARED and STATIC belong inside a procedure, and DIM SHARED outside one.
+#[test]
+fn test_shared_and_static_placement_is_checked() {
+    for (source, msg) in [
+        ("SHARED X\n", "SHARED belongs inside a SUB or FUNCTION"),
+        ("STATIC X\n", "STATIC belongs inside a SUB or FUNCTION"),
+        (
+            "SUB S\nDIM SHARED X\nEND SUB\n",
+            "DIM SHARED belongs at module level",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// DEF FN is part of the module, as in GW-BASIC: its expression sees module
+/// variables without any SHARED.
+#[test]
+fn test_def_fn_sees_module_variables() {
+    let output =
+        compile_and_run("Rate = 3\nDEF FNScale(X) = X * Rate\nPRINT FNScale(5)\n").unwrap();
+    assert_eq!(output.trim(), "15");
 }

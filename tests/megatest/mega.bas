@@ -37,6 +37,8 @@ TYPE Person
     Home AS Point
 END TYPE
 
+' Check's tallies, shared with every procedure -- Check among them.
+DIM SHARED Passed, Failed, Shared%
 Passed = 0
 Failed = 0
 
@@ -672,14 +674,20 @@ Check "CVL round trip", STR$(CVL(MKL$(2147483647))), "2147483647"
 Check "CVS round trip", STR$(CVS(MKS$(3.5))), "3.5"
 
 ' ---------------------------------------------------------------------------
-' Scope: a module-level name is the same storage inside a procedure, a name
-' used only inside one is not.
+' Scope: a procedure sees a module-level name only when it is shared -- by DIM
+' SHARED or a SHARED statement -- and its other names are its own, fresh on
+' every call unless STATIC.
 ' ---------------------------------------------------------------------------
 Shared% = 1
 TouchShared
-Check "procedures see module storage", STR$(Shared%), "2"
+Check "DIM SHARED reaches a procedure", STR$(Shared%), "2"
 Check "locals start fresh", STR$(FreshLocal()), "1"
 Check "locals start fresh again", STR$(FreshLocal()), "1"
+Hidden = 5
+Check "an unshared name is local", STR$(SeesHidden()), "0"
+Check "and the module's is untouched", STR$(Hidden), "5"
+Check "STATIC keeps its value", STR$(Counted()), "1"
+Check "STATIC keeps its value again", STR$(Counted()), "2"
 
 ' ---------------------------------------------------------------------------
 ' Report
@@ -765,12 +773,14 @@ FUNCTION EarlyOut(N)
 END FUNCTION
 
 FUNCTION SetUnlessZero(N)
+    SHARED Marker
     Marker = 0
     Marked N
     SetUnlessZero = Marker
 END FUNCTION
 
 SUB Marked(N)
+    SHARED Marker
     IF N = 0 THEN EXIT SUB
     Marker = 1
 END SUB
@@ -780,6 +790,7 @@ SUB Doubler(X)
 END SUB
 
 SUB Bumper
+    SHARED CallCount
     CallCount = CallCount + 1
 END SUB
 
@@ -792,6 +803,17 @@ END SUB
 FUNCTION FreshLocal()
     OnlyHere = OnlyHere + 1
     FreshLocal = OnlyHere
+END FUNCTION
+
+FUNCTION SeesHidden()
+    SeesHidden = Hidden
+    Hidden = 99
+END FUNCTION
+
+FUNCTION Counted()
+    STATIC Calls
+    Calls = Calls + 1
+    Counted = Calls
 END FUNCTION
 
 FUNCTION ShowName$(P AS Person)

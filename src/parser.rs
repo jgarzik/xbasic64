@@ -161,7 +161,15 @@ pub enum StmtKind {
     },
     Dim {
         decls: Vec<Declarator>,
+        /// `DIM SHARED`: visible inside every SUB and FUNCTION.
+        shared: bool,
     },
+    /// `SHARED a, b(), c AS T` -- inside a procedure, use these module-level
+    /// names rather than locals of the same names.
+    Shared(Vec<ScopeItem>),
+    /// `STATIC a, b(), c AS T` -- inside a procedure, locals that keep their
+    /// values between calls.
+    Static(Vec<ScopeItem>),
     /// `REDIM [PRESERVE] A(bounds)` -- resize an existing array.
     Redim {
         decls: Vec<Declarator>,
@@ -172,6 +180,8 @@ pub enum StmtKind {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
+        /// `SUB name STATIC`: every local keeps its value between calls.
+        is_static: bool,
     },
     Function {
         name: String,
@@ -180,6 +190,11 @@ pub enum StmtKind {
         /// type comes from the name's suffix.
         ret_ty: Option<TypeRef>,
         body: Vec<Stmt>,
+        /// `FUNCTION name STATIC`, as for a SUB.
+        is_static: bool,
+        /// Written as `DEF FN`, which is part of the module: it sees every
+        /// module-level name, where a FUNCTION sees only what is shared.
+        def_fn: bool,
     },
     Call {
         name: String,
@@ -378,6 +393,16 @@ pub struct Declarator {
     /// one it is the OPTION BASE. As long as `dimensions`, or empty.
     pub lowers: Vec<Option<Expr>>,
     /// Declared type from an `AS` clause.
+    pub ty: Option<TypeRef>,
+}
+
+/// One name in a SHARED or STATIC statement.
+#[derive(Debug, Clone)]
+pub struct ScopeItem {
+    pub name: String,
+    /// Written `name()`: the array of that name, not the scalar.
+    pub array: bool,
+    /// An `AS` clause, when one was given.
     pub ty: Option<TypeRef>,
 }
 
@@ -1440,6 +1465,14 @@ impl Parser {
                         err("DECLARE is not supported yet")
                     }
                     "WIDTH" if !matches!(self.peek_at(1), Token::Eq) => self.parse_width(),
+                    "SHARED" if self.next_is_ident() => {
+                        self.advance();
+                        Ok(StmtKind::Shared(self.parse_scope_items()?))
+                    }
+                    "STATIC" if self.next_is_ident() => {
+                        self.advance();
+                        Ok(StmtKind::Static(self.parse_scope_items()?))
+                    }
                     // RESET closes every file, which is what a bare CLOSE does.
                     "RESET" if self.next_ends_statement() => {
                         self.advance();
@@ -1690,6 +1723,8 @@ impl Parser {
             name: name.clone(),
             params,
             ret_ty: None,
+            is_static: false,
+            def_fn: true,
             body: vec![Stmt {
                 line,
                 kind: StmtKind::Let {
@@ -2482,9 +2517,53 @@ impl Parser {
 
     fn parse_dim(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DIM
+        let shared = matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("SHARED"));
+        if shared {
+            self.advance();
+        }
         Ok(StmtKind::Dim {
             decls: self.parse_dim_list()?,
+            shared,
         })
+    }
+
+    /// `STATIC` after a procedure's header.
+    fn take_static(&mut self) -> bool {
+        let is_static = matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("STATIC"));
+        if is_static {
+            self.advance();
+        }
+        is_static
+    }
+
+    /// The names of a SHARED or STATIC statement: `a`, `b()` for an array,
+    /// `c AS T` with a type.
+    fn parse_scope_items(&mut self) -> PResult<Vec<ScopeItem>> {
+        let mut items = Vec::new();
+        loop {
+            let Token::Ident(name) = self.advance() else {
+                return err("Expected a variable or array name");
+            };
+            let mut array = false;
+            if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                self.expect(Token::RParen)?;
+                array = true;
+            }
+            let ty = if matches!(self.peek(), Token::As) {
+                self.advance();
+                Some(self.parse_type_ref()?)
+            } else {
+                None
+            };
+            items.push(ScopeItem { name, array, ty });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(items)
     }
 
     /// Parse the `name(bounds), name(bounds), ...` part shared by DIM and REDIM.
@@ -2536,13 +2615,6 @@ impl Parser {
             } else {
                 None
             };
-
-            if dimensions.is_none() && ty.is_none() {
-                return err(format!(
-                    "'{}' needs either array bounds or an AS clause",
-                    name
-                ));
-            }
 
             decls.push(Declarator {
                 name,
@@ -2672,12 +2744,18 @@ impl Parser {
                 name
             ));
         }
+        let is_static = self.take_static();
 
         self.skip_newlines();
 
         let body = self.parse_block(BlockEnd::EndSub, &format!("SUB '{}'", name), sub_line)?;
 
-        Ok(StmtKind::Sub { name, params, body })
+        Ok(StmtKind::Sub {
+            name,
+            params,
+            body,
+            is_static,
+        })
     }
 
     /// `FUNCTION name(params)` ... `END FUNCTION`
@@ -2714,6 +2792,7 @@ impl Parser {
             }
             ret_ty = Some(ty);
         }
+        let is_static = self.take_static();
 
         self.skip_newlines();
 
@@ -2728,6 +2807,8 @@ impl Parser {
             params,
             ret_ty,
             body,
+            is_static,
+            def_fn: false,
         })
     }
 
@@ -3922,7 +4003,7 @@ mod tests {
     fn test_dim_single() {
         let prog = parse("DIM A(10)").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 1);
@@ -3934,7 +4015,7 @@ mod tests {
     #[test]
     fn test_dim_multiple() {
         let prog = parse("DIM A(10), B$(100), C(50)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 3);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[1].name, "B$");
@@ -3947,7 +4028,7 @@ mod tests {
     #[test]
     fn test_dim_2d() {
         let prog = parse("DIM A(10, 20)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 2);
@@ -3959,7 +4040,7 @@ mod tests {
     #[test]
     fn test_dim_3d() {
         let prog = parse("DIM Matrix(5, 10, 15)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "MATRIX");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 3);
@@ -3971,7 +4052,7 @@ mod tests {
     #[test]
     fn test_dim_mixed_declarators() {
         let prog = parse("DIM A(3), B AS INTEGER, C(2) AS LONG").unwrap();
-        let StmtKind::Dim { decls } = &prog.statements[0].kind else {
+        let StmtKind::Dim { decls, .. } = &prog.statements[0].kind else {
             panic!("Expected Dim");
         };
         assert_eq!(decls.len(), 3);
@@ -4029,7 +4110,10 @@ mod tests {
     fn test_sub_no_params() {
         let prog = parse("SUB MySub\nPRINT X\nEND SUB").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Sub { name, params, body } = &prog.statements[0].kind {
+        if let StmtKind::Sub {
+            name, params, body, ..
+        } = &prog.statements[0].kind
+        {
             assert_eq!(name, "MYSUB");
             assert!(params.is_empty());
             assert_eq!(body.len(), 1);

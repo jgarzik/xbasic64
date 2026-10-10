@@ -436,11 +436,11 @@ fn test_math_domain_is_checked() {
 /// The use used to be the error "Array used before DIM".
 #[test]
 fn test_use_before_dim_creates_the_array() {
-    let run = compile_and_run_raw("SUB T\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n", "")
+    let run = compile_and_run_raw("SUB T\nSHARED A()\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n", "")
         .expect("should compile");
     assert_eq!(run.lines(), vec!["0"]);
     assert!(
-        run.stderr.contains("Duplicate definition in 5"),
+        run.stderr.contains("Duplicate definition in 6"),
         "{}",
         run.stderr
     );

@@ -133,11 +133,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("CSRLIN", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
-    (
-        "SHARED",
-        "SHARED is not implemented; module-level names are already global",
-    ),
-    ("STATIC", "STATIC is not implemented yet"),
     ("SHELL", "SHELL is not implemented yet"),
     ("ENVIRON$", "ENVIRON$ is not implemented yet"),
     ("KILL", "KILL is not implemented yet"),
@@ -339,9 +334,71 @@ pub struct Symbols {
     pub records: HashMap<String, RecordInfo>,
     /// Variables declared with `DIM ... AS`, by (scope, upper-case name).
     pub typed_vars: HashMap<(Scope, String), TypeRef>,
+    /// Module-level scalars and arrays `DIM SHARED` makes visible inside every
+    /// procedure.
+    pub shared_all: NameSets,
+    /// Per procedure, the module-level names its SHARED statements use.
+    pub proc_shared: HashMap<String, NameSets>,
+    /// Per procedure, the locals its STATIC statements keep between calls.
+    pub proc_static: HashMap<String, NameSets>,
+    /// Procedures declared `SUB name STATIC`, whose every local is static.
+    pub static_procs: HashSet<String>,
+    /// FUNCTIONs written as `DEF FN`, which see every module-level name.
+    pub def_fns: HashSet<String>,
+}
+
+/// Upper-case names of scalars and of arrays, which BASIC keeps apart: `A`
+/// and `A()` are different things.
+#[derive(Debug, Default, Clone)]
+pub struct NameSets {
+    pub vars: HashSet<String>,
+    pub arrays: HashSet<String>,
+}
+
+impl NameSets {
+    fn insert(&mut self, name: &str, array: bool) {
+        let upper = name.to_uppercase();
+        if array {
+            self.arrays.insert(upper);
+        } else {
+            self.vars.insert(upper);
+        }
+    }
+
+    fn contains(&self, name: &str, array: bool) -> bool {
+        let upper = name.to_uppercase();
+        if array {
+            self.arrays.contains(&upper)
+        } else {
+            self.vars.contains(&upper)
+        }
+    }
 }
 
 impl Symbols {
+    /// Whether procedure `proc` uses the module-level `name` (an array when
+    /// `array`) rather than a local of its own, as QuickBASIC decides it: the
+    /// module DIMs it SHARED, or the procedure says SHARED. A DEF FN is part
+    /// of the module and sees everything. A procedure used to see every name
+    /// the module used.
+    pub fn shares(&self, proc: &str, name: &str, array: bool) -> bool {
+        self.def_fns.contains(&proc.to_uppercase())
+            || self.shared_all.contains(name, array)
+            || self
+                .proc_shared
+                .get(&proc.to_uppercase())
+                .is_some_and(|s| s.contains(name, array))
+    }
+
+    /// Whether procedure `proc`'s own `name` keeps its value between calls.
+    pub fn is_static(&self, proc: &str, name: &str, array: bool) -> bool {
+        self.static_procs.contains(&proc.to_uppercase())
+            || self
+                .proc_static
+                .get(&proc.to_uppercase())
+                .is_some_and(|s| s.contains(name, array))
+    }
+
     /// Size of a declared type, in 8-byte words.
     ///
     /// A string field is a (pointer, length) pair, so two words; a fixed-length
@@ -362,10 +419,13 @@ impl Symbols {
     /// Look up a variable's declared type, preferring the current scope.
     pub fn typed_var(&self, scope: &Scope, name: &str) -> Option<&TypeRef> {
         let upper = name.to_uppercase();
-        if let Scope::Proc(_) = scope
-            && let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone()))
-        {
-            return Some(t);
+        if let Scope::Proc(p) = scope {
+            if let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone())) {
+                return Some(t);
+            }
+            if !self.shares(p, &upper, false) {
+                return None;
+            }
         }
         self.typed_vars.get(&(Scope::Module, upper))
     }
@@ -378,13 +438,16 @@ impl Symbols {
         self.typed_vars.get(&(scope.clone(), name.to_uppercase()))
     }
 
-    /// Look up an array visible from `scope`: a procedure-local declaration
-    /// shadows a module-level one of the same name.
+    /// Look up an array visible from `scope`: a procedure's own, or a
+    /// module-level one it shares.
     pub fn lookup_array(&self, scope: &Scope, name: &str) -> Option<&ArrayInfo> {
-        if let Scope::Proc(_) = scope
-            && let Some(info) = self.arrays.get(&(scope.clone(), name.to_string()))
-        {
-            return Some(info);
+        if let Scope::Proc(p) = scope {
+            if let Some(info) = self.arrays.get(&(scope.clone(), name.to_string())) {
+                return Some(info);
+            }
+            if !self.shares(p, name, true) {
+                return None;
+            }
         }
         self.arrays.get(&(Scope::Module, name.to_string()))
     }
@@ -581,13 +644,22 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
                     *var = renamed;
                 }
             }
-            StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+            StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
                 for d in decls.iter_mut() {
                     // A declarator with an `AS` clause states its own type.
                     if d.ty.is_none()
                         && let Some(renamed) = defaulted(&d.name, table, procs)
                     {
                         d.name = renamed;
+                    }
+                }
+            }
+            StmtKind::Shared(items) | StmtKind::Static(items) => {
+                for item in items.iter_mut() {
+                    if item.ty.is_none()
+                        && let Some(renamed) = defaulted(&item.name, table, procs)
+                    {
+                        item.name = renamed;
                     }
                 }
             }
@@ -756,7 +828,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         StmtKind::While { condition, .. } => f(condition),
         StmtKind::DoLoop { condition, .. } => condition.iter_mut().for_each(&mut *f),
         StmtKind::OnGoto { expr, .. } | StmtKind::OnGosub { expr, .. } => f(expr),
-        StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+        StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
             for d in decls {
                 if let Some(dims) = &mut d.dimensions {
                     dims.iter_mut().for_each(&mut *f);
@@ -870,6 +942,8 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::Beep
         | StmtKind::Erase(_)
         | StmtKind::Data(_)
+        | StmtKind::Shared(_)
+        | StmtKind::Static(_)
         | StmtKind::Restore(_)
         | StmtKind::Cls
         | StmtKind::End
@@ -1044,9 +1118,61 @@ impl Analyzer {
                         ),
                     }
                 }
+                StmtKind::Shared(items) | StmtKind::Static(items) => {
+                    let what = if matches!(stmt.kind, StmtKind::Shared(_)) {
+                        "SHARED"
+                    } else {
+                        "STATIC"
+                    };
+                    let Scope::Proc(proc) = scope else {
+                        self.error(
+                            stmt.line,
+                            format!("{} belongs inside a SUB or FUNCTION", what),
+                        );
+                        continue;
+                    };
+                    let sets = if what == "SHARED" {
+                        self.symbols
+                            .proc_shared
+                            .entry(proc.to_uppercase())
+                            .or_default()
+                    } else {
+                        self.symbols
+                            .proc_static
+                            .entry(proc.to_uppercase())
+                            .or_default()
+                    };
+                    for item in items {
+                        sets.insert(&item.name, item.array);
+                    }
+                    // A STATIC name with a type is a typed local like DIM AS.
+                    if what == "STATIC" {
+                        for item in items {
+                            if let (Some(ty), false) = (&item.ty, item.array) {
+                                self.symbols
+                                    .typed_vars
+                                    .insert((scope.clone(), item.name.to_uppercase()), ty.clone());
+                            }
+                        }
+                    }
+                }
                 // REDIM may also introduce an array, so both are collected.
-                StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+                StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
                     let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
+                    if let StmtKind::Dim { shared: true, .. } = &stmt.kind {
+                        if scope == &Scope::Module {
+                            for decl in decls {
+                                self.symbols
+                                    .shared_all
+                                    .insert(&decl.name, decl.dimensions.is_some());
+                            }
+                        } else {
+                            self.error(
+                                stmt.line,
+                                "DIM SHARED belongs at module level; inside a procedure, use SHARED",
+                            );
+                        }
+                    }
                     for decl in decls {
                         let key = (scope.clone(), decl.name.to_uppercase());
 
@@ -1169,6 +1295,21 @@ impl Analyzer {
                             line: stmt.line,
                         },
                     );
+                    if matches!(
+                        stmt.kind,
+                        StmtKind::Sub {
+                            is_static: true,
+                            ..
+                        } | StmtKind::Function {
+                            is_static: true,
+                            ..
+                        }
+                    ) {
+                        self.symbols.static_procs.insert(name.to_uppercase());
+                    }
+                    if matches!(stmt.kind, StmtKind::Function { def_fn: true, .. }) {
+                        self.symbols.def_fns.insert(name.to_uppercase());
+                    }
                     // A parameter with an AS clause is a typed variable inside
                     // the body, so field access on it resolves.
                     for p in params {
@@ -1667,7 +1808,7 @@ impl Analyzer {
                 }
             }
             StmtKind::Restore(Some(target)) => self.check_restore_target(target, line),
-            StmtKind::Dim { decls } => {
+            StmtKind::Dim { decls, .. } => {
                 for decl in decls {
                     for d in decl.dimensions.iter().flatten() {
                         self.check_expr(d, scope, line);

@@ -292,15 +292,33 @@ DIM Values%(50)          ' Integer array
 
 ### Scope
 
-- **Global by default**: a name used anywhere at module level is global, and
-  refers to the same storage inside every procedure
-- **Local in procedures**: a name used only inside a `SUB` or `FUNCTION` is
-  local to it, and starts fresh (0 or `""`) on every call, so recursion works
-- **Parameters shadow**: a parameter, and a `FUNCTION`'s return
-  pseudo-variable, are always local even when a global shares the name
+Scope follows QuickBASIC:
 
-The first two rules together mean that assigning to `X` inside a procedure
-writes the global `X` if and only if `X` also appears at module level.
+- **Module-level names stay at module level.** A `SUB` or `FUNCTION` sees one
+  only when it is shared -- by `DIM SHARED` at module level, for every
+  procedure, or by a `SHARED` statement inside the procedure, for that one.
+- **A procedure's other names are its own**, and start fresh (0 or `""`) on
+  every call, so recursion works -- even when the module has a name the same.
+- **`STATIC`** inside a procedure keeps the names it lists from one call to the
+  next; `SUB name STATIC` (or `FUNCTION`) does that for every local.
+- **A parameter**, and a `FUNCTION`'s return pseudo-variable, are always local.
+- **`CONST`s and `DEF FN`** belong to the whole program; a `DEF FN` sees every
+  module-level name.
+
+```basic
+DIM SHARED Total          ' every procedure sees Total
+Count = 5                 ' only the module does
+SUB Add(N)
+    SHARED Count          ' ...and now this procedure too
+    STATIC Calls          ' kept between calls
+    Calls = Calls + 1
+    Total = Total + N
+END SUB
+```
+
+`SHARED` lists names, and `A()` for an array: `SHARED X, Names$(), R AS P`.
+`DIM SHARED` takes the same forms as `DIM`, and a plain name -- `DIM SHARED X`
+-- shares a scalar. Every procedure used to see every name the module used.
 
 Unassigned variables read as `0` or `""`; they are never left holding whatever
 was previously in memory.
@@ -1665,7 +1683,7 @@ written. Programs using them are refused today.
 - **Console control** -- `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`
-- **Procedures** -- `SHARED`, `STATIC`, `DECLARE`, `BYVAL`
+- **Procedures** -- `DECLARE`, `BYVAL`
 - **Odds and ends** -- `INPUT$`
 
 ### Out of scope

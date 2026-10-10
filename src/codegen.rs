@@ -639,6 +639,8 @@ pub struct CodeGen {
     proc_types: HashMap<String, TypeRef>,
     /// Module-level typed variables and their size in words, for .bss.
     record_globals: BTreeMap<String, i32>,
+    /// STATIC storage of procedures: symbol -> size in words, for `.bss`.
+    static_slots: BTreeMap<String, i32>,
     /// Element size in words for module-level arrays of records, by
     /// upper-case name.
     record_elem_words: HashMap<String, i32>,
@@ -1152,18 +1154,6 @@ impl CodeGen {
 
     /// Get variable info, allocating if necessary
     fn get_var_info(&mut self, name: &str) -> VarInfo {
-        if self.current_proc.is_some() {
-            // Check local variables first
-            if let Some(info) = self.proc_vars.get(name) {
-                return info.clone();
-            }
-        }
-
-        if let Some(info) = self.vars.get(name) {
-            return info.clone();
-        }
-
-        // Allocate new variable - determine type from suffix.
         // A string needs two words (pointer, length); everything else one.
         // Reserving both here, once, is what keeps the length word inside the
         // variable's own storage: it used to be scavenged at `offset - 8`,
@@ -1172,10 +1162,44 @@ impl CodeGen {
         let data_type = DataType::from_suffix(name);
         let words = Self::words_for(data_type);
 
+        if let Some(proc) = self.current_proc.clone() {
+            // Check local variables first
+            if let Some(info) = self.proc_vars.get(name) {
+                return info.clone();
+            }
+            // A STATIC local keeps its value between calls, so it lives in
+            // static storage under the procedure's name.
+            if self.symbols.is_static(&proc, name, false) {
+                let sym = format!("_static_{}_{}", mangle(&proc), mangle(name));
+                self.static_slots.insert(sym.clone(), words);
+                let info = VarInfo {
+                    loc: Loc::Global(sym),
+                    data_type,
+                };
+                self.proc_vars.insert(name.to_string(), info.clone());
+                return info;
+            }
+        }
+
+        if self.module_visible(name, false) {
+            if let Some(info) = self.vars.get(name) {
+                return info.clone();
+            }
+            // A shared name the module itself never used still lives at
+            // module level.
+            if self.current_proc.is_some() {
+                let info = VarInfo {
+                    loc: Loc::Global(format!("_var_{}", mangle(name))),
+                    data_type,
+                };
+                self.vars.insert(name.to_string(), info.clone());
+                return info;
+            }
+        }
+
         if self.current_proc.is_some() {
-            // Not a module-level name, so it is local to this procedure: a
-            // fresh, zeroed slot per invocation, which is what makes recursion
-            // work.
+            // Not shared, so it is local to this procedure: a fresh, zeroed
+            // slot per invocation, which is what makes recursion work.
             self.stack_offset -= 8 * words;
             let info = VarInfo {
                 loc: Loc::Frame(self.stack_offset),
@@ -1184,8 +1208,8 @@ impl CodeGen {
             self.proc_vars.insert(name.to_string(), info.clone());
             info
         } else {
-            // Module-level: static storage, shared with every procedure and
-            // zero-initialized by the loader.
+            // Module-level: static storage, zero-initialized by the loader,
+            // and reachable from the procedures that share it.
             let info = VarInfo {
                 loc: Loc::Global(format!("_var_{}", mangle(name))),
                 data_type,
@@ -1203,7 +1227,19 @@ impl CodeGen {
         {
             return Some(info);
         }
+        if !self.module_visible(name, true) {
+            return None;
+        }
         self.arrays.get(name)
+    }
+
+    /// Whether the code being generated sees the module-level `name` (an array
+    /// when `array`): always in main, and in a procedure only when shared.
+    fn module_visible(&self, name: &str, array: bool) -> bool {
+        match &self.current_proc {
+            None => true,
+            Some(p) => self.symbols.shares(p, name, array),
+        }
     }
 
     /// Value representation of a parameter: its `AS` clause when it has one,
@@ -1577,7 +1613,10 @@ impl CodeGen {
 
         // Procedures
         for stmt in &program.statements {
-            if let StmtKind::Sub { name, params, body } = &stmt.kind {
+            if let StmtKind::Sub {
+                name, params, body, ..
+            } = &stmt.kind
+            {
                 self.gen_procedure(name, params, body, false);
             } else if let StmtKind::Function {
                 name, params, body, ..
@@ -1622,11 +1661,17 @@ impl CodeGen {
             if self.lookup_array(&name).is_some() {
                 continue;
             }
-            let loc = if self.current_proc.is_some() {
-                self.stack_offset -= 8 * (1 + 2 * rank as i32);
-                Loc::Frame(self.stack_offset)
-            } else {
-                Loc::Global(format!("_arr_{}", mangle(&name)))
+            let loc = match self.current_proc.clone() {
+                Some(proc) if self.symbols.is_static(&proc, &name, true) => {
+                    let sym = format!("_sarr_{}_{}", mangle(&proc), mangle(&name));
+                    self.static_slots.insert(sym.clone(), 1 + 2 * rank as i32);
+                    Loc::Global(sym)
+                }
+                Some(_) => {
+                    self.stack_offset -= 8 * (1 + 2 * rank as i32);
+                    Loc::Frame(self.stack_offset)
+                }
+                None => Loc::Global(format!("_arr_{}", mangle(&name))),
             };
             let info = ArrayInfo { loc, ndims: rank };
             if self.current_proc.is_some() {
@@ -3857,7 +3902,7 @@ impl CodeGen {
                 self.emit_label(&after);
             }
 
-            StmtKind::Dim { decls } => {
+            StmtKind::Dim { decls, .. } => {
                 for decl in decls {
                     self.gen_declarator(decl, false, false);
                 }
@@ -3874,6 +3919,10 @@ impl CodeGen {
             StmtKind::Data(_) => {
                 // Data already collected in first pass
             }
+
+            // Where a name lives is decided when it is looked up; these only
+            // tell the lookup.
+            StmtKind::Shared(_) | StmtKind::Static(_) => {}
 
             StmtKind::Read(vars) => {
                 for var in vars {
@@ -5688,6 +5737,9 @@ impl CodeGen {
         {
             return Some(info);
         }
+        if !self.module_visible(name, false) {
+            return None;
+        }
         self.vars.get(name)
     }
 
@@ -5698,7 +5750,7 @@ impl CodeGen {
     /// record parameter is the opposite, and is registered in `record_vars`.
     fn has_plain_slot(&self, name: &str) -> bool {
         (self.current_proc.is_some() && self.proc_vars.contains_key(name))
-            || self.vars.contains_key(name)
+            || (self.module_visible(name, false) && self.vars.contains_key(name))
     }
 
     /// Typed storage for a variable declared with `AS`, if that is where it
@@ -5757,8 +5809,15 @@ impl CodeGen {
         // it. Deciding on `current_proc.is_some()` alone gave a frame slot to a
         // module-level record merely *referred to* from inside a procedure.
         if self.declared_in_current_proc(name) {
-            self.stack_offset -= 8 * words;
-            let loc = Loc::Frame(self.stack_offset);
+            let proc = self.current_proc.clone().expect("declared in a procedure");
+            let loc = if self.symbols.is_static(&proc, name, false) {
+                let sym = format!("_srec_{}_{}", mangle(&proc), mangle(name));
+                self.static_slots.insert(sym.clone(), words);
+                Loc::Global(sym)
+            } else {
+                self.stack_offset -= 8 * words;
+                Loc::Frame(self.stack_offset)
+            };
             self.proc_record_vars.insert(name.to_string(), loc.clone());
             return loc;
         }
@@ -5777,6 +5836,9 @@ impl CodeGen {
         {
             return Some(loc.clone());
         }
+        if !self.module_visible(name, false) {
+            return None;
+        }
         self.record_vars.get(name).cloned()
     }
 
@@ -5787,6 +5849,9 @@ impl CodeGen {
             && let Some(w) = self.proc_record_elem_words.get(&upper)
         {
             return Some(*w);
+        }
+        if !self.module_visible(&upper, true) {
+            return None;
         }
         self.record_elem_words.get(&upper).copied()
     }
@@ -6803,7 +6868,9 @@ impl CodeGen {
                 let ty = ty.clone();
                 self.get_record_loc(&decl.name, &ty);
             }
-            (None, None) => unreachable!("the parser rejects a bare declarator"),
+            // `DIM X` declares a scalar as BASIC already would on first use;
+            // with SHARED it is what makes the name visible in procedures.
+            (None, None) => {}
         }
     }
 
@@ -7247,6 +7314,14 @@ impl CodeGen {
                 self.output
                     .push_str(&format!("{}: .zero {}  # {}\n", sym, bytes, name));
             }
+        }
+
+        // A procedure's STATIC variables, records and array descriptors: its
+        // own names, kept from one call to the next.
+        let static_slots = std::mem::take(&mut self.static_slots);
+        for (sym, words) in &static_slots {
+            self.output
+                .push_str(&format!("{}: .zero {}  # STATIC\n", sym, words * 8));
         }
 
         let record_globals = std::mem::take(&mut self.record_globals);

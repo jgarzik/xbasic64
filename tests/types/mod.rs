@@ -264,7 +264,7 @@ fn test_record_array_in_loop() {
 #[test]
 fn test_record_visible_in_procedure() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB Bump\nG.X = G.X + 1\nEND SUB\nG.X = 5\nBump\nBump\nPRINT G.X\n",
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM SHARED G AS P\nSUB Bump\nG.X = G.X + 1\nEND SUB\nG.X = 5\nBump\nBump\nPRINT G.X\n",
     )
     .unwrap();
     assert_eq!(output.trim(), "7");
@@ -289,7 +289,7 @@ fn test_local_record_is_fresh_each_call() {
 #[test]
 fn test_record_storage_does_not_leak_between_procedures() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB First(G AS P)\nPRINT G.X\nEND SUB\nSUB Second\nPRINT G.X\nEND SUB\nG.X = 7\nSecond\n",
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM SHARED G AS P\nSUB First(G AS P)\nPRINT G.X\nEND SUB\nSUB Second\nPRINT G.X\nEND SUB\nG.X = 7\nSecond\n",
     )
     .unwrap();
     assert_eq!(output.trim(), "7");

@@ -202,6 +202,7 @@ fn test_array_use_before_its_dim() {
     let output = compile_and_run(
         r#"
 SUB Show(N)
+SHARED A()
 PRINT A(N)
 END SUB
 DIM A(3)

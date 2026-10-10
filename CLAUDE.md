@@ -67,8 +67,11 @@ Integration tests organized by feature area:
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility
-- **Module-level storage is static**: globals live in `.bss`, so they are zeroed
-  and reachable from procedures; procedure locals are stack slots zeroed on entry
+- **Scope is QuickBASIC's**: module-level storage is static (.bss, zeroed),
+  but a procedure reaches a module name only when it is shared (`DIM SHARED`,
+  or `SHARED` in the procedure; a DEF FN sees all). Its other names are frame
+  slots zeroed on entry, unless STATIC, which gives them .bss storage of their
+  own. `Symbols::shares` and `Symbols::is_static` decide, in one place each
 - **Uniform word addressing**: every variable, string (pointer + length), array
   descriptor and record field is a sequence of 8-byte words reached through `Loc`
 - **Runtime checks on by default**: `--unsafe` removes them
