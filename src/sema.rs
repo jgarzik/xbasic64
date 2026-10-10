@@ -1317,6 +1317,7 @@ impl Analyzer {
                             );
                         }
                     }
+                    self.check_variable_length_strings(name, params, ret_ty.as_ref(), stmt.line);
                     if scope != &Scope::Module {
                         self.error(
                             stmt.line,
@@ -2776,6 +2777,7 @@ impl Analyzer {
         scope: &Scope,
         line: u32,
     ) {
+        self.check_variable_length_strings(name, params, ret_ty, line);
         if scope != &Scope::Module {
             self.error(line, "DECLARE belongs at module level");
             return;
@@ -2819,6 +2821,43 @@ impl Analyzer {
                 line,
                 format!("DECLARE of '{}' does not match: {}", name, p),
                 format!("'{}' is defined on line {}", name, def_line),
+            );
+        }
+    }
+
+    /// Refuse a fixed-length string as a parameter or a FUNCTION result.
+    ///
+    /// QuickBASIC requires both to be variable-length. The parameter was
+    /// accepted and its width ignored -- the callee saw whatever length the
+    /// caller passed -- and the result failed later, as a type mismatch on
+    /// the assignment to the FUNCTION's name, which named the wrong line.
+    fn check_variable_length_strings(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        ret_ty: Option<&TypeRef>,
+        line: u32,
+    ) {
+        for p in params {
+            if let Some(TypeRef::FixedString(n @ 1..)) = p.ty {
+                self.error_with_note(
+                    line,
+                    format!(
+                        "parameter '{}' of '{}' is declared AS STRING * {}, but a parameter must be a variable-length string",
+                        p.name, name, n
+                    ),
+                    format!("declare it {} AS STRING", p.name),
+                );
+            }
+        }
+        if let Some(TypeRef::FixedString(n @ 1..)) = ret_ty {
+            self.error_with_note(
+                line,
+                format!(
+                    "the result of '{}' is declared AS STRING * {}, but a FUNCTION's result must be a variable-length string",
+                    name, n
+                ),
+                "declare it AS STRING".to_string(),
             );
         }
     }

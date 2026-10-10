@@ -356,7 +356,7 @@ fn test_as_typed_variables() {
 #[test]
 fn test_as_typed_parameters_and_result() {
     let output = compile_and_run(
-        "SUB T(N AS INTEGER, S AS STRING * 10)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
+        "SUB T(N AS INTEGER, S AS STRING)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
     )
     .unwrap();
     let lines = crate::common::lines(&output);

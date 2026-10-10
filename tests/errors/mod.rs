@@ -2881,3 +2881,39 @@ fn test_a_const_cannot_be_assigned() {
     let out = compile_and_run("CONST MAX = 100\nX = MAX: PRINT X; MAX\n").unwrap();
     assert_eq!(crate::common::lines(&out), &["100  100"]);
 }
+
+/// A parameter and a FUNCTION result must be variable-length strings, as
+/// QuickBASIC requires. A `STRING * 8` parameter was accepted and its width
+/// ignored, and a `STRING * 3` result failed later as a confusing "type
+/// mismatch" on the assignment to the FUNCTION's name.
+#[test]
+fn test_fixed_length_parameters_and_results_are_refused() {
+    let cases = [
+        (
+            "SUB S(T AS STRING * 8)\nPRINT T\nEND SUB\nS \"x\"\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+        (
+            "FUNCTION F(N, BYVAL T AS STRING * 2)\nF = N\nEND FUNCTION\nPRINT F(1, \"x\")\n",
+            "parameter 'T' of 'F' is declared AS STRING * 2",
+        ),
+        (
+            "FUNCTION F AS STRING * 3\nF = \"abc\"\nEND FUNCTION\nPRINT F\n",
+            "the result of 'F' is declared AS STRING * 3",
+        ),
+        (
+            "DECLARE SUB S (T AS STRING * 8)\nSUB S (T AS STRING)\nEND SUB\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+        expect_rejected(source, "must be a variable-length string");
+        let err = compile_only(source).unwrap_err();
+        assert!(
+            !err.contains("type mismatch"),
+            "{source:?} should be refused for the declaration alone:\n{}",
+            err.stderr
+        );
+    }
+}
