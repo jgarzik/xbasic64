@@ -10,6 +10,8 @@ mod abi;
 mod codegen;
 mod lexer;
 mod parser;
+#[cfg(test)]
+mod rtbuild;
 mod rtsig;
 mod runtime;
 mod sema;
@@ -32,7 +34,8 @@ struct Args {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Emit assembly only (don't assemble or link)
+    /// Emit the program's assembly only (don't assemble or link). The
+    /// runtime is prebuilt and linked separately, so it is not included.
     #[arg(short = 'S')]
     asm_only: bool,
 
@@ -142,12 +145,7 @@ fn main() {
     let opts = codegen::Options {
         checks: !args.no_checks,
     };
-    let mut full_asm = codegen.generate(&program, symbols, opts);
-
-    // Append the runtime rather than `format!("{}\n{}", ..)`, which would build
-    // a third copy of an assembly text that reaches 145 MB on a large program.
-    full_asm.push('\n');
-    full_asm.push_str(&runtime::generate_runtime());
+    let full_asm = codegen.generate(&program, symbols, opts);
 
     // Determine output file names - put temp files next to output
     let input_path = Path::new(&input_file);
@@ -175,6 +173,10 @@ fn main() {
         .to_string();
     let obj_file = exe_dir
         .join(format!("{}.o", exe_stem))
+        .to_string_lossy()
+        .to_string();
+    let rt_file = exe_dir
+        .join(format!("{}.rt.o", exe_stem))
         .to_string_lossy()
         .to_string();
 
@@ -220,6 +222,12 @@ fn main() {
         }
     }
 
+    // The runtime, assembled when the compiler was built.
+    if let Err(e) = fs::write(&rt_file, runtime::OBJECT) {
+        eprintln!("Error writing the runtime object: {}", e);
+        std::process::exit(1);
+    }
+
     // Link - Windows uses link.exe with UCRT, others use cc
     // msvcrt.lib provides CRT startup (mainCRTStartup) and imports CRT DLL
     //
@@ -230,6 +238,7 @@ fn main() {
         .args([
             &format!("/OUT:{}", exe_file),
             &obj_file,
+            &rt_file,
             "/SUBSYSTEM:CONSOLE",
             // Discard the runtime helpers this program never calls. Each is
             // emitted into a COMDAT section of its own for exactly this;
@@ -254,6 +263,7 @@ fn main() {
             "-o",
             &exe_file,
             &obj_file,
+            &rt_file,
             "-lm",
             "-no-pie",
             "-Wl,--gc-sections",
@@ -293,6 +303,7 @@ fn main() {
     // Clean up temporary files
     let _ = fs::remove_file(&asm_file);
     let _ = fs::remove_file(&obj_file);
+    let _ = fs::remove_file(&rt_file);
 
     println!("Compiled {} -> {}", input_file, exe_file);
 }

@@ -253,19 +253,12 @@ pub fn compile_and_run_with_stdin(source: &str, stdin_input: &str) -> Result<Str
     Ok(run.stdout)
 }
 
-/// Compile to assembly and return the *generated* portion of it.
-///
-/// The runtime is concatenated onto every program, and it is thousands of
-/// hand-written instructions containing an example of nearly everything. A
-/// shape assertion that searched the whole file would be satisfied, or broken,
-/// by code the compiler did not emit -- so the text is cut at the runtime's
-/// banner and only what precedes it is returned.
+/// Compile to assembly and return it: only what the compiler generated, since
+/// the runtime is a prebuilt object linked beside it.
 ///
 /// `-S` writes the assembly beside the output path and stops before the
 /// assembler, so nothing here depends on `as` or `cc` being able to run.
 pub fn compile_to_asm(source: &str) -> Result<String, String> {
-    const RUNTIME_BANNER: &str = "# BASIC Runtime Library";
-
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let bas_file = tmp.path().join("test.bas");
     let out_file = tmp.path().join("test");
@@ -288,12 +281,7 @@ pub fn compile_to_asm(source: &str) -> Result<String, String> {
         ));
     }
 
-    let asm = fs::read_to_string(tmp.path().join("test.s")).map_err(|e| e.to_string())?;
-
-    Ok(match asm.find(RUNTIME_BANNER) {
-        Some(cut) => asm[..cut].to_string(),
-        None => return Err("the runtime banner is missing from the emitted assembly".to_string()),
-    })
+    fs::read_to_string(tmp.path().join("test.s")).map_err(|e| e.to_string())
 }
 
 /// Helper to compile and run with access to temp directory for file I/O tests

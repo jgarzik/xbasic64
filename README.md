@@ -93,7 +93,7 @@ Source → Lexer → Parser → Semantic Analysis → Code Generator → Assembl
    reports problems with a source line
 4. **Code Generator** - Direct AST-to-x86-64 assembly translation
 
-The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability.
+The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability. It is assembled once, when the compiler is built, and linked beside each program.
 
 Key design choices:
 - No IR—direct AST to assembly for simplicity
@@ -103,7 +103,8 @@ Key design choices:
 ## Requirements
 
 - Rust toolchain
-- Linux: system assembler (`as`) and C compiler/linker (`cc`) with libc
+- Linux: system assembler (`as`) and C compiler/linker (`cc`) with libc,
+  both to build the compiler and to compile programs
 - Windows: Clang (used to assemble) and the MSVC linker (`link.exe`)
 
 ## Platforms

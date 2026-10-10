@@ -22,7 +22,7 @@ cargo test strings::
 # Compile a BASIC program
 cargo run -- program.bas           # Output: ./program
 cargo run -- program.bas -o out    # Custom output name
-cargo run -- -S program.bas        # Emit assembly only (no linking)
+cargo run -- -S program.bas        # Emit the program's assembly only (no runtime, no linking)
 ```
 
 ## Architecture
@@ -42,11 +42,20 @@ Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
   records, constants, labels) and reports errors with a source line, so codegen
   never has to guess what a name means
 - **codegen.rs** - Direct AST-to-x86-64 assembly translation using System V AMD64 ABI
-- **runtime.rs** - Hand-written x86-64 assembly runtime library (I/O, strings, math) using libc
+- **rtbuild.rs** - The hand-written x86-64 runtime library's trees
+  (`runtime/sysv`, `runtime/win64-native`: I/O, strings, math, using libc) and
+  how they become one assembly unit. Shared by `build.rs`, which assembles the
+  target's tree into `$OUT_DIR/runtime.o`, and by the crate's tests
+- **runtime.rs** - The prebuilt runtime object, embedded; `main.rs` writes it
+  beside the program's object and links the two. Generated code reaches the
+  runtime's state and messages, and the runtime the program's `_data_*`, only
+  through `.globl` symbols
 - **rtsig.rs** - Signature of every runtime helper generated code calls, and
   whether it can raise an error. Every call goes through `CodeGen::call_rt`,
   which looks it up; a test derives `fallible` from the assembly's control flow
 - **main.rs** - CLI driver: reads source, runs pipeline, shells out to `as` and `cc` for linking
+- **build.rs** - Assembles the runtime when the compiler is built, so building
+  needs the target's assembler too
 
 ### Test Structure (`tests/`)
 
@@ -77,8 +86,8 @@ Integration tests organized by feature area:
 - **Runtime checks on by default**: `--unsafe` removes them
 - **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
   the same `.globl` names; a new helper must be added to both
-- **Two assemblers, not just two runtimes**: `main.rs` assembles with GNU `as`
-  on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
+- **Two assemblers, not just two runtimes**: `build.rs` and `main.rs` assemble
+  with GNU `as` on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
   assembler no test here runs. They disagree about `.equ len, . - label`: GNU
   `as` folds it to an immediate, and an assembler that cannot prove the symbol
   absolute assembles `mov reg, len` as a *load from that address* instead.

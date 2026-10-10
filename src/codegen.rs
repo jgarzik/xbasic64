@@ -1748,6 +1748,12 @@ impl CodeGen {
         // Emit data section
         self.emit_data_section();
 
+        // Without this note GNU ld assumes the object needs an executable
+        // stack, warns, and gives the program one. COFF has no such note.
+        if !cfg!(windows) {
+            self.emit(".section .note.GNU-stack,\"\",@progbits");
+        }
+
         // Handed over rather than cloned. The buffer is the whole program's
         // assembly -- 145 MB for a 200k-line source -- so copying it to return
         // it doubled the compiler's peak memory for nothing.
@@ -7781,7 +7787,10 @@ impl CodeGen {
             }
         }
 
-        // DATA table - always define it (even if empty) to avoid linker errors
+        // DATA table - always define it (even if empty): the prebuilt
+        // runtime's READ helpers name these three.
+        self.output
+            .push_str(".globl _data_table\n.globl _data_count\n.globl _data_ptr\n");
         self.output.push_str(".p2align 3\n");
         self.output.push_str("_data_table:\n");
         for (quoted, text) in &rows {

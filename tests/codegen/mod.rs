@@ -728,51 +728,6 @@ PRINT Y
     assert!(run.stderr.contains("Overflow"), "stderr {}", run.stderr);
 }
 
-/// Each runtime helper is emitted into a section of its own.
-///
-/// A linker discards an unreferenced *section*, never an unreferenced label,
-/// so this is what lets the linker drop the helpers a program does not call.
-/// Without it all 69 went into every binary.
-///
-/// Counted against the exported helpers, not against every label: a COMDAT
-/// section is identified by a symbol and that symbol has to be external, so
-/// the handful of helpers that are not `.globl` deliberately ride in the
-/// section of whichever helper precedes them.
-///
-/// The two object formats spell the directive differently -- ELF names the
-/// section after the helper, COFF repeats `.text` and names the helper as the
-/// COMDAT symbol -- so the match is on what they have in common.
-#[test]
-fn test_runtime_helpers_get_their_own_sections() {
-    let tmp = tempfile::TempDir::new().expect("temp dir");
-    let bas = tmp.path().join("t.bas");
-    std::fs::write(&bas, "PRINT \"hi\"\n").expect("write");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg("-S")
-        .arg(&bas)
-        .arg("-o")
-        .arg(tmp.path().join("t"))
-        .output()
-        .expect("run compiler");
-    assert!(out.status.success());
-    let asm = std::fs::read_to_string(tmp.path().join("t.s")).expect("read asm");
-
-    let exported = asm.lines().filter(|l| l.starts_with(".globl _rt_")).count();
-    let sections = asm
-        .lines()
-        .filter(|l| l.starts_with(".section .text") && l.contains("_rt_"))
-        .count();
-    assert!(
-        exported > 50,
-        "expected the whole runtime, saw {} exported helpers",
-        exported
-    );
-    assert_eq!(
-        sections, exported,
-        "every exported helper needs a section of its own"
-    );
-}
-
 /// No runtime helper may fall through into the next one.
 ///
 /// Sections are not laid out in source order, so a helper that ran off its

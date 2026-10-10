@@ -17,6 +17,39 @@
 .equ STD_ERROR_HANDLE, -12
 
 .data
+# Named by generated code, which is a separate object: the program's
+# checks pass these messages to _rt_error, and its trapping code reads
+# and writes the state below.
+.globl _err_fmt_line
+.globl _err_fmt_bare
+.globl _err_syntax
+.globl _err_subscript
+.globl _err_typemismatch
+.globl _err_div0
+.globl _err_domain
+.globl _err_overflow
+.globl _err_dupdef
+.globl _err_memory
+.globl _err_gosub
+.globl _err_noreturn
+.globl _err_outofdata
+.globl _err_badfile
+.globl _err_badmode
+.globl _err_fieldovf
+.globl _err_permission
+.globl _err_notfound
+.globl _err_alreadyopen
+.globl _err_pastend
+.globl _err_badname
+.globl _err_access
+.globl _err_pathnotfound
+.globl _err_unprintable
+.globl _err_resnoerr
+.globl _err_handler
+.globl _err_pending
+.globl _err_active
+.globl _err_line
+
 _err_fmt_line: .asciz "?%s in %lld\r\n"
 _err_fmt_bare: .asciz "?%s\r\n"
 _stop_fmt_line: .asciz "Break in %lld\r\n"
