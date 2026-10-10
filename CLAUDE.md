@@ -91,9 +91,10 @@ Integration tests organized by feature area:
 - **No IR of its own**: the AST is lowered straight to Cranelift IR. Cranelift
   0.136.2, pinned exactly: its API changes between releases
 - **Scalars only a function can reach live in SSA values** (`codegen/ssa.rs`):
-  a numeric scalar not passed to a procedure, not SHARED or STATIC, and -- in
+  a numeric scalar, typed (`DIM X AS LONG`, in its declared type) or
+  suffixed, not passed to a procedure, not SHARED or STATIC, and -- in
   main -- not in a program with ON ERROR is a Cranelift `Variable`, as are
-  FOR's limit and step. GOTO, GOSUB and RESUME entering a statement just give
+  FOR's limit and step. Records and strings declared `AS` stay in memory. GOTO, GOSUB and RESUME entering a statement just give
   it a block parameter. Everything else lives in memory: module names in data
   objects, a procedure's own in stack slots zeroed on entry. No plain SSA
   value lives across a statement, since one defined in a statement would not

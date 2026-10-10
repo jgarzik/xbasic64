@@ -844,3 +844,106 @@ fn test_plain_as_string_field_is_refused() {
     // One diagnostic, not a cascade: the rest of the TYPE still parses.
     assert!(err.contains("1 error"), "got:\n{}", err.stderr);
 }
+
+/// A scalar declared `AS INTEGER`, `AS LONG`, `AS SINGLE` or `AS DOUBLE`
+/// has its declared type whatever its name says, wherever it lives: an SSA
+/// value when nothing else can reach it, memory when something can.
+#[test]
+fn test_typed_scalars_keep_their_declared_type() {
+    let run = |src: &str| crate::common::compile_and_run_raw(src, "").expect("must compile");
+
+    // An unsuffixed INTEGER rounds half to even, and overflows past 32767.
+    let r = run("DIM X AS INTEGER\nX = 2.5: PRINT X\nX = 3.5: PRINT X\nX = 40000: PRINT X\n");
+    assert_eq!(r.lines(), &["2", "4"]);
+    assert!(r.stderr.contains("Overflow in 4"), "{:?}", r.stderr);
+    assert_eq!(r.exit_code, Some(1));
+
+    let r = run("DIM L AS LONG\nL = 2147483647: PRINT L\nL = L + 1: PRINT L\n");
+    assert_eq!(r.lines(), &["2147483647"]);
+    assert!(r.stderr.contains("Overflow in 3"), "{:?}", r.stderr);
+    assert_eq!(r.exit_code, Some(1));
+
+    let out =
+        compile_and_run("DIM F AS SINGLE, D AS DOUBLE\nF = 1 / 3: D = 1 / 3: PRINT F: PRINT D\n")
+            .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &[".3333333", ".3333333333333333"]
+    );
+}
+
+/// Typed scalars through GOTO into a loop, recursion, FOR, SWAP, INPUT and
+/// READ, and a DIM run again in a loop -- which never re-zeroes.
+#[test]
+fn test_typed_scalars_in_control_flow() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "DIM K AS INTEGER, N AS LONG\nGOTO 20\n10 N = N + 100\n20 FOR K = 1 TO 3\n\
+             30 N = N + K\n40 NEXT K\nIF N < 100 THEN GOTO 10\nPRINT N; K\n",
+            &["112  4"],
+        ),
+        // Each call has a T of its own, starting at 0.
+        (
+            "PRINT F(4)\nFUNCTION F(N%)\nDIM T AS LONG\nT = T + N%\n\
+             IF N% > 1 THEN T = T + F(N% - 1)\nF = T\nEND FUNCTION\n",
+            &["10"],
+        ),
+        (
+            "CALL P: CALL P\nSUB P\nDIM X AS INTEGER\nPRINT X\nX = 5\nEND SUB\n",
+            &["0", "0"],
+        ),
+        (
+            "DIM K AS LONG\nFOR K = 1 TO 10: S = S + K: NEXT\nPRINT S; K\n",
+            &["55  11"],
+        ),
+        (
+            "DIM A AS INTEGER, B AS INTEGER\nA = 1: B = 2: SWAP A, B: PRINT A; B\n\
+             C% = 9: SWAP A, C%: PRINT A; C%\n",
+            &["2  1", "9  2"],
+        ),
+        (
+            "DIM Z AS LONG, G AS SINGLE\nREAD Z, G: PRINT Z; G\nDATA 123456, 2.5\n",
+            &["123456  2.5"],
+        ),
+        (
+            "FOR I = 1 TO 3\nDIM X AS INTEGER\nX = X + 1\nPRINT X\nNEXT\n",
+            &["1", "2", "3"],
+        ),
+    ];
+    for (src, want) in cases {
+        let out = compile_and_run(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+        assert_eq!(&crate::common::lines(&out), want, "{src}");
+    }
+
+    let out = crate::common::compile_and_run_with_stdin(
+        "DIM X AS INTEGER, Y AS SINGLE\nINPUT X, Y\nPRINT X; Y\n",
+        "7.5, 2.25\n",
+    )
+    .unwrap();
+    assert!(out.ends_with(" 8  2.25 \n"), "{out:?}");
+}
+
+/// Typed scalars something else can reach stay in memory and behave so: one
+/// passed by reference sees the SUB's change, a DIM SHARED one the SUB's
+/// update, and a STATIC one keeps its value between calls.
+#[test]
+fn test_reachable_typed_scalars() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "DIM X AS INTEGER\nX = 5: CALL P(X): PRINT X\nSUB P(A AS INTEGER)\nA = A * 2\nEND SUB\n",
+            &["10"],
+        ),
+        (
+            "DIM SHARED X AS LONG\nX = 7: CALL P: PRINT X\nSUB P\nX = X + 1\nEND SUB\n",
+            &["8"],
+        ),
+        (
+            "CALL P: CALL P: CALL P\nSUB P\nSTATIC N AS INTEGER\nN = N + 1: PRINT N\nEND SUB\n",
+            &["1", "2", "3"],
+        ),
+    ];
+    for (src, want) in cases {
+        let out = compile_and_run(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+        assert_eq!(&crate::common::lines(&out), want, "{src}");
+    }
+}

@@ -678,6 +678,23 @@ fn test_private_scalars_live_in_registers() {
     assert!(!uses_symbol(&clif, "_var_S_I"), "{clif}");
 }
 
+/// So does one declared `AS` a numeric type, in main and in a procedure;
+/// one shared with a procedure keeps its data object.
+#[test]
+fn test_typed_scalars_live_in_registers() {
+    let src = "DIM K AS LONG\nFOR K = 1 TO 10: S = S + K: NEXT\nPRINT S\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!uses_symbol(&clif, "_rec_K"), "{clif}");
+
+    let src = "CALL P\nSUB P\nDIM X AS INTEGER\nX = X + 1\nPRINT X\nEND SUB\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!clif.contains("stack_store"), "{clif}");
+
+    let src = "DIM SHARED K AS LONG\nK = 1\nCALL P\nPRINT K\nSUB P\nK = 2\nEND SUB\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(uses_symbol(&clif, "_rec_K"), "{clif}");
+}
+
 /// ...and every scalar something else can reach stays in memory: under ON
 /// ERROR, whose handler is a function of its own; passed by reference to a
 /// procedure; shared with one; or seen by a DEF FN.

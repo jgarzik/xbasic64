@@ -128,7 +128,10 @@ impl FnGen<'_> {
                 name,
                 indices: None,
                 value,
-            } if self.typed_var(name).is_some() && !self.has_plain_slot(name) => {
+            } if self.typed_var(name).is_some()
+                && self.ssa_var(name).is_none()
+                && !self.has_plain_slot(name) =>
+            {
                 let (loc, ty) = self.typed_storage(name).expect("guarded above");
                 if let TypeRef::Record(_) = &ty {
                     // Assigning one whole record to another copies its words.
