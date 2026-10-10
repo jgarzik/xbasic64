@@ -6,11 +6,13 @@
 //! expression is lowered straight into Cranelift IR with a
 //! `FunctionBuilder`, and Cranelift does instruction selection, register
 //! allocation and the object file. The runtime library is a separate object,
-//! prebuilt (see `rtbuild.rs`), reached through calls whose signatures come
-//! from `rtsig`.
+//! prebuilt from `rt/` by `build.rs`, reached through calls whose signatures
+//! come from `rtsig`.
 //!
-//! One `CodeGen` holds what is module-wide: the `ObjectModule`, the
-//! declared functions and data, and module-level storage. Each function --
+//! One `CodeGen` holds what is module-wide: the Cranelift module -- an
+//! `ObjectModule` for an executable (`generate`), or any other `Module`, such
+//! as the JIT's (`lower`) -- the declared functions and data, and
+//! module-level storage. Each function --
 //! `main`, every SUB and FUNCTION, and the error handler -- is lowered by an
 //! `FnGen`, which owns that function's builder and its own names.
 //!
@@ -246,9 +248,20 @@ impl ArrayInfo {
     }
 }
 
-/// Module-wide state: the object being built and what every function shares.
-pub struct CodeGen {
-    module: ObjectModule,
+/// Module-wide state: the module being built and what every function shares.
+///
+/// The module is any Cranelift `Module`: an `ObjectModule` for an executable,
+/// a `JITModule` for `xbasic64 run`. `CodeGen<M>` is built around the
+/// concrete one, and lowering works through `CodeGen` -- `CodeGen<dyn
+/// Module>` -- so the rest of codegen is written once, for both.
+pub struct CodeGen<M: ?Sized = dyn Module> {
+    /// Whether every reference may be PC-relative. True for an executable,
+    /// where everything -- the runtime and the C library included -- is
+    /// linked within reach. Not in the JIT, where the runtime is the
+    /// compiler's own and may be anywhere in its address space: a reference
+    /// to it is an absolute address, as Cranelift makes an imported one by
+    /// default.
+    colocate: bool,
     /// The same target, with the cheap settings for huge functions.
     huge_isa: OwnedTargetIsa,
     call_conv: CallConv,
@@ -296,6 +309,9 @@ pub struct CodeGen {
     /// the address of its limit expression: shared by main and the handler,
     /// which is main compiled a second time and may GOTO into the loop.
     for_slots: HashMap<usize, DataId>,
+    /// Last, so that `CodeGen<ObjectModule>` and the rest can be used as
+    /// `CodeGen<dyn Module>`.
+    module: M,
 }
 
 /// The convention runtime helpers are called with, where it is not the
@@ -317,15 +333,49 @@ pub fn generate(
     opts: Options,
     want_clif: bool,
 ) -> Result<Output, String> {
-    let isa = make_isa(false)?;
-    let huge_isa = make_isa(true)?;
-    let call_conv = isa.default_call_conv();
-    let builder = ObjectBuilder::new(isa, "basic", cranelift_module::default_libcall_names())
-        .map_err(|e| e.to_string())?;
-    let module = ObjectModule::new(builder);
+    let builder = ObjectBuilder::new(
+        make_isa(false)?,
+        "basic",
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| e.to_string())?;
+    let lowered = lower(
+        program,
+        symbols,
+        opts,
+        ObjectModule::new(builder),
+        want_clif,
+        true,
+    )?;
+    let object = lowered.module.finish().emit().map_err(|e| e.to_string())?;
+    Ok(Output {
+        object,
+        clif: lowered.clif,
+    })
+}
 
+/// A program lowered into a module: every function and data object
+/// defined, `main` among them.
+pub struct Lowered<M> {
+    pub module: M,
+    /// The CLIF, when asked for, with a header naming each `uN:M`.
+    pub clif: String,
+}
+
+/// Lower `program` into `module`, whose ISA is `make_isa(false)`'s. With
+/// `colocate`, every reference is PC-relative (see `CodeGen::colocate`).
+pub fn lower<M: Module + 'static>(
+    program: &Program,
+    symbols: Symbols,
+    opts: Options,
+    module: M,
+    want_clif: bool,
+    colocate: bool,
+) -> Result<Lowered<M>, String> {
+    let huge_isa = make_isa(true)?;
+    let call_conv = module.isa().default_call_conv();
     let mut cg = CodeGen {
-        module,
+        colocate,
         huge_isa,
         call_conv,
         symbols,
@@ -350,60 +400,69 @@ pub fn generate(
         stmt_count: 0,
         module_in_memory: HashSet::new(),
         for_slots: HashMap::new(),
+        module,
     };
+    let clif = (&mut cg as &mut CodeGen).lower(program)?;
+    Ok(Lowered {
+        module: cg.module,
+        clif,
+    })
+}
 
-    for stmt in &program.statements {
-        cg.preprocess(stmt, true);
-    }
-    cg.module_in_memory = ssa::module_in_memory(program, &cg.symbols);
-    if cg.traps {
-        let names = ssa::handler_names(program, &cg.err_handlers);
-        cg.module_in_memory.extend(names);
-    }
-    cg.declare_procedures(program)?;
-
-    // Main first, so every module-level name is known before a procedure
-    // refers to it.
-    cg.compile_function(FnKind::Main, None, program)?;
-    if cg.traps {
-        cg.compile_function(FnKind::Handler, None, program)?;
-    }
-    for stmt in &program.statements {
-        if matches!(stmt.kind, StmtKind::Sub { .. } | StmtKind::Function { .. }) {
-            cg.compile_function(FnKind::Proc, Some(stmt), program)?;
+impl CodeGen {
+    /// Lower every function and data object of `program`; the CLIF, if
+    /// asked for.
+    fn lower(&mut self, program: &Program) -> Result<String, String> {
+        for stmt in &program.statements {
+            self.preprocess(stmt, true);
         }
-    }
-
-    cg.define_data()?;
-
-    // CLIF names a function `u0:N` and a data object `u1:N`; the header says
-    // which symbol each is.
-    let clif = match cg.clif.take() {
-        Some(body) => {
-            let decls = cg.module.declarations();
-            let mut header = String::from("; symbols\n");
-            for (id, f) in decls.get_functions() {
-                header.push_str(&format!(
-                    "; u0:{} = {}\n",
-                    id.as_u32(),
-                    f.name.as_deref().unwrap_or("?")
-                ));
-            }
-            for (id, d) in decls.get_data_objects() {
-                header.push_str(&format!(
-                    "; u1:{} = {}\n",
-                    id.as_u32(),
-                    d.name.as_deref().unwrap_or("?")
-                ));
-            }
-            header.push('\n');
-            header + &body
+        self.module_in_memory = ssa::module_in_memory(program, &self.symbols);
+        if self.traps {
+            let names = ssa::handler_names(program, &self.err_handlers);
+            self.module_in_memory.extend(names);
         }
-        None => String::new(),
-    };
-    let product = cg.module.finish();
-    let object = product.emit().map_err(|e| e.to_string())?;
-    Ok(Output { object, clif })
+        self.declare_procedures(program)?;
+
+        // Main first, so every module-level name is known before a procedure
+        // refers to it.
+        self.compile_function(FnKind::Main, None, program)?;
+        if self.traps {
+            self.compile_function(FnKind::Handler, None, program)?;
+        }
+        for stmt in &program.statements {
+            if matches!(stmt.kind, StmtKind::Sub { .. } | StmtKind::Function { .. }) {
+                self.compile_function(FnKind::Proc, Some(stmt), program)?;
+            }
+        }
+
+        self.define_data()?;
+
+        // CLIF names a function `u0:N` and a data object `u1:N`; the header
+        // says which symbol each is.
+        Ok(match self.clif.take() {
+            Some(body) => {
+                let decls = self.module.declarations();
+                let mut header = String::from("; symbols\n");
+                for (id, f) in decls.get_functions() {
+                    header.push_str(&format!(
+                        "; u0:{} = {}\n",
+                        id.as_u32(),
+                        f.name.as_deref().unwrap_or("?")
+                    ));
+                }
+                for (id, d) in decls.get_data_objects() {
+                    header.push_str(&format!(
+                        "; u1:{} = {}\n",
+                        id.as_u32(),
+                        d.name.as_deref().unwrap_or("?")
+                    ));
+                }
+                header.push('\n');
+                header + &body
+            }
+            None => String::new(),
+        })
+    }
 }
 
 /// Blocks past which a function is compiled cheaply: with the single-pass
@@ -1054,10 +1113,11 @@ impl<'a> FnGen<'a> {
             Some(gv) => *gv,
             None => {
                 let gv = self.cg.module.declare_data_in_func(id, self.b.func);
-                // Everything is linked into one executable, so a direct,
-                // PC-relative reference reaches it.
-                if let GlobalValueData::Symbol { colocated, .. } =
-                    &mut self.b.func.global_values[gv]
+                // In an executable everything is linked within reach, so a
+                // direct, PC-relative reference reaches it.
+                if self.cg.colocate
+                    && let GlobalValueData::Symbol { colocated, .. } =
+                        &mut self.b.func.global_values[gv]
                 {
                     *colocated = true;
                 }
@@ -1225,7 +1285,11 @@ impl<'a> FnGen<'a> {
             return *r;
         }
         let r = self.cg.module.declare_func_in_func(id, self.b.func);
-        self.b.func.dfg.ext_funcs[r].colocated = true;
+        // A direct call in an executable; in the JIT, a call to the runtime
+        // goes through its absolute address (see `CodeGen::colocate`).
+        if self.cg.colocate {
+            self.b.func.dfg.ext_funcs[r].colocated = true;
+        }
         self.func_refs.insert(id, r);
         r
     }
