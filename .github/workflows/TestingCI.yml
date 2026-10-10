@@ -23,7 +23,67 @@ jobs:
       - name: Run clippy
         run: cargo clippy --release --all-targets -- -D warnings
       # The examples are the only programs compiled and run end to end through
-      # the real driver -- shelling out to the assembler and linker -- rather
+      # the real driver -- shelling out to the linker -- rather
+      # than through the test harness.
+      - name: Compile and run the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.bas; do
+            echo "== $f"
+            ./target/release/xbasic64 "$f" -o /tmp/example
+            /tmp/example </dev/null >/dev/null
+          done
+
+  linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Fetch
+        run: cargo fetch
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test --release --verbose
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # The examples are the only programs compiled and run end to end through
+      # the real driver -- shelling out to the linker -- rather
+      # than through the test harness.
+      - name: Compile and run the examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in examples/*.bas; do
+            echo "== $f"
+            ./target/release/xbasic64 "$f" -o /tmp/example
+            /tmp/example </dev/null >/dev/null
+          done
+
+  macos-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Fetch
+        run: cargo fetch
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Run tests
+        run: cargo test --release --verbose
+      - name: Run fmt check
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+      # The examples are the only programs compiled and run end to end through
+      # the real driver -- shelling out to the linker -- rather
       # than through the test harness.
       - name: Compile and run the examples
         shell: bash

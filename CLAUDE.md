@@ -27,7 +27,8 @@ cargo run -- -S program.bas        # Cranelift IR to <output>.clif instead (no o
 
 ## Architecture
 
-xbasic64 is a BASIC-to-x86_64 native code compiler. The AST is lowered straight
+xbasic64 is a BASIC native code compiler for x86-64 (Linux, Windows) and
+aarch64 (Linux, macOS). The AST is lowered straight
 to Cranelift IR, and Cranelift writes the object file:
 
 ```
@@ -48,23 +49,38 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
   (array descriptors read once per loop), `strings.rs`
   (string ownership), `expr.rs`, `builtins.rs`, `stmt.rs`, `calls.rs`
   (procedures and by-reference calls), `io.rs`, `trap.rs` (ON ERROR)
-- **rtbuild.rs** - The hand-written x86-64 runtime library's trees
-  (`runtime/sysv`, `runtime/win64-native`: I/O, strings, math, using libc) and
-  how they become one assembly unit. Shared by `build.rs`, which assembles the
-  target's tree into `$OUT_DIR/runtime.o`, and by the crate's tests
-- **runtime.rs** - The prebuilt runtime object, embedded; `main.rs` writes it
-  beside the program's object and links the two. Generated code reaches the
-  runtime's state and messages, and the runtime the program's `_data_*`, only
-  through `.globl` symbols
+- **runtime.rs** - The prebuilt runtime object (from `rt/`), embedded;
+  `main.rs` writes it beside the program's object and links the two.
+  Generated code reaches the runtime's state and messages, and the runtime
+  the program's `_data_*`, only through exported symbols
 - **rtsig.rs** - Signature of every runtime helper generated code calls,
   whether it can raise an error, and whether its string result is fresh.
   Every call goes through `FnGen::call`, which builds the call from it; tests
-  derive `fallible` from the assembly's control flow and check that every
-  `fresh` helper reaches `malloc`
+  read a call graph from `rt/src` and check that `fallible` is exactly "can
+  reach `raise_with_code`" and `fresh` exactly "can reach `alloc_str`"
 - **main.rs** - CLI driver: reads source, runs the pipeline, writes the object
   and the runtime's, and links them with `cc` (or `link.exe`)
-- **build.rs** - Assembles the runtime when the compiler is built, so building
-  needs the target's assembler too
+- **build.rs** - Builds the runtime (`rt/`) with rustc for the target when the
+  compiler is built: a `no_std` staticlib with fat LTO, of which only the
+  crate's one merged object is kept (`$OUT_DIR/rt.o`; the rest of the
+  archive is `compiler_builtins`). It reads the `ar` format itself
+
+### The runtime (`rt/`)
+
+A `no_std` Rust crate, one source for every target, calling the C library
+through `rt/src/sys.rs`, where everything OS-specific lives (the standard
+streams, errno, 64-bit seeks, locking, the clock). One module per area:
+`error` (messages, trapping state, `_rt_error`), `num` (number formatting and
+reading), `string`, `data`, `file` (files and the console as file 0), `input`,
+`using`, `math`, `print`. Helpers are defined with `export!` under the names
+and signatures `rtsig.rs` lists. Its unit tests run with std (`cargo test`
+covers the workspace). In the runtime:
+
+- **No `core::fmt`** outside tests: it adds tens of KB to every program.
+  Numbers are formatted with the C library's `snprintf`, as the asm runtime
+  did, so output is unchanged
+- **Every string result that is fresh comes from `alloc_str`**, which raises
+  Out of memory; so every fresh helper is also fallible
 
 ### Test Structure (`tests/`)
 
@@ -82,8 +98,6 @@ Integration tests organized by feature area:
 - `codegen/` - Assertions on the Cranelift IR the compiler generates (through
   `common::compile_to_clif()`), and behavioural tests of code paths
   with special cases: constant divisors, scalars in SSA values, huge functions
-- `runtime/` - Structural checks on the two assembly runtimes: the same
-  `.globl` names, no `.equ` length constants, and the like
 - Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `errors/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
 
 ### Key Design Decisions
@@ -111,8 +125,14 @@ Integration tests organized by feature area:
   the backtracking one is superlinear with SSA values live across it; that
   code runs about 2x slower
 - **Every reference is colocated**: functions and data, the runtime's and libc's
-  included, are reached with `call rel32` and RIP-relative addresses; on Linux
-  the link is `-no-pie`
+  included, are reached PC-relative (`call rel32` and RIP-relative on x86-64,
+  `bl` and adrp+add on aarch64); on Linux the link is `-no-pie`, and macOS,
+  where executables are always PIE, needs nothing more
+- **Native only, two ISAs**: Cranelift's `x86` and `arm64` backends are built
+  in, and the compiler targets the host it was built for. aarch64 Linux can be
+  checked on an x86-64 host under qemu-user: cross-build with
+  `aarch64-linux-gnu-gcc` as the linker, and put a `cc` that is that compiler
+  first in PATH for the compiler's own link step
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility
@@ -126,20 +146,6 @@ Integration tests organized by feature area:
   reached through `Loc`; a scalar in an SSA value is a `Place::Var`
 - **Runtime checks on by default**: subscripts, division by zero, overflow
   and the rest; `--unsafe` removes them, and is refused with ON ERROR
-- **Two runtimes in lockstep**: `src/runtime/sysv/` and `src/runtime/win64-native/` export
-  the same `.globl` names; a new helper must be added to both
-- **Two assemblers, not just two runtimes**: `build.rs` assembles the runtime
-  with GNU `as` on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
-  assembler no test here runs. They disagree about `.equ len, . - label`: GNU
-  `as` folds it to an immediate, and an assembler that cannot prove the symbol
-  absolute assembles `mov reg, len` as a *load from that address* instead.
-  `CLS` did that on every Windows run. Bracket data with an `_end` label and
-  subtract at run time
-- **A runtime helper should take at most four arguments**: Win64 passes only
-  four in registers, so a fifth is on the stack, where the hand-written Win64
-  helper must find it above the shadow space. Cranelift places it correctly,
-  but `_rt_instr` and `_rt_mid_assign` show what the runtime side costs; fold an
-  argument away where possible (see `_rt_file_open_random`)
 - **Unsupported GW-BASIC names are refused, not ignored**: an unrecognised name
   is otherwise just a new variable, so `UNSUPPORTED` in `sema.rs` names the
   keywords this compiler does not provide and why
@@ -149,7 +155,7 @@ Integration tests organized by feature area:
 - **Strings are owned and freed** (`codegen/strings.rs`): bit 63 of a string
   slot's length word marks bytes the slot owns, which assignment frees; a
   FIELD window owns nothing. A helper's result is a temporary to free only if
-  `rtsig` marks it `fresh` -- which a test checks reaches `malloc` -- so a new
+  `rtsig` marks it `fresh` -- which a test checks reaches `alloc_str` -- so a new
   helper that allocates must say so, and one that returns a slice or a static
   buffer must not. The runtime allocates every string with `malloc`, never
   `HeapAlloc`, since generated code frees with `free`
@@ -170,10 +176,13 @@ Integration tests organized by feature area:
   on `_err_resume_label`. By-reference parameters are real
   references, so the handler sees what a procedure wrote. Only programs with
   ON ERROR pay for any of this
-- **Every helper follows its platform's standard ABI**: a double goes where the
-  ABI puts it -- by position on Win64, so `(file, value)` passes the value in
-  xmm1 there. `rtsig.rs` lists one signature that serves both ABIs, and codegen
-  builds each call's Cranelift signature from it
+- **Runtime helpers use System V on x86-64, on every OS**: a string result
+  is two words returned in rax:rdx, as Cranelift returns two values, where
+  the Windows C convention would return it through a hidden pointer. So
+  `export!` defines each helper `extern "sysv64"` on x86-64 and codegen calls
+  it with `CallConv::SystemV` (`RT_CALL_CONV`); elsewhere both use the
+  platform's C convention, which returns two words in two registers.
+  `rtsig.rs` lists one signature, and codegen builds each call from it
 
 ## Language Reference
 

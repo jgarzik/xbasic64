@@ -658,3 +658,20 @@ fn test_legacy_print_forms() {
     let out = compile_and_run("? \"a\"\"b\"\n?1+1\nPRINT \"open\nPRINT \"next\"\n").unwrap();
     assert_eq!(crate::common::lines(&out), &["ab", "2", "open", "next"]);
 }
+
+/// A negative number in a `$$` or `**$` field has its sign before the
+/// dollar sign, as GW-BASIC writes it: -$12.50, not $-12.50.
+#[test]
+fn test_print_using_negative_currency() {
+    let out = compile_and_run(
+        "PRINT USING \"$$###.##\"; -12.5\nPRINT USING \"**$###.##\"; -12.5\nPRINT USING \"$$###.##\"; 12.5\n",
+    )
+    .unwrap();
+    let lines = crate::common::lines(&out);
+    assert_eq!(lines[0], "-$12.50");
+    assert!(
+        lines[1].ends_with("-$12.50") && lines[1].starts_with('*'),
+        "{lines:?}"
+    );
+    assert_eq!(lines[2], "$12.50");
+}

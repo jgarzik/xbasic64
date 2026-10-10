@@ -387,62 +387,6 @@ PRINT Y
     assert!(run.stderr.contains("Overflow"), "stderr {}", run.stderr);
 }
 
-/// No runtime helper may fall through into the next one.
-///
-/// Sections are not laid out in source order, so a helper that ran off its
-/// end into its neighbour would land somewhere else entirely once each is
-/// sectioned separately. `_rt_lcase` used to do this, into `_rt_case_convert`.
-#[test]
-fn test_no_runtime_helper_falls_through() {
-    for tree in ["sysv", "win64-native"] {
-        for file in [
-            "print.s", "input.s", "string.s", "math.s", "data.s", "file.s", "error.s", "using.s",
-        ] {
-            // Anchored at the manifest rather than the working directory,
-            // which a test runner is free to set wherever it likes.
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src/runtime")
-                .join(tree)
-                .join(file);
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
-            let mut previous: Option<String> = None;
-            for line in text.lines() {
-                let t = line.trim();
-                if t.starts_with("_rt_")
-                    && t.ends_with(':')
-                    && let Some(prev) = &previous
-                {
-                    let op = prev.split_whitespace().next().unwrap_or("");
-                    // `_rt_error` never returns, so reaching a label after
-                    // a call to it is not a fall-through.
-                    let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
-                        || prev.starts_with("call _rt_error");
-                    assert!(
-                        terminal,
-                        "{} falls into {} from `{}`",
-                        path.display(),
-                        t,
-                        prev
-                    );
-                }
-                // Track the last thing that is an instruction: not a comment,
-                // not a directive, and not a label -- including the
-                // `name: .skip 1024` form, whose first token ends in a colon
-                // but whose line does not.
-                let first = t.split_whitespace().next().unwrap_or("");
-                if !t.is_empty()
-                    && !t.starts_with('#')
-                    && !t.starts_with('.')
-                    && !first.ends_with(':')
-                {
-                    previous = Some(t.to_string());
-                }
-            }
-        }
-    }
-}
-
 /// Several accumulators in one loop all accumulate.
 #[test]
 fn test_accumulator_promotion_has_a_limit() {

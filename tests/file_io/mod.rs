@@ -1076,3 +1076,81 @@ PRINT "["; X$; "]["; Y$; "]["; Z$; "]"
         vec!["10  0  20", "[ab][][cd]"]
     );
 }
+
+/// The widest FIELD width a program can pass, the largest LONG, is FIELD
+/// overflow (error 50), not a window past the record buffer. (A width past
+/// LONG is Overflow before it reaches the runtime, whose own check cannot
+/// wrap either: see rt's `a_huge_field_width_is_field_overflow`.)
+#[test]
+fn test_field_width_that_wraps_is_overflow() {
+    let (out, _tmp) = compile_and_run_with_files(
+        r#"
+ON ERROR GOTO H
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 16
+FIELD #1, 3 AS A$, 2147483647 AS B$
+PRINT "no"
+END
+H:
+PRINT ERR
+END
+"#,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["50"]);
+}
+
+/// A FIELD variable still names its window after its file is closed and
+/// the number opened again: QuickBASIC leaves its value undefined, but
+/// using it must not touch freed memory. The record buffer outlives the
+/// file, and a fresh OPEN reuses it.
+#[test]
+fn test_field_variable_after_its_file_is_reopened() {
+    let (out, _tmp) = compile_and_run_with_files(
+        r#"
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS F$
+LSET F$ = "abc"
+PUT #1, 1
+CLOSE #1
+FOR I = 1 TO 50
+  OPEN "s.txt" FOR OUTPUT AS #1
+  PRINT #1, "x"
+  CLOSE #1
+  OPEN "r.dat" FOR RANDOM AS #1 LEN = 8
+  LSET F$ = "zz"
+  CLOSE #1
+NEXT
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 8
+FIELD #1, 8 AS G$
+GET #1, 1
+PRINT "["; G$; "]"
+CLOSE #1
+"#,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["[abc     ]"]);
+}
+
+/// FIELD on a number that was opened FOR RANDOM and then closed is Bad file
+/// number (error 52): the record buffer outlives the file, the file does not.
+#[test]
+fn test_field_on_a_closed_random_file() {
+    let (out, _tmp) = compile_and_run_with_files(
+        r#"
+ON ERROR GOTO H
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 8
+CLOSE #1
+FIELD #1, 4 AS F$
+PRINT "no"
+END
+H:
+PRINT ERR
+END
+"#,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["52"]);
+}

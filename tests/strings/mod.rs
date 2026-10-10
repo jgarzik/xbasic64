@@ -562,7 +562,8 @@ fn test_val_overflow_is_an_error() {
 /// must still finish. The cases are each place a string can be dropped:
 /// reassignment, a temporary, a FUNCTION result, a BYVAL copy, a local
 /// array, REDIM, a record field and record copy, and a SELECT selector.
-#[cfg(unix)]
+// `ulimit -v` limits the address space on Linux; macOS does not enforce it.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_string_churn_runs_in_bounded_memory() {
     let src = r#"
@@ -629,7 +630,8 @@ PRINT LEN(A$); LEN(B$); LEN(C$); LEN(S$(3))
 /// with about 60 KB of them live, once while the arguments are evaluated
 /// and once when the call itself is left by a RESUME to a label; leaking
 /// them is over 2 GB, against a 256 MB address-space limit.
-#[cfg(unix)]
+// `ulimit -v` limits the address space on Linux; macOS does not enforce it.
+#[cfg(target_os = "linux")]
 #[test]
 fn test_error_path_frees_temporaries() {
     let src = r#"
@@ -745,4 +747,15 @@ PRINT REC$(3)
             "3 2 1 0"
         ]
     );
+}
+
+/// A number longer than any buffer keeps its magnitude: the digits past
+/// what can matter still count as places.
+#[test]
+fn test_val_of_a_very_long_number() {
+    let out = compile_and_run(
+        "A$ = \"1\" + STRING$(129, \"0\")\nPRINT VAL(A$)\nPRINT VAL(\"0.\" + STRING$(200, \"0\") + \"5\")\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["1D+129", "5D-201"]);
 }

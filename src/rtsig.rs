@@ -99,7 +99,7 @@ pub static HELPERS: &[RtHelper] = &[
     h("_rt_input_string", &[], STR),
     fallible(h("_rt_input_line", &[I64, I64, I64, I64], &[])),
     h("_rt_input_field_num", &[I64], &[F64]),
-    fresh(h("_rt_input_field_str", &[I64], STR)),
+    fallible(fresh(h("_rt_input_field_str", &[I64], STR))),
     h("_rt_cls", &[], &[]),
     h("_rt_beep", &[], &[]),
     h("_rt_pos", &[], &[I32]),
@@ -153,7 +153,7 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_lock", &[I64, I64, I64, I64], &[])),
     fallible(h("_rt_unlock", &[I64, I64, I64, I64], &[])),
     // (value bits, width)
-    fresh(h("_rt_mk", &[I64, I64], STR)),
+    fallible(fresh(h("_rt_mk", &[I64, I64], STR))),
     // (pointer, length, line)
     fallible(h("_rt_cvi", &[I64, I64, I64], &[F64])),
     fallible(h("_rt_cvl", &[I64, I64, I64], &[F64])),
@@ -166,28 +166,28 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_array_autodim", &[I64, I64, I64, I64], &[])),
     // Strings
     fallible(h("_rt_val", STR, &[F64])),
-    fresh(h("_rt_str", &[F64], STR)),
-    fresh(h("_rt_str_single", &[F64], STR)),
-    fresh(h("_rt_chr", &[I64], STR)),
-    fresh(h("_rt_space", &[I64], STR)),
-    fresh(h("_rt_hex", &[I64], STR)),
-    fresh(h("_rt_oct", &[I64], STR)),
+    fallible(fresh(h("_rt_str", &[F64], STR))),
+    fallible(fresh(h("_rt_str_single", &[F64], STR))),
+    fallible(fresh(h("_rt_chr", &[I64], STR))),
+    fallible(fresh(h("_rt_space", &[I64], STR))),
+    fallible(fresh(h("_rt_hex", &[I64], STR))),
+    fallible(fresh(h("_rt_oct", &[I64], STR))),
     // (count, character code)
-    fresh(h("_rt_string_n", &[I64, I64], STR)),
+    fallible(fresh(h("_rt_string_n", &[I64, I64], STR))),
     h("_rt_ltrim", STR, STR),
     h("_rt_rtrim", STR, STR),
-    fresh(h("_rt_ucase", STR, STR)),
-    fresh(h("_rt_lcase", STR, STR)),
-    fresh(h("_rt_strdup", STR, STR)),
+    fallible(fresh(h("_rt_ucase", STR, STR))),
+    fallible(fresh(h("_rt_lcase", STR, STR))),
+    fallible(fresh(h("_rt_strdup", STR, STR))),
     // (pointer, length, width)
-    fresh(h("_rt_fixed", &[I64, I64, I64], STR)),
+    fallible(fresh(h("_rt_fixed", &[I64, I64, I64], STR))),
     // (pointer, length, count)
     h("_rt_left", &[I64, I64, I64], STR),
     h("_rt_right", &[I64, I64, I64], STR),
     // (pointer, length, start, count)
     h("_rt_mid", &[I64, I64, I64, I64], STR),
     // (left pointer, left length, right pointer, right length)
-    fresh(h("_rt_strcat", &[I64, I64, I64, I64], STR)),
+    fallible(fresh(h("_rt_strcat", &[I64, I64, I64, I64], STR))),
     h("_rt_strcmp", &[I64, I64, I64, I64], &[I32]),
     // (haystack pointer, haystack length, needle pointer, needle length, start)
     fallible(h("_rt_instr", &[I64, I64, I64, I64, I64], &[I64])),
@@ -197,8 +197,8 @@ pub static HELPERS: &[RtHelper] = &[
     h("_rt_rnd", &[F64], &[F64]),
     h("_rt_randomize", &[F64], &[]),
     h("_rt_timer", &[], &[F64]),
-    fresh(h("_rt_date", &[], STR)),
-    fresh(h("_rt_time", &[], STR)),
+    fallible(fresh(h("_rt_date", &[], STR))),
+    fallible(fresh(h("_rt_time", &[], STR))),
 ];
 
 /// The helper called `name`.
@@ -218,71 +218,122 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
-    /// Labels and the labels each can transfer control to, for one tree.
+    /// The runtime's sources, `rt/src/*.rs`, by module name.
+    const RT_SOURCES: [(&str, &str); 11] = [
+        ("data", include_str!("../rt/src/data.rs")),
+        ("error", include_str!("../rt/src/error.rs")),
+        ("file", include_str!("../rt/src/file.rs")),
+        ("input", include_str!("../rt/src/input.rs")),
+        ("crate", include_str!("../rt/src/lib.rs")),
+        ("math", include_str!("../rt/src/math.rs")),
+        ("num", include_str!("../rt/src/num.rs")),
+        ("print", include_str!("../rt/src/print.rs")),
+        ("string", include_str!("../rt/src/string.rs")),
+        ("sys", include_str!("../rt/src/sys.rs")),
+        ("using", include_str!("../rt/src/using.rs")),
+    ];
+
+    /// A function: its file's module, and its name.
+    type Func = (&'static str, String);
+
+    /// Each function in the runtime, and the functions its body may call --
+    /// a call graph read from the text.
     ///
-    /// Deliberately crude, and conservative in the right direction: every
-    /// jump or call to a label is an edge, and so is falling off the end of
-    /// one label into the next unless the last instruction was a `jmp` or
-    /// `ret`. It can only over-report what reaches a label.
-    fn control_flow(source: &str) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
-        let is_label = |s: &str| {
-            !s.is_empty()
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-        };
-        let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        let mut exported = BTreeSet::new();
-        let mut current: Option<String> = None;
-        let mut ended = false;
-        for raw in source.lines() {
-            let line = raw.split('#').next().unwrap().trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(name) = line.strip_prefix(".globl ") {
-                exported.insert(name.trim().to_string());
-                continue;
-            }
-            // A label, alone or followed by data on the same line
-            // (`_mode: .asciz "r+b"`). Data is never executed, so nothing
-            // falls through a data label.
-            if let Some((label, rest)) = line.split_once(':')
-                && is_label(label)
-            {
-                if let Some(prev) = &current
-                    && !ended
-                {
-                    edges.get_mut(prev).unwrap().insert(label.to_string());
+    /// Deliberately crude, and conservative in the right direction: a name
+    /// mentioned in a body is a call. `m::f` is `f` in `m.rs` when there is
+    /// such a file; a bare `f` (or one under some other path) is `f` in the
+    /// same file if it has one, else every `f`; and functions of one name in
+    /// one file are merged. It can only over-report what a function reaches.
+    fn call_graph() -> BTreeMap<Func, BTreeSet<Func>> {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        // (module, name) -> the (qualifier, name) pairs its body mentions.
+        let mut mentions: BTreeMap<Func, Vec<(String, String)>> = BTreeMap::new();
+        for (module, source) in RT_SOURCES {
+            // Comments and character literals hold braces that are not code.
+            let code: String = source
+                .lines()
+                .map(|l| l.split("//").next().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                .replace("'{'", "' '")
+                .replace("'}'", "' '");
+            let mut rest = code.as_str();
+            while let Some(at) = rest.find("fn ") {
+                let after = &rest[at + 3..];
+                let name: String = after.chars().take_while(|c| ident(*c)).collect();
+                let word_start = !rest[..at].chars().last().is_some_and(ident);
+                let Some(open) = after.find('{') else { break };
+                // A declaration (`fn f();` in an extern block) has no body.
+                if name.is_empty() || !word_start || after[..open].contains(';') {
+                    rest = &rest[at + 3..];
+                    continue;
                 }
-                current = Some(label.to_string());
-                edges.entry(label.to_string()).or_default();
-                ended = !rest.trim().is_empty();
-                continue;
+                let mut depth = 0;
+                let mut close = open;
+                for (i, c) in after[open..].char_indices() {
+                    match c {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                close = open + i;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &after[open..close];
+                let entry = mentions.entry((module, name)).or_default();
+                let mut prev = "";
+                let mut words = body.split_inclusive(|c: char| !ident(c)).peekable();
+                while let Some(w) = words.next() {
+                    let word = w.trim_end_matches(|c: char| !ident(c));
+                    if !word.is_empty() {
+                        entry.push((prev.to_string(), word.to_string()));
+                    }
+                    // `a::b`: remember `a` as `b`'s qualifier.
+                    prev = if w.ends_with(':') && words.peek().is_some_and(|n| n == &":") {
+                        word
+                    } else {
+                        ""
+                    };
+                }
+                rest = &after[open + 1..];
             }
-            let Some(cur) = &current else { continue };
-            if line.starts_with('.') {
-                continue; // a directive, not an instruction
-            }
-            let mut words = line.split_whitespace();
-            let op = words.next().unwrap();
-            let arg = words.next().unwrap_or("");
-            if (op.starts_with('j') || op == "call") && is_label(arg) {
-                edges.get_mut(cur).unwrap().insert(arg.to_string());
-            }
-            ended = op == "jmp" || op == "ret";
         }
-        (edges, exported)
+        let defined: BTreeSet<Func> = mentions.keys().cloned().collect();
+        let modules: BTreeSet<&str> = RT_SOURCES.iter().map(|(m, _)| *m).collect();
+        let mut graph = BTreeMap::new();
+        for (func, words) in &mentions {
+            let mut callees = BTreeSet::new();
+            for (qualifier, name) in words {
+                let in_module = |m: &'static str| defined.get(&(m, name.clone())).cloned();
+                if let Some(m) = modules.get(qualifier.as_str())
+                    && let Some(f) = in_module(m)
+                {
+                    callees.insert(f);
+                } else if let Some(f) = in_module(func.0) {
+                    callees.insert(f);
+                } else {
+                    callees.extend(defined.iter().filter(|(_, n)| n == name).cloned());
+                }
+            }
+            graph.insert(func.clone(), callees);
+        }
+        graph
     }
 
-    fn reaches_error(edges: &BTreeMap<String, BTreeSet<String>>, from: &str) -> bool {
+    /// Whether the helper `from` reaches a function named in `targets`.
+    fn reaches(graph: &BTreeMap<Func, BTreeSet<Func>>, from: &str, targets: &[&str]) -> bool {
         let mut seen = BTreeSet::new();
-        let mut work = vec![from.to_string()];
-        while let Some(label) = work.pop() {
-            if label == "_rt_error" || label == "_rt_error_num" {
+        let mut work: Vec<Func> = graph.keys().filter(|(_, n)| n == from).cloned().collect();
+        while let Some(func) = work.pop() {
+            if targets.contains(&func.1.as_str()) {
                 return true;
             }
-            if seen.insert(label.clone())
-                && let Some(next) = edges.get(&label)
+            if seen.insert(func.clone())
+                && let Some(next) = graph.get(&func)
             {
                 work.extend(next.iter().cloned());
             }
@@ -290,81 +341,60 @@ mod tests {
         false
     }
 
-    /// Every helper that says its string result is fresh allocates, in both
-    /// trees: generated code frees such a result, and freeing a slice or a
-    /// static buffer instead would corrupt the heap.
+    /// Every helper that says its string result is fresh allocates it, and
+    /// every one that does not, does not: generated code frees a fresh
+    /// result, and freeing a slice or a static buffer would corrupt the heap,
+    /// while not freeing a fresh one leaks it. `alloc_str` is the only
+    /// allocator of returned strings.
     #[test]
-    fn test_fresh_helpers_allocate() {
-        for (tree, source) in crate::runtime::tree_sources() {
-            let (edges, _) = control_flow(&source);
-            for helper in HELPERS.iter().filter(|h| h.fresh) {
-                let mut seen = BTreeSet::new();
-                let mut work = vec![helper.name.to_string()];
-                let mut found = false;
-                while let Some(label) = work.pop() {
-                    if label == "malloc" {
-                        found = true;
-                        break;
-                    }
-                    if seen.insert(label.clone())
-                        && let Some(next) = edges.get(&label)
-                    {
-                        work.extend(next.iter().cloned());
-                    }
-                }
-                assert!(
-                    found,
-                    "{} is marked fresh but never calls malloc in the {tree} runtime",
-                    helper.name
-                );
-                assert_eq!(
-                    helper.rets, STR,
-                    "{} is fresh, so returns a string",
-                    helper.name
-                );
-            }
+    fn test_fresh_matches_the_runtime() {
+        let graph = call_graph();
+        for helper in HELPERS.iter().filter(|h| h.rets == STR) {
+            assert_eq!(
+                helper.fresh,
+                reaches(&graph, helper.name, &["alloc_str"]),
+                "{}: fresh is {}",
+                helper.name,
+                helper.fresh
+            );
+        }
+        for helper in HELPERS.iter().filter(|h| h.fresh) {
+            assert_eq!(
+                helper.rets, STR,
+                "{} is fresh, so returns a string",
+                helper.name
+            );
         }
     }
 
-    /// Every helper in the table is exported by both runtime trees.
+    /// Every helper in the table is a function of the runtime.
     #[test]
-    fn test_every_helper_exists_in_both_trees() {
-        for (tree, source) in crate::runtime::tree_sources() {
-            let (_, exported) = control_flow(&source);
-            for helper in HELPERS {
-                assert!(
-                    exported.contains(helper.name),
-                    "{} is in rtsig.rs but not exported by the {tree} runtime",
-                    helper.name
-                );
-            }
+    fn test_every_helper_is_in_the_runtime() {
+        let graph = call_graph();
+        for helper in HELPERS {
+            assert!(
+                graph.keys().any(|(_, n)| n == helper.name),
+                "{} is in rtsig.rs but not defined in rt/src",
+                helper.name
+            );
         }
     }
 
-    /// `fallible` says exactly whether a helper can reach `_rt_error` in
-    /// either tree.
+    /// `fallible` says exactly whether a helper can raise an error a
+    /// handler may trap.
     #[test]
-    fn test_fallible_matches_the_assembly() {
-        let trees: Vec<_> = crate::runtime::tree_sources()
-            .into_iter()
-            .map(|(tree, source)| (tree, control_flow(&source).0))
-            .collect();
+    fn test_fallible_matches_the_runtime() {
+        let graph = call_graph();
         for helper in HELPERS {
             if helper.name == "_rt_error" || helper.name == "_rt_fatal" {
                 continue;
             }
-            let reaching: Vec<&str> = trees
-                .iter()
-                .filter(|(_, edges)| reaches_error(edges, helper.name))
-                .map(|(tree, _)| *tree)
-                .collect();
             assert_eq!(
                 helper.fallible,
-                !reaching.is_empty(),
-                "{}: fallible is {} but _rt_error is reachable in {:?}",
+                reaches(&graph, helper.name, &["raise_with_code"]),
+                "{}: fallible is {}",
                 helper.name,
-                helper.fallible,
-                reaching
+                helper.fallible
             );
         }
     }
@@ -383,6 +413,7 @@ mod tests {
             include_str!("codegen/io.rs"),
             include_str!("codegen/stmt.rs"),
             include_str!("codegen/storage.rs"),
+            include_str!("codegen/strings.rs"),
             include_str!("codegen/trap.rs"),
         ] {
             let mut rest = source;

@@ -1,0 +1,21 @@
+[package]
+name = "xbasic64-rt"
+version = "1.0.2"
+# Also passed to rustc by the compiler's build.rs, which does not read this
+# file: change both together.
+edition = "2024"
+authors = ["Jeff Garzik <jgarzik@pobox.com>"]
+description = "The runtime library linked into every program xbasic64 compiles"
+license = "MIT"
+publish = false
+rust-version = "1.96"
+
+# Built for real by the compiler's build.rs, with rustc, as a no_std
+# staticlib for the target. Cargo builds it only as an rlib, so that clippy
+# and the unit tests (which run with std) cover it.
+[lib]
+path = "src/lib.rs"
+doctest = false
+
+[dev-dependencies]
+tempfile = "3"

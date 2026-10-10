@@ -298,6 +298,18 @@ pub struct CodeGen {
     for_slots: HashMap<usize, DataId>,
 }
 
+/// The convention runtime helpers are called with, where it is not the
+/// platform's: on x86-64 the runtime (`rt/`, `export!`) uses System V on
+/// every OS, Windows included, because a string result is two words returned
+/// in rax:rdx -- as Cranelift returns two values -- where the Windows C
+/// convention would return it through a hidden pointer. Elsewhere the C
+/// convention already returns two words in two registers.
+const RT_CALL_CONV: Option<CallConv> = if cfg!(target_arch = "x86_64") {
+    Some(CallConv::SystemV)
+} else {
+    None
+};
+
 /// Lower `program` to an object file.
 pub fn generate(
     program: &Program,
@@ -427,7 +439,11 @@ fn make_isa(huge: bool) -> Result<OwnedTargetIsa, String> {
     }
     let mut isa = cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
         .map_err(|e| e.to_string())?;
-    isa.set("has_sse41", "true").map_err(|e| e.to_string())?;
+    // x86-64's baseline has no SSE4.1, whose roundsd `nearest`, `floor` and
+    // `trunc` use instead of a libcall. aarch64 has its equivalents always.
+    if cfg!(target_arch = "x86_64") {
+        isa.set("has_sse41", "true").map_err(|e| e.to_string())?;
+    }
     isa.finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())
 }
@@ -653,6 +669,7 @@ impl CodeGen {
         }
         let mut sig = Signature::new(self.call_conv);
         if name.starts_with("_rt_") {
+            sig.call_conv = RT_CALL_CONV.unwrap_or(self.call_conv);
             let h = rtsig::lookup(name);
             sig.params
                 .extend(h.params.iter().map(|t| AbiParam::new(rt_type(*t))));

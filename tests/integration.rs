@@ -18,7 +18,6 @@ mod math;
 mod megatest;
 mod print;
 mod procedures;
-mod runtime;
 mod strings;
 mod types;
 mod variables;
