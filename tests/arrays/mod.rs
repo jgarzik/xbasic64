@@ -292,3 +292,27 @@ fn test_option_base_one_bounds_and_created_arrays() {
         run.stderr
     );
 }
+
+/// An array too large to address is Out of memory, not a small block.
+///
+/// The size is the product of the dimensions' counts and the element size,
+/// and 65536^4 * 2 bytes is 2^65: computed in 64 bits it wrapped to 0, calloc
+/// returned a block of nothing, and every subscript still passed its bounds
+/// check -- so the assignment below wrote far outside the heap and the
+/// program carried on as if nothing had happened.
+#[test]
+fn test_array_size_overflow_is_out_of_memory() {
+    for src in [
+        "DIM A%(65535, 65535, 65535, 65535)\nPRINT \"allocated\"\nA%(65535, 65535, 65535, 65535) = 7\n",
+        "DIM A%(1, 1, 1, 1)\nREDIM A%(65535, 65535, 65535, 65535)\nPRINT \"allocated\"\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(src, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{src}\nstdout {:?}", run.stdout);
+        assert!(
+            run.stderr.contains("Out of memory"),
+            "got: {:?}",
+            run.stderr
+        );
+        assert!(!run.stdout.contains("allocated"), "{src}");
+    }
+}

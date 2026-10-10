@@ -568,13 +568,29 @@ impl FnGen<'_> {
     }
 
     /// Total bytes an array's descriptor describes.
+    ///
+    /// A size that does not fit 64 bits is Out of memory. Wrapping instead
+    /// -- 65536^4 two-byte elements is 2^65 bytes, which wraps to 0 -- would
+    /// allocate a small block that every subscript's bounds check still
+    /// admits, and writes would land outside it.
     fn descriptor_bytes(&mut self, loc: Loc, ndims: usize, elem_size: i64) -> Value {
         let mut n = self.load(types::I64, loc.offset(8));
-        for i in 1..ndims {
-            let c = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
-            n = self.b.ins().imul(n, c);
+        let size = self.iconst(types::I64, elem_size);
+        for i in 1..=ndims {
+            let factor = if i < ndims {
+                self.load(types::I64, loc.offset(8 * (1 + i as i32)))
+            } else {
+                size
+            };
+            n = if self.cg.opts.checks {
+                let (p, of) = self.b.ins().umul_overflow(n, factor);
+                self.raise_if(of, RtError::OutOfMemory);
+                p
+            } else {
+                self.b.ins().imul(n, factor)
+            };
         }
-        self.b.ins().imul_imm_s(n, elem_size)
+        n
     }
 
     /// Emit storage for one DIM/REDIM declarator.
