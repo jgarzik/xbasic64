@@ -2047,6 +2047,37 @@ fn test_on_error_traps_the_error_statement() {
     assert_eq!(out.trim(), "62");
 }
 
+/// `ERROR n` sets ERR to n even for a number GW-BASIC has no message for,
+/// which is how a program raises errors of its own: `ERROR 200` and then
+/// `IF ERR = 200` in the handler.
+///
+/// ERR used to be found by looking the message up in the table, and every
+/// unlisted number shares the one "Unprintable error" message, which the table
+/// does not list -- so ERR was 0 and the idiom failed silently. Listed numbers
+/// were unaffected, apart from a number that shares its message with another:
+/// `ERROR 7` and the GOSUB overflow both say "Out of memory".
+#[test]
+fn test_on_error_traps_an_unlisted_error_number() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 ERROR 200\n30 ERROR 7\n40 ERROR 1\n50 ERROR 255\n60 END\n\
+         100 PRINT ERR; ERL\n110 RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["200  20", "7  30", "1  40", "255  50"]
+    );
+}
+
+/// Untrapped, an unlisted number still reports GW-BASIC's "Unprintable
+/// error", with its line.
+#[test]
+fn test_unlisted_error_number_untrapped_reports_its_line() {
+    let run = compile_and_run_raw("10 PRINT \"x\"\n20 ERROR 200\n", "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert_eq!(run.stderr.trim(), "?Unprintable error in 20");
+}
+
 /// `ON ERROR GOTO 0` puts the fatal path back.
 #[test]
 fn test_on_error_goto_zero_disarms() {
