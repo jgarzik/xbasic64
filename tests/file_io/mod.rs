@@ -1053,3 +1053,23 @@ CLOSE 1
     let err = crate::common::compile_only("OPEN \"X\", 1, \"f\"\n").unwrap_err();
     assert!(err.contains("not O, I, A or R"), "got: {}", err.stderr);
 }
+
+/// An empty field between commas reads as 0 or "", and the field after it is
+/// still the next one, as GW-BASIC reads it. The comma used to be taken as the
+/// empty field's contents, so the next field ran on past the end of the file.
+#[test]
+fn test_input_hash_empty_fields() {
+    let source = r#"
+OPEN "e.txt" FOR INPUT AS #1
+INPUT #1, A, B, C
+INPUT #1, X$, Y$, Z$
+CLOSE #1
+PRINT A; B; C
+PRINT "["; X$; "]["; Y$; "]["; Z$; "]"
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |path| {
+        fs::write(path.join("e.txt"), "10,,20\nab,,cd\n").map_err(|e| e.to_string())
+    })
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["10  0  20", "[ab][][cd]"]);
+}

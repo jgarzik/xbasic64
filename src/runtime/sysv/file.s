@@ -793,6 +793,11 @@ _rt_file_read_field:
     cmp eax, 10                 # LF
     je .Lfield_skip
 
+    # A comma here ends an empty field: "10,,20" is three fields, the
+    # middle one 0 or "". Taken as the field's first character, it ran the
+    # rest of the line into this field and left the next one nothing.
+    cmp eax, ','
+    je .Lfield_done
     cmp eax, '"'
     je .Lfield_quoted
 
