@@ -791,7 +791,7 @@ _rt_file_read_field:
     mov ecx, ebx
     call _rt_file_getc
     cmp eax, -1
-    je .Lfield_done
+    je .Lfield_past_end
     cmp eax, ' '
     je .Lfield_skip
     cmp eax, 9                  # tab
@@ -866,6 +866,9 @@ _rt_file_read_field:
     je .Lfield_done
     jmp .Lfield_after_quote
 
+.Lfield_past_end:
+    # No field left before the end of the file: "Input past end of file".
+    call .Lfile_past_end
 .Lfield_done:
     lea rax, [rip + _file_input_buf]
     mov BYTE PTR [rax + r12], 0
@@ -879,11 +882,14 @@ _rt_file_read_field:
     ret
 
 # _rt_file_input_number - INPUT #: read one numeric field
+#
+# Read as VAL reads a string; see the System V twin.
+#
 # Arguments:
 #   rcx = file number
 #
 # Returns:
-#   xmm0 = value read, or 0.0 for a field that is not a number
+#   xmm0 = value read
 .globl _rt_file_input_number
 _rt_file_input_number:
     push rbp
@@ -891,10 +897,15 @@ _rt_file_input_number:
     sub rsp, 32                 # shadow space
 
     call _rt_file_read_field
-    mov rcx, rax                # NUL-terminated by _rt_file_read_field
-    xor edx, edx                # endptr = NULL
-    call strtod
-
+    mov rcx, rax
+    call _rt_scan_number        # rdx is the field's length already
+    test edx, edx
+    jz .Lfile_input_number_done
+    lea rcx, [rip + _err_overflow]
+    xor edx, edx
+    call _rt_error              # returns only when trapped
+    xorpd xmm0, xmm0
+.Lfile_input_number_done:
     add rsp, 32
     leave
     ret

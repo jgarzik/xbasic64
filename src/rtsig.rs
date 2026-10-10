@@ -95,7 +95,9 @@ pub static HELPERS: &[RtHelper] = &[
     h("_rt_erl", &[], &[I32]),
     // Console
     h("_rt_input_string", &[], STR),
-    fallible(h("_rt_input_number", &[], &[F64])),
+    fallible(h("_rt_input_line", &[I64, I64, I64, I64], &[])),
+    h("_rt_input_field_num", &[I64], &[F64]),
+    h("_rt_input_field_str", &[I64], STR),
     h("_rt_cls", &[], &[]),
     h("_rt_beep", &[], &[]),
     h("_rt_pos", &[], &[I32]),

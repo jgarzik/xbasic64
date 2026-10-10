@@ -522,6 +522,17 @@ INPUT "X, Y: ", X, Y      ' Multiple values
 The separator decides the question mark: a `;` after the prompt adds `? `, a
 `,` suppresses it, and a prompt-less `INPUT` prints `? ` on its own.
 
+`INPUT` reads one line and splits it on commas, as GW-BASIC does: `INPUT A, B$`
+takes `3, hello` from a single line. A field may be quoted, which lets it hold
+a comma or keep its blanks; an unquoted one has its surrounding blanks dropped.
+A number is read as `VAL` reads one, and an empty field is 0 or `""`.
+
+Each field must suit its variable before any is stored. Text where a number
+belongs, a number too large for the variable (`40000` for an INTEGER), a quoted
+number, or too few fields prints `?Redo from start`, and the statement asks
+again, prompt and all. More fields than variables prints `?Extra ignored`.
+When the input has ended, every variable reads as empty.
+
 A `;` *before* the prompt is accepted and ignored:
 
 ```basic
@@ -1309,8 +1320,9 @@ LINE INPUT #1, Text$  ' Read entire line
 
 `INPUT #` reads one comma-delimited field per variable, skipping leading
 blanks and line breaks, so several fields may come from one line and one
-field may span several. A field wrapped in quotes may contain commas.
-`LINE INPUT #` takes a whole line, commas and all.
+field may span several. A field wrapped in quotes may contain commas. A numeric
+field is read as `VAL` reads a string. `LINE INPUT #` takes a whole line,
+commas and all.
 
 Reading past the end of a file is an error (`Input past end of file`), as is
 opening a file that is not there (`File not found`) or re-using a file number

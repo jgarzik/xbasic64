@@ -840,3 +840,30 @@ PRINT A$; B$
     .unwrap();
     assert_eq!(crate::common::lines(&output), vec!["onetwo"]);
 }
+
+/// INPUT # reads a numeric field as VAL reads a string, and reading when no
+/// field is left is "Input past end of file" (62). It used to read an empty
+/// field there, so a loop that forgot EOF() read zeros forever.
+#[test]
+fn test_input_hash_numbers_and_the_end_of_the_file() {
+    let output = compile_and_run(
+        r#"
+OPEN "n.txt" FOR OUTPUT AS #1
+PRINT #1, "1 2, &HFF, 1D2, abc"
+CLOSE #1
+ON ERROR GOTO 100
+OPEN "n.txt" FOR INPUT AS #1
+INPUT #1, A, B, C, D
+PRINT A; B; C; D
+INPUT #1, E
+PRINT "not reached"
+END
+100 PRINT "ERR"; ERR
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["12  255  100  0", "ERR 62"]
+    );
+}

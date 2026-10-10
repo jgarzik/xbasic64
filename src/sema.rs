@@ -32,6 +32,10 @@ use std::collections::{HashMap, HashSet};
 ///
 /// The table is 16 pointers wide and slot 0 is the console, so a program may
 /// use 1 through 15.
+/// The most variables one INPUT statement may read; the runtime's field table
+/// (`MAX_INPUT_FIELDS` in input.s) holds this many.
+pub const MAX_INPUT_VARS: usize = 64;
+
 pub const MAX_FILE_NUM: i64 = 15;
 
 /// Builtin functions, with the argument counts they accept.
@@ -1515,6 +1519,14 @@ impl Analyzer {
             StmtKind::Input { file_num, vars, .. } => {
                 if let Some(file_num) = file_num {
                     self.check_file_num(file_num, scope, line);
+                }
+                // The console form checks a whole line against every variable
+                // before storing any, in a table of this many fields.
+                if vars.len() > MAX_INPUT_VARS {
+                    self.error(
+                        line,
+                        format!("INPUT reads at most {} variables at once", MAX_INPUT_VARS),
+                    );
                 }
                 for var in vars {
                     self.check_lvalue(var, scope, line);

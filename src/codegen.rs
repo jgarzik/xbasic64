@@ -3302,24 +3302,56 @@ impl CodeGen {
                     (None, true) => Some("? ".to_string()),
                     (None, false) => None,
                 };
-                if let Some(text) = text {
-                    self.gen_console_prompt(&text);
+                if let Some(e) = file_num {
+                    let fnum = self.gen_file_num(e);
+                    for var in vars {
+                        self.emit_arg_file_num(0, &fnum);
+                        self.call_rt(if is_string_var(&var.name) {
+                            "_rt_file_input_string"
+                        } else {
+                            "_rt_file_input_number"
+                        });
+                        self.gen_store_lvalue(var);
+                    }
+                    return;
                 }
-                let fnum = file_num.as_ref().map(|e| self.gen_file_num(e));
-                for var in vars {
-                    let rt = match (&fnum, is_string_var(&var.name)) {
-                        (Some(f), string) => {
-                            self.emit_arg_file_num(0, f);
-                            if string {
-                                "_rt_file_input_string"
-                            } else {
-                                "_rt_file_input_number"
-                            }
-                        }
-                        (None, true) => "_rt_input_string",
-                        (None, false) => "_rt_input_number",
-                    };
-                    self.call_rt(rt);
+
+                // The console form reads and checks one whole line for the
+                // statement -- the runtime asks again, prompt and all, until
+                // every field suits its variable -- and then hands the values
+                // out one by one. It needs each variable's type for that.
+                let types: String = vars
+                    .iter()
+                    .map(|v| match self.expr_type(&Self::lvalue_expr(v)) {
+                        DataType::String => '$',
+                        DataType::Integer => 'I',
+                        DataType::Long => 'L',
+                        DataType::Single => 'S',
+                        DataType::Double => 'D',
+                    })
+                    .collect();
+                match text {
+                    Some(t) => {
+                        let idx = self.add_string_literal(&t);
+                        self.emit_arg_lea(0, &format!("[rip + _str_{}]", idx));
+                        self.emit_arg_imm(1, t.len() as i64);
+                    }
+                    None => {
+                        self.emit_arg_imm(0, 0);
+                        self.emit_arg_imm(1, 0);
+                    }
+                }
+                let idx = self.add_string_literal(&types);
+                self.emit_arg_lea(2, &format!("[rip + _str_{}]", idx));
+                self.emit_arg_imm(3, vars.len() as i64);
+                self.call_rt("_rt_input_line");
+                for (i, var) in vars.iter().enumerate() {
+                    self.emit_arg_imm(0, i as i64);
+                    self.call_rt(if is_string_var(&var.name) {
+                        "_rt_input_field_str"
+                    } else {
+                        "_rt_input_field_num"
+                    });
                     self.gen_store_lvalue(var);
                 }
             }

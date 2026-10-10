@@ -742,7 +742,7 @@ _rt_file_read_field:
     mov edi, ebx
     call _rt_file_getc
     cmp eax, -1
-    je .Lfield_done
+    je .Lfield_past_end
     cmp eax, ' '
     je .Lfield_skip
     cmp eax, 9                  # tab
@@ -818,6 +818,11 @@ _rt_file_read_field:
     je .Lfield_done
     jmp .Lfield_after_quote
 
+.Lfield_past_end:
+    # No field left before the end of the file: GW-BASIC's "Input past end
+    # of file" (62). This used to read an empty field, so a loop that forgot
+    # EOF() read zeros forever.
+    call .Lfile_past_end
 .Lfield_done:
     lea rax, [rip + _file_input_buf]
     mov BYTE PTR [rax + r12], 0
@@ -831,23 +836,32 @@ _rt_file_read_field:
     ret
 
 # _rt_file_input_number - INPUT #: read one numeric field
+#
+# The field is read as VAL reads a string (_rt_scan_number): text that is not
+# a number is 0, and one too large for a DOUBLE is Overflow. It used to go to
+# strtod, which took "inf", "nan" and "0x1F" and knew no D or &H.
+#
 # Arguments:
 #   rdi = file number
 #
 # Returns:
-#   xmm0 = value read, or 0.0 for a field that is not a number
+#   xmm0 = value read
 .globl _rt_file_input_number
 _rt_file_input_number:
     push rbp
     mov rbp, rsp
-    sub rsp, 16
 
     call _rt_file_read_field
-    mov rdi, rax                # NUL-terminated by _rt_file_read_field
-    xor esi, esi                # endptr = NULL
-    call strtod
-
-    add rsp, 16
+    mov rdi, rax
+    mov rsi, rdx
+    call _rt_scan_number
+    test edx, edx
+    jz .Lfile_input_number_done
+    lea rdi, [rip + _err_overflow]
+    xor esi, esi
+    call _rt_error                  # returns only when trapped
+    xorpd xmm0, xmm0
+.Lfile_input_number_done:
     leave
     ret
 
