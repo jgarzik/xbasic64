@@ -1186,7 +1186,6 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
         ("TIMER OFF\n", "TIMER OFF"),
         ("LINE (0, 0)-(10, 10)\n", "LINE"),
         ("DEF SEG = 0\n", "DEF SEG"),
-        ("DECLARE SUB S ()\n", "DECLARE"),
     ];
 
     for (source, name) in cases {

@@ -539,6 +539,14 @@ struct Promoted {
     loc: Loc,
 }
 
+/// A by-reference parameter's way back to the caller, at procedure exit.
+enum CopyBack {
+    /// A scalar or string, at its own width.
+    Typed { ptr: Loc, local: Loc, ty: DataType },
+    /// A record, or an array descriptor, word by word.
+    Words { ptr: Loc, local: Loc, words: i32 },
+}
+
 /// An array whose descriptor a loop is holding in registers.
 ///
 /// The element pointer and the per-dimension element counts do not change
@@ -1242,17 +1250,67 @@ impl CodeGen {
         }
     }
 
-    /// Value representation of a parameter: its `AS` clause when it has one,
-    /// otherwise the type its name's suffix implies.
+    /// How a parameter travels: an address for an array or a by-reference
+    /// parameter, otherwise its value -- `AS` clause or name suffix decides.
     ///
     /// A record parameter is passed as a pointer to the caller's copy, which
-    /// the prologue then copies into a local slot, so it arrives by value like
-    /// every other parameter without needing a new addressing mode.
+    /// the prologue then copies into a local slot.
+    ///
+    /// A by-reference parameter is copied in on entry and back out at exit
+    /// (`CopyBack`), so the procedure works on a local like any other.
     fn param_data_type(p: &Param) -> DataType {
+        // An array, and anything passed by reference, arrives as an address.
+        if p.array || !p.byval {
+            return DataType::Long;
+        }
+        Self::param_value_type(p)
+    }
+
+    /// The type a parameter holds inside the procedure.
+    fn param_value_type(p: &Param) -> DataType {
         match &p.ty {
             Some(TypeRef::Record(_)) => DataType::Long, // a pointer
             Some(t) => DataType::from_type_ref(t),
             None => DataType::from_suffix(&p.name),
+        }
+    }
+
+    /// Keep an incoming address in a frame slot of its own, for the copy
+    /// back at exit.
+    fn park_pointer(&mut self, src: &str) -> Loc {
+        self.stack_offset -= 8;
+        let slot = Loc::Frame(self.stack_offset);
+        emit!(self, "    mov {}, {}", slot.q(0), src);
+        slot
+    }
+
+    /// Copy a `ty` between the address in `reg` and `local`: into `local`
+    /// when `inward`, out of it otherwise. A value is moved at its own width,
+    /// since the other side may be an array element packed at that width.
+    fn emit_copy_typed(&mut self, reg: &str, local: &Loc, ty: DataType, inward: bool) {
+        let (size, scratch) = match ty {
+            DataType::Integer => ("WORD PTR", "ax"),
+            DataType::Long | DataType::Single => ("DWORD PTR", "eax"),
+            DataType::Double => ("QWORD PTR", "rax"),
+            DataType::String => {
+                for w in 0..2 {
+                    if inward {
+                        emit!(self, "    mov rax, QWORD PTR [{} + {}]", reg, w * 8);
+                        emit!(self, "    mov {}, rax", local.q(w));
+                    } else {
+                        emit!(self, "    mov rax, {}", local.q(w));
+                        emit!(self, "    mov QWORD PTR [{} + {}], rax", reg, w * 8);
+                    }
+                }
+                return;
+            }
+        };
+        if inward {
+            emit!(self, "    mov {}, {} [{}]", scratch, size, reg);
+            emit!(self, "    mov {}, {}", local.at(size, 0), scratch);
+        } else {
+            emit!(self, "    mov {}, {}", scratch, local.at(size, 0));
+            emit!(self, "    mov {} [{}], {}", size, reg, scratch);
         }
     }
 
@@ -2999,43 +3057,9 @@ impl CodeGen {
         let param_types: Vec<DataType> = params.iter().map(Self::param_data_type).collect();
         let (places, _) = Self::classify_params(&param_types);
 
+        let mut copy_backs: Vec<CopyBack> = Vec::new();
         for (param_decl, place) in params.iter().zip(&places) {
             let param = &param_decl.name;
-
-            // A record parameter arrives as a pointer to the caller's copy.
-            // Copying it into a local slot here gives by-value semantics and
-            // lets field access use ordinary frame addressing.
-            if let Some(TypeRef::Record(_)) = &param_decl.ty {
-                let ty = param_decl.ty.clone().expect("matched above");
-                let words = self.symbols.type_words(&ty);
-                self.stack_offset -= 8 * words;
-                let loc = Loc::Frame(self.stack_offset);
-                let src = match place.ptr {
-                    Slot::Reg(i) => int_regs[i].to_string(),
-                    Slot::Stk(i) => {
-                        emit!(self, "    mov r11, QWORD PTR [rbp + {}]", 16 + 8 * i as i32);
-                        "r11".to_string()
-                    }
-                };
-                emit!(self, "    mov r10, {}", src);
-                for w in 0..words {
-                    emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
-                    emit!(self, "    mov {}, rax", loc.q(w));
-                }
-                self.proc_record_vars.insert(param.clone(), loc);
-                self.proc_types.insert(param.clone(), ty);
-                continue;
-            }
-
-            self.stack_offset -= 8 * Self::words_for(place.ty);
-            let loc = Loc::Frame(self.stack_offset);
-            self.proc_vars.insert(
-                param.clone(),
-                VarInfo {
-                    loc: loc.clone(),
-                    data_type: place.ty,
-                },
-            );
 
             // Bring a slot's value into a register we can store from. r11 is
             // caller-saved and an argument register on neither ABI, so using it
@@ -3052,6 +3076,89 @@ impl CodeGen {
                     }
                 }
             };
+
+            // An array arrives as the address of the caller's descriptor. Its
+            // copy here is what the body indexes, and goes back at exit, so a
+            // REDIM or ERASE in here reaches the caller.
+            if param_decl.array {
+                let upper = param.to_uppercase();
+                if let Some(TypeRef::Record(_)) = &param_decl.ty {
+                    let ty = param_decl.ty.clone().expect("matched above");
+                    let words = self.symbols.type_words(&ty);
+                    self.proc_record_elem_words.insert(upper.clone(), words);
+                }
+                let info = self
+                    .lookup_array(&upper)
+                    .expect("sema registers an array parameter")
+                    .clone();
+                let words = 1 + 2 * info.ndims as i32;
+                let src = fetch(self, place.ptr);
+                let ptr_slot = self.park_pointer(&src);
+                emit!(self, "    mov r10, {}", ptr_slot.q(0));
+                for w in 0..words {
+                    emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
+                    emit!(self, "    mov {}, rax", info.loc.q(w));
+                }
+                copy_backs.push(CopyBack::Words {
+                    ptr: ptr_slot,
+                    local: info.loc,
+                    words,
+                });
+                continue;
+            }
+
+            // A record parameter arrives as a pointer to the caller's copy.
+            // Copying it into a local slot lets field access use ordinary
+            // frame addressing; by reference, it goes back at exit.
+            if let Some(TypeRef::Record(_)) = &param_decl.ty {
+                let ty = param_decl.ty.clone().expect("matched above");
+                let words = self.symbols.type_words(&ty);
+                self.stack_offset -= 8 * words;
+                let loc = Loc::Frame(self.stack_offset);
+                let src = fetch(self, place.ptr);
+                let ptr_slot = self.park_pointer(&src);
+                emit!(self, "    mov r10, {}", ptr_slot.q(0));
+                for w in 0..words {
+                    emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
+                    emit!(self, "    mov {}, rax", loc.q(w));
+                }
+                if !param_decl.byval {
+                    copy_backs.push(CopyBack::Words {
+                        ptr: ptr_slot,
+                        local: loc.clone(),
+                        words,
+                    });
+                }
+                self.proc_record_vars.insert(param.clone(), loc);
+                self.proc_types.insert(param.clone(), ty);
+                continue;
+            }
+
+            let value_type = Self::param_value_type(param_decl);
+            self.stack_offset -= 8 * Self::words_for(value_type);
+            let loc = Loc::Frame(self.stack_offset);
+            self.proc_vars.insert(
+                param.clone(),
+                VarInfo {
+                    loc: loc.clone(),
+                    data_type: value_type,
+                },
+            );
+
+            // By reference: the slot holds the address of the caller's
+            // variable. Its value is copied in here and back out at exit.
+            if !param_decl.byval {
+                let src = fetch(self, place.ptr);
+                let ptr_slot = self.park_pointer(&src);
+                emit!(self, "    mov r10, {}", ptr_slot.q(0));
+                self.emit_copy_typed("r10", &loc, value_type, true);
+                copy_backs.push(CopyBack::Typed {
+                    ptr: ptr_slot,
+                    local: loc,
+                    ty: value_type,
+                });
+                continue;
+            }
 
             match place.ty {
                 DataType::String => {
@@ -3121,6 +3228,24 @@ impl CodeGen {
         self.loop_stack = saved_loops;
         self.proc_exit_label = saved_exit;
         self.emit_label(&exit_label);
+        // Every route out passes here, so this is where by-reference
+        // parameters go back to the caller's variables -- before a FUNCTION's
+        // result is loaded into the registers it is returned in.
+        for cb in &copy_backs {
+            match cb {
+                CopyBack::Typed { ptr, local, ty } => {
+                    emit!(self, "    mov r10, {}", ptr.q(0));
+                    self.emit_copy_typed("r10", local, *ty, false);
+                }
+                CopyBack::Words { ptr, local, words } => {
+                    emit!(self, "    mov r10, {}", ptr.q(0));
+                    for w in 0..*words {
+                        emit!(self, "    mov rax, {}", local.q(w));
+                        emit!(self, "    mov QWORD PTR [r10 + {}], rax", w * 8);
+                    }
+                }
+            }
+        }
         // Every route out passes here, EXIT SUB included, so one decrement
         // matches the increment above -- a trapped error leaves through here
         // too, which is what brings the counter back to 0 by the time main's
@@ -3922,7 +4047,7 @@ impl CodeGen {
 
             // Where a name lives is decided when it is looked up; these only
             // tell the lookup.
-            StmtKind::Shared(_) | StmtKind::Static(_) => {}
+            StmtKind::Shared(_) | StmtKind::Static(_) | StmtKind::Declare { .. } => {}
 
             StmtKind::Read(vars) => {
                 for var in vars {
@@ -6754,6 +6879,60 @@ impl CodeGen {
         let mut temp_of: Vec<i32> = Vec::with_capacity(args.len());
         let mut w = 0i32;
         for (i, (arg, ty)) in args.iter().zip(&param_types).enumerate() {
+            let decl = param_decls.get(i).cloned();
+
+            // An array is passed as the address of its descriptor.
+            if let Some(Param { array: true, .. }) = &decl {
+                self.gen_array_descriptor_addr(arg);
+                emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
+                temp_of.push(w * 8);
+                w += 1;
+                continue;
+            }
+
+            // By reference, a variable, an array element or a field is passed
+            // as its address, so the procedure's changes reach it; anything
+            // else is evaluated into a temporary of the parameter's type, and
+            // its address passed.
+            if let Some(d) = &decl
+                && !d.byval
+                && !matches!(d.ty, Some(TypeRef::Record(_)))
+            {
+                let value_type = Self::param_value_type(d);
+                if !self.gen_lvalue_addr(arg, value_type) {
+                    self.stack_offset -= 8 * Self::words_for(value_type);
+                    let temp = Loc::Frame(self.stack_offset);
+                    if value_type == DataType::String {
+                        self.gen_expr(arg);
+                        emit!(self, "    mov {}, rax", temp.q(0));
+                        emit!(self, "    mov {}, rdx", temp.q(1));
+                    } else {
+                        let t = self.gen_expr(arg);
+                        self.gen_coercion(t, value_type);
+                        let operand = match value_type {
+                            DataType::Integer => (temp.at("WORD PTR", 0), "ax"),
+                            DataType::Long => (temp.at("DWORD PTR", 0), "eax"),
+                            DataType::Single => (temp.at("DWORD PTR", 0), "xmm0"),
+                            _ => (temp.q(0), "xmm0"),
+                        };
+                        match value_type {
+                            DataType::Single => {
+                                emit!(self, "    movss {}, {}", operand.0, operand.1)
+                            }
+                            DataType::Double => {
+                                emit!(self, "    movsd {}, {}", operand.0, operand.1)
+                            }
+                            _ => emit!(self, "    mov {}, {}", operand.0, operand.1),
+                        }
+                    }
+                    emit!(self, "    lea rax, {}", temp.q(0));
+                }
+                emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
+                temp_of.push(w * 8);
+                w += 1;
+                continue;
+            }
+
             // A record argument is passed as the address of the caller's copy.
             // Any record lvalue qualifies, not just a plain variable: passing
             // `A(1)` used to fall through to the numeric path below and hand
@@ -6830,6 +7009,75 @@ impl CodeGen {
         emit!(self, "    call _proc_{}", mangled);
         self.emit_error_check();
         emit!(self, "    add rsp, {}", stack_bytes + temp_bytes);
+    }
+
+    /// Leave in rax the address of `arg` when it is a variable, an array
+    /// element or a record field of type `ty` -- something a by-reference
+    /// parameter shares -- and say whether it was one.
+    fn gen_lvalue_addr(&mut self, arg: &Expr, ty: DataType) -> bool {
+        match arg {
+            Expr::Variable(name) => {
+                if self.symbols.consts.contains_key(normalized(name))
+                    || crate::sema::is_zero_arg_builtin(name)
+                    || self.symbols.procs.contains_key(&name.to_uppercase())
+                    || self.expr_type(arg) != ty
+                {
+                    return false;
+                }
+                let loc = match self.typed_storage(name) {
+                    Some((_, TypeRef::Record(_))) => return false,
+                    Some((loc, _)) => loc,
+                    None => self.get_var_info(name).loc,
+                };
+                emit!(self, "    lea rax, {}", loc.q(0));
+                true
+            }
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } if !indices.is_empty()
+                && self.lookup_array(&name.to_uppercase()).is_some()
+                && self.array_elem_type(name).is_none()
+                && DataType::from_suffix(name) == ty =>
+            {
+                let indices = indices.clone();
+                self.gen_array_addr(name, &indices);
+                true
+            }
+            Expr::Field { .. } => {
+                let Some((name, fields)) = Self::flatten_field_path(arg) else {
+                    return false;
+                };
+                let Some((loc, fty)) = self.resolve_field_path(&name, &fields) else {
+                    return false;
+                };
+                if matches!(fty, TypeRef::Record(_) | TypeRef::FixedString(_))
+                    || DataType::from_type_ref(&fty) != ty
+                {
+                    return false;
+                }
+                emit!(self, "    lea rax, {}", loc.q(0));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Leave in rax the address of the descriptor of the array `arg` names --
+    /// `A` or `A()` -- for an array parameter.
+    fn gen_array_descriptor_addr(&mut self, arg: &Expr) {
+        let name = match arg {
+            Expr::Variable(n) => n.to_uppercase(),
+            Expr::ArrayAccess { name, .. } | Expr::FnCall { name, .. } => name.to_uppercase(),
+            _ => unreachable!("sema requires an array argument"),
+        };
+        let loc = self
+            .lookup_array(&name)
+            .expect("sema checked the array exists")
+            .loc
+            .clone();
+        emit!(self, "    lea rax, {}", loc.q(0));
     }
 
     /// Emit storage for one DIM/REDIM declarator.

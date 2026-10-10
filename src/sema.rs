@@ -184,8 +184,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("STICK", "joystick input is not supported"),
     ("STRIG", "joystick input is not supported"),
     ("KEY", "KEY is not implemented yet"),
-    ("DECLARE", "DECLARE is not implemented yet"),
-    ("BYVAL", "BYVAL is not implemented yet"),
     ("ERDEV", "device error codes are specific to MS-DOS drivers"),
     (
         "ERDEV$",
@@ -663,7 +661,9 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
                     }
                 }
             }
-            StmtKind::Sub { params, .. } | StmtKind::Function { params, .. } => {
+            StmtKind::Sub { params, .. }
+            | StmtKind::Function { params, .. }
+            | StmtKind::Declare { params, .. } => {
                 for p in params.iter_mut() {
                     if p.ty.is_none()
                         && let Some(renamed) = defaulted(&p.name, table, procs)
@@ -944,6 +944,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::Data(_)
         | StmtKind::Shared(_)
         | StmtKind::Static(_)
+        | StmtKind::Declare { .. }
         | StmtKind::Restore(_)
         | StmtKind::Cls
         | StmtKind::End
@@ -968,6 +969,9 @@ struct Analyzer {
     /// Set by `const_eval` when a fold failed because the value overflowed its
     /// type, so the caller can say so rather than "not constant".
     fold_overflowed: std::cell::Cell<bool>,
+    /// Array parameters, (procedure, name), that the body never subscripts,
+    /// so whose number of dimensions no call can be checked against.
+    unranked_array_params: HashSet<(String, String)>,
 }
 
 impl Analyzer {
@@ -1310,9 +1314,29 @@ impl Analyzer {
                     if matches!(stmt.kind, StmtKind::Function { def_fn: true, .. }) {
                         self.symbols.def_fns.insert(name.to_uppercase());
                     }
+                    // An array parameter is an array of the procedure's own,
+                    // as many dimensions as the body subscripts it with -- the
+                    // declaration (`A()`) does not say. Its bounds are the
+                    // caller's, so it may have a lower bound.
+                    for p in params.iter().filter(|p| p.array) {
+                        let rank = subscript_count(body, &p.name);
+                        self.symbols.arrays.insert(
+                            (Scope::Proc(name.clone()), p.name.to_uppercase()),
+                            ArrayInfo {
+                                rank: rank.unwrap_or(1),
+                                line: stmt.line,
+                                has_lower: true,
+                                implicit: false,
+                            },
+                        );
+                        if rank.is_none() {
+                            self.unranked_array_params
+                                .insert((name.to_uppercase(), p.name.to_uppercase()));
+                        }
+                    }
                     // A parameter with an AS clause is a typed variable inside
                     // the body, so field access on it resolves.
-                    for p in params {
+                    for p in params.iter().filter(|p| !p.array) {
                         if let Some(ty) = &p.ty {
                             if let TypeRef::Record(r) = ty
                                 && !self.symbols.records.contains_key(normalized(r))
@@ -1665,6 +1689,12 @@ impl Analyzer {
             StmtKind::Call { name, args } => {
                 self.check_call(name, args, scope, line, true);
             }
+            StmtKind::Declare {
+                name,
+                is_function,
+                params,
+                ret_ty,
+            } => self.check_declare(name, *is_function, params, ret_ty.as_ref(), scope, line),
             StmtKind::Print {
                 file_num,
                 items,
@@ -2436,10 +2466,20 @@ impl Analyzer {
 
     /// Check a call, either as a statement (`is_stmt`) or in an expression.
     fn check_call(&mut self, name: &str, args: &[Expr], scope: &Scope, line: u32, is_stmt: bool) {
-        for a in args {
-            self.check_expr(a, scope, line);
-        }
         let upper = name.to_uppercase();
+        // An argument for an array parameter names a whole array, `A()`, and
+        // is checked as one below rather than as an element reference.
+        let array_params: Vec<bool> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.iter().map(|q| q.array).collect())
+            .unwrap_or_default();
+        for (i, a) in args.iter().enumerate() {
+            if array_params.get(i) != Some(&true) {
+                self.check_expr(a, scope, line);
+            }
+        }
 
         // An array indexed in an expression parses as a call when the DIM was
         // not seen first, so resolve against arrays before reporting.
@@ -2460,6 +2500,28 @@ impl Analyzer {
                 })
                 .collect();
             let (expected, is_function) = (proc.params.len(), proc.is_function);
+            // An array parameter takes an array, written `A()` or `A`, with
+            // the dimensions the procedure uses it with.
+            let param_arrays: Vec<Option<(String, String)>> = proc
+                .params
+                .iter()
+                .map(|p| p.array.then(|| (p.name.clone(), name.to_uppercase())))
+                .collect();
+            // A by-reference parameter given a variable shares that variable,
+            // so the two must be the same type -- QuickBASIC's "Parameter type
+            // mismatch". Anything else is evaluated into a temporary.
+            let param_types: Vec<Option<DataType>> = proc
+                .params
+                .iter()
+                .map(|p| {
+                    (!p.byval && !p.array && !matches!(p.ty, Some(TypeRef::Record(_)))).then(|| {
+                        match &p.ty {
+                            Some(t) => DataType::from_type_ref(t),
+                            None => DataType::from_suffix(&p.name),
+                        }
+                    })
+                })
+                .collect();
 
             // A record parameter takes the address of the caller's variable,
             // so the argument has to be a record lvalue of the same type --
@@ -2499,7 +2561,33 @@ impl Analyzer {
             }
 
             for (i, arg) in args.iter().enumerate() {
-                if matches!(param_records.get(i), Some(Some(_))) {
+                if let Some(Some((pname, pproc))) = param_arrays.get(i) {
+                    self.check_array_argument(arg, pname, pproc, scope, line, i + 1, name);
+                    continue;
+                }
+                if let Some(Some(want)) = param_types.get(i)
+                    && let Some(got) = self.lvalue_type(arg, scope)
+                    && got != *want
+                {
+                    self.error_with_note(
+                        line,
+                        format!(
+                            "argument {} of '{}' is passed by reference, so it must be {}, not {}",
+                            i + 1,
+                            name,
+                            type_name(*want),
+                            type_name(got)
+                        ),
+                        "pass an expression instead -- CINT(X), X + 0 -- or declare the parameter BYVAL"
+                            .to_string(),
+                    );
+                }
+            }
+
+            for (i, arg) in args.iter().enumerate() {
+                if matches!(param_records.get(i), Some(Some(_)))
+                    || matches!(param_arrays.get(i), Some(Some(_)))
+                {
                     continue;
                 }
                 let Some(want_string) = param_strings.get(i).copied() else {
@@ -2627,6 +2715,168 @@ impl Analyzer {
                 format!("did you mean '{}'?", sug),
             ),
             None => self.error(line, format!("unknown {} '{}'", what, name)),
+        }
+    }
+
+    /// A DECLARE must match the procedure it declares: the same kind, the
+    /// same parameters -- each of the same type, passing and arrayness -- and
+    /// the same result type.
+    fn check_declare(
+        &mut self,
+        name: &str,
+        is_function: bool,
+        params: &[Param],
+        ret_ty: Option<&TypeRef>,
+        scope: &Scope,
+        line: u32,
+    ) {
+        if scope != &Scope::Module {
+            self.error(line, "DECLARE belongs at module level");
+            return;
+        }
+        let Some(proc) = self.symbols.procs.get(&name.to_uppercase()) else {
+            self.error(line, format!("'{}' is declared but never defined", name));
+            return;
+        };
+        let def_line = proc.line;
+        let mut problems = Vec::new();
+        if proc.is_function != is_function {
+            problems.push(format!(
+                "it is defined as a {}",
+                if proc.is_function { "FUNCTION" } else { "SUB" }
+            ));
+        }
+        if proc.params.len() != params.len() {
+            problems.push(format!(
+                "it is defined with {} parameter{}",
+                proc.params.len(),
+                if proc.params.len() == 1 { "" } else { "s" }
+            ));
+        } else {
+            let ty = |p: &Param| match &p.ty {
+                Some(t) => DataType::from_type_ref(t),
+                None => DataType::from_suffix(&p.name),
+            };
+            for (i, (d, p)) in params.iter().zip(&proc.params).enumerate() {
+                if ty(d) != ty(p) || d.byval != p.byval || d.array != p.array {
+                    problems.push(format!("parameter {} differs from its definition", i + 1));
+                }
+            }
+        }
+        let declared = ret_ty.map(DataType::from_type_ref);
+        let defined = proc.ret_ty.as_ref().map(DataType::from_type_ref);
+        if is_function && proc.is_function && declared.is_some() && declared != defined {
+            problems.push("its result type differs".to_string());
+        }
+        for p in problems {
+            self.error_with_note(
+                line,
+                format!("DECLARE of '{}' does not match: {}", name, p),
+                format!("'{}' is defined on line {}", name, def_line),
+            );
+        }
+    }
+
+    /// The type of `arg` when it is a variable, array element or field --
+    /// something a by-reference parameter would share -- or None for any
+    /// other expression.
+    fn lvalue_type(&self, arg: &Expr, scope: &Scope) -> Option<DataType> {
+        match arg {
+            Expr::Variable(n) => {
+                if self.symbols.consts.contains_key(normalized(n)) || is_zero_arg_builtin(n) {
+                    return None;
+                }
+                Some(match self.symbols.typed_var(scope, n) {
+                    Some(TypeRef::Record(_)) => return None,
+                    Some(t) => DataType::from_type_ref(t),
+                    None => DataType::from_suffix(n),
+                })
+            }
+            Expr::ArrayAccess { name, .. } => Some(DataType::from_suffix(name)),
+            Expr::FnCall { name, args }
+                if !args.is_empty()
+                    && self
+                        .symbols
+                        .lookup_array(scope, &name.to_uppercase())
+                        .is_some() =>
+            {
+                Some(DataType::from_suffix(name))
+            }
+            _ => None,
+        }
+    }
+
+    /// Check an argument for array parameter `pname` of `proc`: it must name
+    /// an array, as `A()` or `A`, used with the same number of dimensions.
+    #[allow(clippy::too_many_arguments)]
+    fn check_array_argument(
+        &mut self,
+        arg: &Expr,
+        pname: &str,
+        proc: &str,
+        scope: &Scope,
+        line: u32,
+        position: usize,
+        callee: &str,
+    ) {
+        let given = match arg {
+            Expr::Variable(n) => Some(n.to_uppercase()),
+            Expr::FnCall { name, args }
+            | Expr::ArrayAccess {
+                name,
+                indices: args,
+            } if args.is_empty() => Some(name.to_uppercase()),
+            _ => None,
+        };
+        let Some(arr) = given else {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' must be an array, written {}()",
+                    position, callee, pname
+                ),
+            );
+            return;
+        };
+        // An array argument the caller never declared is created, as a use
+        // of it would be.
+        let want = self
+            .symbols
+            .arrays
+            .get(&(Scope::Proc(proc.to_string()), pname.to_uppercase()))
+            .map(|a| a.rank);
+        if self.symbols.lookup_array(scope, &arr).is_none() {
+            self.check_array_use(&arr, want.unwrap_or(1), scope, line);
+        }
+        let got = self.symbols.lookup_array(scope, &arr).map(|a| a.rank);
+        if DataType::from_suffix(&arr) != DataType::from_suffix(pname) {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' is an array of the wrong type for {}()",
+                    position, callee, pname
+                ),
+            );
+        }
+        let checkable = !self
+            .unranked_array_params
+            .contains(&(proc.to_string(), pname.to_uppercase()));
+        if checkable
+            && let (Some(want), Some(got)) = (want, got)
+            && want != got
+        {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' has {} dimension{}, but {}() is used with {}",
+                    position,
+                    callee,
+                    got,
+                    if got == 1 { "" } else { "s" },
+                    pname,
+                    want
+                ),
+            );
         }
     }
 
@@ -3042,4 +3292,74 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// How many subscripts `body` gives `name` the first time it subscripts it.
+///
+/// An array parameter (`A()`) does not declare its dimensions, so its uses
+/// say: QuickBASIC infers them the same way.
+fn subscript_count(body: &[Stmt], name: &str) -> Option<usize> {
+    fn in_expr(e: &Expr, name: &str) -> Option<usize> {
+        match e {
+            Expr::ArrayAccess { name: n, indices }
+            | Expr::FnCall {
+                name: n,
+                args: indices,
+            } if n.eq_ignore_ascii_case(name) && !indices.is_empty() => Some(indices.len()),
+            Expr::ArrayAccess { indices, .. } | Expr::FnCall { args: indices, .. } => {
+                indices.iter().find_map(|i| in_expr(i, name))
+            }
+            Expr::Binary { left, right, .. } => {
+                in_expr(left, name).or_else(|| in_expr(right, name))
+            }
+            Expr::Unary { operand, .. } => in_expr(operand, name),
+            Expr::Field { base, .. } => in_expr(base, name),
+            Expr::Literal(_) | Expr::Variable(_) => None,
+        }
+    }
+    fn in_lvalue(lv: &LValue, name: &str) -> Option<usize> {
+        match &lv.indices {
+            Some(ix) if lv.name.eq_ignore_ascii_case(name) => Some(ix.len()),
+            _ => None,
+        }
+    }
+    let mut found = None;
+    walk_stmts(body, &mut |stmt| {
+        if found.is_some() {
+            return;
+        }
+        found = match &stmt.kind {
+            StmtKind::Let {
+                name: n,
+                indices: Some(ix),
+                ..
+            } if n.eq_ignore_ascii_case(name) => Some(ix.len()),
+            StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
+                vars.iter().find_map(|v| in_lvalue(v, name))
+            }
+            StmtKind::LineInput { var, .. } => in_lvalue(var, name),
+            StmtKind::Swap(a, b) => in_lvalue(a, name).or_else(|| in_lvalue(b, name)),
+            _ => None,
+        };
+        if found.is_none() {
+            let mut stmt = stmt.clone();
+            for_each_expr_mut(&mut stmt, &mut |e| {
+                if found.is_none() {
+                    found = in_expr(e, name);
+                }
+            });
+        }
+    });
+    found
+}
+
+/// The BASIC name of a numeric or string type, for diagnostics.
+fn type_name(t: DataType) -> &'static str {
+    match t {
+        DataType::Integer => "an INTEGER",
+        DataType::Long => "a LONG",
+        DataType::Single => "a SINGLE",
+        DataType::Double => "a DOUBLE",
+        DataType::String => "a STRING",
+    }
 }

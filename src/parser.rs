@@ -164,6 +164,14 @@ pub enum StmtKind {
         /// `DIM SHARED`: visible inside every SUB and FUNCTION.
         shared: bool,
     },
+    /// `DECLARE SUB|FUNCTION name(params) [AS T]` -- checked against the
+    /// definition, and otherwise nothing.
+    Declare {
+        name: String,
+        is_function: bool,
+        params: Vec<Param>,
+        ret_ty: Option<TypeRef>,
+    },
     /// `SHARED a, b(), c AS T` -- inside a procedure, use these module-level
     /// names rather than locals of the same names.
     Shared(Vec<ScopeItem>),
@@ -410,6 +418,12 @@ pub struct ScopeItem {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
+    /// `BYVAL`: the procedure gets a copy, and the caller's variable is
+    /// never written. Without it a variable argument is passed by
+    /// reference, as in QuickBASIC.
+    pub byval: bool,
+    /// Written `name()`: an array, passed by reference.
+    pub array: bool,
     /// Declared type from an `AS` clause; `None` means the type comes from the
     /// name's suffix, as it always has.
     pub ty: Option<TypeRef>,
@@ -1462,7 +1476,7 @@ impl Parser {
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
                     "DECLARE" if matches!(self.peek_at(1), Token::Sub | Token::Function) => {
-                        err("DECLARE is not supported yet")
+                        self.parse_declare()
                     }
                     "WIDTH" if !matches!(self.peek_at(1), Token::Eq) => self.parse_width(),
                     "SHARED" if self.next_is_ident() => {
@@ -2812,10 +2826,64 @@ impl Parser {
         })
     }
 
+    /// `DECLARE SUB name (params)` or `DECLARE FUNCTION name (params) [AS T]`:
+    /// a procedure's signature ahead of its definition, which sema checks the
+    /// definition against. QuickBASIC writes these at the top of every module.
+    fn parse_declare(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume DECLARE
+        let is_function = matches!(self.advance(), Token::Function);
+        let Token::Ident(name) = self.advance() else {
+            return err("Expected a procedure name after DECLARE");
+        };
+        let params = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let params = self.parse_param_list()?;
+            self.expect(Token::RParen)?;
+            params
+        } else {
+            Vec::new()
+        };
+        let ret_ty = if is_function && matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+        Ok(StmtKind::Declare {
+            name,
+            is_function,
+            params,
+            ret_ty,
+        })
+    }
+
     fn parse_param_list(&mut self) -> PResult<Vec<Param>> {
         let mut params = Vec::new();
         while let Token::Ident(name) = self.peek().clone() {
             self.advance();
+            // `BYVAL name` passes a copy.
+            let (byval, name) = if name.eq_ignore_ascii_case("BYVAL")
+                && let Token::Ident(real) = self.peek().clone()
+            {
+                self.advance();
+                (true, real)
+            } else {
+                (false, name)
+            };
+            // `name()` is an array.
+            let array = if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                self.expect(Token::RParen)?;
+                true
+            } else {
+                false
+            };
+            if array && byval {
+                return err(format!(
+                    "array parameter '{}' cannot be BYVAL; an array is always passed by reference",
+                    name
+                ));
+            }
             // `name AS Type` declares a typed parameter, including a record.
             let ty = if matches!(self.peek(), Token::As) {
                 self.advance();
@@ -2823,7 +2891,12 @@ impl Parser {
             } else {
                 None
             };
-            params.push(Param { name, ty });
+            params.push(Param {
+                name,
+                byval,
+                array,
+                ty,
+            });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {

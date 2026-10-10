@@ -1084,7 +1084,7 @@ People(0).Name = "Bob"
 ```
 
 Assigning one record to another copies it. A record may be passed to a
-procedure, where it arrives by value:
+procedure, by reference like any other variable, or by value with `BYVAL`:
 
 ```basic
 TYPE Person
@@ -1558,18 +1558,46 @@ Return value is assigned to the function name within the function body.
 
 ### Parameters
 
-Parameters are passed **by value**:
+Parameters are passed **by reference**, as in QuickBASIC: a variable, array
+element or record field given as an argument is changed by what the procedure
+does to its parameter. `BYVAL` passes a copy instead, and an argument that is
+any other expression -- `A + 0`, `CINT(B#)`, a literal -- is a copy whatever
+the parameter says.
 
 ```basic
 SUB Double(X)
-    X = X * 2       ' Only affects local copy
-    PRINT X
+    X = X * 2
+END SUB
+SUB Show(BYVAL X)
+    X = 0           ' only the copy
 END SUB
 
 A = 5
-Double A            ' Prints 10
-PRINT A             ' Prints 5 (unchanged)
+Double A            ' A is now 10
+Show A              ' A is still 10
+Double A + 0        ' an expression: A is still 10
 ```
+
+A variable passed by reference must be the parameter's type -- an INTEGER
+variable for an INTEGER parameter -- as QuickBASIC requires; to pass another
+type, pass an expression, which is converted.
+
+An **array parameter** is written `name()`, and takes an array, written the
+same way, by reference: the procedure works on the caller's elements and
+bounds, and a `REDIM` or `ERASE` in it reaches the caller. It has as many
+dimensions as the procedure subscripts it with.
+
+```basic
+SUB Fill(V(), N)
+    FOR I = LBOUND(V) TO UBOUND(V): V(I) = N: NEXT I
+END SUB
+DIM Scores(10)
+Fill Scores(), 1
+```
+
+`DECLARE SUB name (params)` and `DECLARE FUNCTION name (params) [AS type]`
+state a procedure's signature ahead of it, as QuickBASIC modules do; each is
+checked against the definition.
 
 ### Recursion
 
@@ -1683,7 +1711,6 @@ written. Programs using them are refused today.
 - **Console control** -- `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`
-- **Procedures** -- `DECLARE`, `BYVAL`
 - **Odds and ends** -- `INPUT$`
 
 ### Out of scope
@@ -1730,9 +1757,7 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 3. **Boolean true is -1** - Comparisons return -1 (true) or 0 (false)
 4. **Array indices start at 0** - `DIM A(10)` creates 11 elements (0-10)
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
-6. **Parameters are by-value only** - No `BYREF` support, records included:
-   a record argument is passed as the address of the caller's copy, which the
-   callee copies into a local, so changes to it do not escape
+6. **Parameters are by reference**, as in QuickBASIC; `BYVAL` passes a copy
 
 ### Deliberate Differences from GW-BASIC
 

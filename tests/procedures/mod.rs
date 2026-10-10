@@ -320,23 +320,40 @@ IF Name$ = "bob" THEN PRINT "eq" ELSE PRINT "ne"
     assert_eq!(lines, vec!["bob", "42", "eq"]);
 }
 
-/// String parameters are by value, like numeric ones.
+/// A variable argument is passed by reference, as in QuickBASIC: the
+/// procedure's changes reach it, strings included. BYVAL passes a copy, and
+/// an expression is a copy whatever the parameter says. Every parameter used
+/// to be by value.
 #[test]
-fn test_string_parameters_are_by_value() {
+fn test_parameters_are_by_reference() {
     let output = compile_and_run(
         r#"
-SUB Change(S$)
+SUB Change(S$, N)
 S$ = "changed"
-PRINT S$
+N = N * 2
 END SUB
-T$ = "original"
-Change(T$)
-PRINT T$
+SUB Keep(BYVAL S$, BYVAL N)
+S$ = "kept?"
+N = 0
+END SUB
+T$ = "original": X = 21
+Change T$, X
+PRINT T$; X
+Keep T$, X
+PRINT T$; X
+Change T$ + "", X + 0
+PRINT T$; X
+DIM A%(3): A%(2) = 5
+SUB Bump(K%)
+K% = K% + 1
+END SUB
+Bump A%(2)
+PRINT A%(2)
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["changed", "original"]);
+    assert_eq!(lines, vec!["changed 42", "changed 42", "changed 42", "6"]);
 }
 
 /// DEF FN is desugared into an ordinary FUNCTION, so it reuses the whole
@@ -535,4 +552,143 @@ fn test_def_fn_sees_module_variables() {
     let output =
         compile_and_run("Rate = 3\nDEF FNScale(X) = X * Rate\nPRINT FNScale(5)\n").unwrap();
     assert_eq!(output.trim(), "15");
+}
+
+/// An array parameter, `A()`, takes an array by reference: the procedure sees
+/// the caller's elements and bounds, and a REDIM or ERASE in it reaches the
+/// caller. Its dimensions are whatever the body subscripts it with.
+#[test]
+fn test_array_parameters() {
+    let output = compile_and_run(
+        r#"
+SUB Fill(V(), N)
+FOR I = LBOUND(V) TO UBOUND(V): V(I) = I * N: NEXT I
+END SUB
+FUNCTION Total(V())
+T = 0
+FOR I = LBOUND(V) TO UBOUND(V): T = T + V(I): NEXT I
+Total = T
+END FUNCTION
+SUB Grow(V())
+REDIM PRESERVE V(5)
+V(5) = 50
+END SUB
+SUB Corner(M$())
+M$(2, 3) = "x"
+END SUB
+DIM A(3), B(1 TO 2)
+Fill A(), 10
+Fill B(), 1
+PRINT A(3); Total(A()); Total(B())
+Grow A()
+PRINT UBOUND(A); A(5); A(3)
+DIM G$(2, 3)
+Corner G$()
+PRINT G$(2, 3)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["30  60  3", "5  50  30", "x"]
+    );
+}
+
+/// An array argument must be an array of the parameter's type, with the
+/// dimensions the procedure uses.
+#[test]
+fn test_array_arguments_are_checked() {
+    for (source, msg) in [
+        ("SUB S(V())\nV(1) = 1\nEND SUB\nS 5\n", "must be an array"),
+        (
+            "SUB S(V())\nV(1) = 1\nEND SUB\nDIM M(2, 2)\nS M()\n",
+            "has 2 dimensions, but V() is used with 1",
+        ),
+        (
+            "SUB S(V())\nV(1) = 1\nEND SUB\nDIM N$(2)\nS N$()\n",
+            "wrong type",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// A variable passed by reference must be the parameter's type, as
+/// QuickBASIC's "Parameter type mismatch" requires; an expression of another
+/// type is converted into a temporary.
+#[test]
+fn test_by_reference_type_must_match() {
+    let err =
+        crate::common::compile_only("SUB S(N%)\nN% = 1\nEND SUB\nX# = 2\nS X#\n").unwrap_err();
+    assert!(
+        err.contains("passed by reference, so it must be an INTEGER, not a DOUBLE"),
+        "{}",
+        err.stderr
+    );
+    let output = compile_and_run(
+        "SUB S(N%)\nN% = N% * 2\nPRINT N%\nEND SUB\nX# = 2.6\nS X# + 0\nS CINT(X#)\nPRINT X#\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["6", "6", "2.6"]);
+}
+
+/// DECLARE states a procedure's signature, as QuickBASIC modules begin with;
+/// it is checked against the definition.
+#[test]
+fn test_declare() {
+    let output = compile_and_run(
+        "DECLARE SUB Show (A$, BYVAL N%)\nDECLARE FUNCTION Twice# (X#)\nShow \"n\", 2\nPRINT Twice#(4)\nSUB Show (A$, BYVAL N%)\nPRINT A$; N%\nEND SUB\nFUNCTION Twice# (X#)\nTwice# = X# * 2\nEND FUNCTION\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["n 2", "8"]);
+    for (source, msg) in [
+        ("DECLARE SUB Nope ()\n", "declared but never defined"),
+        (
+            "DECLARE SUB S (A)\nSUB S (A, B)\nEND SUB\n",
+            "defined with 2 parameters",
+        ),
+        (
+            "DECLARE FUNCTION S (A)\nSUB S (A)\nEND SUB\n",
+            "defined as a SUB",
+        ),
+        (
+            "DECLARE SUB S (BYVAL A)\nSUB S (A)\nEND SUB\n",
+            "parameter 1 differs",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// By reference through recursion, and when an error leaves the procedure:
+/// what it had written still reaches the caller.
+#[test]
+fn test_by_reference_through_recursion_and_errors() {
+    let output = compile_and_run(
+        r#"
+SUB Down(N, Steps)
+IF N <= 0 THEN EXIT SUB
+Steps = Steps + 1
+Down N - 1, Steps
+END SUB
+S = 0
+Down 5, S
+PRINT S
+SUB Fails(V)
+V = 7
+ERROR 5
+END SUB
+ON ERROR GOTO 100
+X = 1
+Fails X
+200 PRINT "x"; X
+END
+100 PRINT "trapped"; X
+RESUME 200
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["5", "trapped 7", "x 7"]);
 }

@@ -311,11 +311,15 @@ fn test_local_records_in_sibling_procedures() {
 #[test]
 fn test_record_parameters() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\n",
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nSUB Look(BYVAL V AS P)\nV.Y = 0\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\nLook A\nPRINT A.Y\n",
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["7  8", "7"], "the caller's record is unchanged");
+    assert_eq!(
+        lines,
+        vec!["7  8", "99", "8"],
+        "by reference the caller's record changes; BYVAL, it does not"
+    );
 }
 
 /// A record parameter mixed with ordinary ones, and a nested record.

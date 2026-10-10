@@ -415,7 +415,10 @@ Check "FUNCTION AS INTEGER rounds half to even", STR$(HalfInt(7)), "4"
 
 Arg = 5
 Doubler Arg
-Check "parameters are by value", STR$(Arg), "5"
+Check "parameters are by reference", STR$(Arg), "10"
+Arg = 5
+Doubler Arg + 0
+Check "an expression argument is a copy", STR$(Arg), "5"
 
 CallCount = 0
 Bumper
