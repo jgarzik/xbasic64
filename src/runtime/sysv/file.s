@@ -172,9 +172,13 @@ _rt_file_open:
     sub rsp, 144            # struct stat, which is 144 bytes on x86-64 Linux
     mov rdi, rax
     call fileno
-    mov edi, eax
-    mov rsi, rsp
-    call fstat
+    # fstat(fd, buf), through syscall(2): glibc exports an fstat symbol only
+    # from 2.33, and linking against one would fail on every older system.
+    # 5 is SYS_fstat on x86-64 Linux.
+    mov esi, eax
+    mov edi, 5
+    mov rdx, rsp
+    call syscall
     mov ecx, DWORD PTR [rsp + 24]       # st_mode
     add rsp, 144
     test eax, eax
