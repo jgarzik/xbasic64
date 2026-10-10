@@ -509,7 +509,7 @@ PRINT LEN(T)
     let lines = crate::common::lines(&output);
     assert_eq!(lines[0], "4", "DEFINT");
     assert_eq!(lines[1], "100001", "DEFLNG");
-    assert_eq!(lines[2], ".33333334", "DEFSNG carries ~7 digits");
+    assert_eq!(lines[2], ".3333333", "DEFSNG carries 7 digits");
     assert_eq!(
         lines[3], ".3333333333333333",
         "DEFDBL carries full precision"

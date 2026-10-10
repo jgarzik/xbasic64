@@ -11,23 +11,8 @@
 # Format strings for sprintf (number formatting)
 _fmt_int: .asciz "%lld"
 _fmt_float: .asciz "%g"
-# Shortest-round-trip formats, tried in order until the printed text reads
-# back as the identical double. %g alone gives only 6 significant digits,
-# which discards most of a Double's precision.
-_fmt_g15: .asciz "%.15g"
-_fmt_g16: .asciz "%.16g"
-_fmt_g17: .asciz "%.17g"
-.p2align 3
-_fmt_g_table: .quad _fmt_g15, _fmt_g16, _fmt_g17, 0
-# SINGLE carries ~7 significant digits, so its search starts far lower: at
-# 15 digits even a float's value round-trips, printing 3.14159! as
-# 3.1415901184082.
-_fmt_g6: .asciz "%.6g"
-_fmt_g7: .asciz "%.7g"
-_fmt_g8: .asciz "%.8g"
-_fmt_g9: .asciz "%.9g"
-.p2align 3
-_fmt_g_single_table: .quad _fmt_g6, _fmt_g7, _fmt_g8, _fmt_g9, 0
+# _rt_fmt_double's request: P significant digits in exponent form.
+_fmt_sci: .asciz "%.*e"
 _redo_msg: .ascii "?Redo from start\r\n"
 # Bracketed rather than measured by the assembler; see _cls_seq in math.s.
 _redo_msg_end:
@@ -46,5 +31,7 @@ _redo_msg_end:
 .bss
 .p2align 3
 _num_buf: .skip 64
+_fmt_scratch: .skip 64          # _rt_fmt_double's printf output, before reshaping
+_fmt_digits: .skip 32           # ... and its significant digits
 _console_mode: .skip 4          # GetConsoleMode's output, for the VT enable
 

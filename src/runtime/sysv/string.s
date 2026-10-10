@@ -98,8 +98,7 @@ _rt_val:
 _rt_str:
     push rbp
     mov rbp, rsp
-    lea rdi, [rip + _fmt_g_table]
-    xor esi, esi
+    xor edi, edi                    # a DOUBLE
     call _rt_fmt_basic              # includes the sign position's blank
     lea rdi, [rip + _num_buf]
     mov rsi, rax                    # length
@@ -118,8 +117,7 @@ _rt_str:
 _rt_str_single:
     push rbp
     mov rbp, rsp
-    lea rdi, [rip + _fmt_g_single_table]
-    mov esi, 1
+    mov edi, 1                      # a SINGLE
     call _rt_fmt_basic
     lea rdi, [rip + _num_buf]
     mov rsi, rax

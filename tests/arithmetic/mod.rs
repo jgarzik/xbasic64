@@ -345,7 +345,9 @@ PRINT 123456789.123456
             ".3333333333333333",
             ".6666666666666666",
             "3.141592653589793",
-            "1.4142135623730951",
+            // 16 significant digits, as GW-BASIC prints a DOUBLE: the 17th
+            // that read back exactly (1.4142135623730951) is not shown.
+            "1.414213562373095",
             // Values that are exact at fewer digits keep their short form.
             "3.14159",
             ".1",
@@ -371,7 +373,7 @@ PRINT CSNG(1 / 3)
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["3.14159", ".1", "3.14", ".33333334"]);
+    assert_eq!(lines, vec!["3.14159", ".1", "3.14", ".3333333"]);
 }
 
 /// The bitwise operators must work on Double operands, which is what an

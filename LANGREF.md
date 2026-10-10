@@ -430,8 +430,23 @@ sign would go if it is not negative, and a blank after it. So `PRINT 1; 2; 3`
 writes ` 1  2  3 `, and `PRINT 1; -2; 3` writes ` 1 -2  3 ` -- the minus takes
 the leading blank's place. A string is written exactly as it is.
 
-A value below one drops its leading zero (`.5`, not `0.5`), and an exponent is
-spelled with `D` for a DOUBLE and `E` for a SINGLE: `1D+20`, `1.5E-10`.
+An INTEGER or LONG is written in full. A SINGLE or DOUBLE is rounded to the
+digits its type carries -- 7 significant digits for a SINGLE, 16 for a DOUBLE -- and
+written in fixed point when that shows it in at most that many digits, as
+GW-BASIC and QuickBASIC do. Otherwise it gets an exponent, spelled `E` for a
+SINGLE and `D` for a DOUBLE, with at least two digits:
+
+```basic
+PRINT .1 + .2       ' .3
+PRINT 1 / 3         ' .3333333333333333
+X! = 1.1E-6         ' .0000011: seven digits after the point
+X! = 1.1E-7         ' 1.1E-07: eight would be needed
+X! = 12345678       ' 1.234568E+07
+PRINT 1E16          ' 1D+16
+```
+
+Trailing zeros are dropped, and a value below one has no leading zero (`.5`,
+not `0.5`). `STR$` gives exactly what `PRINT` writes.
 
 A comma moves to the start of the next 14-column zone, padding with blanks.
 There is no line width, so the zones go on as far as the line does. `WRITE` and
@@ -1075,9 +1090,9 @@ STOP    ' Terminate (historically for debugging)
 | `RND`      | Random number 0 ≤ r < 1                  |
 | `FRE(x)`   | Free memory; a large constant here       |
 
-**Numeric output:** `PRINT` writes the shortest decimal that reads back as the
-same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
-`0.3333333333333333`) and a `SINGLE` shows only the ~7 digits it carries.
+**Numeric output:** `PRINT` shows 16 significant digits of a `DOUBLE`
+(`PRINT 1 / 3` gives `.3333333333333333`) and 7 of a `SINGLE`; see
+[PRINT](#print).
 
 **RND behavior:** the argument selects between three behaviours.
 

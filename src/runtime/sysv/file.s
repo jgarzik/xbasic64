@@ -298,8 +298,7 @@ _rt_file_print_float:
 
     # Format through the shared helper, so every sink renders a number the
     # same way.
-    lea rdi, [rip + _fmt_g_table]
-    xor esi, esi
+    xor edi, edi                    # a DOUBLE
     call _rt_fmt_double
     jmp .Lfile_num_emit
 
@@ -325,8 +324,7 @@ _rt_file_print_single:
 
     mov ebx, edi            # save file number
 
-    lea rdi, [rip + _fmt_g_single_table]
-    mov esi, 1
+    mov edi, 1                      # a SINGLE
     call _rt_fmt_double
 
 .Lfile_num_emit:
@@ -356,8 +354,7 @@ _rt_print_number:
     sub rsp, 8
 
     mov ebx, edi
-    lea rdi, [rip + _fmt_g_table]
-    xor esi, esi
+    xor edi, edi                    # a DOUBLE
     call _rt_fmt_basic
     jmp .Lprint_num_emit
 
@@ -374,8 +371,7 @@ _rt_print_number_single:
     sub rsp, 8
 
     mov ebx, edi
-    lea rdi, [rip + _fmt_g_single_table]
-    mov esi, 1
+    mov edi, 1                      # a SINGLE
     call _rt_fmt_basic
 
 .Lprint_num_emit:

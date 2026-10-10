@@ -104,8 +104,7 @@ _rt_str:
     push rbp
     mov rbp, rsp
     sub rsp, 32             # shadow space
-    lea rcx, [rip + _fmt_g_table]
-    xor edx, edx
+    xor ecx, ecx                    # a DOUBLE
     call _rt_fmt_basic              # includes the sign position's blank
     lea rcx, [rip + _num_buf]
     mov rdx, rax            # length
@@ -125,8 +124,7 @@ _rt_str_single:
     push rbp
     mov rbp, rsp
     sub rsp, 32             # shadow space
-    lea rcx, [rip + _fmt_g_single_table]
-    mov edx, 1
+    mov ecx, 1                      # a SINGLE
     call _rt_fmt_basic
     lea rcx, [rip + _num_buf]
     mov rdx, rax

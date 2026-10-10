@@ -401,9 +401,10 @@ PRINT STR$(A) = STR$(A)
     );
 }
 
-/// STR$ renders what PRINT renders, so it neither loses digits nor stops
-/// round-tripping through VAL. It used to be its own sprintf("%g"), which cuts
-/// off at six significant digits.
+/// STR$ renders what PRINT renders: 16 significant digits for a DOUBLE and 7
+/// for a SINGLE, as GW-BASIC does. It used to be its own sprintf("%g"), which
+/// cut off at six. So `.1 + .2` is " .3", not the " .30000000000000004" a
+/// shortest-round-trip rendering gave, and 1/3 still reads back exactly.
 #[test]
 fn test_str_matches_print_and_round_trips() {
     let source = r#"
@@ -421,7 +422,7 @@ PRINT STR$(X!)
             " 123456789.125",
             " .3333333333333333",
             "-1 ",
-            " .30000000000000004",
+            " .3",
             // A SINGLE carries ~7 digits, and STR$ respects that as PRINT does.
             " 3.14159",
         ]

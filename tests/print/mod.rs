@@ -431,3 +431,55 @@ fn test_print_using_is_unaffected() {
         .expect("should compile");
     assert_eq!(out.stdout.lines().next().unwrap(), "  3.50");
 }
+
+/// Numbers print as GW-BASIC prints them: rounded to 7 significant digits for
+/// a SINGLE and 16 for a DOUBLE, in fixed point when that fits in so many
+/// digits and with an E (SINGLE) or D (DOUBLE) exponent otherwise.
+///
+/// The thresholds are QuickBASIC's documented ones: 1.1E-6 shows as .0000011,
+/// 1.1E-7 as 1.1E-07. This used to print the shortest decimal that read back
+/// exactly -- 17 digits for a DOUBLE, `.1 + .2` as .30000000000000004 -- and
+/// any whole number in full, whatever its type.
+#[test]
+fn test_numbers_print_with_gw_basic_digits() {
+    let output = compile_and_run(
+        r#"
+PRINT .1 + .2
+X! = 1.1E-6: PRINT X!
+X! = 1.1E-7: PRINT X!
+X! = 1234567: PRINT X!
+X! = 12345678: PRINT X!
+X! = 1E7: PRINT X!
+X! = 2 / 3: PRINT X!
+PRINT 1E15
+PRINT 1E16
+PRINT 1.5E-300
+PRINT 1.1E-15
+PRINT 1.1E-16
+PRINT 9.9999999999999999
+X! = -1E-10: PRINT X!
+PRINT 1E100
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            ".3",
+            ".0000011",
+            "1.1E-07",
+            "1234567",
+            "1.234568E+07",
+            "1E+07",
+            ".6666667",
+            "1000000000000000",
+            "1D+16",
+            "1.5D-300",
+            ".0000000000000011",
+            "1.1D-16",
+            "10",
+            "-1E-10",
+            "1D+100"
+        ]
+    );
+}
