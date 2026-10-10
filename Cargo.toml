@@ -1,6 +1,6 @@
 [package]
 name = "xbasic64"
-version = "1.0.2"
+version = "1.2.0"
 edition = "2024"
 authors = ["Jeff Garzik <jgarzik@pobox.com>"]
 description = "A BASIC native code compiler (x86-64, aarch64) targeting 1980s-era BASIC dialects"
