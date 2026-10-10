@@ -224,8 +224,25 @@ impl FnGen<'_> {
                     }
                     None => 0,
                 };
+                // In a handler that is handling an error, GOTO 0 stops the
+                // program with that error, as GW-BASIC does: the handler is
+                // saying it cannot deal with this one. Trapping is off by
+                // then, so raising it again is fatal.
+                let handling = (number == 0 && self.kind == FnKind::Handler)
+                    .then(|| self.load_rt_word("_err_active"));
                 self.store_rt_word("_err_handler", number as i64);
                 self.store_rt_word("_err_active", 0);
+                if let Some(active) = handling {
+                    let reraise = self.b.create_block();
+                    let done = self.b.create_block();
+                    self.brif(active, reraise, done);
+                    self.switch_sealed(reraise);
+                    let code = self.call_rt("_rt_err", &[])[0];
+                    let line = self.call_rt("_rt_erl", &[])[0];
+                    self.call_rt("_rt_error_num", &[code, line]);
+                    self.b.ins().jump(done, &[]);
+                    self.switch_sealed(done);
+                }
             }
 
             // `ERROR n`: raise the error GW-BASIC numbers n, 1 to 255.

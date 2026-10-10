@@ -2718,3 +2718,25 @@ fn test_failed_redim_leaves_the_array_unchanged() {
         &["error 9", "10  10", "5", "error 7", "1", "error 9"]
     );
 }
+
+/// `ON ERROR GOTO 0` inside a handler stops the program with the error the
+/// handler was given, as GW-BASIC and QuickBASIC do: it is how a handler
+/// says "I cannot deal with this one". It used to disarm the handler and
+/// carry on, so the error was silently swallowed.
+#[test]
+fn test_on_error_goto_0_in_a_handler_reraises() {
+    let src = "10 ON ERROR GOTO 100\n20 PRINT 1 / 0\n30 PRINT \"nope\"\n40 END\n\
+               100 IF ERR = 53 THEN RESUME NEXT\n110 ON ERROR GOTO 0\n";
+    let run = compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stdout {:?}", run.stdout);
+    assert!(
+        run.stderr.contains("Division by zero in 20"),
+        "got: {:?}",
+        run.stderr
+    );
+    assert!(!run.stdout.contains("nope"));
+
+    // Outside a handler it only disarms trapping.
+    let src = "10 ON ERROR GOTO 100\n20 ON ERROR GOTO 0\n30 PRINT \"armed no more\"\n40 END\n100 RESUME NEXT\n";
+    assert_eq!(compile_and_run(src).unwrap().trim(), "armed no more");
+}
