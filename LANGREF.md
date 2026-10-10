@@ -619,6 +619,11 @@ END
 1010 RETURN
 ```
 
+A `RETURN` goes back only to a `GOSUB` made in the same scope: main's
+`RETURN` to main's `GOSUB`, a procedure's to its own. Reaching one with no such
+`GOSUB` outstanding -- typically by falling into a subroutine -- is the
+runtime error `RETURN without GOSUB`.
+
 ### ON...GOTO / ON...GOSUB
 
 Computed jump:
@@ -1433,8 +1438,8 @@ Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
 run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
 overflows, `SQR` of a negative number, `LOG` of a non-positive number, a file
-number outside 1 to 15, `GOSUB` nested deeper than the return stack holds,
-allocation failure, a random-access operation on a file not opened `FOR
+number outside 1 to 15, `GOSUB` nested deeper than the return stack holds, a
+`RETURN` with no `GOSUB` of its own scope to go back to, allocation failure, a random-access operation on a file not opened `FOR
 RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
 few bytes, and a `LOCK` another process already holds.
 
@@ -1442,6 +1447,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 
 | No. | Message                  | Cause                                        |
 |-----|--------------------------|----------------------------------------------|
+| 3   | `RETURN without GOSUB`   | A `RETURN` no `GOSUB` of its scope is waiting for |
 | 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive |
 | 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
 | 7   | `Out of memory`          | A string or array allocation that failed     |

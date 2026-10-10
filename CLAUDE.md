@@ -44,6 +44,9 @@ Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
 - **codegen.rs** - Direct AST-to-x86-64 assembly translation using System V AMD64 ABI
 - **using.rs** - `PRINT USING` format strings, parsed at compile time
 - **runtime.rs** - Hand-written x86-64 assembly runtime library (I/O, strings, math) using libc
+- **rtsig.rs** - Signature of every runtime helper generated code calls, and
+  whether it can raise an error. Every call goes through `CodeGen::call_rt`,
+  which looks it up; a test derives `fallible` from the assembly's control flow
 - **main.rs** - CLI driver: reads source, runs pipeline, shells out to `as` and `cc` for linking
 
 ### Test Structure (`tests/`)
@@ -89,6 +92,23 @@ Integration tests organized by feature area:
 - **String builtins returning a static buffer must copy**: two calls in one
   expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
   `_rt_oct` and `_rt_mk` end in `_rt_strdup`
+- **No jumps to code addresses**: GOSUB pushes a return site *number* and
+  RETURN dispatches through `_gosub_sites`; ON GOTO/GOSUB and the ON ERROR
+  handler (`_err_handler` holds a number) go through tables too. Every indirect
+  transfer is a bounded table jump, the shape Cranelift's `br_table` has
+- **ON ERROR is error-status propagation**: a trapped `_rt_error` sets
+  `_err_pending` and returns. A helper that raised leaves through its own
+  epilogue; generated code tests the flag after each fallible call and each
+  procedure call, leaving a procedure through its epilogue and main through
+  `_err_dispatch`, which resets rsp and jumps to the handler. Main saves the
+  callee-saved registers itself when it traps, and nothing in main keeps a value
+  in one across a statement then (FOR promotion is off). Only programs with
+  ON ERROR pay for any of this
+- **Every helper follows its platform's standard ABI**: a double goes where the
+  ABI puts it -- by position on Win64, so `(file, value)` passes the value in
+  xmm1 there; `Abi::float_arg_reg` knows the rule. `rtsig.rs` lists one
+  signature that serves both ABIs, so a compiler that follows the ABI can call
+  any helper
 
 ## Language Reference
 
