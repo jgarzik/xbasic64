@@ -408,15 +408,42 @@ impl FnGen<'_> {
             // Both are read before either is written, so `SWAP A(I), A(J)`
             // is right even when the subscripts alias.
             StmtKind::Swap(a, b) => {
-                if self.expr_type(&Self::lvalue_expr(a)) == DataType::String {
-                    // A string's two words move as they are, ownership and
-                    // all: neither side is copied, and nothing is freed.
-                    let (la, _) = self.lvalue_loc(a);
-                    let (lb, _) = self.lvalue_loc(b);
-                    let wa = self.load_str_raw(la);
-                    let wb = self.load_str_raw(lb);
-                    self.store_str_raw(wb, la);
-                    self.store_str_raw(wa, lb);
+                let (ea, eb) = (Self::lvalue_expr(a), Self::lvalue_expr(b));
+                if let Some(ty) = self.record_type_of(&ea) {
+                    // Two records exchange every word, their strings' with
+                    // the rest: each string stays owned by exactly one.
+                    let pa = self.record_addr(&ea).expect("a record lvalue");
+                    let pb = self.record_addr(&eb).expect("sema matched the types");
+                    for w in 0..self.cg.symbols.type_words(&ty) {
+                        let flags = MemFlagsData::trusted();
+                        let va = self.b.ins().load(types::I64, flags, pa, 8 * w);
+                        let vb = self.b.ins().load(types::I64, flags, pb, 8 * w);
+                        self.b.ins().store(flags, vb, pa, 8 * w);
+                        self.b.ins().store(flags, va, pb, 8 * w);
+                    }
+                } else if self.expr_type(&ea) == DataType::String {
+                    let (la, ta) = self.lvalue_loc(a);
+                    let (lb, tb) = self.lvalue_loc(b);
+                    let fixed = |t: &TypeRef| matches!(t, TypeRef::FixedString(1..));
+                    if fixed(&ta) || fixed(&tb) {
+                        // A fixed-length string keeps its width, so each side
+                        // takes a copy of the other's value, stored -- and
+                        // padded or cut -- as an assignment would.
+                        let (pa, la_len) = self.load_str(la);
+                        let (pb, lb_len) = self.load_str(lb);
+                        let ca = self.call_rt("_rt_strdup", &[pa, la_len]);
+                        let cb = self.call_rt("_rt_strdup", &[pb, lb_len]);
+                        self.store_typed(la, &ta, Val::Str(cb[0], cb[1]));
+                        self.store_typed(lb, &tb, Val::Str(ca[0], ca[1]));
+                    } else {
+                        // A string's two words move as they are, ownership
+                        // and all: neither side is copied, and nothing is
+                        // freed.
+                        let wa = self.load_str_raw(la);
+                        let wb = self.load_str_raw(lb);
+                        self.store_str_raw(wb, la);
+                        self.store_str_raw(wa, lb);
+                    }
                 } else {
                     let va = self.gen_expr(&Self::lvalue_expr(a));
                     let vb = self.gen_expr(&Self::lvalue_expr(b));
@@ -490,6 +517,30 @@ impl FnGen<'_> {
             | StmtKind::OptionBase(_)
             | StmtKind::DefType { .. } => {}
         }
+    }
+
+    /// The record type an lvalue expression denotes, if it denotes a whole
+    /// record: a record variable, an element of an array of records, or a
+    /// field that is itself a record.
+    fn record_type_of(&self, e: &Expr) -> Option<TypeRef> {
+        let ty = match e {
+            Expr::Variable(n) => self.typed_var(n)?,
+            Expr::ArrayAccess { name, .. } | Expr::FnCall { name, .. } => {
+                self.array_elem_type(name)?
+            }
+            Expr::Field { .. } => {
+                if let Some((name, _, fields)) = Self::flatten_indexed_field_path(e) {
+                    let base = self.array_elem_type(&name)?;
+                    self.field_byte_offset(&base, &fields)?.1
+                } else {
+                    let (name, fields) = Self::flatten_field_path(e)?;
+                    let base = self.typed_var(&name)?;
+                    self.field_byte_offset(&base, &fields)?.1
+                }
+            }
+            _ => return None,
+        };
+        matches!(ty, TypeRef::Record(_)).then_some(ty)
     }
 
     /// Store a number into a target: SWAP's numeric half.

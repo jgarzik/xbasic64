@@ -623,3 +623,21 @@ fn test_record_element_assignment_copies() {
     .unwrap();
     assert_eq!(output.trim(), "uno   1 one   1 one   1 q");
 }
+
+/// SWAP exchanges whole records -- variables, array elements and nested
+/// record fields -- and a fixed-length string keeps its width when it swaps
+/// with an ordinary string.
+#[test]
+fn test_swap_records_and_fixed_strings() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nN AS STRING * 4\nEND TYPE\nDIM Q AS P, R AS P, A(2) AS P\n\
+         Q.X = 1: Q.N = \"q\": R.X = 2: R.N = \"r\"\nSWAP Q, R\nPRINT Q.X; Q.N; R.X; R.N\n\
+         A(1) = Q: SWAP A(1), R: PRINT A(1).X; R.X\n\
+         DIM F AS STRING * 3\nF = \"abc\": S$ = \"longer\"\nSWAP F, S$\nPRINT \"[\"; F; \"][\"; S$; \"]\"; LEN(F)\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["2 r    1 q", "1  2", "[lon][abc] 3"]
+    );
+}
