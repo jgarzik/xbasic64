@@ -296,26 +296,25 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scan a string literal. The opening quote is already consumed.
-    fn read_string(&mut self) -> Result<String, String> {
+    ///
+    /// GW-BASIC's rules: the first quote ends it, so `"a""b"` is two strings
+    /// side by side (PRINT shows `ab`) -- there is no escape, and a quote is
+    /// written `CHR$(34)`. A string the line ends inside closes there, which
+    /// is how `PRINT "Hello` is written in many a listing. The newline is
+    /// left for `next_token`, which owns `at_line_start`.
+    fn read_string(&mut self) -> String {
         let mut s = String::new();
-        loop {
-            match self.advance() {
-                Some('"') => {
-                    // Check for escaped quote ""
-                    if self.peek() == Some('"') {
-                        self.advance();
-                        s.push('"');
-                    } else {
-                        break;
-                    }
+        while let Some(c) = self.peek() {
+            match c {
+                '"' => {
+                    self.advance();
+                    break;
                 }
-                Some('\n') | None => {
-                    return Err("Unterminated string".to_string());
-                }
-                Some(c) => s.push(c),
+                '\n' => break,
+                _ => s.push(self.advance().unwrap()),
             }
         }
-        Ok(s)
+        s
     }
 
     /// Scan the operand of a `DATA` statement as raw source text.
@@ -511,8 +510,12 @@ impl<'a> Lexer<'a> {
         let mut s = String::new();
         s.push(first.to_ascii_uppercase());
 
+        // A dot belongs to the name, as in GW-BASIC (`MY.VAR`), when a letter
+        // or digit follows it. The parser splits it again where the part
+        // before the dot is a record variable (`P.X`).
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            let dotted = c == '.' && self.peek_at(1).is_some_and(|n| n.is_ascii_alphanumeric());
+            if c.is_ascii_alphanumeric() || c == '_' || dotted {
                 s.push(self.advance().unwrap().to_ascii_uppercase());
             } else {
                 break;
@@ -600,7 +603,10 @@ impl<'a> Lexer<'a> {
                 Ok(Token::Newline)
             }
 
-            '"' => Ok(Token::String(self.read_string()?)),
+            '"' => Ok(Token::String(self.read_string())),
+
+            // GW-BASIC's shorthand for PRINT.
+            '?' => Ok(Token::Print),
 
             '\'' => {
                 self.skip_comment();
@@ -630,7 +636,19 @@ impl<'a> Lexer<'a> {
             ':' => Ok(Token::Colon),
             '#' => Ok(Token::Hash),
 
-            '=' => Ok(Token::Eq),
+            // GW-BASIC accepts either order: `=>`, `=<` and `><` are `>=`,
+            // `<=` and `<>`.
+            '=' => match self.peek() {
+                Some('>') => {
+                    self.advance();
+                    Ok(Token::Ge)
+                }
+                Some('<') => {
+                    self.advance();
+                    Ok(Token::Le)
+                }
+                _ => Ok(Token::Eq),
+            },
             '<' => {
                 if self.peek() == Some('>') {
                     self.advance();
@@ -646,6 +664,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::Ge)
+                } else if self.peek() == Some('<') {
+                    self.advance();
+                    Ok(Token::Ne)
                 } else {
                     Ok(Token::Gt)
                 }
@@ -794,18 +815,41 @@ mod tests {
     }
 
     #[test]
-    fn test_string_escaped_quote() {
-        let mut lexer = Lexer::new("X$ = \"He said \"\"Hi\"\"\"");
+    fn test_doubled_quote_is_two_strings() {
+        let mut lexer = Lexer::new("PRINT \"a\"\"b\"");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[2], Token::String("He said \"Hi\"".to_string()));
+        assert_eq!(tokens[1], Token::String("a".to_string()));
+        assert_eq!(tokens[2], Token::String("b".to_string()));
     }
 
     #[test]
     fn test_string_unterminated() {
-        let mut lexer = Lexer::new("X$ = \"unterminated");
-        let result = lexer.tokenize();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unterminated"));
+        let mut lexer = Lexer::new("X$ = \"open\nPRINT");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[2], Token::String("open".to_string()));
+        assert_eq!(tokens[3], Token::Newline);
+        assert_eq!(tokens[4], Token::Print);
+    }
+
+    #[test]
+    fn test_legacy_operators_and_print() {
+        let mut lexer = Lexer::new("? A => B =< C >< D");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Print);
+        assert_eq!(tokens[2], Token::Ge);
+        assert_eq!(tokens[4], Token::Le);
+        assert_eq!(tokens[6], Token::Ne);
+    }
+
+    #[test]
+    fn test_dotted_names() {
+        let mut lexer = Lexer::new("MY.VAR$ = P.X + A(1).F + .5");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("MY.VAR$".to_string()));
+        assert_eq!(tokens[2], Token::Ident("P.X".to_string()));
+        assert_eq!(tokens[8], Token::Dot);
+        assert_eq!(tokens[9], Token::Ident("F".to_string()));
+        assert_eq!(tokens[11], Token::Float(0.5));
     }
 
     // Identifier Tests

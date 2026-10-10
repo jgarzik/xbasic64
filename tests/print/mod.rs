@@ -641,3 +641,11 @@ fn test_print_using_errors() {
         assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
     }
 }
+
+/// GW-BASIC's spellings: `?` for PRINT, a doubled quote ending one string and
+/// starting the next, and a string the line ends inside.
+#[test]
+fn test_legacy_print_forms() {
+    let out = compile_and_run("? \"a\"\"b\"\n?1+1\nPRINT \"open\nPRINT \"next\"\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["ab", "2", "open", "next"]);
+}

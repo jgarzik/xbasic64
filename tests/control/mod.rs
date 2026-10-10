@@ -1354,3 +1354,82 @@ fn test_stop_reports_where_it_stopped() {
     assert_eq!(run.lines(), vec!["in"]);
     assert_eq!(run.stderr.trim(), "Break in 5");
 }
+
+/// GW-BASIC's `IF c GOTO n`: no THEN, and an ELSE may follow.
+#[test]
+fn test_if_goto_without_then() {
+    let out = compile_and_run(
+        r#"
+10 IF 1 GOTO 30
+20 PRINT "skipped"
+30 PRINT "jumped"
+40 IF 0 GOTO 20 ELSE PRINT "else"
+50 IF 1 => 1 AND 1 =< 2 AND 1 >< 2 THEN PRINT "either order"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["jumped", "else", "either order"]
+    );
+}
+
+/// `RETURN line` drops the GOSUB's return site and goes to that line.
+#[test]
+fn test_return_to_a_line() {
+    let out = compile_and_run(
+        r#"
+10 GOSUB 100
+20 PRINT "not here"
+30 GOSUB 200
+40 PRINT "back"; N
+50 END
+100 RETURN 30
+200 N = N + 1
+210 IF N < 3 THEN GOSUB 200
+220 RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["back 3"]);
+
+    // The stack really is popped: a second RETURN has nothing to go to.
+    let run =
+        crate::common::compile_and_run_raw("10 GOSUB 100\n20 END\n30 RETURN\n100 RETURN 30\n", "")
+            .unwrap();
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "{:?}",
+        run.stderr
+    );
+
+    // In a procedure, to one of its own lines.
+    let out = compile_and_run(
+        "CALL S\nSUB S\n  GOSUB 500\n  PRINT \"no\"\n600 PRINT \"in S\"\n  EXIT SUB\n500 RETURN 600\nEND SUB\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "in S");
+
+    let err = compile_only("10 GOSUB 100\n20 END\n100 RETURN 999\n").unwrap_err();
+    assert!(err.contains("999"), "got: {}", err.stderr);
+}
+
+/// A handler's `RETURN line` leaves the GOSUB the error interrupted for a
+/// line of the main program.
+#[test]
+fn test_return_to_a_line_from_a_handler() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 900
+20 GOSUB 100
+30 PRINT "not here"
+40 PRINT "landed"
+50 END
+100 ERROR 5
+110 RETURN
+900 RETURN 40
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "landed");
+}

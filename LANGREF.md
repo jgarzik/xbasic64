@@ -100,9 +100,17 @@ The examples in this reference use the two-word form throughout.
 
 Variable and procedure names:
 - Start with a letter (A-Z, a-z)
-- Followed by letters, digits, or underscore
+- Followed by letters, digits, underscore, or a dot followed by a letter or
+  digit (`MY.VAR`, as GW-BASIC allows)
 - Case-insensitive (`MyVar` and `MYVAR` are the same)
 - May end with a type suffix (`%`, `&`, `!`, `#`, `$`)
+
+A dotted name is a field of a record instead when the part before the first
+dot is a record variable: with `DIM P AS Point`, `P.X` is the field `X` of `P`.
+
+Keywords are words of their own. GW-BASIC's cruncher works the same way: a
+keyword immediately followed by a letter, digit or dot is part of a longer name,
+so `FORI=1TO9` is not a `FOR` loop.
 
 ### Literals
 
@@ -152,8 +160,12 @@ A `CONST` is folded in these types too, so `CONST A = 300 * 300` is an
 **Strings:**
 ```basic
 A$ = "Hello, World!"
-B$ = "She said ""Hi"""   ' Embedded quote
+B$ = "She said " + CHR$(34) + "Hi" + CHR$(34)   ' Embedded quote
 ```
+
+As in GW-BASIC, the first `"` ends a string, so a quote inside one is written
+`CHR$(34)`; `PRINT "a""b"` prints two strings side by side, `ab`. A string
+that the line ends inside is closed there: `PRINT "Hello` prints `Hello`.
 
 ---
 
@@ -351,6 +363,8 @@ was previously in memory.
 | `<=`     | Less than or equal    |
 | `>=`     | Greater than or equal |
 
+GW-BASIC's reversed spellings `=<`, `=>` and `><` mean `<=`, `>=` and `<>`.
+
 Comparisons return `-1` (true) or `0` (false).
 
 Strings compare too, lexicographically by character value, so comparison is
@@ -455,6 +469,7 @@ PRINT X; Y; Z             ' Semicolon: items adjoin
 PRINT A, B, C             ' Comma: next 14-column print zone
 PRINT "Value: "; X
 PRINT                     ' Print blank line
+? "Hello"                 ' ? is GW-BASIC's shorthand for PRINT
 ```
 
 **A number carries its own spacing**, as in GW-BASIC: a blank where the minus
@@ -607,11 +622,13 @@ Both branches take a list of statements separated by colons. Everything after
 IF X > 0 THEN Y = 1 : PRINT "Positive" ELSE Y = 0 : PRINT "Not positive"
 ```
 
-A bare line number after `THEN` or `ELSE` is an implied `GOTO`:
+A bare line number after `THEN` or `ELSE` is an implied `GOTO`, and GW-BASIC's
+`IF ... GOTO` needs no `THEN`:
 
 ```basic
 10 IF X < 0 THEN 90
 20 IF X = 0 THEN 90 ELSE 80
+30 IF X > 100 GOTO 90
 80 PRINT "Positive"
 90 PRINT "Done"
 ```
@@ -754,6 +771,18 @@ A `RETURN` goes back only to a `GOSUB` made in the same scope: main's
 `RETURN` to main's `GOSUB`, a procedure's to its own. Reaching one with no such
 `GOSUB` outstanding -- typically by falling into a subroutine -- is the
 runtime error `RETURN without GOSUB`.
+
+`RETURN line` ends the subroutine as `RETURN` does, but continues at `line`
+rather than after the `GOSUB`. The line must be in the same scope as the
+`RETURN`.
+
+```basic
+10 GOSUB 100
+20 PRINT "not reached"
+30 PRINT "continued at 30"
+40 END
+100 RETURN 30
+```
 
 ### ON...GOTO / ON...GOSUB
 
@@ -1327,6 +1356,18 @@ OPEN "filename.txt" FOR APPEND AS #1   ' Write mode (append)
 OPEN "data.dat" FOR RANDOM AS #1 LEN = 64   ' Fixed-length records
 ```
 
+GW-BASIC's short form takes the mode as a letter -- `"O"`, `"I"`, `"A"` or
+`"R"` -- then the file number and the name, and for `"R"` the record length:
+
+```basic
+OPEN "O", #1, "filename.txt"           ' FOR OUTPUT AS #1
+OPEN "R", #2, "data.dat", 64           ' FOR RANDOM AS #2 LEN = 64
+```
+
+The `#` before a file number is optional in `OPEN`, `CLOSE`, `FIELD`, `GET`,
+`PUT`, `LOCK` and `UNLOCK` (`OPEN "f" FOR INPUT AS 1`, `CLOSE 1`), as in
+GW-BASIC. `PRINT #` and the other reading and writing statements need it.
+
 `FOR RANDOM` opens for reading *and* writing, and creates the file when it
 does not exist. `LEN =` gives the record length in bytes; without it the record
 is 128 bytes, as in GW-BASIC. The largest record is 32767 bytes.
@@ -1339,6 +1380,7 @@ One outside that range is refused at compile time, or reported as
 
 ```basic
 CLOSE #1          ' Close specific file
+CLOSE #1, #2      ' Close several
 CLOSE             ' Close all files
 RESET             ' Close all files, as GW-BASIC spells it
 ```

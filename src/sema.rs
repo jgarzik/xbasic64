@@ -709,7 +709,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             | StmtKind::DoLoop { .. }
             | StmtKind::Goto(_)
             | StmtKind::Gosub(_)
-            | StmtKind::Return
+            | StmtKind::Return(_)
             | StmtKind::OnGoto { .. }
             | StmtKind::OnGosub { .. }
             | StmtKind::Call { .. }
@@ -892,7 +892,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             f(file_num);
             reclen.iter_mut().for_each(&mut *f);
         }
-        StmtKind::Close { file_num } => file_num.iter_mut().for_each(&mut *f),
+        StmtKind::Close(file_nums) => file_nums.iter_mut().for_each(&mut *f),
         StmtKind::Width { file_num, width } => {
             file_num.iter_mut().for_each(&mut *f);
             f(width);
@@ -930,7 +930,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::LabelName(_)
         | StmtKind::Goto(_)
         | StmtKind::Gosub(_)
-        | StmtKind::Return
+        | StmtKind::Return(_)
         | StmtKind::Sub { .. }
         | StmtKind::Function { .. }
         | StmtKind::ExitLoop { .. }
@@ -1379,7 +1379,7 @@ impl Analyzer {
         let mut first_return = None;
         walk_stmts(stmts, &mut |stmt| match &stmt.kind {
             StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => has_gosub = true,
-            StmtKind::Return if first_return.is_none() => first_return = Some(stmt.line),
+            StmtKind::Return(_) if first_return.is_none() => first_return = Some(stmt.line),
             _ => {}
         });
         if let (false, Some(line)) = (has_gosub, first_return) {
@@ -1776,6 +1776,7 @@ impl Analyzer {
             }
             StmtKind::Goto(target) => self.check_target(target, scope, line, "GOTO"),
             StmtKind::Gosub(target) => self.check_target(target, scope, line, "GOSUB"),
+            StmtKind::Return(Some(target)) => self.check_target(target, scope, line, "RETURN"),
             StmtKind::OnGoto { expr, targets } => {
                 self.check_expr(expr, scope, line);
                 for t in targets {
@@ -1866,10 +1867,10 @@ impl Analyzer {
                 }
                 self.check_file_num(file_num, scope, line);
             }
-            StmtKind::Close {
-                file_num: Some(file_num),
-            } => {
-                self.check_file_num(file_num, scope, line);
+            StmtKind::Close(file_nums) => {
+                for file_num in file_nums {
+                    self.check_file_num(file_num, scope, line);
+                }
             }
             StmtKind::Width { file_num, width } => {
                 if let Some(file_num) = file_num {

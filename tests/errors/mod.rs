@@ -753,7 +753,7 @@ fn test_type_rules() {
         "TYPE 'P' has no field 'Z'",
     );
     expect_rejected("DIM Q AS NoSuch\n", "undefined TYPE 'NOSUCH'");
-    expect_rejected("A = 1\nPRINT A.X\n", "is not a record variable");
+    expect_rejected("DIM A(3)\nPRINT A(1).X\n", "is not a record");
     expect_rejected(
         "TYPE P\nX AS INTEGER\nX AS LONG\nEND TYPE\n",
         "is declared twice",

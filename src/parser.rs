@@ -145,7 +145,9 @@ pub enum StmtKind {
     },
     Goto(GotoTarget),
     Gosub(GotoTarget),
-    Return,
+    /// `RETURN`, or GW-BASIC's `RETURN line`: leave the subroutine for that
+    /// line rather than for the statement after the GOSUB.
+    Return(Option<GotoTarget>),
     OnGoto {
         expr: Expr,
         targets: Vec<GotoTarget>,
@@ -299,10 +301,9 @@ pub enum StmtKind {
         /// `None` takes GW-BASIC's default of 128.
         reclen: Option<Expr>,
     },
-    /// `CLOSE #n`, or bare `CLOSE` to close every open file.
-    Close {
-        file_num: Option<Expr>,
-    },
+    /// `CLOSE #n [, #m]...`, or bare `CLOSE` (an empty list) to close every
+    /// open file.
+    Close(Vec<Expr>),
     /// `WIDTH w` for the console, or `WIDTH #n, w` for a file.
     Width {
         file_num: Option<Expr>,
@@ -1006,6 +1007,7 @@ impl Parser {
     /// Build a parser. `lines` gives each token's source line, and may be
     /// empty when position information is unavailable.
     pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
+        let (tokens, lines) = Self::split_field_names(tokens, lines);
         let declared_procs = Self::scan_proc_names(&tokens);
         Parser {
             tokens,
@@ -1013,6 +1015,87 @@ impl Parser {
             declared_procs,
             ..Default::default()
         }
+    }
+
+    /// Split `P.X` into a field access where `P` is a record variable.
+    ///
+    /// The lexer keeps a dot inside a name, as GW-BASIC does, so `MY.VAR` is
+    /// one variable. A record's field is reached the same way, though, and
+    /// QuickBASIC's rule decides: a name whose part before the dot is a record
+    /// variable is that record's field. So the record variables -- names
+    /// declared `AS` a TYPE anywhere -- are found first, and their dotted
+    /// names split again. A name after a dot (`A(1).X.Y`) is always a field.
+    fn split_field_names(tokens: Vec<Token>, lines: Vec<u32>) -> (Vec<Token>, Vec<u32>) {
+        if !tokens
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.contains('.')))
+        {
+            return (tokens, lines);
+        }
+        let mut types = HashSet::new();
+        for pair in tokens.windows(2) {
+            if let (Token::Type, Token::Ident(n)) = (&pair[0], &pair[1]) {
+                types.insert(n.clone());
+            }
+        }
+        let mut records = HashSet::new();
+        for (i, pair) in tokens.windows(2).enumerate() {
+            let (Token::As, Token::Ident(t)) = (&pair[0], &pair[1]) else {
+                continue;
+            };
+            if !types.contains(t) {
+                continue;
+            }
+            // Back over an array's bounds, `A(1 TO 5) AS T`, to its name.
+            let mut j = i;
+            if j > 0 && tokens[j - 1] == Token::RParen {
+                let mut depth = 0;
+                while j > 0 {
+                    j -= 1;
+                    match tokens[j] {
+                        Token::RParen => depth += 1,
+                        Token::LParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(Token::Ident(n)) = j.checked_sub(1).map(|k| &tokens[k]) {
+                records.insert(n.clone());
+            }
+        }
+
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for (i, tok) in tokens.into_iter().enumerate() {
+            let line = lines.get(i).copied();
+            let split = match &tok {
+                Token::Ident(n) if n.contains('.') => {
+                    out.last() == Some(&Token::Dot)
+                        || records.contains(n.split('.').next().unwrap_or(""))
+                }
+                _ => false,
+            };
+            if !split {
+                out.push(tok);
+                out_lines.extend(line);
+                continue;
+            }
+            let Token::Ident(n) = tok else { unreachable!() };
+            for (k, part) in n.split('.').enumerate() {
+                if k > 0 {
+                    out.push(Token::Dot);
+                    out_lines.extend(line);
+                }
+                out.push(Token::Ident(part.to_string()));
+                out_lines.extend(line);
+            }
+        }
+        (out, out_lines)
     }
 
     /// Collect the names following SUB and FUNCTION, before parsing.
@@ -1049,12 +1132,18 @@ impl Parser {
         )
     }
 
-    /// True if the token after the current one is `tok`.
-    ///
-    /// Used to tell the random-access statements apart from ordinary names:
-    /// `FIELD` is only the statement when a `#` follows it.
-    fn next_is(&self, tok: Token) -> bool {
-        *self.peek_at(1) == tok
+    /// True if a file number follows the statement word `word`: `#n`, or,
+    /// as GW-BASIC also allows, a bare number or name -- unless the program
+    /// has a procedure of that name, for which it is an argument.
+    fn next_is_file_number(&self, word: &str) -> bool {
+        match self.peek_at(1) {
+            Token::Hash => true,
+            Token::Integer(_) | Token::Ident(_) => {
+                !self.declared_procs.contains(word)
+                    && !matches!(self.peek_at(2), Token::Eq | Token::LParen)
+            }
+            _ => false,
+        }
     }
 
     /// True if the token after the current one is any identifier.
@@ -1413,7 +1502,15 @@ impl Parser {
             Token::Gosub => self.parse_gosub(),
             Token::Return => {
                 self.advance();
-                Ok(StmtKind::Return)
+                let target = if matches!(
+                    self.peek(),
+                    Token::Integer(_) | Token::LineNumber(_) | Token::Ident(_)
+                ) {
+                    Some(self.parse_goto_target()?)
+                } else {
+                    None
+                };
+                Ok(StmtKind::Return(target))
             }
             Token::On => self.parse_on_goto(),
             Token::Dim => self.parse_dim(),
@@ -1465,11 +1562,11 @@ impl Parser {
                 // -- so programs may still use these names for their own
                 // variables and procedures.
                 match n.to_uppercase().as_str() {
-                    "FIELD" if self.next_is(Token::Hash) => self.parse_field(),
-                    "GET" if self.next_is(Token::Hash) => self.parse_get_put(false),
-                    "PUT" if self.next_is(Token::Hash) => self.parse_get_put(true),
-                    "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
-                    "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
+                    "FIELD" if self.next_is_file_number(n) => self.parse_field(),
+                    "GET" if self.next_is_file_number(n) => self.parse_get_put(false),
+                    "PUT" if self.next_is_file_number(n) => self.parse_get_put(true),
+                    "LOCK" if self.next_is_file_number(n) => self.parse_lock(false),
+                    "UNLOCK" if self.next_is_file_number(n) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
                     "ERASE" if self.next_is_ident() => self.parse_erase(),
                     "ERROR" if self.next_is_an_operand() => self.parse_raise_error(),
@@ -1490,7 +1587,7 @@ impl Parser {
                     // RESET closes every file, which is what a bare CLOSE does.
                     "RESET" if self.next_ends_statement() => {
                         self.advance();
-                        Ok(StmtKind::Close { file_num: None })
+                        Ok(StmtKind::Close(Vec::new()))
                     }
                     // TIMER ON / OFF / STOP switch event trapping.
                     "TIMER"
@@ -2061,6 +2158,21 @@ impl Parser {
         let if_line = self.cur_line();
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
+        // GW-BASIC's `IF c GOTO n` needs no THEN: the GOTO is the branch.
+        if matches!(self.peek(), Token::Goto) {
+            let then_branch = self.parse_single_line_branch()?;
+            let else_branch = if matches!(self.peek(), Token::Else) {
+                self.advance();
+                Some(self.parse_single_line_branch()?)
+            } else {
+                None
+            };
+            return Ok(StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            });
+        }
         self.expect(Token::Then)?;
 
         // A run of colons after THEN separates no statements, so the line ends
@@ -3125,11 +3237,63 @@ impl Parser {
         self.parse_expression()
     }
 
+    /// A file number where GW-BASIC makes the `#` optional: OPEN's `AS n`,
+    /// CLOSE, FIELD, GET, PUT, LOCK and UNLOCK. PRINT # and its kin need it,
+    /// since without it the number would be something to print.
+    fn parse_file_number_hash_optional(&mut self) -> PResult<Expr> {
+        if matches!(self.peek(), Token::Hash) {
+            self.advance();
+        }
+        self.parse_expression()
+    }
+
+    /// GW-BASIC's other OPEN: `OPEN mode, [#]n, file [, reclen]`, the mode
+    /// a string whose first letter is O, I, A or R. The mode string and the
+    /// comma after it are already consumed.
+    fn parse_open_short(&mut self, mode: Expr) -> PResult<StmtKind> {
+        let Expr::Literal(Literal::String(m)) = &mode else {
+            return err("OPEN's mode must be written as a string: \"O\", \"I\", \"A\" or \"R\"");
+        };
+        let mode = match m
+            .trim_start()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase())
+        {
+            Some('O') => FileMode::Output,
+            Some('I') => FileMode::Input,
+            Some('A') => FileMode::Append,
+            Some('R') => FileMode::Random,
+            _ => return err(format!("OPEN mode \"{}\" is not O, I, A or R", m)),
+        };
+        let file_num = self.parse_file_number_hash_optional()?;
+        self.expect(Token::Comma)?;
+        let filename = self.parse_expression()?;
+        // The record length. For a sequential file GW-BASIC took it as a
+        // buffer size, which means nothing here, so it is ignored there.
+        let reclen = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+        Ok(StmtKind::Open {
+            filename,
+            reclen: reclen.filter(|_| mode == FileMode::Random),
+            mode,
+            file_num,
+        })
+    }
+
     fn parse_open(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume OPEN
 
         // Parse filename expression
         let filename = self.parse_expression()?;
+        if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            return self.parse_open_short(filename);
+        }
 
         // Expect FOR
         self.expect(Token::For)?;
@@ -3166,7 +3330,7 @@ impl Parser {
         // Expect AS
         self.expect(Token::As)?;
 
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
 
         // `LEN = n` sets the record length. LEN is the string function's name
         // everywhere else, so it is matched here as an identifier rather than
@@ -3195,7 +3359,7 @@ impl Parser {
     /// `FIELD #n, width AS var$ [, width AS var$]...`
     fn parse_field(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume FIELD
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         self.expect(Token::Comma)?;
 
         let mut fields = Vec::new();
@@ -3254,7 +3418,7 @@ impl Parser {
     /// `GET #n[, record]` / `PUT #n[, record]`
     fn parse_get_put(&mut self, is_put: bool) -> PResult<StmtKind> {
         self.advance(); // consume GET or PUT
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         let record = if matches!(self.peek(), Token::Comma) {
             self.advance();
             // `GET #1,` with nothing after it means "the next record", the same
@@ -3277,7 +3441,7 @@ impl Parser {
     /// `LOCK #n[, start [TO end]]` / `UNLOCK #n[, start [TO end]]`
     fn parse_lock(&mut self, is_unlock: bool) -> PResult<StmtKind> {
         self.advance(); // consume LOCK or UNLOCK
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         let range = if matches!(self.peek(), Token::Comma) {
             self.advance();
             let start = self.parse_expression()?;
@@ -3319,14 +3483,23 @@ impl Parser {
     fn parse_close(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume CLOSE
 
-        // Bare CLOSE closes every open file.
-        let file_num = if matches!(self.peek(), Token::Hash) {
-            Some(self.parse_file_number()?)
-        } else {
-            None
-        };
+        // Bare CLOSE closes every open file; otherwise a list, each `#`
+        // optional, as in GW-BASIC.
+        let mut file_nums = Vec::new();
+        if !matches!(
+            self.peek(),
+            Token::Newline | Token::Colon | Token::Eof | Token::Else
+        ) {
+            loop {
+                file_nums.push(self.parse_file_number_hash_optional()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
 
-        Ok(StmtKind::Close { file_num })
+        Ok(StmtKind::Close(file_nums))
     }
 
     // Expression parsing with precedence climbing
@@ -4053,7 +4226,7 @@ mod tests {
     fn test_return() {
         let prog = parse("RETURN").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0].kind, StmtKind::Return));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Return(None)));
     }
 
     // OnGoto Tests

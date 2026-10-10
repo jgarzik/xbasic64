@@ -264,3 +264,25 @@ PRINT B#
     let lines = crate::common::lines(&output);
     assert_eq!(lines, &["2", "1"], "A% takes CINT(2.5), B# takes 1");
 }
+
+/// A dot is part of a name, as in GW-BASIC, unless the part before it is a
+/// record variable.
+#[test]
+fn test_dotted_names() {
+    let out = compile_and_run(
+        r#"
+TYPE PT
+X AS INTEGER
+END TYPE
+DIM P AS PT, Q(2) AS PT
+MY.VAR = 3
+A.B$ = "s"
+P.X = 4
+Q(1).X = 5
+X.1 = 6
+PRINT MY.VAR; A.B$; P.X; Q(1).X; X.1
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "3 s 4  5  6");
+}

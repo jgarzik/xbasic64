@@ -463,7 +463,8 @@ Check "LCASE$", LCASE$("MiXeD"), "mixed"
 Check "HEX$", HEX$(255), "FF"
 Check "OCT$", OCT$(8), "10"
 Check "concatenation", "a" + "b" + "c", "abc"
-Check "embedded quote", "say ""hi""", "say " + CHR$(34) + "hi" + CHR$(34)
+Check "embedded quote", MID$("say " + CHR$(34) + "hi" + CHR$(34), 5, 1), CHR$(34)
+Check "dotted name", STR$(MY.COUNT + 1), " 1"
 Check "empty string", "[" + "" + "]", "[]"
 
 B$ = "hello"

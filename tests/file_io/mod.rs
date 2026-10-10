@@ -867,3 +867,35 @@ END
         vec!["12  255  100  0", "ERR 62"]
     );
 }
+
+/// GW-BASIC's `OPEN "O", #1, "f"`, and file numbers without `#` where it
+/// allows them: OPEN's AS, CLOSE (with a list), FIELD, GET and PUT.
+#[test]
+fn test_legacy_open_and_file_numbers() {
+    let source = r#"
+OPEN "O", #1, "a.txt"
+PRINT #1, 5
+CLOSE 1
+OPEN "a.txt" FOR INPUT AS 2
+OPEN "a", 3, "b.txt"
+INPUT #2, A
+PRINT #3, A * 2
+CLOSE #2, 3
+OPEN "I", 1, "b.txt"
+INPUT #1, B
+PRINT A; B
+CLOSE
+OPEN "R", #1, "r.dat", 16
+FIELD 1, 16 AS R$
+LSET R$ = "rec"
+PUT 1, 1
+GET #1, 1
+PRINT LEFT$(R$, 3)
+CLOSE 1
+"#;
+    let (output, _tmp) = compile_and_run_with_files(source, |_| Ok(())).unwrap();
+    assert_eq!(crate::common::lines(&output), &["5  10", "rec"]);
+
+    let err = crate::common::compile_only("OPEN \"X\", 1, \"f\"\n").unwrap_err();
+    assert!(err.contains("not O, I, A or R"), "got: {}", err.stderr);
+}

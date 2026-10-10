@@ -2175,6 +2175,19 @@ impl CodeGen {
         }
     }
 
+    /// The index of main's `target` in `_err_resume_targets`, which the
+    /// unwind to it dispatches on.
+    fn resume_target_index(&mut self, target: &GotoTarget) -> usize {
+        let label = Self::main_label(target);
+        match self.resume_targets.iter().position(|l| *l == label) {
+            Some(i) => i,
+            None => {
+                self.resume_targets.push(label);
+                self.resume_targets.len() - 1
+            }
+        }
+    }
+
     /// The assembly label a branch target names in the code being generated:
     /// main's own label, or in the handler copy of main, its copy's.
     fn branch_label(&self, target: &GotoTarget) -> String {
@@ -4198,8 +4211,9 @@ impl CodeGen {
                 self.emit_label(&ret_label);
             }
 
-            StmtKind::Return => {
-                // Pop a return site number and dispatch through the table.
+            StmtKind::Return(target) => {
+                // Pop a return site number and dispatch through the table --
+                // or, for `RETURN line`, drop it and go to the line.
                 // The number must be one of this scope's: an empty stack is
                 // a RETURN nobody GOSUBed to, and another scope's site would
                 // jump into code whose frame is not the live one. Both are
@@ -4229,8 +4243,18 @@ impl CodeGen {
                     self.emit_check("jae", RtError::ReturnWithoutGosub);
                     self.emit("    add rcx, 8");
                     self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
-                    self.emit("    mov QWORD PTR [rip + _err_resume_label], rax");
-                    self.emit("    mov QWORD PTR [rip + _err_pending], 3");
+                    match target {
+                        None => {
+                            self.emit("    mov QWORD PTR [rip + _err_resume_label], rax");
+                            self.emit("    mov QWORD PTR [rip + _err_pending], 3");
+                        }
+                        // To a line of main's, as RESUME <line> goes.
+                        Some(t) => {
+                            let idx = self.resume_target_index(t);
+                            emit!(self, "    mov QWORD PTR [rip + _err_resume_label], {}", idx);
+                            self.emit("    mov QWORD PTR [rip + _err_pending], 2");
+                        }
+                    }
                     self.emit("    mov QWORD PTR [rip + _err_active], 0");
                     self.emit("    mov eax, 3");
                     self.emit("    jmp .Lhandler_ret");
@@ -4240,8 +4264,16 @@ impl CodeGen {
                 }
                 self.emit("    add rcx, 8");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
-                self.emit("    lea rcx, [rip + _gosub_sites]");
-                self.emit("    jmp QWORD PTR [rcx + rax*8]");
+                match target {
+                    None => {
+                        self.emit("    lea rcx, [rip + _gosub_sites]");
+                        self.emit("    jmp QWORD PTR [rcx + rax*8]");
+                    }
+                    Some(t) => {
+                        let label = self.branch_label(t);
+                        emit!(self, "    jmp {}", label);
+                    }
+                }
             }
 
             StmtKind::OnGoto { expr, targets } => {
@@ -4466,14 +4498,7 @@ impl CodeGen {
                     ResumeTarget::Same => self.emit("    mov eax, 1"),
                     ResumeTarget::Next => self.emit("    mov eax, 2"),
                     ResumeTarget::At(t) => {
-                        let label = Self::main_label(t);
-                        let idx = match self.resume_targets.iter().position(|l| *l == label) {
-                            Some(i) => i,
-                            None => {
-                                self.resume_targets.push(label);
-                                self.resume_targets.len() - 1
-                            }
-                        };
+                        let idx = self.resume_target_index(t);
                         emit!(self, "    mov QWORD PTR [rip + _err_resume_label], {}", idx);
                         self.emit("    mov QWORD PTR [rip + _err_pending], 2");
                         self.emit("    mov eax, 3");
@@ -4755,15 +4780,17 @@ impl CodeGen {
                 }
             }
 
-            StmtKind::Close { file_num } => match file_num {
-                Some(e) => {
+            // Bare CLOSE closes every open file.
+            StmtKind::Close(file_nums) if file_nums.is_empty() => {
+                self.call_rt("_rt_file_close_all");
+            }
+            StmtKind::Close(file_nums) => {
+                for e in file_nums {
                     let fnum = self.gen_file_num(e);
                     self.emit_arg_file_num(0, &fnum);
                     self.call_rt("_rt_file_close");
                 }
-                // Bare CLOSE closes every open file.
-                None => self.call_rt("_rt_file_close_all"),
-            },
+            }
 
             // WIDTH: 1 to 255 columns, 255 meaning no limit, as in GW-BASIC.
             StmtKind::Width { file_num, width } => {
