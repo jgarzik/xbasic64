@@ -174,6 +174,18 @@ pub fn generate_runtime() -> String {
     emit(rt)
 }
 
+/// Both runtime trees, each as one unsplit assembly text, by tree name.
+#[cfg(test)]
+pub(crate) fn tree_sources() -> [(&'static str, String); 2] {
+    let whole = |rt: &Runtime| {
+        emit(&Runtime {
+            function_section: "",
+            ..*rt
+        })
+    };
+    [("sysv", whole(&SYSV)), ("win64-native", whole(&WIN64))]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

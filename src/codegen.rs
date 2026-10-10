@@ -207,6 +207,7 @@ use crate::abi::{Abi, PlatformAbi};
 use crate::lexer::normalized;
 use crate::parser::TypeRef;
 use crate::parser::*;
+use crate::rtsig;
 use crate::sema::{Scope as SemaScope, Symbols};
 use crate::using;
 use std::collections::{BTreeMap, HashMap};
@@ -703,6 +704,14 @@ impl CodeGen {
             .expect("argument index out of bounds")
     }
 
+    /// Call the runtime helper `name`, which must have a signature in
+    /// `rtsig`: every runtime call goes through here, so that table is
+    /// complete by construction.
+    fn call_rt(&mut self, name: &str) {
+        rtsig::lookup(name);
+        emit!(self, "    call {}", name);
+    }
+
     /// Move the double in `xmm0` to where argument `pos`, the `nth_float`-th
     /// floating-point argument, is passed. Nothing on System V when it is the
     /// first float; on Win64 the register is the argument's position.
@@ -800,7 +809,11 @@ impl CodeGen {
             }
         }
 
-        emit!(self, "    call {}", sym);
+        if sym.starts_with("_rt_") {
+            self.call_rt(sym);
+        } else {
+            emit!(self, "    call {}", sym);
+        }
         if reserve > 0 {
             emit!(self, "    add rsp, {}", reserve);
         }
@@ -1509,7 +1522,7 @@ impl CodeGen {
         // The console is file handle 0, and each platform's runtime seeds that
         // slot its own way -- a libc stream on System V, a handle from the OS
         // on Windows. Both answer to the same call.
-        self.emit("    call _rt_platform_init");
+        self.call_rt("_rt_platform_init");
 
         // Record what a trapped error has to restore. Taken here because the
         // callee-saved registers still hold the C runtime's values, so putting
@@ -1518,7 +1531,7 @@ impl CodeGen {
         // lives in each runtime tree rather than here.
         if self.traps {
             self.emit("    # ON ERROR: what the handler starts from");
-            self.emit("    call _rt_trap_capture");
+            self.call_rt("_rt_trap_capture");
         }
 
         // Generate main body
@@ -2584,7 +2597,7 @@ impl CodeGen {
             } else {
                 "_rt_fatal"
             };
-            emit!(self, "    call {}", entry);
+            self.call_rt(entry);
         }
     }
 
@@ -2990,7 +3003,7 @@ impl CodeGen {
                 self.gen_print_using(fmt, items);
                 if *newline {
                     self.emit_arg_imm(0, CONSOLE);
-                    self.emit("    call _rt_file_print_newline");
+                    self.call_rt("_rt_file_print_newline");
                 }
             }
 
@@ -3012,7 +3025,7 @@ impl CodeGen {
                                 if !first {
                                     self.emit_arg_file_num(0, &sink);
                                     self.emit_arg_imm(1, ASCII_COMMA);
-                                    self.emit("    call _rt_file_print_char");
+                                    self.call_rt("_rt_file_print_char");
                                 }
                                 self.gen_write_expr(expr, &sink);
                             } else {
@@ -3026,7 +3039,7 @@ impl CodeGen {
                             // tab as well wrote "10\t,20".
                             if !*write {
                                 self.emit_arg_file_num(0, &sink);
-                                self.emit("    call _rt_print_zone");
+                                self.call_rt("_rt_print_zone");
                             }
                         }
                         PrintItem::Empty => {}
@@ -3034,7 +3047,7 @@ impl CodeGen {
                 }
                 if *newline {
                     self.emit_arg_file_num(0, &sink);
-                    self.emit("    call _rt_file_print_newline");
+                    self.call_rt("_rt_file_print_newline");
                 }
             }
 
@@ -3069,7 +3082,7 @@ impl CodeGen {
                         (None, true) => "_rt_input_string",
                         (None, false) => "_rt_input_number",
                     };
-                    emit!(self, "    call {}", rt);
+                    self.call_rt(rt);
                     self.gen_store_lvalue(var);
                 }
             }
@@ -3088,9 +3101,9 @@ impl CodeGen {
                         // comma-delimited field, which is a different reader.
                         let fnum = self.gen_file_num(e);
                         self.emit_arg_file_num(0, &fnum);
-                        self.emit("    call _rt_file_line_input");
+                        self.call_rt("_rt_file_line_input");
                     }
-                    None => self.emit("    call _rt_input_string"),
+                    None => self.call_rt("_rt_input_string"),
                 }
                 self.gen_store_lvalue(var);
             }
@@ -3538,9 +3551,9 @@ impl CodeGen {
                     if is_string_var(&var.name) {
                         // _rt_read_string returns (ptr, len); the length used to
                         // be discarded, leaving whatever was in the length word.
-                        self.emit("    call _rt_read_string");
+                        self.call_rt("_rt_read_string");
                     } else {
-                        self.emit("    call _rt_read_number");
+                        self.call_rt("_rt_read_number");
                     }
                     self.gen_store_lvalue(var);
                 }
@@ -3561,7 +3574,7 @@ impl CodeGen {
                     None => 0,
                 };
                 self.emit_arg_imm(0, idx as i64);
-                self.emit("    call _rt_restore");
+                self.call_rt("_rt_restore");
             }
 
             // A TYPE definition emits nothing; its layout lives in Symbols.
@@ -3619,7 +3632,7 @@ impl CodeGen {
             }
 
             StmtKind::Cls => {
-                self.emit("    call _rt_cls");
+                self.call_rt("_rt_cls");
             }
 
             // DEF* is consumed by sema, which rewrites the names it affects;
@@ -3639,12 +3652,12 @@ impl CodeGen {
                 self.emit("    movsxd r10, eax");
                 match col {
                     Some(e) => self.gen_expr_to_long(e),
-                    None => self.emit("    call _rt_pos"),
+                    None => self.call_rt("_rt_pos"),
                 }
                 self.emit("    movsxd r11, eax");
                 self.emit_arg_reg(0, "r10");
                 self.emit_arg_reg(1, "r11");
-                self.emit("    call _rt_locate");
+                self.call_rt("_rt_locate");
             }
 
             StmtKind::Color { fg, bg } => {
@@ -3660,10 +3673,10 @@ impl CodeGen {
                 self.emit("    movsxd r11, eax");
                 self.emit_arg_reg(0, "r10");
                 self.emit_arg_reg(1, "r11");
-                self.emit("    call _rt_color");
+                self.call_rt("_rt_color");
             }
 
-            StmtKind::Beep => self.emit("    call _rt_beep"),
+            StmtKind::Beep => self.call_rt("_rt_beep"),
 
             // ERASE releases the storage and nulls the descriptor, so the array
             // reads as undimensioned again and a later DIM allocates afresh.
@@ -3731,7 +3744,7 @@ impl CodeGen {
                 self.emit_arg_range_check("r10", 1, Some(255));
                 self.emit_arg_reg(0, "r10");
                 self.emit_arg_imm(1, self.report_line() as i64);
-                self.emit("    call _rt_error_num");
+                self.call_rt("_rt_error_num");
             }
 
             StmtKind::Erase(names) => {
@@ -3751,9 +3764,9 @@ impl CodeGen {
                 // already returns fractional seconds, so it is the clock.
                 match seed {
                     Some(e) => self.gen_expr_to_double(e),
-                    None => self.emit("    call _rt_timer"),
+                    None => self.call_rt("_rt_timer"),
                 }
-                self.emit("    call _rt_randomize");
+                self.call_rt("_rt_randomize");
             }
 
             StmtKind::SelectCase { expr, cases } => {
@@ -3815,7 +3828,7 @@ impl CodeGen {
                 // Terminate the program, not just the current frame. A plain
                 // `leave; ret` only ends the program when END appears in main;
                 // inside a SUB or FUNCTION it just returns to the caller.
-                self.emit("    call _rt_end");
+                self.call_rt("_rt_end");
             }
 
             StmtKind::Open {
@@ -3847,7 +3860,7 @@ impl CodeGen {
                     Some(r) => {
                         self.emit_arg_file_num(2, &fnum);
                         self.emit_arg_file_num(3, &r);
-                        self.emit("    call _rt_file_open_random");
+                        self.call_rt("_rt_file_open_random");
                     }
                     None => {
                         let mode_num = match mode {
@@ -3858,7 +3871,7 @@ impl CodeGen {
                         };
                         self.emit_arg_imm(2, mode_num);
                         self.emit_arg_file_num(3, &fnum);
-                        self.emit("    call _rt_file_open");
+                        self.call_rt("_rt_file_open");
                     }
                 }
             }
@@ -3870,12 +3883,12 @@ impl CodeGen {
                 // may be any expression.
                 let fnum = self.gen_file_num(file_num);
                 self.emit_arg_file_num(0, &fnum);
-                self.emit("    call _rt_field_reset");
+                self.call_rt("_rt_field_reset");
                 for f in fields {
                     let width = self.gen_file_num_like(&f.width);
                     self.emit_arg_file_num(0, &fnum);
                     self.emit_arg_file_num(1, &width);
-                    self.emit("    call _rt_field_next");
+                    self.call_rt("_rt_field_next");
                     // rax/rdx now hold the slice; bind without copying, which
                     // is what makes the variable alias the record buffer.
                     self.gen_bind_alias(&f.target);
@@ -3907,9 +3920,9 @@ impl CodeGen {
                 emit!(self, "    mov {}, QWORD PTR [rsp + 8]", src_len);
                 emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
                 if *right {
-                    self.emit("    call _rt_rset");
+                    self.call_rt("_rt_rset");
                 } else {
-                    self.emit("    call _rt_lset");
+                    self.call_rt("_rt_lset");
                 }
             }
 
@@ -3929,9 +3942,9 @@ impl CodeGen {
                 self.emit_arg_file_num(1, &rec);
                 self.emit_arg_imm(2, self.report_line() as i64);
                 if *is_put {
-                    self.emit("    call _rt_file_put");
+                    self.call_rt("_rt_file_put");
                 } else {
-                    self.emit("    call _rt_file_get");
+                    self.call_rt("_rt_file_get");
                 }
             }
 
@@ -3960,9 +3973,9 @@ impl CodeGen {
                 self.emit_arg_file_num(2, &end);
                 self.emit_arg_imm(3, self.report_line() as i64);
                 if *is_unlock {
-                    self.emit("    call _rt_unlock");
+                    self.call_rt("_rt_unlock");
                 } else {
-                    self.emit("    call _rt_lock");
+                    self.call_rt("_rt_lock");
                 }
             }
 
@@ -3970,10 +3983,10 @@ impl CodeGen {
                 Some(e) => {
                     let fnum = self.gen_file_num(e);
                     self.emit_arg_file_num(0, &fnum);
-                    self.emit("    call _rt_file_close");
+                    self.call_rt("_rt_file_close");
                 }
                 // Bare CLOSE closes every open file.
-                None => self.emit("    call _rt_file_close_all"),
+                None => self.call_rt("_rt_file_close_all"),
             },
         }
     }
@@ -4216,7 +4229,7 @@ impl CodeGen {
             self.emit_arg_reg(1, "rdx"); // left len
             self.emit_arg_reg(2, "r8"); // right ptr
             self.emit_arg_reg(3, "r9"); // right len
-            self.emit("    call _rt_strcat");
+            self.call_rt("_rt_strcat");
             // Result: ptr in rax, len in rdx
             self.expr_depth -= 1;
             return DataType::String;
@@ -4545,7 +4558,7 @@ impl CodeGen {
         self.emit_arg_reg(1, "rdx");
         self.emit_arg_reg(2, "r8");
         self.emit_arg_reg(3, "r9");
-        self.emit("    call _rt_strcmp");
+        self.call_rt("_rt_strcmp");
         self.emit("    test eax, eax");
     }
 
@@ -4836,7 +4849,7 @@ impl CodeGen {
         self.emit_arg_file_num(0, &FileNum::Imm(CONSOLE));
         self.emit_arg_lea(1, &format!("[rip + _str_{}]", idx));
         self.emit_arg_imm(2, prompt.len() as i64);
-        self.emit("    call _rt_file_print_string");
+        self.call_rt("_rt_file_print_string");
     }
 
     /// Check the file number in `eax` against the handle table's slots.
@@ -4908,7 +4921,7 @@ impl CodeGen {
         if regs.len() >= 6 {
             emit!(self, "    mov {}, QWORD PTR [rsp + 32]", regs[4]);
             emit!(self, "    mov {}, QWORD PTR [rsp + 40]", regs[5]);
-            self.emit("    call _rt_mid_assign");
+            self.call_rt("_rt_mid_assign");
         } else {
             // Win64: the 5th and 6th arguments sit just above the 32-byte
             // shadow space, at [rsp+32] and [rsp+40] as seen by the caller.
@@ -4919,7 +4932,7 @@ impl CodeGen {
             self.emit("    sub rsp, 64");
             self.emit("    mov QWORD PTR [rsp + 32], r10");
             self.emit("    mov QWORD PTR [rsp + 40], r11");
-            self.emit("    call _rt_mid_assign");
+            self.call_rt("_rt_mid_assign");
             self.emit("    add rsp, 64");
         }
 
@@ -5059,7 +5072,7 @@ impl CodeGen {
         self.emit("    mov r11, rdx");
         self.emit_arg_reg(0, "r10");
         self.emit_arg_reg(1, "r11");
-        self.emit("    call _rt_strdup");
+        self.call_rt("_rt_strdup");
     }
 
     /// Split `arr(i).f...` into its array name, subscripts and field path.
@@ -5512,7 +5525,7 @@ impl CodeGen {
                 self.emit_arg_reg(0, "rax");
                 self.emit_arg_reg(1, "rdx");
                 self.emit_arg_imm(2, *width as i64);
-                self.emit("    call _rt_fixed");
+                self.call_rt("_rt_fixed");
                 emit!(self, "    mov {}, rax", loc.q(0));
                 emit!(self, "    mov {}, rdx", loc.q(1));
             }
@@ -5685,7 +5698,7 @@ impl CodeGen {
                         self.emit_arg_imm(1, *decimals as i64);
                         self.emit_arg_imm(2, *flags);
                         self.emit_arg_float_from_xmm0(3, 0);
-                        self.emit("    call _rt_print_using_num");
+                        self.call_rt("_rt_print_using_num");
                     }
                     using::UsingPart::Str { kind, width } => {
                         if next >= values.len() {
@@ -5705,7 +5718,7 @@ impl CodeGen {
                             using::StrFieldKind::Fixed => *width as i64,
                         };
                         self.emit_arg_imm(2, w);
-                        self.emit("    call _rt_print_using_str");
+                        self.call_rt("_rt_print_using_str");
                     }
                 }
             }
@@ -5797,7 +5810,7 @@ impl CodeGen {
             s.emit_arg_reg(1, "rdx");
             s.emit_arg_reg(2, "r10");
             s.emit_arg_reg(3, "r11");
-            s.emit("    call _rt_strcmp");
+            s.call_rt("_rt_strcmp");
             s.emit("    test eax, eax");
         };
 
@@ -5839,11 +5852,11 @@ impl CodeGen {
         if self.expr_type(expr) == DataType::String {
             self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
-            self.emit("    call _rt_file_print_char");
+            self.call_rt("_rt_file_print_char");
             self.gen_print_expr(expr, sink, false);
             self.emit_arg_file_num(0, sink);
             self.emit_arg_imm(1, ASCII_QUOTE);
-            self.emit("    call _rt_file_print_char");
+            self.call_rt("_rt_file_print_char");
         } else {
             self.gen_print_expr(expr, sink, false);
         }
@@ -5875,7 +5888,7 @@ impl CodeGen {
             self.emit_arg_reg(2, "rdx"); // len
             self.emit_arg_reg(1, "rax"); // ptr
             self.emit_arg_file_num(0, sink);
-            self.emit("    call _rt_file_print_string");
+            self.call_rt("_rt_file_print_string");
         } else {
             // A Single is printed via its own helper, which round-trips
             // against 32-bit precision: widening 3.14159! to a double and
@@ -5890,7 +5903,7 @@ impl CodeGen {
                 (false, true) => "_rt_print_number",
                 (false, false) => "_rt_file_print_float",
             };
-            emit!(self, "    call {}", helper);
+            self.call_rt(helper);
         }
     }
 
@@ -5906,7 +5919,7 @@ impl CodeGen {
         } else {
             "_rt_file_print_spc"
         };
-        emit!(self, "    call {}", rt);
+        self.call_rt(rt);
     }
 
     fn gen_fn_call(&mut self, name: &str, args: &[Expr]) {
@@ -5939,7 +5952,7 @@ impl CodeGen {
         // Table-driven: evaluate one argument, coerce it, call the helper.
         if let Some(builtin) = RT_BUILTINS.get(upper_name.as_str()) {
             match builtin {
-                Builtin::Call0(sym) => emit!(self, "    call {}", sym),
+                Builtin::Call0(sym) => self.call_rt(sym),
                 Builtin::CallStr(sym) => {
                     // gen_expr leaves a string in rax/rdx. Loading the length
                     // first keeps Win64, where the pointer's register is rdx,
@@ -5947,7 +5960,7 @@ impl CodeGen {
                     self.gen_expr(&args[0]);
                     self.emit_arg_reg(1, "rdx");
                     self.emit_arg_reg(0, "rax");
-                    emit!(self, "    call {}", sym);
+                    self.call_rt(sym);
                 }
                 Builtin::CallLong(sym) => {
                     let arg_type = self.gen_expr(&args[0]);
@@ -5957,7 +5970,7 @@ impl CodeGen {
                         self.emit_arg_range_check("rax", min, max);
                     }
                     self.emit_arg_reg(0, "rax");
-                    emit!(self, "    call {}", sym);
+                    self.call_rt(sym);
                 }
                 Builtin::Coerce(ty) => {
                     let arg_type = self.gen_expr(&args[0]);
@@ -6003,7 +6016,7 @@ impl CodeGen {
                 } else {
                     self.gen_expr_to_double(&args[0]);
                 }
-                self.emit("    call _rt_rnd");
+                self.call_rt("_rt_rnd");
             }
             "LEN" => {
                 self.gen_expr(&args[0]);
@@ -6028,7 +6041,7 @@ impl CodeGen {
                 self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
-                self.emit("    call _rt_left");
+                self.call_rt("_rt_left");
                 self.emit("    pop r13");
                 self.emit("    pop r12");
             }
@@ -6050,7 +6063,7 @@ impl CodeGen {
                 self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
-                self.emit("    call _rt_right");
+                self.call_rt("_rt_right");
                 self.emit("    pop r13");
                 self.emit("    pop r12");
             }
@@ -6094,7 +6107,7 @@ impl CodeGen {
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
                 self.emit_arg_reg(2, "r14"); // start
-                self.emit("    call _rt_mid");
+                self.call_rt("_rt_mid");
                 self.emit("    add rsp, 8");
                 self.emit("    pop r14");
                 self.emit("    pop r13");
@@ -6162,7 +6175,7 @@ impl CodeGen {
                 // The argument is ignored, as in GW-BASIC: POS(0) is the idiom
                 // and any value means the same thing.
                 self.gen_expr(&args[0]);
-                self.emit("    call _rt_pos");
+                self.call_rt("_rt_pos");
             }
             "ASC" => {
                 self.gen_expr(&args[0]);
@@ -6207,7 +6220,7 @@ impl CodeGen {
                 self.emit("    pop rax");
                 self.emit_arg_reg(0, "rax");
                 self.emit_arg_reg(1, "r10");
-                self.emit("    call _rt_string_n");
+                self.call_rt("_rt_string_n");
             }
             // Trimming and case conversion.
             // Radix conversions.
@@ -6272,7 +6285,7 @@ impl CodeGen {
                     "LOC" => "_rt_file_loc",
                     _ => "_rt_file_lof",
                 };
-                emit!(self, "    call {}", rt);
+                self.call_rt(rt);
             }
             // STR$ renders what PRINT would, which means picking the same
             // table PRINT would: a SINGLE carries ~7 digits, and rendering it
@@ -6285,9 +6298,9 @@ impl CodeGen {
                 let single = self.expr_type(&args[0]) == DataType::Single;
                 self.gen_expr_to_double(&args[0]);
                 if single {
-                    self.emit("    call _rt_str_single");
+                    self.call_rt("_rt_str_single");
                 } else {
-                    self.emit("    call _rt_str");
+                    self.call_rt("_rt_str");
                 }
             }
             // MKI$/MKL$/MKS$/MKD$: a number's bytes, as a string. The width
@@ -6316,7 +6329,7 @@ impl CodeGen {
                     }
                 }
                 self.emit_arg_imm(1, Self::mk_width(&upper_name));
-                self.emit("    call _rt_mk");
+                self.call_rt("_rt_mk");
             }
             // CVI/CVL/CVS/CVD: read those bytes back as a number. A string
             // narrower than the type is an error rather than a value, so the
@@ -6332,7 +6345,7 @@ impl CodeGen {
                     "CVS" => "_rt_cvs",
                     _ => "_rt_cvd",
                 };
-                emit!(self, "    call {}", rt);
+                self.call_rt(rt);
             }
             // Print positioning. These emit output rather than yielding a
             // value, so they are only meaningful inside PRINT.

@@ -10,6 +10,7 @@ mod abi;
 mod codegen;
 mod lexer;
 mod parser;
+mod rtsig;
 mod runtime;
 mod sema;
 mod using;
