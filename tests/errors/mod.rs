@@ -993,6 +993,63 @@ fn test_gosub_stack_overflow() {
     );
 }
 
+/// A RETURN reached with nothing on the GOSUB stack is GW-BASIC's error 3.
+///
+/// Sema refuses a program with no GOSUB at all, but falling into a subroutine
+/// is the classic way to reach one at run time, and it used to pop past the
+/// top of the stack and jump to whatever was there.
+#[test]
+fn test_return_without_gosub_at_run_time() {
+    let src = "10 PRINT \"A\"\n20 GOSUB 100\n30 PRINT \"B\"\n100 PRINT \"SUB\"\n110 RETURN\n";
+    let run = compile_and_run_raw(src, "").unwrap();
+    assert_eq!(run.lines(), &["A", "SUB", "B", "SUB"]);
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// ...and it is trappable, as error number 3.
+#[test]
+fn test_return_without_gosub_is_trappable() {
+    let src = "10 ON ERROR GOTO 200\n20 GOSUB 100\n30 PRINT \"B\"\n\
+               100 PRINT \"SUB\"\n110 RETURN\n200 PRINT \"ERR\"; ERR\n210 END\n";
+    let out = compile_and_run(src).unwrap();
+    assert_eq!(crate::common::lines(&out), &["SUB", "B", "SUB", "ERR 3"]);
+}
+
+/// A procedure's RETURN may only go back to a GOSUB made in that procedure.
+///
+/// Popping a return site that main pushed would jump into main's code with the
+/// procedure's frame still live.
+#[test]
+fn test_return_cannot_cross_into_another_scope() {
+    let src = "10 GOSUB 100\n20 PRINT \"never\"\n30 END\n100 CALL S\n110 RETURN\n\
+               SUB S\n  IF 0 THEN GOSUB 500\n500 PRINT \"in S\"\n  RETURN\nEND SUB\n";
+    let run = compile_and_run_raw(src, "").unwrap();
+    assert_eq!(run.lines(), &["in S"]);
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// `ERROR 3` raises the same error by number.
+#[test]
+fn test_error_3_is_return_without_gosub() {
+    let run = compile_and_run_raw("ERROR 3\n", "").unwrap();
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
 /// `--unsafe` removes the runtime checks, and the program still works.
 ///
 /// The flag's entire effect is on emitted code, so without a test that runs

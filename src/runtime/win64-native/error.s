@@ -27,6 +27,7 @@ _err_overflow:  .asciz "Overflow"
 _err_undim:     .asciz "Array used before DIM"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
+_err_noreturn:  .asciz "RETURN without GOSUB"
 _err_badfile:   .asciz "Bad file number"
 _err_badmode:   .asciz "Bad file mode"
 _err_fieldovf:  .asciz "FIELD overflow"
@@ -54,6 +55,7 @@ _err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 # two messages share a number the first one listed is the one ERROR n raises.
 .p2align 3
 _err_codes:
+    .quad _err_noreturn,    3
     .quad _err_domain,      5
     .quad _err_overflow,    6
     .quad _err_memory,      7

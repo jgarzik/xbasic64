@@ -396,6 +396,8 @@ enum RtError {
     OutOfMemory,
     GosubOverflow,
     BadFileNum,
+    /// RETURN with no GOSUB of its own scope to go back to.
+    ReturnWithoutGosub,
     /// RESUME with nothing to return from.
     ResumeNoError,
     /// RESUME after an error raised inside a procedure, whose frame is gone.
@@ -413,6 +415,7 @@ impl RtError {
             RtError::Undim => "_err_undim",
             RtError::OutOfMemory => "_err_memory",
             RtError::GosubOverflow => "_err_gosub",
+            RtError::ReturnWithoutGosub => "_err_noreturn",
             RtError::BadFileNum => "_err_badfile",
             RtError::ResumeNoError => "_err_resnoerr",
             RtError::ResumeInProc => "_err_resproc",
@@ -437,6 +440,7 @@ impl RtError {
             RtError::Undim => "undim",
             RtError::OutOfMemory => "mem",
             RtError::GosubOverflow => "gosub",
+            RtError::ReturnWithoutGosub => "noret",
             RtError::BadFileNum => "badfile",
             RtError::ResumeNoError => "resnoerr",
             RtError::ResumeInProc => "resproc",
@@ -645,6 +649,18 @@ pub struct CodeGen {
     /// Array descriptors currently held in registers, innermost loop last.
     hoisted_arrays: Vec<HoistedArray>,
     gosub_used: bool, // whether GOSUB is used (need return stack)
+    /// Label of every GOSUB return site, indexed by the number GOSUB pushes.
+    ///
+    /// A number rather than the label's address, so that RETURN is a bounded
+    /// table dispatch -- which a code generator without indirect jumps to
+    /// arbitrary addresses can express -- and so that RETURN can tell a site
+    /// of its own scope from garbage or another scope's.
+    gosub_sites: Vec<String>,
+    /// The current scope's slice of `gosub_sites`, as (first id, count). Each
+    /// scope's sites are numbered contiguously because scopes are compiled one
+    /// after another, and the count is taken before the scope is compiled so
+    /// that a RETURN ahead of a GOSUB already knows its range.
+    gosub_scope: (usize, usize),
     /// One entry per module-level statement, in emission order, when trapping.
     ///
     /// Only the count matters -- the labels are `_rs_<i>` and `_rn_<i>` -- but
@@ -1494,12 +1510,14 @@ impl CodeGen {
         }
 
         // Generate main body
+        self.begin_gosub_scope(&program.statements);
         for stmt in &program.statements {
             match stmt.kind {
                 StmtKind::Sub { .. } | StmtKind::Function { .. } => {}
                 _ => self.gen_stmt(stmt),
             }
         }
+        self.end_gosub_scope();
 
         // Exit
         self.emit("    xor eax, eax");
@@ -1526,6 +1544,54 @@ impl CodeGen {
     }
 
     /// Preprocess statement: collect DATA items and check for GOSUB usage
+    /// Number of GOSUB return sites in `stmts`, not counting procedure bodies,
+    /// which are scopes of their own. Each GOSUB and each ON ... GOSUB makes
+    /// exactly one.
+    fn count_return_sites(stmts: &[Stmt]) -> usize {
+        stmts
+            .iter()
+            .map(|stmt| match &stmt.kind {
+                StmtKind::Sub { .. } | StmtKind::Function { .. } => 0,
+                StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => 1,
+                _ => child_bodies(stmt)
+                    .into_iter()
+                    .map(Self::count_return_sites)
+                    .sum(),
+            })
+            .sum()
+    }
+
+    /// Start a scope's run of GOSUB return site numbers.
+    fn begin_gosub_scope(&mut self, body: &[Stmt]) {
+        self.gosub_scope = (self.gosub_sites.len(), Self::count_return_sites(body));
+    }
+
+    /// Check that the scope used exactly the numbers it was given.
+    fn end_gosub_scope(&self) {
+        let (first, count) = self.gosub_scope;
+        assert_eq!(
+            self.gosub_sites.len() - first,
+            count,
+            "return sites counted and compiled disagree"
+        );
+    }
+
+    /// Push the number of a new return site, whose label is `ret_label`.
+    ///
+    /// The stack grows down from `_gosub_stack`'s end; running into its base
+    /// is "GOSUB stack overflow".
+    fn emit_gosub_push(&mut self, ret_label: &str) {
+        let id = self.gosub_sites.len();
+        self.gosub_sites.push(ret_label.to_string());
+        self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+        self.emit("    sub rcx, 8");
+        self.emit("    lea rax, [rip + _gosub_stack]");
+        self.emit("    cmp rcx, rax");
+        self.emit_check("jb", RtError::GosubOverflow);
+        emit!(self, "    mov QWORD PTR [rcx], {}", id);
+        self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+    }
+
     fn preprocess(&mut self, stmt: &Stmt) {
         match &stmt.kind {
             StmtKind::Data(values) => self.data_items.extend(values.clone()),
@@ -2663,9 +2729,11 @@ impl CodeGen {
         let exit_label = format!(".Lproc_exit_{}", mangle(name));
         let saved_exit = self.proc_exit_label.replace(exit_label.clone());
         let saved_loops = std::mem::take(&mut self.loop_stack);
+        self.begin_gosub_scope(body);
         for stmt in body {
             self.gen_stmt(stmt);
         }
+        self.end_gosub_scope();
         self.loop_stack = saved_loops;
         self.proc_exit_label = saved_exit;
         self.emit_label(&exit_label);
@@ -3344,27 +3412,35 @@ impl CodeGen {
             StmtKind::Gosub(target) => {
                 let label = Self::branch_label(target);
                 let ret_label = self.new_label("gosub_ret");
-                // Check for stack overflow before push
-                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
-                self.emit("    sub rcx, 8");
-                self.emit("    lea rax, [rip + _gosub_stack]");
-                self.emit("    cmp rcx, rax");
-                self.emit_check("jb", RtError::GosubOverflow);
-                // Push return address to GOSUB stack
-                emit!(self, "    lea rax, [rip + {}]", ret_label);
-                self.emit("    mov QWORD PTR [rcx], rax");
-                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+                self.emit_gosub_push(&ret_label);
                 emit!(self, "    jmp {}", label);
                 self.emit_label(&ret_label);
             }
 
             StmtKind::Return => {
-                // Pop return address from GOSUB stack and jump (use rcx - caller-saved on both ABIs)
+                // Pop a return site number and dispatch through the table.
+                // The number must be one of this scope's: an empty stack is
+                // a RETURN nobody GOSUBed to, and another scope's site would
+                // jump into code whose frame is not the live one. Both are
+                // GW-BASIC's "RETURN without GOSUB", and the stack is left
+                // alone so that a handler sees it as it was.
+                let (first, count) = self.gosub_scope;
                 self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
+                emit!(
+                    self,
+                    "    lea rax, [rip + _gosub_stack + {}]",
+                    GOSUB_STACK_SIZE
+                );
+                self.emit("    cmp rcx, rax");
+                self.emit_check("jae", RtError::ReturnWithoutGosub);
                 self.emit("    mov rax, QWORD PTR [rcx]");
+                emit!(self, "    lea rdx, [rax - {}]", first);
+                emit!(self, "    cmp rdx, {}", count);
+                self.emit_check("jae", RtError::ReturnWithoutGosub);
                 self.emit("    add rcx, 8");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
-                self.emit("    jmp rax");
+                self.emit("    lea rcx, [rip + _gosub_sites]");
+                self.emit("    jmp QWORD PTR [rcx + rax*8]");
             }
 
             StmtKind::OnGoto { expr, targets } => {
@@ -3384,15 +3460,15 @@ impl CodeGen {
             }
 
             StmtKind::OnGosub { expr, targets } => {
-                // One return address serves the whole statement: whichever
+                // One return site serves the whole statement: whichever
                 // subroutine runs, RETURN comes back to the same place, which
                 // is the statement after this one.
                 //
-                // That address must not be pushed when the selector picks
+                // That site must not be pushed when the selector picks
                 // nothing, or a GOSUB that never happened would leave a frame
                 // behind and the next RETURN would jump to it. So the range is
                 // checked first, and out-of-range branches past the push --
-                // to the very label the return address points at, since
+                // to the very label the return site names, since
                 // "matched nothing" and "came back" continue identically.
                 let expr_type = self.gen_expr(expr);
                 if expr_type.is_integer() {
@@ -3411,14 +3487,7 @@ impl CodeGen {
                 emit!(self, "    cmp r8, {}", targets.len());
                 emit!(self, "    jg {}", after);
 
-                self.emit("    mov rcx, QWORD PTR [rip + _gosub_sp]");
-                self.emit("    sub rcx, 8");
-                self.emit("    lea rax, [rip + _gosub_stack]");
-                self.emit("    cmp rcx, rax");
-                self.emit_check("jb", RtError::GosubOverflow);
-                emit!(self, "    lea rax, [rip + {}]", after);
-                self.emit("    mov QWORD PTR [rcx], rax");
-                self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+                self.emit_gosub_push(&after);
 
                 for (i, target) in targets.iter().enumerate() {
                     let label = Self::branch_label(target);
@@ -6831,9 +6900,15 @@ impl CodeGen {
             }
         }
 
-        // GOSUB return stack pointer
+        // GOSUB return stack pointer, and where each return site number
+        // RETURN pops leads.
         if self.gosub_used {
             self.emit("_gosub_sp: .quad 0");
+            self.emit(".p2align 3");
+            self.emit("_gosub_sites:");
+            for label in std::mem::take(&mut self.gosub_sites) {
+                emit!(self, "    .quad {}", label);
+            }
         }
 
         self.emit("");

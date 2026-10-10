@@ -293,6 +293,33 @@ fn test_goto_gosub() {
     assert_eq!(lines[4], "second", "on goto");
 }
 
+/// GOSUB inside a procedure returns into that procedure's own frame, including
+/// when the procedure recurses between the GOSUB and its RETURN.
+#[test]
+fn test_gosub_inside_a_recursive_procedure() {
+    let output = compile_and_run(
+        r#"
+CALL S(3)
+PRINT "done"
+SUB S(N%)
+  GOSUB 500
+  PRINT "back"; N%
+  EXIT SUB
+500 PRINT "sub"; N%
+  IF N% > 1 THEN CALL S(N% - 1)
+  RETURN
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &[
+            "sub 3", "sub 2", "sub 1", "back 1", "back 2", "back 3", "done"
+        ]
+    );
+}
+
 #[test]
 fn test_select_case() {
     // Test SELECT CASE and CASE ELSE
