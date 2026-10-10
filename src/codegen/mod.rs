@@ -455,6 +455,7 @@ fn libc_sig(name: &str) -> (&'static [Type], &'static [Type]) {
         "calloc" | "realloc" => (&[types::I64, types::I64], &[types::I64]),
         "free" => (&[types::I64], &[]),
         "memset" => (&[types::I64, types::I32, types::I64], &[types::I64]),
+        "memcpy" => (&[types::I64, types::I64, types::I64], &[types::I64]),
         _ => unreachable!("{} is not a libc function generated code calls", name),
     }
 }

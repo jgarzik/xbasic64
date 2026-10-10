@@ -527,6 +527,26 @@ impl FnGen<'_> {
 
         let counts: Vec<Value> = bounds.iter().map(|(_, c)| *c).collect();
         let size = self.checked_size(&counts, elem_size);
+        // PRESERVE of a many-dimensional array: elements are stored row by
+        // row, the last subscript fastest, so a new last dimension changes
+        // where every row starts, and realloc would scramble them. Each row
+        // is copied to a fresh block instead.
+        if preserve && ndims > 1 {
+            let mem = self.preserve_rows(&arr.name, loc, ndims, &bounds, size, elem_size);
+            let n = ndims as i32;
+            self.store(mem, loc);
+            for (i, (lo, count)) in bounds.into_iter().enumerate() {
+                self.store(count, loc.offset(8 * (1 + i as i32)));
+                self.store(lo, loc.offset(8 * (1 + n + i as i32)));
+            }
+            let info = ArrayInfo { loc, ndims };
+            if self.current_proc.is_some() {
+                self.proc_arrays.insert(arr.name.clone(), info);
+            } else {
+                self.cg.arrays.insert(arr.name.clone(), info);
+            }
+            return;
+        }
         if preserve {
             // Elements past the new end are lost to realloc: free the
             // strings they hold first.
@@ -587,6 +607,100 @@ impl FnGen<'_> {
         } else {
             self.cg.arrays.insert(arr.name.clone(), info);
         }
+    }
+
+    /// The new element block for `REDIM PRESERVE` of a many-dimensional
+    /// array, the old elements copied into it row by row, and the old block
+    /// freed. Only the last dimension may change, as in QuickBASIC: any
+    /// other is Subscript out of range. Strings the copy drops, when the
+    /// last dimension shrinks, are freed; the rest move with their bytes.
+    fn preserve_rows(
+        &mut self,
+        name: &str,
+        loc: Loc,
+        ndims: usize,
+        bounds: &[(Value, Value)],
+        size: Value,
+        elem_size: i64,
+    ) -> Value {
+        let n = ndims as i32;
+        let old = self.load(types::I64, loc);
+        // An array with no elements yet has nothing to keep, and no shape
+        // the new one must match.
+        if self.cg.opts.checks {
+            let has = self.b.create_block();
+            let fine = self.b.create_block();
+            self.brif(old, has, fine);
+            self.switch_sealed(has);
+            for (i, (lo, count)) in bounds.iter().enumerate().take(ndims - 1) {
+                let old_count = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
+                let old_lo = self.load(types::I64, loc.offset(8 * (1 + n + i as i32)));
+                let c = self.b.ins().icmp(IntCC::NotEqual, old_count, *count);
+                let l = self.b.ins().icmp(IntCC::NotEqual, old_lo, *lo);
+                let bad = self.b.ins().bor(c, l);
+                self.raise_if(bad, RtError::Subscript);
+            }
+            self.begin_sealed(fine);
+        }
+
+        let one = self.iconst(types::I64, 1);
+        let mem = self.call("calloc", &[one, size])[0];
+        if self.cg.opts.checks {
+            let null = self.b.ins().icmp_imm_s(IntCC::Equal, mem, 0);
+            self.raise_if(null, RtError::OutOfMemory);
+        }
+
+        let copy = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(old, copy, done);
+        self.switch_sealed(copy);
+        let mut rows = self.iconst(types::I64, 1);
+        for i in 0..ndims - 1 {
+            let c = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
+            rows = self.b.ins().imul(rows, c);
+        }
+        let old_last = self.load(types::I64, loc.offset(8 * n));
+        let new_last = bounds[ndims - 1].1;
+        let keep_lt = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedLessThan, old_last, new_last);
+        let keep = self.b.ins().select(keep_lt, old_last, new_last);
+        let layout = self.array_string_layout(name);
+
+        let r = self.b.declare_var(types::I64);
+        let zero = self.iconst(types::I64, 0);
+        self.b.def_var(r, zero);
+        let head = self.b.create_block();
+        let body = self.b.create_block();
+        let after = self.b.create_block();
+        self.begin_block(head);
+        let rv = self.b.use_var(r);
+        let more = self.b.ins().icmp(IntCC::UnsignedLessThan, rv, rows);
+        self.brif(more, body, after);
+        self.switch_sealed(body);
+        let old_row_start = self.b.ins().imul(rv, old_last);
+        if let Some((es, offsets)) = &layout {
+            // The row's elements past the new last dimension.
+            let from = self.b.ins().iadd(old_row_start, keep);
+            let to = self.b.ins().iadd(old_row_start, old_last);
+            self.free_element_strings(old, from, to, *es, offsets);
+        }
+        let src_off = self.b.ins().imul_imm_s(old_row_start, elem_size);
+        let src = self.b.ins().iadd(old, src_off);
+        let new_row_start = self.b.ins().imul(rv, new_last);
+        let dst_off = self.b.ins().imul_imm_s(new_row_start, elem_size);
+        let dst = self.b.ins().iadd(mem, dst_off);
+        let bytes = self.b.ins().imul_imm_s(keep, elem_size);
+        self.call("memcpy", &[dst, src, bytes]);
+        let next = self.b.ins().iadd_imm_s(rv, 1);
+        self.b.def_var(r, next);
+        self.b.ins().jump(head, &[]);
+        self.b.seal_block(head);
+        self.switch_sealed(after);
+        self.call("free", &[old]);
+        self.begin_sealed(done);
+        mem
     }
 
     /// The number of elements the descriptor at `loc` describes.

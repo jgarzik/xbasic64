@@ -356,3 +356,51 @@ D(1) = 1 / 3: PRINT D(1)
         ]
     );
 }
+
+/// REDIM PRESERVE of a two-dimensional array keeps every element whose
+/// subscripts still exist, growing or shrinking the last dimension, as
+/// QuickBASIC does; strings dropped by a shrink are freed. Changing any
+/// other dimension is Subscript out of range.
+#[test]
+fn test_redim_preserve_of_a_2d_array() {
+    let out = compile_and_run(
+        r#"
+DIM G(2, 3), S$(1, 2)
+FOR I = 0 TO 2: FOR J = 0 TO 3: G(I, J) = I * 10 + J: NEXT J: NEXT I
+REDIM PRESERVE G(2, 5)
+PRINT G(0, 3); G(1, 0); G(2, 3); G(2, 5)
+REDIM PRESERVE G(2, 1)
+PRINT G(0, 1); G(1, 1); G(2, 0); G(2, 1)
+S$(0, 2) = "x": S$(1, 0) = "y": S$(1, 1) = "z"
+REDIM PRESERVE S$(1, 1)
+PRINT S$(1, 0); S$(1, 1); UBOUND(S$, 2)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["3  10  23  0", "1  11  20  21", "yz 1"]
+    );
+
+    let run = crate::common::compile_and_run_raw(
+        "DIM G(2, 3)\nG(1, 1) = 5\nREDIM PRESERVE G(3, 3)\nPRINT \"no\"\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Subscript out of range"),
+        "{:?}",
+        run.stderr
+    );
+}
+
+/// A plain `AS STRING` array holds variable-length strings, suffix or no.
+#[test]
+fn test_array_declared_as_string() {
+    let out = compile_and_run(
+        "DIM A(3) AS STRING\nA(1) = \"one\"\nA(2) = A(1) + \"+\"\nPRINT A(2); LEN(A(3))\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "one+ 0");
+}
