@@ -25,6 +25,7 @@ unsafe extern "C" {
     pub fn fwrite(p: *const c_void, size: usize, n: usize, f: *mut FILE) -> usize;
     pub fn fprintf(f: *mut FILE, fmt: *const c_char, ...) -> c_int;
     pub fn snprintf(buf: *mut c_char, n: usize, fmt: *const c_char, ...) -> c_int;
+    pub fn strtod(s: *const c_char, end: *mut *mut c_char) -> f64;
 }
 
 /// What ends a line of output: Windows programs have always written CRLF,
