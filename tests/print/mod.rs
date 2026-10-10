@@ -483,3 +483,85 @@ PRINT 1E100
         ]
     );
 }
+
+/// WIDTH sets the line length output wraps at, as in GW-BASIC: long text is
+/// cut and continued, a number that does not fit moves to the next line whole,
+/// and a comma past the last full zone starts a new line. 255 means no limit,
+/// which is also where every program and every file starts.
+#[test]
+fn test_width_wraps_output() {
+    let output = compile_and_run(
+        r#"
+WIDTH 10
+PRINT "abcdefghijklmnopqrstuvwxyz"
+PRINT "12345"; 678
+PRINT "12345"; 6789
+PRINT "1234567890"
+PRINT "a", "b"
+WIDTH 30
+PRINT "a", "b", "c"
+WIDTH 255
+PRINT STRING$(300, "x")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "abcdefghij",
+            "klmnopqrst",
+            "uvwxyz",
+            "12345 678 ",
+            "12345",
+            " 6789 ",
+            "1234567890",
+            "a",
+            "b",
+            "a             b",
+            "c",
+            &"x".repeat(300),
+        ]
+    );
+}
+
+/// WIDTH applies to a file by number, and OPEN starts a file without one.
+#[test]
+fn test_width_on_a_file() {
+    let output = compile_and_run(
+        r#"
+OPEN "w.txt" FOR OUTPUT AS #1
+WIDTH #1, 4
+PRINT #1, "abcdefgh"
+CLOSE #1
+OPEN "w.txt" FOR APPEND AS #1
+PRINT #1, "abcdefgh"
+CLOSE #1
+OPEN "w.txt" FOR INPUT AS #1
+WHILE NOT EOF(1)
+LINE INPUT #1, A$
+PRINT A$
+WEND
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["abcd", "efgh", "abcdefgh"]
+    );
+}
+
+/// A width outside 1-255 is Illegal function call; a file not open is Bad file
+/// number.
+#[test]
+fn test_width_arguments_are_checked() {
+    for (source, msg) in [
+        ("WIDTH 0\n", "Illegal function call"),
+        ("WIDTH 256\n", "Illegal function call"),
+        ("WIDTH #2, 40\n", "Bad file number"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
+    }
+}

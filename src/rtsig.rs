@@ -128,6 +128,7 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_file_open_random", &[I64, I64, I64, I64], &[])),
     h("_rt_file_close", &[I64], &[]),
     h("_rt_file_close_all", &[], &[]),
+    fallible(h("_rt_width", &[I64, I64], &[])),
     fallible(h("_rt_file_input_string", &[I64], STR)),
     fallible(h("_rt_file_input_number", &[I64], &[F64])),
     fallible(h("_rt_file_line_input", &[I64], STR)),

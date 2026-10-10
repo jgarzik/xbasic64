@@ -4234,6 +4234,20 @@ impl CodeGen {
                 // Bare CLOSE closes every open file.
                 None => self.call_rt("_rt_file_close_all"),
             },
+
+            // WIDTH: 1 to 255 columns, 255 meaning no limit, as in GW-BASIC.
+            StmtKind::Width { file_num, width } => {
+                let fnum = match file_num {
+                    Some(e) => self.gen_file_num(e),
+                    None => FileNum::Imm(CONSOLE),
+                };
+                self.gen_expr_to_long(width);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_range_check("rax", 1, Some(255));
+                self.emit_arg_reg(1, "rax");
+                self.emit_arg_file_num(0, &fnum);
+                self.call_rt("_rt_width");
+            }
         }
     }
 

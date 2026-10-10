@@ -449,7 +449,18 @@ Trailing zeros are dropped, and a value below one has no leading zero (`.5`,
 not `0.5`). `STR$` gives exactly what `PRINT` writes.
 
 A comma moves to the start of the next 14-column zone, padding with blanks.
-There is no line width, so the zones go on as far as the line does. `WRITE` and
+
+`WIDTH w` sets the line length console output wraps at, and `WIDTH #n, w` that
+of file `n`; `w` is 1 to 255, and 255 means no limit, which is where every
+program and every newly opened file starts. Under a width, text that runs past
+the end of the line continues on the next, a number that does not fit on the
+rest of the line moves to the next one whole, and a comma whose zone would not
+fit starts a new line -- as in GW-BASIC, whose screen started at 80.
+
+```basic
+WIDTH 40
+PRINT STRING$(50, "*")    ' 40 stars, then 10 on the next line
+``` `WRITE` and
 `PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
 meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
 
@@ -1599,7 +1610,7 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
+- **Console control** -- `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
 - **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`
 - **Procedures** -- `SHARED`, `STATIC`, `DECLARE`, `BYVAL`

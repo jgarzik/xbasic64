@@ -126,7 +126,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "INKEY$ needs raw console input, which is not implemented yet",
     ),
     ("INPUT$", "INPUT$ is not implemented yet"),
-    ("WIDTH", "console width control is not implemented yet"),
     ("CSRLIN", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
@@ -648,6 +647,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             | StmtKind::Stop
             | StmtKind::Open { .. }
             | StmtKind::Close { .. }
+            | StmtKind::Width { .. }
             | StmtKind::GetPut { .. }
             | StmtKind::Lock { .. } => {}
         }
@@ -809,6 +809,10 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             reclen.iter_mut().for_each(&mut *f);
         }
         StmtKind::Close { file_num } => file_num.iter_mut().for_each(&mut *f),
+        StmtKind::Width { file_num, width } => {
+            file_num.iter_mut().for_each(&mut *f);
+            f(width);
+        }
         StmtKind::Field { file_num, fields } => {
             f(file_num);
             for slice in fields {
@@ -1698,6 +1702,13 @@ impl Analyzer {
                 file_num: Some(file_num),
             } => {
                 self.check_file_num(file_num, scope, line);
+            }
+            StmtKind::Width { file_num, width } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
+                }
+                self.check_expr(width, scope, line);
+                self.require_numeric(width, scope, line, "a width");
             }
             StmtKind::Field { file_num, fields } => {
                 self.check_file_num(file_num, scope, line);

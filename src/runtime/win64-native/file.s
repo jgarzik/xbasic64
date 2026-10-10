@@ -58,6 +58,8 @@ _file_newline:     .ascii "\r\n"
 _file_handles: .skip 128        # 16 * 8 bytes = 16 HANDLEs
 # How each number was opened: 0 INPUT, 1 OUTPUT, 2 APPEND, 3 RANDOM.
 _file_mode: .skip 128
+# WIDTH: the line length output wraps at, per file number; 0 = no limit.
+_file_width: .skip 128
 # Current output column per file number, so TAB(n) knows how far to advance.
 # Updated by the print helpers and reset by a newline. Slot 0 is the console,
 # which is file handle 0.
@@ -168,6 +170,8 @@ _rt_file_open:
     mov [rcx + rbx*8], rax
     lea rcx, [rip + _file_mode]
     mov [rcx + rbx*8], r14
+    lea rcx, [rip + _file_width]
+    mov QWORD PTR [rcx + rbx*8], 0      # a new file has no WIDTH
     mov r12, rax            # the handle, for the seek below
 
     # A record buffer left by an earlier OPEN ... FOR RANDOM on this number
@@ -252,6 +256,9 @@ _rt_file_close:
 #   r8  = string length
 #
 # Returns: nothing
+#
+# Under a WIDTH, the text is cut where the line ends and continued on the next;
+# see the System V twin.
 .globl _rt_file_print_string
 _rt_file_print_string:
     push rbp
@@ -259,40 +266,63 @@ _rt_file_print_string:
     push rbx
     push rdi
     push rsi
-    sub rsp, 40             # Shadow space + stack arg
+    push r12
+    sub rsp, 48             # Shadow space + stack arg, 16-byte aligned
 
     # An unassigned string is (NULL, 0); writing nothing is correct and avoids
     # handing WriteFile a NULL buffer.
     test r8, r8
     jz .Lfile_print_str_done
 
-    mov ebx, ecx            # save file number
-    mov rdi, rdx            # save string ptr
-    mov rsi, r8             # save string len
+    mov ebx, ecx            # file number
+    mov rdi, rdx            # where the text left to write starts
+    mov rsi, r8             # how much is left
 
-    # Get HANDLE from table
     lea rax, [rip + _file_handles]
-    mov rcx, [rax + rbx*8]  # hFile
-    test rcx, rcx
-    jnz .Lfile_print_str_open
+    cmp QWORD PTR [rax + rbx*8], 0
+    jne .Lfile_print_str_open
     call .Lfile_not_open    # a number nobody OPENed is NULL here
     jmp .Lfile_print_str_done
 .Lfile_print_str_open:
     call .Lfile_check_writable
     jc .Lfile_print_str_done
 
+.Lfile_print_str_chunk:
+    mov r12, rsi            # this piece: all of what is left ...
+    lea rax, [rip + _file_width]
+    mov rcx, QWORD PTR [rax + rbx*8]
+    test rcx, rcx
+    jz .Lfile_print_str_write
+    lea rax, [rip + _file_col]
+    sub rcx, QWORD PTR [rax + rbx*8]    # ... or the room left on the line
+    jg .Lfile_print_str_room
+    mov ecx, ebx
+    call _rt_file_print_newline         # none: start the next line
+    lea rax, [rip + _file_width]
+    mov rcx, QWORD PTR [rax + rbx*8]
+.Lfile_print_str_room:
+    cmp r12, rcx
+    jbe .Lfile_print_str_write
+    mov r12, rcx
+.Lfile_print_str_write:
     # WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped)
-    mov rdx, rdi            # lpBuffer = string ptr
-    mov r8, rsi             # nNumberOfBytesToWrite = length
+    lea rax, [rip + _file_handles]
+    mov rcx, QWORD PTR [rax + rbx*8]
+    mov rdx, rdi
+    mov r8, r12
     lea r9, [rip + _file_bytes_written]
     mov QWORD PTR [rsp + 32], 0  # lpOverlapped = NULL
     call WriteFile
 
     lea rax, [rip + _file_col]
-    add QWORD PTR [rax + rbx*8], rsi
+    add QWORD PTR [rax + rbx*8], r12
+    add rdi, r12
+    sub rsi, r12
+    jnz .Lfile_print_str_chunk
 
 .Lfile_print_str_done:
-    add rsp, 40
+    add rsp, 48
+    pop r12
     pop rsi
     pop rdi
     pop rbx
@@ -405,7 +435,26 @@ _rt_print_number_single:
     lea rdx, [rip + _num_buf]
     mov BYTE PTR [rdx + rax], 32    # the trailing blank
     inc rax
-    mov r8, rax
+    mov r12, rax                    # the length, across the call below
+
+    # Under a WIDTH, a number that does not fit on the rest of the line starts
+    # the next one, as in GW-BASIC, rather than being split.
+    lea rcx, [rip + _file_width]
+    mov rcx, QWORD PTR [rcx + rbx*8]
+    test rcx, rcx
+    jz .Lprint_num_write
+    lea rdx, [rip + _file_col]
+    mov rdx, QWORD PTR [rdx + rbx*8]
+    test rdx, rdx
+    jz .Lprint_num_write            # already at the start of a line
+    add rdx, rax
+    cmp rdx, rcx
+    jbe .Lprint_num_write
+    mov ecx, ebx
+    call _rt_file_print_newline
+.Lprint_num_write:
+    lea rdx, [rip + _num_buf]
+    mov r8, r12
     mov ecx, ebx
     call _rt_file_print_string
 
@@ -445,11 +494,26 @@ _rt_print_zone:
     div r8
     inc rax
     imul rax, rax, PRINT_ZONE           # first column of the next zone, 0-based
+
+    # Under a WIDTH, a zone that would not fit whole on the line means the
+    # next line, as in GW-BASIC.
+    lea rcx, [rip + _file_width]
+    mov rcx, QWORD PTR [rcx + rbx*8]
+    test rcx, rcx
+    jz .Lprint_zone_fits
+    lea rdx, [rax + PRINT_ZONE]
+    cmp rdx, rcx
+    jbe .Lprint_zone_fits
+    mov ecx, ebx
+    call _rt_file_print_newline
+    jmp .Lprint_zone_done
+.Lprint_zone_fits:
     inc rax                             # _rt_file_print_tab counts from 1
     mov rdx, rax
     mov ecx, ebx
     call _rt_file_print_tab
 
+.Lprint_zone_done:
     add rsp, 40
     pop rbx
     leave
@@ -577,6 +641,21 @@ _rt_file_print_char:
 .Lfile_char_open:
     call .Lfile_check_writable
     jc .Lfile_char_done
+
+    # Under a WIDTH, a full line wraps before the character, as in
+    # _rt_file_print_string.
+    lea rax, [rip + _file_width]
+    mov rdx, QWORD PTR [rax + rbx*8]
+    test rdx, rdx
+    jz .Lfile_char_write
+    lea rax, [rip + _file_col]
+    cmp QWORD PTR [rax + rbx*8], rdx
+    jb .Lfile_char_write
+    mov ecx, ebx
+    call _rt_file_print_newline
+.Lfile_char_write:
+    lea rax, [rip + _file_handles]
+    mov rcx, QWORD PTR [rax + rbx*8]
 
     # WriteFile(hFile, buffer, 1, &bytesWritten, NULL)
     lea rdx, [rip + _file_output_buf]
@@ -1110,6 +1189,8 @@ _rt_file_open_random:
     mov [rcx + rbx*8], rax
     lea rcx, [rip + _file_mode]
     mov QWORD PTR [rcx + rbx*8], 3
+    lea rcx, [rip + _file_width]
+    mov QWORD PTR [rcx + rbx*8], 0
 
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
@@ -1964,3 +2045,30 @@ _rt_file_lof:
     lea rcx, [rip + _err_pastend]
     xor edx, edx
     jmp _rt_error
+
+# _rt_width - WIDTH [#n,] w: wrap output to file n at w columns
+#
+# 255 means no limit, as in GW-BASIC. The range 1-255 is checked by the caller.
+#
+# Arguments: rcx = file number (0 = the console), rdx = width
+# Returns: nothing
+.globl _rt_width
+_rt_width:
+    push rbp
+    mov rbp, rsp
+    lea rax, [rip + _file_handles]
+    cmp QWORD PTR [rax + rcx*8], 0
+    jne .Lwidth_open
+    sub rsp, 48             # shadow space; aligns rsp for the call
+    call .Lfile_not_open
+    leave
+    ret
+.Lwidth_open:
+    cmp rdx, 255
+    jne .Lwidth_set
+    xor edx, edx            # 255: no limit
+.Lwidth_set:
+    lea rax, [rip + _file_width]
+    mov QWORD PTR [rax + rcx*8], rdx
+    leave
+    ret

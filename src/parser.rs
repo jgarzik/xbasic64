@@ -280,6 +280,11 @@ pub enum StmtKind {
     Close {
         file_num: Option<Expr>,
     },
+    /// `WIDTH w` for the console, or `WIDTH #n, w` for a file.
+    Width {
+        file_num: Option<Expr>,
+        width: Expr,
+    },
     /// `FIELD #n, w AS v$, ...` -- name slices of a random file's record buffer.
     ///
     /// Each target is bound to (buffer + offset, width) rather than to a copy,
@@ -1449,6 +1454,7 @@ impl Parser {
                     "DECLARE" if matches!(self.peek_at(1), Token::Sub | Token::Function) => {
                         err("DECLARE is not supported yet")
                     }
+                    "WIDTH" if !matches!(self.peek_at(1), Token::Eq) => self.parse_width(),
                     // RESET closes every file, which is what a bare CLOSE does.
                     "RESET" if self.next_ends_statement() => {
                         self.advance();
@@ -3136,6 +3142,24 @@ impl Parser {
             range,
             is_unlock,
         })
+    }
+
+    /// `WIDTH w` or `WIDTH #n, w`. GW-BASIC's device forms (`WIDTH "LPT1:",
+    /// w`) name devices this compiler does not have.
+    fn parse_width(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume WIDTH
+        if matches!(self.peek(), Token::String(_)) {
+            return err("WIDTH for a device is not supported; WIDTH w or WIDTH #n, w");
+        }
+        let file_num = if matches!(self.peek(), Token::Hash) {
+            let n = self.parse_file_number()?;
+            self.expect(Token::Comma)?;
+            Some(n)
+        } else {
+            None
+        };
+        let width = self.parse_expression()?;
+        Ok(StmtKind::Width { file_num, width })
     }
 
     fn parse_close(&mut self) -> PResult<StmtKind> {
