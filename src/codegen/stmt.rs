@@ -396,8 +396,12 @@ impl FnGen<'_> {
                 len,
                 value,
             } => {
-                let cur = self.gen_expr(&Self::lvalue_expr(target));
-                let (tp, tl) = cur.str();
+                // Written in place: the target itself, not a copy of it.
+                let (loc, ty) = self.lvalue_loc(target);
+                if let TypeRef::FixedString(w @ 1..) = ty {
+                    self.own_fixed(loc, w);
+                }
+                let (tp, tl) = self.load_str(loc);
                 let s = self.gen_i64(start);
                 let n = match len {
                     Some(e) => self.gen_i64(e),
@@ -432,8 +436,8 @@ impl FnGen<'_> {
                         // A fixed-length string keeps its width, so each side
                         // takes a copy of the other's value, stored -- and
                         // padded or cut -- as an assignment would.
-                        let (pa, la_len) = self.load_str(la);
-                        let (pb, lb_len) = self.load_str(lb);
+                        let (pa, la_len) = self.load_typed(la, &ta).str();
+                        let (pb, lb_len) = self.load_typed(lb, &tb).str();
                         let ca = self.call_rt("_rt_strdup", &[pa, la_len]);
                         let cb = self.call_rt("_rt_strdup", &[pb, lb_len]);
                         self.store_typed(la, &ta, Val::Str(cb[0], cb[1]));

@@ -375,6 +375,22 @@ fn test_mid_assignment_into_array() {
     assert_eq!(output.trim(), "Jello");
 }
 
+/// MID$ writes into the target even in a statement that calls a user
+/// FUNCTION, where a string load is a copy: it wrote into that copy, and
+/// the target kept its old value. A fixed-length string never assigned is
+/// given NULs of its own to write into, not the ones every such string
+/// reads as.
+#[test]
+fn test_mid_assignment_beside_a_function_call() {
+    let output = compile_and_run(
+        "FUNCTION F(N)\nF = N\nEND FUNCTION\nA$ = \"hello\"\nMID$(A$, F(2)) = \"XY\"\n\
+         DIM G AS STRING * 3, H AS STRING * 3\nMID$(G, F(2)) = \"Z\"\n\
+         PRINT A$; ASC(G); ASC(MID$(G, 2)); ASC(MID$(H, 2))\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "hXYlo 0  90  0");
+}
+
 /// Two calls to the same string builtin in one expression must not alias.
 ///
 /// STR$, CHR$, HEX$ and OCT$ each formatted into a buffer they owned outright,

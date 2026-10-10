@@ -393,8 +393,8 @@ impl FnGen<'_> {
                         let loc = Loc::Stack(slot, 0);
                         let z = self.iconst(types::I64, 0);
                         self.store_str_raw((z, z), loc);
-                        let (p, l) = self.load_str(now);
-                        self.assign_str(loc, Val::Str(p, l));
+                        let v = self.load_typed(now, &TypeRef::FixedString(width));
+                        self.assign_str(loc, v);
                         string_temps.push(loc);
                         copy_backs.push((loc, target, width));
                         vals.push(self.addr(loc));

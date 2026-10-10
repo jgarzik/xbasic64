@@ -1226,6 +1226,18 @@ END FUNCTION
 A declared result type must not contradict a type suffix on the name, and
 a `SUB` -- having no result -- cannot be declared `AS` anything.
 
+A `STRING * n` -- a variable, an array element, a record field or a
+procedure's local -- is always `n` characters long. Until it is first
+assigned it holds `n` copies of `CHR$(0)`, as in QuickBASIC; an assignment
+pads a shorter value with spaces and cuts a longer one to `n`:
+
+```basic
+DIM Code AS STRING * 4
+PRINT LEN(Code); ASC(Code)      ' 4  0
+Code = "ab"
+PRINT "["; Code; "]"            ' [ab  ]
+```
+
 One `DIM` may mix declarators freely:
 
 ```basic
