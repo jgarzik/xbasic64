@@ -41,16 +41,17 @@ _using_out:     .skip 2048      # after sign/currency, padded to the width
 .text
 
 # _rt_print_using_num - Render one numeric field
-# Arguments (Win64):
-#   xmm0 = value
+# Arguments (Win64), the value last so that both ABIs can name it:
 #   rcx  = field width in characters
 #   rdx  = digits after the decimal point
 #   r8   = flags
+#   xmm3 = value, the fourth argument by position
 #
 # A value too wide for its field is printed in full, preceded by '%', which is
 # what GW-BASIC does rather than truncating.
 .globl _rt_print_using_num
 _rt_print_using_num:
+    movaps xmm0, xmm3           # the body works on the value in xmm0
     push rbp
     mov rbp, rsp
     push rbx

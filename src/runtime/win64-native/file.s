@@ -269,11 +269,12 @@ _rt_file_print_string:
 # _rt_file_print_float - Write number to file
 # Arguments:
 #   rcx = file number
-#   xmm0 = value to write (double)
+#   xmm1 = value to write (double), the second argument by position
 #
 # Returns: nothing
 .globl _rt_file_print_float
 _rt_file_print_float:
+    movaps xmm0, xmm1       # the formatter takes the value in xmm0
     push rbp
     mov rbp, rsp
     push rbx
@@ -299,11 +300,12 @@ _rt_file_print_float:
 #
 # Arguments:
 #   rcx = file number
-#   xmm0 = value, already widened to double
+#   xmm1 = value, already widened to double
 #
 # Returns: nothing
 .globl _rt_file_print_single
 _rt_file_print_single:
+    movaps xmm0, xmm1
     push rbp
     mov rbp, rsp
     push rbx
@@ -334,10 +336,11 @@ _rt_file_print_single:
 # A blank where the sign would go, and a blank after. WRITE renders numbers
 # through _rt_file_print_float instead, because WRITE pads nothing.
 #
-# Arguments: rcx = file number, xmm1 = value (xmm0 by position; see below)
+# Arguments: rcx = file number, xmm1 = value
 # Returns: nothing
 .globl _rt_print_number
 _rt_print_number:
+    movaps xmm0, xmm1
     push rbp
     mov rbp, rsp
     push rbx
@@ -353,10 +356,11 @@ _rt_print_number:
 # _rt_print_number_single - The same for a SINGLE, whose shorter digit table
 # is the reason PRINT keeps two entry points at all.
 #
-# Arguments: rcx = file number, the value already widened to double
+# Arguments: rcx = file number, xmm1 = value already widened to double
 # Returns: nothing
 .globl _rt_print_number_single
 _rt_print_number_single:
+    movaps xmm0, xmm1
     push rbp
     mov rbp, rsp
     push rbx

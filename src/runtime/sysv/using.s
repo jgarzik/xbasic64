@@ -41,11 +41,11 @@ _using_out:     .skip 2048      # after sign/currency, padded to the width
 .text
 
 # _rt_print_using_num - Render one numeric field
-# Arguments:
-#   xmm0 = value
+# Arguments, in order (width, decimals, flags, value):
 #   rdi  = field width in characters
 #   rsi  = digits after the decimal point
 #   rdx  = flags
+#   xmm0 = value, the first float argument
 #
 # Returns: nothing
 #

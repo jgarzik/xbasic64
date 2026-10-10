@@ -703,6 +703,16 @@ impl CodeGen {
             .expect("argument index out of bounds")
     }
 
+    /// Move the double in `xmm0` to where argument `pos`, the `nth_float`-th
+    /// floating-point argument, is passed. Nothing on System V when it is the
+    /// first float; on Win64 the register is the argument's position.
+    fn emit_arg_float_from_xmm0(&mut self, pos: usize, nth_float: usize) {
+        let reg = PlatformAbi::float_arg_reg(pos, nth_float);
+        if reg != "xmm0" {
+            emit!(self, "    movaps {}, xmm0", reg);
+        }
+    }
+
     /// Emit a mov instruction to set up an integer argument from a register
     fn emit_arg_reg(&mut self, arg_n: usize, src_reg: &str) {
         let dst = Self::arg_reg(arg_n);
@@ -5674,6 +5684,7 @@ impl CodeGen {
                         self.emit_arg_imm(0, *width as i64);
                         self.emit_arg_imm(1, *decimals as i64);
                         self.emit_arg_imm(2, *flags);
+                        self.emit_arg_float_from_xmm0(3, 0);
                         self.emit("    call _rt_print_using_num");
                     }
                     using::UsingPart::Str { kind, width } => {
@@ -5872,6 +5883,7 @@ impl CodeGen {
             let expr_type = self.expr_type(expr);
             self.gen_expr_to_double(expr);
             self.emit_arg_file_num(0, sink);
+            self.emit_arg_float_from_xmm0(1, 0);
             let helper = match (expr_type == DataType::Single, padded) {
                 (true, true) => "_rt_print_number_single",
                 (true, false) => "_rt_file_print_single",
