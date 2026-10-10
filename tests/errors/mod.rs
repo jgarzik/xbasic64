@@ -669,6 +669,91 @@ fn test_error_before_the_first_line_number() {
     );
 }
 
+/// An error raised inside a runtime helper reports its line, as every other
+/// runtime error does: "?File not found in 20", not a bare "?File not found".
+///
+/// Most file helpers, PRINT USING and VAL are given no line, and passed 0 to
+/// `_rt_error`, which then printed the message alone. Generated code now
+/// stores the line in `_err_line` before each call that can fail, and the
+/// runtime falls back on it when it is given 0.
+#[test]
+fn test_errors_raised_in_helpers_report_their_line() {
+    let cases = [
+        (
+            "10 PRINT \"x\"\n20 OPEN \"missing.txt\" FOR INPUT AS #1\n",
+            "File not found",
+        ),
+        (
+            "10 PRINT \"x\"\n20 OPEN \"no-such-dir/x.txt\" FOR OUTPUT AS #1\n",
+            "Path not found",
+        ),
+        (
+            "10 OPEN \"a.txt\" FOR OUTPUT AS #1\n20 OPEN \"b.txt\" FOR OUTPUT AS #1\n",
+            "File already open",
+        ),
+        (
+            "10 PRINT \"x\"\n20 OPEN \"\" FOR RANDOM AS #1\n",
+            "Bad file name",
+        ),
+        (
+            "5 OPEN \"e.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"e.txt\" FOR INPUT AS #1\n20 INPUT #1, A\n",
+            "Input past end of file",
+        ),
+        (
+            "5 OPEN \"e.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"e.txt\" FOR INPUT AS #1\n20 LINE INPUT #1, A$\n",
+            "Input past end of file",
+        ),
+        (
+            "10 OPEN \"f.txt\" FOR OUTPUT AS #1\n20 INPUT #1, A$\n",
+            "Bad file mode",
+        ),
+        (
+            "5 OPEN \"f.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"f.txt\" FOR INPUT AS #1\n20 PRINT #1, \"x\"\n",
+            "Bad file mode",
+        ),
+        (
+            "10 OPEN \"f.txt\" FOR OUTPUT AS #1\n20 FIELD #1, 4 AS A$\n",
+            "Bad file mode",
+        ),
+        ("10 PRINT \"x\"\n20 PRINT #3, \"x\"\n", "Bad file number"),
+        (
+            "10 OPEN \"r.dat\" FOR RANDOM AS #1 LEN = 4\n20 FIELD #1, 8 AS A$\n",
+            "FIELD overflow",
+        ),
+        (
+            "10 PRINT \"x\"\n20 PRINT USING \"##\"; \"abc\"\n",
+            "Type mismatch",
+        ),
+        ("10 PRINT \"x\"\n20 X = VAL(\"1D400\")\n", "Overflow"),
+        (
+            "10 SUB S\n15 OPEN \"missing.txt\" FOR INPUT AS #1\n16 END SUB\n20 CALL S\n",
+            "File not found",
+        ),
+    ];
+    for (source, message) in cases {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        let line = if source.contains("SUB") { 15 } else { 20 };
+        assert_eq!(
+            run.stderr.trim(),
+            format!("?{message} in {line}"),
+            "{source:?}"
+        );
+    }
+}
+
+/// A program without line numbers reports the source line of a helper's
+/// error, as it does for any other.
+#[test]
+fn test_errors_raised_in_helpers_report_the_source_line() {
+    let run = compile_and_run_raw(
+        "PRINT \"x\"\nPRINT \"y\"\nOPEN \"missing.txt\" FOR INPUT AS #1\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.stderr.trim(), "?File not found in 3");
+}
+
 /// Runtime diagnostics go to stderr, leaving the program's own output clean.
 #[test]
 fn test_runtime_errors_go_to_stderr() {
@@ -2157,6 +2242,11 @@ END SUB
 
 /// A program that never traps carries none of the machinery: no trap state
 /// is read or written, and there is no handler function.
+///
+/// `_err_line` is not in the list. It is not trap state alone: a runtime
+/// helper given no line reports the one stored there, so every program
+/// stores it before each call that can fail -- `PRINT` here -- and a failed
+/// OPEN says "?File not found in 20" rather than a bare "?File not found".
 #[test]
 fn test_no_cost_without_on_error() {
     let src = "PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n";
@@ -2165,7 +2255,6 @@ fn test_no_cost_without_on_error() {
         "_err_handler",
         "_err_pending",
         "_err_active",
-        "_err_line",
         "_err_resume_label",
         "_err_handler_fn",
     ] {

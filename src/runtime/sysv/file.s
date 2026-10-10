@@ -1944,8 +1944,9 @@ _rt_file_lof:
 # PRINT # and LINE INPUT # used to load the NULL handle and hand it straight to
 # fprintf/fgets, so `PRINT #3, "x"` on an unopened number died with SIGSEGV --
 # no message, exit 139. _rt_file_getc and _rt_file_eof already guarded; these
-# did not. The line number is unknown here (these helpers are not given one),
-# and _rt_error prints a bare message for 0.
+# did not. These helpers are not given the line, so they pass 0 and
+# _rt_error reports the one generated code stored in _err_line before the
+# call.
 #
 # These four are reached by `call`, from inside helpers with different frames,
 # and tail-call _rt_error: when a handler traps the error, _rt_error returns
@@ -1955,8 +1956,8 @@ _rt_file_lof:
     xor esi, esi
     jmp _rt_error
 
-# The line number is not passed to _rt_file_open, so the OPEN errors report
-# without one; _rt_error prints a bare message for 0.
+# The line number is not passed to _rt_file_open either, so the OPEN errors
+# pass 0 as well and report _err_line's.
 .Lopen_already:
     lea rdi, [rip + _err_alreadyopen]
     xor esi, esi

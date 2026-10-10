@@ -128,7 +128,8 @@ _err_pending: .skip 8       # 1 from a trapped error until its handler runs;
                             # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
-_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_line:    .skip 8       # the line now running: codegen stores it per statement
+                            # when trapping, else before each call that can fail
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
 
 .text
@@ -184,7 +185,7 @@ _rt_error_num:
 # _rt_error - Report a runtime error and terminate
 # Arguments:
 #   rdi = message pointer (NUL-terminated)
-#   rsi = BASIC line number, or 0 when unknown
+#   rsi = BASIC line number, or 0 for the one in _err_line
 #
 # Returns: only when a handler traps the error, with _err_pending set.
 # Otherwise never (exit code 1).
@@ -261,6 +262,14 @@ _rt_fatal:
     # otherwise clobber them, since rcx/rdx/rsi/rdi are all caller-saved.
     mov rbx, rdi            # message
     mov r12, rsi            # line number
+
+    # Most helpers are given no line and pass 0, so "?File not found" used to
+    # print with none. Generated code stores the line in _err_line before
+    # every call that can fail, so that is the line this error happened on.
+    test r12, r12
+    jnz .Lerr_have_line
+    mov r12, QWORD PTR [rip + _err_line]
+.Lerr_have_line:
 
     # Flush stdout first, so output written before the error is not lost when
     # the process exits.

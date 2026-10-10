@@ -137,7 +137,8 @@ _err_pending: .skip 8       # 1 from a trapped error until its handler runs;
                             # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
-_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_line:    .skip 8       # the line now running: codegen stores it per statement
+                            # when trapping, else before each call that can fail
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
 
 .text
@@ -190,7 +191,7 @@ _rt_error_num:
 # _rt_error - Report a runtime error and terminate
 # Arguments (Win64):
 #   rcx = message pointer (NUL-terminated)
-#   rdx = BASIC line number, or 0 when unknown
+#   rdx = BASIC line number, or 0 for the one in _err_line
 #
 # Returns: only when a handler traps the error, with _err_pending set.
 # Otherwise never (exit code 1).
@@ -269,6 +270,13 @@ _rt_fatal:
 
     mov rbx, rcx            # message
     mov rsi, rdx            # line number
+
+    # A helper given no line passes 0; _err_line holds it. See the System V
+    # twin.
+    test rsi, rsi
+    jnz .Lerr_have_line
+    mov rsi, QWORD PTR [rip + _err_line]
+.Lerr_have_line:
 
     # sprintf(_err_buf, fmt, message [, line])
     lea rcx, [rip + _err_buf]

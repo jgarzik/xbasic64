@@ -1204,6 +1204,13 @@ impl<'a> FnGen<'a> {
                 }
             })
             .collect();
+        // The line a helper's error reports. Most helpers are given none and
+        // pass 0, so the runtime prints _err_line instead; a program that
+        // traps has stored it already, per statement, for ERL.
+        if !self.cg.traps && name.starts_with("_rt_") && rtsig::lookup(name).fallible {
+            let line = i64::from(self.report_line());
+            self.store_rt_word("_err_line", line);
+        }
         let inst = self.b.ins().call(fref, &args);
         let rets = self.b.inst_results(inst).to_vec();
         if name.starts_with("_rt_") {
