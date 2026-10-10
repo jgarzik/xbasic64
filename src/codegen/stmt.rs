@@ -75,7 +75,10 @@ impl FnGen<'_> {
         let outer_temps = std::mem::take(&mut self.temps);
         let outer_copy = self.copy_loads;
         self.copy_loads = self.calls_user_function(stmt);
+        self.err_line_block = None;
         self.gen_stmt_framed(stmt);
+        // The enclosing statement's line is no longer the one stored.
+        self.err_line_block = None;
         self.free_temps();
         self.temps = outer_temps;
         self.copy_loads = outer_copy;

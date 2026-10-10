@@ -774,3 +774,143 @@ SHOW 7, 2.5, "s"
     .unwrap();
     assert_eq!(crate::common::lines(&output), vec!["6765", "7  2.5 s"]);
 }
+
+/// A fixed-length string passed to an ordinary string parameter is passed
+/// as a copy and copied back padded or cut to its width, as in QuickBASIC:
+/// the callee cannot change its length. A record field the same.
+#[test]
+fn test_fixed_length_string_argument_keeps_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 5
+  V AS INTEGER
+END TYPE
+SUB P(X$)
+  PRINT "in["; X$; "]"; LEN(X$)
+  X$ = "abcdefgh"
+END SUB
+SUB Q(X$)
+  X$ = "z"
+END SUB
+DIM T AS R
+T.N = "hello"
+T.V = 7
+P T.N
+PRINT "["; T.N; "]"; LEN(T.N); T.V
+DIM F AS STRING * 4
+F = "wxyz"
+P F
+PRINT "["; F; "]"; LEN(F)
+Q F
+PRINT "["; F; "]"; LEN(F)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "in[hello] 5",
+            "[abcde] 5  7",
+            "in[wxyz] 4",
+            "[abcd] 4",
+            "[z   ] 4",
+        ]
+    );
+}
+
+/// An argument in parentheses is an expression, so it is passed as a copy
+/// even to a by-reference parameter: QuickBASIC's way to protect a variable.
+#[test]
+fn test_parenthesized_argument_is_passed_by_value() {
+    let out = compile_and_run(
+        r#"
+SUB D(X)
+  X = X * 2
+END SUB
+FUNCTION F(X)
+  X = X + 1
+  F = X
+END FUNCTION
+A = 5
+CALL D((A))
+PRINT A
+D (A)
+PRINT A
+D A
+PRINT A
+B = 1
+PRINT F((B)); B
+PRINT F(B); B
+DIM Z(2)
+Z(1) = 3
+D (Z(1))
+PRINT Z(1)
+S$ = "a"
+CALL T((S$))
+PRINT S$
+SUB T(X$)
+  X$ = "changed"
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["5", "5", "10", "2  1", "2  2", "3", "a"]
+    );
+}
+
+/// An element of an array of fixed-length strings, and a fixed-length field
+/// of an array of records, are copied back at their width too -- found again
+/// by their subscripts, since the procedure may have REDIMmed the array.
+#[test]
+fn test_fixed_length_element_argument_keeps_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 5
+  V AS INTEGER
+END TYPE
+DIM SHARED A(3) AS STRING * 4
+DIM T(2) AS R
+SUB P(X$)
+  PRINT "in["; X$; "]"; LEN(X$)
+  X$ = "abcdefgh"
+END SUB
+SUB Q(X$)
+  X$ = "z"
+END SUB
+SUB SHRINK(X$)
+  REDIM A(1) AS STRING * 4
+  X$ = "qq"
+END SUB
+A(2) = "wxyz"
+P A(2)
+PRINT "["; A(2); "]"
+Q A(2)
+PRINT "["; A(2); "]"
+T(1).N = "hello"
+T(1).V = 9
+P T(1).N
+PRINT "["; T(1).N; "]"; T(1).V
+Q T(1).N
+PRINT "["; T(1).N; "]"; T(1).V
+SHRINK A(1)
+PRINT "["; A(1); "]"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "in[wxyz] 4",
+            "[abcd]",
+            "[z   ]",
+            "in[hello] 5",
+            "[abcde] 9",
+            "[z    ] 9",
+            "[qq  ]",
+        ]
+    );
+}

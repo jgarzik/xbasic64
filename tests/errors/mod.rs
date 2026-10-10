@@ -742,6 +742,23 @@ fn test_errors_raised_in_helpers_report_their_line() {
     }
 }
 
+/// `_err_line` is stored once in a statement rather than before every
+/// helper, so a FUNCTION called between two helpers -- whose own statements
+/// store their lines -- must not leave its line for the second helper's
+/// error. Nor may an earlier statement on the same line leave its own.
+#[test]
+fn test_helper_error_line_after_a_function_call() {
+    let cases = [
+        "FUNCTION F(X)\n  PRINT \"f\";\n  F = X\nEND FUNCTION\nPRINT USING \"##\"; 1; F(1); \"x\"\n",
+        "SUB S\n  PRINT \"s\";\nEND SUB\nPRINT \"a\";\nS: PRINT \"b\";: PRINT USING \"##\"; \"x\"\n",
+    ];
+    for source in cases {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert_eq!(run.stderr.trim(), "?Type mismatch in 5", "{source:?}");
+    }
+}
+
 /// A program without line numbers reports the source line of a helper's
 /// error, as it does for any other.
 #[test]

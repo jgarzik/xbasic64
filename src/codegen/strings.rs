@@ -74,10 +74,12 @@ impl FnGen<'_> {
         let owned = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, raw, 0);
         let free = self.b.create_block();
         let done = self.b.create_block();
+        let from = self.b.current_block();
         self.brif(owned, free, done);
         self.switch_sealed(free);
         self.call("free", &[p]);
         self.begin_sealed(done);
+        self.carry_err_line(from, done);
     }
 
     /// Free this statement's temporaries.
@@ -230,7 +232,7 @@ impl FnGen<'_> {
                     }
                     exprs.extend(args);
                 }
-                Expr::Unary { operand, .. } => exprs.push(*operand),
+                Expr::Unary { operand, .. } | Expr::Paren(operand) => exprs.push(*operand),
                 Expr::Binary { left, right, .. } => {
                     exprs.push(*left);
                     exprs.push(*right);

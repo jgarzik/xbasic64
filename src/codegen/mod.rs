@@ -878,6 +878,12 @@ struct FnGen<'a> {
     current_line: u32,
     /// The BASIC line number most recently reached, or 0 before the first.
     basic_line: u32,
+    /// In a program that does not trap, the block where this statement
+    /// stored `_err_line` for a fallible helper: a later one in the same
+    /// block -- or in one reached only from it -- needs no store of its own.
+    /// Forgotten when a statement begins or ends and after a procedure call,
+    /// each of which may store another line.
+    err_line_block: Option<Block>,
 }
 
 impl<'a> FnGen<'a> {
@@ -920,6 +926,7 @@ impl<'a> FnGen<'a> {
             data_gvs: HashMap::new(),
             current_line: 0,
             basic_line: 0,
+            err_line_block: None,
         }
     }
 
@@ -1231,10 +1238,15 @@ impl<'a> FnGen<'a> {
             .collect();
         // The line a helper's error reports. Most helpers are given none and
         // pass 0, so the runtime prints _err_line instead; a program that
-        // traps has stored it already, per statement, for ERL.
+        // traps has stored it already, per statement, for ERL. Stored once
+        // where it still holds: see `err_line_block`.
         if !self.cg.traps && name.starts_with("_rt_") && rtsig::lookup(name).fallible {
-            let line = i64::from(self.report_line());
-            self.store_rt_word("_err_line", line);
+            let here = self.b.current_block();
+            if here.is_none() || self.err_line_block != here {
+                let line = i64::from(self.report_line());
+                self.store_rt_word("_err_line", line);
+                self.err_line_block = here;
+            }
         }
         let inst = self.b.ins().call(fref, &args);
         let rets = self.b.inst_results(inst).to_vec();
@@ -1283,8 +1295,17 @@ impl<'a> FnGen<'a> {
     fn raise_if(&mut self, cond: Value, kind: RtError) {
         let eb = self.error_block(kind);
         let cont = self.b.create_block();
+        let from = self.b.current_block();
         self.brif(cond, eb, cont);
         self.switch_sealed(cont);
+        self.carry_err_line(from, cont);
+    }
+
+    /// `to` is reached only through `from`: a line stored there holds.
+    fn carry_err_line(&mut self, from: Option<Block>, to: Block) {
+        if from.is_some() && self.err_line_block == from {
+            self.err_line_block = Some(to);
+        }
     }
 
     /// Raise `kind` unconditionally: what follows is unreachable.
