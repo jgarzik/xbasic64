@@ -538,13 +538,13 @@ fn rt_type(t: rtsig::Ty) -> Type {
     }
 }
 
-/// The C library functions generated code calls, with their signatures.
 /// The C library functions generated code calls, all of them.
 pub(crate) const LIBC_FUNCTIONS: [&str; 12] = [
     "pow", "sin", "cos", "tan", "atan", "exp", "log", "calloc", "realloc", "free", "memset",
     "memcpy",
 ];
 
+/// The C library functions generated code calls, with their signatures.
 fn libc_sig(name: &str) -> (&'static [Type], &'static [Type]) {
     debug_assert!(LIBC_FUNCTIONS.contains(&name), "{name} is not listed");
     const F: &[Type] = &[types::F64];

@@ -1343,6 +1343,31 @@ mod tests {
         );
     }
 
+    /// A file the program has open is not handed to a child process the
+    /// compiler or a test starts meanwhile. On Windows the C library's
+    /// handles were inheritable, so a child started while a file was open
+    /// for writing kept its own write handle to it; the file, closed and
+    /// opened again (which refuses other writers), was then "Permission
+    /// denied" for as long as the child lived. CI hit it when the unit tests
+    /// that run in child processes ran beside a file test.
+    #[cfg(windows)]
+    #[test]
+    fn an_open_file_is_not_inherited_by_a_child() {
+        let _g = serial();
+        let (_dir, path) = temp("inherit.txt");
+        open(&path, OUTPUT, 9);
+        put(9, "x");
+        // A child that outlives the close, started while the file is open.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 3 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        unsafe { _rt_file_close(9) };
+        open(&path, OUTPUT, 9);
+        unsafe { _rt_file_close(9) };
+        let _ = child.wait();
+    }
+
     /// A FIELD variable is a window onto its file's record buffer, and
     /// outlives the OPEN that made it: a re-OPEN of the number, sequential or
     /// RANDOM, freed the buffer, and LSET then wrote freed memory and PRINT
