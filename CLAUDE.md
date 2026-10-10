@@ -44,8 +44,9 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
   never has to guess what a name means
 - **codegen/** - Lowers the AST to Cranelift IR with a `FunctionBuilder`, one
   function at a time (`FnGen`), into an `ObjectModule` (`CodeGen`): `storage.rs`
-  (where names live), `expr.rs`, `builtins.rs`, `stmt.rs`, `calls.rs` (procedures
-  and by-reference calls), `io.rs`, `trap.rs` (ON ERROR)
+  (where names live), `ssa.rs` (which scalars live in SSA values), `strings.rs`
+  (string ownership), `expr.rs`, `builtins.rs`, `stmt.rs`, `calls.rs`
+  (procedures and by-reference calls), `io.rs`, `trap.rs` (ON ERROR)
 - **rtbuild.rs** - The hand-written x86-64 runtime library's trees
   (`runtime/sysv`, `runtime/win64-native`: I/O, strings, math, using libc) and
   how they become one assembly unit. Shared by `build.rs`, which assembles the
@@ -54,9 +55,11 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
   beside the program's object and links the two. Generated code reaches the
   runtime's state and messages, and the runtime the program's `_data_*`, only
   through `.globl` symbols
-- **rtsig.rs** - Signature of every runtime helper generated code calls, and
-  whether it can raise an error. Every call goes through `CodeGen::call_rt`,
-  which looks it up; a test derives `fallible` from the assembly's control flow
+- **rtsig.rs** - Signature of every runtime helper generated code calls,
+  whether it can raise an error, and whether its string result is fresh.
+  Every call goes through `FnGen::call`, which builds the call from it; tests
+  derive `fallible` from the assembly's control flow and check that every
+  `fresh` helper reaches `malloc`
 - **main.rs** - CLI driver: reads source, runs the pipeline, writes the object
   and the runtime's, and links them with `cc` (or `link.exe`)
 - **build.rs** - Assembles the runtime when the compiler is built, so building
@@ -72,7 +75,10 @@ Integration tests organized by feature area:
 - `megatest/` - One large program (`mega.bas`) exercising most of the language
   at once, so that features are tested coexisting rather than in isolation. It
   is its own assertion harness: a regression names itself
-- Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
+- `codegen/` - Assertions on the Cranelift IR the compiler generates
+  (`compile_to_clif()`, `uses_symbol()`), and behavioural tests of code paths
+  with special cases: constant divisors, scalars in SSA values, huge functions
+- Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `errors/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
 
 ### Key Design Decisions
 
