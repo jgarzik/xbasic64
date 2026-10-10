@@ -151,6 +151,7 @@ impl FnGen<'_> {
         let ret = self.b.create_block();
         self.b.append_block_param(ret, types::I32);
         self.handler_ret = Some(ret);
+        self.branch_targets = ssa::branch_targets(&program.statements);
 
         // Enter at the armed target, by number.
         let h = self.load_rt_word("_err_handler");

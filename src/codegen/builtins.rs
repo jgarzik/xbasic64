@@ -384,13 +384,13 @@ impl FnGen<'_> {
         let create = self.b.create_block();
         let have = self.b.create_block();
         self.brif(ptr, have, create);
-        self.b.switch_to_block(create);
+        self.switch_sealed(create);
         let desc = self.addr(info.loc);
         let nd = self.iconst(types::I64, info.ndims as i64);
         let es = self.iconst(types::I64, i64::from(self.elem_size_for(&arr)));
         let base = self.iconst(types::I64, self.cg.symbols.option_base);
         self.call_rt("_rt_array_autodim", &[desc, nd, es, base]);
-        self.begin_block(have);
+        self.begin_sealed(have);
 
         let is_lower = upper == "LBOUND";
         let constant = match args.get(1) {

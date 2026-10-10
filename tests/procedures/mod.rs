@@ -754,3 +754,23 @@ PRINT X; Y
     .unwrap();
     assert_eq!(output.trim(), "1  2");
 }
+
+/// A BYVAL parameter declared with `AS` reads as its argument, in a FUNCTION
+/// declared with `AS` too -- recursive, so each call has its own.
+#[test]
+fn test_typed_byval_parameters() {
+    let output = compile_and_run(
+        r#"
+FUNCTION FIB(BYVAL N AS LONG) AS LONG
+IF N < 2 THEN FIB = N ELSE FIB = FIB(N - 1) + FIB(N - 2)
+END FUNCTION
+SUB SHOW(BYVAL X AS INTEGER, BYVAL D AS DOUBLE, BYVAL S$)
+PRINT X; D; S$
+END SUB
+PRINT FIB(20)
+SHOW 7, 2.5, "s"
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["6765", "7  2.5 s"]);
+}

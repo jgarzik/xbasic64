@@ -580,3 +580,112 @@ PRINT T#
     let got = crate::common::lines(&out);
     assert_eq!(got, vec!["9", "23", "90"]);
 }
+
+/// A scalar nothing else can reach lives in an SSA value, not in memory: the
+/// program's IR never names its storage.
+#[test]
+fn test_private_scalars_live_in_registers() {
+    let src = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!uses_symbol(&clif, "_var_I_I"), "{clif}");
+    assert!(!uses_symbol(&clif, "_var_S_I"), "{clif}");
+}
+
+/// ...and every scalar something else can reach stays in memory: under ON
+/// ERROR, whose handler is a function of its own; passed by reference to a
+/// procedure; shared with one; or seen by a DEF FN.
+#[test]
+fn test_reachable_scalars_stay_in_memory() {
+    let cases = [
+        (
+            "10 ON ERROR GOTO 90\nS% = 1\nPRINT S%\nEND\n90 RESUME NEXT\n",
+            "_var_S_I",
+        ),
+        (
+            "S% = 1\nCALL P(S%)\nPRINT S%\nSUB P(X%)\nX% = 2\nEND SUB\n",
+            "_var_S_I",
+        ),
+        (
+            "DIM SHARED S%\nS% = 1\nCALL P\nPRINT S%\nSUB P\nS% = 2\nEND SUB\n",
+            "_var_S_I",
+        ),
+        ("DEF FNA(X) = X + S%\nS% = 1\nPRINT FNA(1)\n", "_var_S_I"),
+    ];
+    for (src, sym) in cases {
+        let clif = compile_to_clif(src).expect("the program must compile");
+        assert!(
+            uses_symbol(&clif, sym),
+            "{sym} should be in memory for:\n{src}"
+        );
+        let out = crate::common::compile_and_run(src).expect("must run");
+        assert!(!out.trim().is_empty(), "{src}");
+    }
+}
+
+/// Scalars in SSA values keep BASIC's behaviour where control flow is least
+/// structured: GOTO within a loop body and back to before the loop, GOSUB
+/// changing a caller's variable, recursion with locals of its own, and
+/// reading what was never assigned.
+#[test]
+fn test_registers_follow_unstructured_control_flow() {
+    let out = crate::common::compile_and_run(
+        r#"
+10 R = R + 1
+20 FOR J = 1 TO 3
+30 IF J = 2 THEN 50
+40 N = N + 1: GOSUB 200
+50 NEXT J
+60 IF R < 2 THEN 10
+80 PRINT N; J; K; R
+85 PRINT F(5); G
+86 END
+200 K = K + 100
+210 RETURN
+FUNCTION F(X)
+  IF X <= 1 THEN EXIT FUNCTION
+  L = X
+  F = F(X - 1) + L
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["4  4  400  2", "14  0"]);
+}
+
+/// A function too large for the optimizing register allocator is compiled
+/// with the cheap one, and still computes the same answers.
+#[test]
+fn test_huge_function_compiles_correctly() {
+    let mut src = String::new();
+    for i in 0..5000 {
+        src.push_str(&format!(
+            "A{} = A{} + {}: IF A{} > 1000 THEN A{} = A{} - 1000\n",
+            i % 7,
+            (i + 1) % 7,
+            i,
+            i % 7,
+            i % 7,
+            i % 7
+        ));
+    }
+    src.push_str("PRINT A0; A1; A2; A3; A4; A5; A6\n");
+    let clif = compile_to_clif(&src).expect("the program must compile");
+    let blocks = clif.lines().filter(|l| l.starts_with("block")).count();
+    assert!(
+        blocks > 20_000,
+        "only {blocks} blocks: not huge enough to test"
+    );
+
+    // The same arithmetic in Rust.
+    let mut a = [0f64; 7];
+    for i in 0..5000usize {
+        a[i % 7] = a[(i + 1) % 7] + i as f64;
+        if a[i % 7] > 1000.0 {
+            a[i % 7] -= 1000.0;
+        }
+    }
+    let want: Vec<String> = a.iter().map(|v| format!("{}", v)).collect();
+    let out = crate::common::compile_and_run(&src).unwrap();
+    let got: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(got, want);
+}

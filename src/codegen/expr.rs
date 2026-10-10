@@ -93,6 +93,7 @@ impl FnGen<'_> {
                 Some(lit) => lit.numeric_type().unwrap_or(DataType::String),
                 // An allocated slot knows its own type -- a parameter declared
                 // `N AS INTEGER` the declared one, not its name's.
+                None if self.ssa.contains_key(name.as_str()) => self.ssa[name.as_str()].1,
                 None => match self.lookup_var(name) {
                     Some(info) => info.data_type,
                     None => match self.typed_var(name) {
@@ -307,6 +308,9 @@ impl FnGen<'_> {
                     return self
                         .gen_call(&upper, &[])
                         .expect("a FUNCTION returns a value");
+                }
+                if let Some((var, t)) = self.ssa_var(name) {
+                    return Val::Num(t, self.b.use_var(var));
                 }
                 let info = self.get_var_info(name);
                 self.load_val(info.data_type, info.loc)

@@ -80,6 +80,9 @@ impl FnGen<'_> {
         let upper = name.to_uppercase();
         self.current_proc = Some(upper.clone());
         self.current_line = stmt.line;
+        self.ssa_enabled = true;
+        self.ssa_excluded = ssa::passed_to_procedures(body, &self.cg.symbols);
+        self.branch_targets = ssa::branch_targets(body);
         let exit = self.b.create_block();
         self.exit_block = Some(exit);
 
@@ -167,7 +170,13 @@ impl FnGen<'_> {
                     let x = args.next().expect("a number");
                     // The ordinary conversion: an argument rounds and range
                     // checks exactly as an assignment would.
-                    let v = self.coerce(Val::Num(DataType::Double, x), t);
+                    let x = Val::Num(DataType::Double, x);
+                    if !self.ssa_excluded.contains(&pname.to_uppercase()) {
+                        let (var, t) = self.declare_ssa(&pname, t);
+                        self.def_ssa(var, t, x);
+                        continue;
+                    }
+                    let v = self.coerce(x, t);
                     let slot = self.local_slot(8);
                     let loc = Loc::Stack(slot, 0);
                     self.store_num(t, v.num(), loc);
@@ -180,7 +189,12 @@ impl FnGen<'_> {
 
         // A FUNCTION's result: a variable of its own name.
         let ret_type = is_function.then(|| self.cg.proc_return_type(&upper));
-        if let Some(t) = ret_type {
+        if let Some(t) = ret_type
+            && t != DataType::String
+            && !self.ssa_excluded.contains(&upper)
+        {
+            self.declare_ssa(name, t);
+        } else if let Some(t) = ret_type {
             let slot = self.local_slot(8 * storage::words_for(t) as u32);
             self.proc_vars.insert(
                 name.to_string(),
@@ -222,8 +236,14 @@ impl FnGen<'_> {
                 self.b.ins().return_(&[]);
             }
             Some(t) => {
-                let info = self.proc_vars[name];
-                let rets = match self.load_val(t, info.loc) {
+                let val = match self.ssa.get(name.as_str()).copied() {
+                    Some((var, t)) => Val::Num(t, self.b.use_var(var)),
+                    None => {
+                        let info = self.proc_vars[name];
+                        self.load_val(t, info.loc)
+                    }
+                };
+                let rets = match val {
                     Val::Str(p, l) => vec![p, l],
                     Val::Num(_, v) => vec![v],
                 };

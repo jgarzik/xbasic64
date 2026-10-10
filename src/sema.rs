@@ -763,7 +763,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
 }
 
 /// Call `f` for every statement in `stmts`, nested bodies included.
-fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+pub(crate) fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
     for stmt in stmts {
         f(stmt);
         for body in child_bodies(stmt) {
@@ -779,7 +779,7 @@ fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
 /// carries one must fail to compile here rather than be silently skipped.
 /// Nested statement bodies are *not* visited -- the caller walks those itself,
 /// because it has to change scope on the way in.
-fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+pub(crate) fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
     /// Every expression an assignment target can hold: its subscripts.
     fn lvalue(lv: &mut LValue, f: &mut impl FnMut(&mut Expr)) {
         if let Some(indices) = &mut lv.indices {

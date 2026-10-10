@@ -9,6 +9,9 @@ use crate::lexer::normalized;
 impl FnGen<'_> {
     /// Lower `main`: the module-level statements.
     pub(super) fn gen_main(&mut self, program: &Program) {
+        // The handler reads and writes main's variables in memory.
+        self.ssa_enabled = !self.cg.traps;
+        self.branch_targets = ssa::branch_targets(&program.statements);
         self.reserve_array_descriptors();
         if self.cg.gosub_used {
             // The GOSUB stack grows down from its end.
@@ -41,6 +44,16 @@ impl FnGen<'_> {
         let b = self.b.create_block();
         self.labels.insert(name.to_string(), b);
         b
+    }
+
+    /// A label: a block of its own when something branches to it, and
+    /// otherwise nothing at all.
+    fn gen_label(&mut self, target: &GotoTarget) {
+        let name = storage::main_label(target);
+        if self.branch_targets.contains(&name) {
+            let b = self.label_block(&name);
+            self.begin_block(b);
+        }
     }
 
     /// The block a GOTO or GOSUB to `target` goes to.
@@ -91,13 +104,9 @@ impl FnGen<'_> {
         match &stmt.kind {
             StmtKind::Label(n) => {
                 self.basic_line = *n;
-                let b = self.target_block(&GotoTarget::Line(*n));
-                self.begin_block(b);
+                self.gen_label(&GotoTarget::Line(*n));
             }
-            StmtKind::LabelName(name) => {
-                let b = self.target_block(&GotoTarget::Label(name.clone()));
-                self.begin_block(b);
-            }
+            StmtKind::LabelName(name) => self.gen_label(&GotoTarget::Label(name.clone())),
 
             StmtKind::Let {
                 name,
@@ -151,9 +160,8 @@ impl FnGen<'_> {
             } => {
                 let v = self.gen_expr(value);
                 let v = self.own_string(v, value);
-                let info = self.get_var_info(name);
-                let ty = storage::type_ref_of(info.data_type);
-                self.store_typed(info.loc, &ty, v);
+                let place = self.var_place(name);
+                self.store_place(&place, v);
             }
 
             StmtKind::FieldAssign { target, value } => {
@@ -192,14 +200,14 @@ impl FnGen<'_> {
                 let end = self.b.create_block();
                 let c = self.gen_condition(condition);
                 self.brif(c, then_b, else_b);
-                self.b.switch_to_block(then_b);
+                self.switch_sealed(then_b);
                 self.gen_body(then_branch);
                 self.b.ins().jump(end, &[]);
-                self.b.switch_to_block(else_b);
+                self.switch_sealed(else_b);
                 if let Some(eb) = else_branch {
                     self.gen_body(eb);
                 }
-                self.begin_block(end);
+                self.begin_sealed(end);
             }
 
             StmtKind::For {
@@ -217,13 +225,14 @@ impl FnGen<'_> {
                 self.begin_block(head);
                 let c = self.gen_condition(condition);
                 self.brif(c, body_b, exit);
-                self.b.switch_to_block(body_b);
+                self.switch_sealed(body_b);
                 // WHILE is a DO-family loop for EXIT DO purposes.
                 self.loop_stack.push((false, exit));
                 self.gen_body(body);
                 self.loop_stack.pop();
                 self.b.ins().jump(head, &[]);
-                self.b.switch_to_block(exit);
+                self.b.seal_block(head);
+                self.switch_sealed(exit);
             }
 
             StmtKind::DoLoop {
@@ -244,7 +253,7 @@ impl FnGen<'_> {
                     } else {
                         self.brif(c, body_b, exit);
                     }
-                    self.b.switch_to_block(body_b);
+                    self.switch_sealed(body_b);
                 }
                 self.loop_stack.push((false, exit));
                 self.gen_body(body);
@@ -263,7 +272,8 @@ impl FnGen<'_> {
                         self.b.ins().jump(head, &[]);
                     }
                 }
-                self.b.switch_to_block(exit);
+                self.b.seal_block(head);
+                self.switch_sealed(exit);
             }
 
             StmtKind::Goto(target) => {
@@ -287,7 +297,7 @@ impl FnGen<'_> {
                 let blocks: Vec<Block> = targets.iter().map(|t| self.target_block(t)).collect();
                 let idx = self.b.ins().iadd_imm_s(sel, -1);
                 self.br_table(idx, &blocks, after);
-                self.b.switch_to_block(after);
+                self.switch_sealed(after);
             }
 
             StmtKind::OnGosub { expr, targets } => {
@@ -304,12 +314,12 @@ impl FnGen<'_> {
                         .icmp_imm_s(IntCC::SignedGreaterThan, sel, targets.len() as i64);
                 let out = self.b.ins().bor(lo, hi);
                 self.brif(out, none, push);
-                self.b.switch_to_block(push);
+                self.switch_sealed(push);
                 let ret = self.gosub_push();
                 let blocks: Vec<Block> = targets.iter().map(|t| self.target_block(t)).collect();
                 let idx = self.b.ins().iadd_imm_s(sel, -1);
                 self.br_table(idx, &blocks, ret);
-                self.b.switch_to_block(none);
+                self.switch_sealed(none);
                 self.begin_block(ret);
             }
 
@@ -528,8 +538,8 @@ impl FnGen<'_> {
     /// Store into a target without copying a string: SWAP moves values
     /// between targets that each own theirs.
     fn store_lvalue_raw(&mut self, target: &LValue, v: Val) {
-        let (loc, ty) = self.lvalue_loc(target);
-        self.store_typed(loc, &ty, v);
+        let place = self.lvalue_place(target);
+        self.store_place(&place, v);
     }
 
     // ---- GOSUB ----
@@ -595,7 +605,7 @@ impl FnGen<'_> {
             let main_site = self.b.create_block();
             let own = self.b.create_block();
             self.brif(foreign, main_site, own);
-            self.b.switch_to_block(main_site);
+            self.switch_sealed(main_site);
             let (mfirst, mcount) = self.cg.main_gosub_scope;
             let mrel = self.b.ins().iadd_imm_s(site, -(mfirst as i64));
             let bad =
@@ -621,7 +631,7 @@ impl FnGen<'_> {
             }
             self.store_rt_word("_err_active", 0);
             self.handler_return(3);
-            self.b.switch_to_block(own);
+            self.switch_sealed(own);
         } else {
             self.check(foreign, RtError::ReturnWithoutGosub);
         }
@@ -636,7 +646,7 @@ impl FnGen<'_> {
                 // Unreachable once the range is checked; with checks off a
                 // foreign site lands here.
                 let cur = self.b.current_block().expect("a block");
-                self.b.switch_to_block(trap);
+                self.switch_sealed(trap);
                 self.b.ins().trap(TrapCode::unwrap_user(1));
                 self.b.switch_to_block(cur);
             }
@@ -660,28 +670,29 @@ impl FnGen<'_> {
     /// Where a FOR control variable lives, and the type it counts in:
     /// resolved as a read of the name is, so the loop writes where every
     /// other reference looks.
-    fn for_control_var(&mut self, name: &str) -> (Loc, DataType) {
-        if let Some((loc, ty)) = self.typed_storage(name) {
-            return (loc, DataType::from_type_ref(&ty));
-        }
-        let info = self.get_var_info(name);
-        (info.loc, info.data_type)
+    fn for_control_var(&mut self, name: &str) -> (Place, DataType) {
+        let place = self.var_place(name);
+        let ty = match &place {
+            Place::Var(_, t) => *t,
+            Place::Mem(_, ty) => DataType::from_type_ref(ty),
+        };
+        (place, ty)
     }
 
     /// FOR: the control variable counts in its own type. The start is
     /// stored, then the limit and the step are each evaluated once, into
-    /// slots -- GOTO and RESUME may enter the body from anywhere, so nothing
-    /// is held in a register across it.
+    /// variables of their own.
     fn gen_for(&mut self, var: &str, start: &Expr, end: &Expr, step: Option<&Expr>, body: &[Stmt]) {
-        let (loc, ct) = self.for_control_var(var);
+        let (place, ct) = self.for_control_var(var);
         let s = self.gen_expr(start);
-        let s = self.coerce(s, ct).num();
-        self.store_num(ct, s, loc);
+        let s = self.coerce(s, ct);
+        self.store_place(&place, s);
 
+        let ty = num_type(ct);
         let e = self.gen_expr(end);
         let e = self.coerce(e, ct).num();
-        let end_slot = self.stack_slot(8);
-        self.b.ins().stack_store(types::I64, e, end_slot, 0);
+        let limit_var = self.b.declare_var(ty);
+        self.b.def_var(limit_var, e);
 
         let st = match step {
             Some(x) => {
@@ -693,8 +704,8 @@ impl FnGen<'_> {
                 self.coerce(one, ct).num()
             }
         };
-        let step_slot = self.stack_slot(8);
-        self.b.ins().stack_store(types::I64, st, step_slot, 0);
+        let step_var = self.b.declare_var(ty);
+        self.b.def_var(step_var, st);
 
         // Which way the loop runs is the step's sign, almost always written
         // into the program and so decided here.
@@ -707,9 +718,8 @@ impl FnGen<'_> {
         let body_b = self.b.create_block();
         let exit = self.b.create_block();
         self.begin_block(head);
-        let ty = num_type(ct);
-        let counter = self.load_num(ct, loc);
-        let limit = self.b.ins().stack_load(types::I64, ty, end_slot, 0);
+        let counter = self.load_place(&place).num();
+        let limit = self.b.use_var(limit_var);
         let past = |f: &mut Self, ascending: bool| -> Value {
             if ct.is_integer() {
                 let cc = if ascending {
@@ -720,7 +730,7 @@ impl FnGen<'_> {
                 f.b.ins().icmp(cc, counter, limit)
             } else {
                 // Ascending, past means above; descending, below -- or
-                // unordered, as the old jb/ja tests read it.
+                // unordered.
                 let cc = if ascending {
                     FloatCC::GreaterThan
                 } else {
@@ -735,7 +745,7 @@ impl FnGen<'_> {
                 self.brif(p, exit, body_b);
             }
             None => {
-                let stepv = self.b.ins().stack_load(types::I64, ty, step_slot, 0);
+                let stepv = self.b.use_var(step_var);
                 let neg = if ct.is_integer() {
                     self.b.ins().icmp_imm_s(IntCC::SignedLessThan, stepv, 0)
                 } else {
@@ -752,7 +762,7 @@ impl FnGen<'_> {
                 self.brif(p, exit, body_b);
             }
         }
-        self.b.switch_to_block(body_b);
+        self.switch_sealed(body_b);
         self.loop_stack.push((true, exit));
         self.gen_body(body);
         self.loop_stack.pop();
@@ -760,8 +770,8 @@ impl FnGen<'_> {
         // The increment reloads the counter, which the body may assign. It
         // is done at the counter's own width, so a step past the type's
         // range is Overflow rather than a loop that never ends.
-        let c = self.load_num(ct, loc);
-        let stepv = self.b.ins().stack_load(types::I64, ty, step_slot, 0);
+        let c = self.load_place(&place).num();
+        let stepv = self.b.use_var(step_var);
         let next = match ct {
             DataType::Integer => {
                 let a = self.b.ins().ireduce(types::I16, c);
@@ -777,9 +787,10 @@ impl FnGen<'_> {
             }
             _ => self.b.ins().fadd(c, stepv),
         };
-        self.store_num(ct, next, loc);
+        self.store_place(&place, Val::Num(ct, next));
         self.b.ins().jump(head, &[]);
-        self.b.switch_to_block(exit);
+        self.b.seal_block(head);
+        self.switch_sealed(exit);
     }
 
     /// A numeric constant known at compile time: a literal, a CONST, or a
@@ -823,13 +834,13 @@ impl FnGen<'_> {
                     self.gen_case_clause(clause, slot, is_string, body_b);
                 }
                 self.b.ins().jump(next, &[]);
-                self.b.switch_to_block(body_b);
+                self.switch_sealed(body_b);
             }
             self.gen_body(body);
             self.b.ins().jump(end, &[]);
-            self.b.switch_to_block(next);
+            self.switch_sealed(next);
         }
-        self.begin_block(end);
+        self.begin_sealed(end);
     }
 
     /// One CASE alternative: go to `body` when it matches.
@@ -864,7 +875,7 @@ impl FnGen<'_> {
                 let c = cmp(self, BinaryOp::Ge, lo);
                 let test_hi = self.b.create_block();
                 self.brif(c, test_hi, next);
-                self.b.switch_to_block(test_hi);
+                self.switch_sealed(test_hi);
                 let c = cmp(self, BinaryOp::Le, hi);
                 self.brif(c, body, next);
             }
@@ -873,6 +884,6 @@ impl FnGen<'_> {
                 self.brif(c, body, next);
             }
         }
-        self.b.switch_to_block(next);
+        self.switch_sealed(next);
     }
 }

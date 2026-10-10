@@ -195,8 +195,11 @@ impl FnGen<'_> {
     }
 
     /// Whether `name` already has ordinary variable storage.
+    /// A name held in an SSA variable counts: a BYVAL parameter declared
+    /// `AS` is one, and its declared type is not typed storage.
     pub(super) fn has_plain_slot(&self, name: &str) -> bool {
-        (self.current_proc.is_some() && self.proc_vars.contains_key(name))
+        self.ssa.contains_key(name)
+            || (self.current_proc.is_some() && self.proc_vars.contains_key(name))
             || (self.module_visible(name, false) && self.cg.vars.contains_key(name))
     }
 
@@ -381,13 +384,13 @@ impl FnGen<'_> {
         let have = self.b.create_block();
         self.b.set_cold_block(create);
         self.brif(ptr, have, create);
-        self.b.switch_to_block(create);
+        self.switch_sealed(create);
         let desc = self.addr(info.loc);
         let nd = self.iconst(types::I64, info.ndims as i64);
         let es = self.iconst(types::I64, i64::from(self.elem_size_for(name)));
         let base = self.iconst(types::I64, self.cg.symbols.option_base);
         self.call_rt("_rt_array_autodim", &[desc, nd, es, base]);
-        self.begin_block(have);
+        self.begin_sealed(have);
     }
 
     /// An array element's address, bounds-checked.
@@ -546,12 +549,12 @@ impl FnGen<'_> {
             let zero_it = self.b.create_block();
             let done = self.b.create_block();
             self.brif(grown, zero_it, done);
-            self.b.switch_to_block(zero_it);
+            self.switch_sealed(zero_it);
             let start = self.b.ins().iadd(mem, old);
             let len = self.b.ins().isub(size, old);
             let z = self.iconst(types::I32, 0);
             self.call("memset", &[start, z, len]);
-            self.begin_block(done);
+            self.begin_sealed(done);
         }
 
         let info = ArrayInfo { loc, ndims };
@@ -708,6 +711,45 @@ impl FnGen<'_> {
         (info.loc, type_ref_of(info.data_type))
     }
 
+    /// Where an assignment target lives: in memory, or -- a plain scalar
+    /// nothing else can reach -- in an SSA variable.
+    pub(super) fn lvalue_place(&mut self, target: &LValue) -> Place {
+        if target.fields.is_empty()
+            && target.indices.is_none()
+            && self.typed_storage(&target.name).is_none()
+            && let Some((v, t)) = self.ssa_var(&target.name)
+        {
+            return Place::Var(v, t);
+        }
+        let (loc, ty) = self.lvalue_loc(target);
+        Place::Mem(loc, ty)
+    }
+
+    /// The place a plain variable name lives.
+    pub(super) fn var_place(&mut self, name: &str) -> Place {
+        self.lvalue_place(&LValue {
+            name: name.to_string(),
+            indices: None,
+            fields: Vec::new(),
+        })
+    }
+
+    /// Store `v` into `place`, converting it to the place's type.
+    pub(super) fn store_place(&mut self, place: &Place, v: Val) {
+        match place {
+            Place::Mem(loc, ty) => self.store_typed(*loc, ty, v),
+            Place::Var(var, t) => self.def_ssa(*var, *t, v),
+        }
+    }
+
+    /// The value at `place`.
+    pub(super) fn load_place(&mut self, place: &Place) -> Val {
+        match place {
+            Place::Mem(loc, ty) => self.load_typed(*loc, ty),
+            Place::Var(var, t) => Val::Num(*t, self.b.use_var(*var)),
+        }
+    }
+
     /// Store `v` into `target`, converting it to the target's type. A
     /// string is copied, so the target owns what it holds.
     pub(super) fn store_lvalue(&mut self, target: &LValue, v: Val, owned: bool) {
@@ -718,8 +760,8 @@ impl FnGen<'_> {
             }
             other => other,
         };
-        let (loc, ty) = self.lvalue_loc(target);
-        self.store_typed(loc, &ty, v);
+        let place = self.lvalue_place(target);
+        self.store_place(&place, v);
     }
 
     /// Store a string into a variable without copying it: what makes a FIELD
@@ -728,6 +770,13 @@ impl FnGen<'_> {
         let (loc, _) = self.lvalue_loc(target);
         self.store_str((p, l), loc);
     }
+}
+
+/// Where an assignment target lives.
+#[derive(Clone)]
+pub(super) enum Place {
+    Mem(Loc, TypeRef),
+    Var(Variable, DataType),
 }
 
 /// The declared-type form of a plain BASIC type: a string variable is a

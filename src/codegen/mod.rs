@@ -43,6 +43,7 @@ mod builtins;
 mod calls;
 mod expr;
 mod io;
+mod ssa;
 mod stmt;
 mod storage;
 mod trap;
@@ -58,11 +59,12 @@ use cranelift_codegen::ir::{
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use storage::Place;
 pub use storage::mangle;
 
 /// Code generation options.
@@ -230,6 +232,8 @@ struct ArrayInfo {
 /// Module-wide state: the object being built and what every function shares.
 pub struct CodeGen {
     module: ObjectModule,
+    /// The same target, with the cheap settings for huge functions.
+    huge_isa: OwnedTargetIsa,
     call_conv: CallConv,
     symbols: Symbols,
     opts: Options,
@@ -268,6 +272,8 @@ pub struct CodeGen {
     resume_targets: Vec<String>,
     /// Statements numbered so far, for unique fault blocks.
     stmt_count: usize,
+    /// Module-level scalars that must stay in memory (see `ssa.rs`).
+    module_in_memory: HashSet<String>,
 }
 
 /// Lower `program` to an object file.
@@ -277,7 +283,8 @@ pub fn generate(
     opts: Options,
     want_clif: bool,
 ) -> Result<Output, String> {
-    let isa = make_isa()?;
+    let isa = make_isa(false)?;
+    let huge_isa = make_isa(true)?;
     let call_conv = isa.default_call_conv();
     let builder = ObjectBuilder::new(isa, "basic", cranelift_module::default_libcall_names())
         .map_err(|e| e.to_string())?;
@@ -285,6 +292,7 @@ pub fn generate(
 
     let mut cg = CodeGen {
         module,
+        huge_isa,
         call_conv,
         symbols,
         opts,
@@ -306,11 +314,13 @@ pub fn generate(
         err_handlers: Vec::new(),
         resume_targets: Vec::new(),
         stmt_count: 0,
+        module_in_memory: HashSet::new(),
     };
 
     for stmt in &program.statements {
         cg.preprocess(stmt, true);
     }
+    cg.module_in_memory = ssa::module_in_memory(program, &cg.symbols);
     cg.declare_procedures(program)?;
 
     // Main first, so every module-level name is known before a procedure
@@ -357,15 +367,31 @@ pub fn generate(
     Ok(Output { object, clif })
 }
 
+/// Blocks past which a function is compiled cheaply: with the single-pass
+/// register allocator, and without the optimizer.
+///
+/// Both grow faster than the function. With its variables in SSA values, a
+/// generated 10,000-line main (60,000 blocks) spent 3.7 of its 4.3 seconds
+/// in the backtracking allocator, and 40,000 lines took 45 seconds; compiled
+/// cheaply they take 0.32 and 1.5. The code is slower -- a hot loop ran at
+/// half the speed -- so this is kept for functions far larger than a program
+/// anyone writes: mega.bas's main is 600 blocks.
+const HUGE_FUNCTION_BLOCKS: usize = 20_000;
+
 /// The target: this host, as the compiler is built for the machine it runs on.
-fn make_isa() -> Result<OwnedTargetIsa, String> {
+/// `huge` selects the cheap settings for functions past
+/// `HUGE_FUNCTION_BLOCKS`.
+fn make_isa(huge: bool) -> Result<OwnedTargetIsa, String> {
     let mut flags = settings::builder();
     let set = |f: &mut settings::Builder, k: &str, v: &str| {
         f.set(k, v).map_err(|e| format!("{}={}: {}", k, v, e))
     };
-    set(&mut flags, "opt_level", "speed")?;
+    set(&mut flags, "opt_level", if huge { "none" } else { "speed" })?;
     set(&mut flags, "is_pic", "false")?;
     set(&mut flags, "enable_verifier", "true")?;
+    if huge {
+        set(&mut flags, "regalloc_algorithm", "single_pass")?;
+    }
     if cfg!(windows) {
         // Windows commits stack a guard page at a time, so a frame larger
         // than a page must touch each one on the way down.
@@ -377,6 +403,15 @@ fn make_isa() -> Result<OwnedTargetIsa, String> {
     isa.set("has_sse41", "true").map_err(|e| e.to_string())?;
     isa.finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())
+}
+
+/// A module error as text; a compilation error -- a verifier failure, say --
+/// with its details.
+fn describe_module_error(e: &cranelift_module::ModuleError) -> String {
+    match e {
+        cranelift_module::ModuleError::Compilation(ce) => format!("{:?}", ce),
+        other => other.to_string(),
+    }
 }
 
 /// The Cranelift type a number of type `ty` is held in.
@@ -669,6 +704,28 @@ impl CodeGen {
         Ok(())
     }
 
+    /// Compile a huge function with `huge_isa` and define its bytes.
+    fn define_huge(
+        &mut self,
+        id: FuncId,
+        ctx: &mut cranelift_codegen::Context,
+    ) -> Result<(), String> {
+        ctx.compile(&*self.huge_isa, &mut Default::default())
+            .map_err(|e| format!("{:?}", e.inner))?;
+        let code = ctx.compiled_code().expect("just compiled");
+        let relocs: Vec<cranelift_module::ModuleReloc> = code
+            .buffer
+            .relocs()
+            .iter()
+            .map(|r| cranelift_module::ModuleReloc::from_mach_reloc(r, &ctx.func, id))
+            .collect();
+        let alignment = u64::from(code.buffer.alignment);
+        let bytes = code.code_buffer().to_vec();
+        self.module
+            .define_function_bytes(id, alignment, &bytes, &relocs)
+            .map_err(|e| describe_module_error(&e))
+    }
+
     /// Lower one function -- main, the handler, or the procedure `proc` --
     /// and define it in the module.
     fn compile_function(
@@ -722,18 +779,14 @@ impl CodeGen {
             clif.push_str(&format!("; {}\n{}\n", sym, text));
         }
         let mut ctx = cranelift_codegen::Context::for_function(func);
-        self.module.define_function(id, &mut ctx).map_err(|e| {
-            format!(
-                "code generation failed in {}: {}",
-                sym,
-                match &e {
-                    cranelift_module::ModuleError::Compilation(ce) => {
-                        format!("{:?}", ce)
-                    }
-                    other => other.to_string(),
-                }
-            )
-        })
+        let r = if ctx.func.layout.blocks().count() > HUGE_FUNCTION_BLOCKS {
+            self.define_huge(id, &mut ctx)
+        } else {
+            self.module
+                .define_function(id, &mut ctx)
+                .map_err(|e| describe_module_error(&e))
+        };
+        r.map_err(|e| format!("code generation failed in {}: {}", sym, e))
     }
 }
 
@@ -754,6 +807,13 @@ struct FnGen<'a> {
     proc_record_elem_words: HashMap<String, i32>,
     /// Stack slots to zero on entry, with their sizes in bytes.
     zeroed_slots: Vec<(StackSlot, u32)>,
+    /// Scalars held in SSA variables, by name, and whether this function
+    /// may hold any; names this function passes to procedures may not.
+    ssa: HashMap<String, (Variable, DataType)>,
+    ssa_enabled: bool,
+    ssa_excluded: HashSet<String>,
+    /// Labels something branches to; only these get a block.
+    branch_targets: HashSet<String>,
 
     /// Blocks of this function's labels, by symbol.
     labels: HashMap<String, Block>,
@@ -802,6 +862,10 @@ impl<'a> FnGen<'a> {
             proc_types: HashMap::new(),
             proc_record_elem_words: HashMap::new(),
             zeroed_slots: Vec::new(),
+            ssa: HashMap::new(),
+            ssa_enabled: false,
+            ssa_excluded: HashSet::new(),
+            branch_targets: HashSet::new(),
             labels: HashMap::new(),
             gosub_first: 0,
             gosub_blocks: Vec::new(),
@@ -833,17 +897,37 @@ impl<'a> FnGen<'a> {
     // ---- blocks ----
 
     /// End the current block with a jump to `block` and continue there.
+    /// The block stays unsealed: more predecessors may come.
     fn begin_block(&mut self, block: Block) {
         self.b.ins().jump(block, &[]);
         self.b.switch_to_block(block);
     }
 
+    /// The same, for a block whose predecessors all exist once this jump
+    /// does.
+    ///
+    /// Sealing a block as early as possible is what keeps SSA construction
+    /// linear: a variable read in a sealed block is looked up through its
+    /// known predecessors, while in an unsealed one it costs a block
+    /// parameter, resolved only at the end. Unsealed until the end, every
+    /// block of a large program gets one per variable.
+    fn begin_sealed(&mut self, block: Block) {
+        self.begin_block(block);
+        self.b.seal_block(block);
+    }
+
+    /// Continue in `block`, all of whose predecessors already exist.
+    fn switch_sealed(&mut self, block: Block) {
+        self.b.switch_to_block(block);
+        self.b.seal_block(block);
+    }
+
     /// Continue in a fresh block after a terminator. Code that follows --
     /// statements after a GOTO -- is unreachable, but still has to be
-    /// somewhere.
+    /// somewhere; with no predecessors, it is sealed at once.
     fn after_terminator(&mut self) {
         let next = self.b.create_block();
-        self.b.switch_to_block(next);
+        self.switch_sealed(next);
     }
 
     /// Jump to `block`; what follows is unreachable.
@@ -1142,7 +1226,7 @@ impl<'a> FnGen<'a> {
         let eb = self.error_block(kind);
         let cont = self.b.create_block();
         self.brif(cond, eb, cont);
-        self.b.switch_to_block(cont);
+        self.switch_sealed(cont);
     }
 
     /// Raise `kind` unconditionally: what follows is unreachable.
@@ -1207,7 +1291,7 @@ impl<'a> FnGen<'a> {
         let p = self.load_rt_word("_err_pending");
         let cont = self.b.create_block();
         self.brif(p, exit, cont);
-        self.b.switch_to_block(cont);
+        self.switch_sealed(cont);
     }
 
     // ---- numeric helpers shared by expressions and statements ----
@@ -1227,22 +1311,19 @@ impl<'a> FnGen<'a> {
         }
     }
 
-    /// Overflow if the float `v` of type `ty` is infinite or NaN: a result
-    /// too large for its type.
-    fn check_float(&mut self, v: Value, ty: DataType) {
+    /// Overflow if the float `v` is infinite or NaN: a result too large for
+    /// its type.
+    ///
+    /// `v - v` is NaN exactly then, so one subtract and an unordered compare
+    /// of the difference with itself say so, with no constant to load: the
+    /// `|v| >= inf` form this replaced rebuilt both its mask and infinity in
+    /// every iteration of a loop.
+    fn check_float(&mut self, v: Value, _ty: DataType) {
         if !self.cg.opts.checks {
             return;
         }
-        let a = self.b.ins().fabs(v);
-        let inf = if ty == DataType::Single {
-            self.b.ins().f32const(f32::INFINITY)
-        } else {
-            self.f64const(f64::INFINITY)
-        };
-        let bad = self
-            .b
-            .ins()
-            .fcmp(FloatCC::UnorderedOrGreaterThanOrEqual, a, inf);
+        let d = self.b.ins().fsub(v, v);
+        let bad = self.b.ins().fcmp(FloatCC::Unordered, d, d);
         self.raise_if(bad, RtError::Overflow);
     }
 
