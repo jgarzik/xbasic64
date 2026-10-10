@@ -1,10 +1,21 @@
 # xbasic64
 
-A BASIC native code compiler for x86-64 and aarch64.
+A compiler for classic BASIC: build a native executable, or compile into
+memory and run at once. x86-64 and aarch64, on Linux, Windows and macOS.
 
 ## Overview
 
-xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC) directly to native x86-64 and aarch64 executables. No interpreter, no bytecode—just fast native binaries.
+xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC,
+QuickBASIC) to native machine code with [Cranelift](https://cranelift.dev).
+It does so two ways, from one code generator:
+
+- **Ahead of time**: `xbasic64 prog.bas` writes a standalone executable.
+- **Just in time**: `xbasic64 run prog.bas` compiles the program into memory
+  and runs it at once, with no executable and no linker -- the immediacy of
+  an interpreter, at native speed.
+
+Either way the whole program is compiled before it starts. Nothing is
+interpreted, and there is no bytecode.
 
 **Why xbasic64?**
 
@@ -45,11 +56,11 @@ cargo build --release
 ### Usage
 
 ```bash
-# Compile a BASIC program to executable
-xbasic64 program.bas
-
-# Or compile it into memory and run it at once, with no executable
+# Run a BASIC program at once (compiled into memory, then run)
 xbasic64 run program.bas
+
+# Compile a BASIC program to an executable
+xbasic64 program.bas
 
 # Specify output file
 xbasic64 program.bas -o myprogram
@@ -57,8 +68,9 @@ xbasic64 program.bas -o myprogram
 # Write the program's Cranelift IR to program.clif instead of compiling it
 xbasic64 -S program.bas
 
-# Omit the runtime safety checks
+# Omit the runtime safety checks (for either)
 xbasic64 --unsafe program.bas
+xbasic64 run --unsafe program.bas
 ```
 
 ### Example
@@ -75,7 +87,8 @@ FOR I = 1 TO 10
 NEXT I
 ```
 
-Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
+Save as `fib.bas` and run it with `xbasic64 run fib.bas` -- or compile it
+with `xbasic64 fib.bas` and run `./fib`.
 
 ## Documentation
 
@@ -83,11 +96,14 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 
 ## Architecture
 
-The compiler is a four-stage pipeline:
+The compiler is a four-stage pipeline, ending in one of two places:
 
 ```
-Source → Lexer → Parser → Semantic Analysis → Code Generator → Object → Executable
-              (tokens)   (AST)              (symbols)     (Cranelift IR)
+Source → Lexer → Parser → Semantic Analysis → Code Generator ─┬→ Object → Executable
+              (tokens)   (AST)              (symbols)        │   (xbasic64 prog.bas)
+                                                  (Cranelift IR)
+                                                             └→ Memory → Run now
+                                                                 (xbasic64 run prog.bas)
 ```
 
 1. **Lexer** - Tokenizes BASIC source (case-insensitive keywords, line numbers, type suffixes)
@@ -104,21 +120,27 @@ The runtime library (I/O, strings, number formatting, math) is a `no_std` Rust c
 
 Key design choices:
 - No IR of its own: the AST is lowered directly to Cranelift's
+- One code generator for both executables and the JIT, so the two cannot
+  disagree; the test suite runs every program both ways
 - A portable `no_std` Rust runtime over the C library
 - GW-BASIC type semantics (division always returns Double)
 
 ## Requirements
 
 - Rust 1.96 or later
-- Linux and macOS: the C compiler/linker (`cc`) with the C library, to link
-  programs
-- Windows: the MSVC linker (`link.exe`) and its C runtime, to link programs
+- To build executables, the platform's linker: `cc` with the C library on
+  Linux and macOS, the MSVC linker (`link.exe`) and its C runtime on Windows.
+  `xbasic64 run` needs no linker
 
 ## Platforms
 
-- Linux (x86-64, aarch64)
-- Windows (x86-64)
-- macOS (arm64)
+| OS      | Architecture    | Executables | `xbasic64 run` |
+|---------|-----------------|-------------|----------------|
+| Linux   | x86-64, aarch64 | yes         | yes            |
+| Windows | x86-64          | yes         | yes            |
+| macOS   | arm64           | yes         | yes            |
+
+The compiler targets the machine it runs on.
 
 ## License
 
