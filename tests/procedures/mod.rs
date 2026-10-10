@@ -387,7 +387,7 @@ fn test_function_declared_return_type() {
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["3", "3000"]);
+    assert_eq!(lines, vec!["4", "3000"], "7 / 2 rounds half to even");
 }
 
 /// Without an AS clause the suffix still decides, as before.

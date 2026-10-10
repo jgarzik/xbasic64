@@ -130,7 +130,7 @@
 //!
 //! Coercion instructions:
 //! - Int→Float: `cvtsi2sd xmm0, eax` (or `cvtsi2ss` for Single)
-//! - Float→Int: `cvttsd2si eax, xmm0` (truncation) or `cvtsd2si` (rounding)
+//! - Float→Int: `cvtsd2si` (rounding half to even), range checked
 //! - Single↔Double: `cvtss2sd` / `cvtsd2ss`
 //!
 //! # String Representation
@@ -738,9 +738,11 @@ impl CodeGen {
         }
     }
 
-    /// The 32-bit name of an integer register, for [`emit_arg_imm`].
+    /// The 32-bit name of an integer register, for [`emit_arg_imm`] and
+    /// [`emit_to_int64`].
     ///
     /// [`emit_arg_imm`]: Self::emit_arg_imm
+    /// [`emit_to_int64`]: Self::emit_to_int64
     fn reg32(reg: &str) -> &'static str {
         match reg {
             "rax" => "eax",
@@ -751,6 +753,7 @@ impl CodeGen {
             "rdi" => "edi",
             "r8" => "r8d",
             "r9" => "r9d",
+            "r14" => "r14d",
             other => panic!("no 32-bit name recorded for {}", other),
         }
     }
@@ -827,6 +830,162 @@ impl CodeGen {
         }
     }
 
+    /// Convert the number of type `ty` -- in eax, or in xmm0 for a float --
+    /// to a 64-bit integer in `reg`.
+    ///
+    /// A float rounds half to even, the MXCSR default and QuickBASIC's rule,
+    /// and one outside LONG range (or NaN, which cvtsd2si turns into the
+    /// out-of-range "indefinite" value) is Overflow. Every conversion from a
+    /// float to an integer goes through here: assignment, subscripts, string
+    /// positions, the operands of `\` and the bitwise operators. They used to
+    /// truncate, and several used `cvttsd2si` on a SINGLE's bits.
+    fn emit_to_int64(&mut self, ty: DataType, reg: &str) {
+        match ty {
+            DataType::Integer | DataType::Long => {
+                emit!(self, "    movsxd {}, eax", reg);
+                return;
+            }
+            DataType::Single => emit!(self, "    cvtss2si {}, xmm0", reg),
+            DataType::Double => emit!(self, "    cvtsd2si {}, xmm0", reg),
+            DataType::String => unreachable!("sema rejects a string used as a number"),
+        }
+        if self.opts.checks {
+            emit!(self, "    movsxd r11, {}", Self::reg32(reg));
+            emit!(self, "    cmp r11, {}", reg);
+            self.emit_check("jne", RtError::Overflow);
+        }
+    }
+
+    /// Overflow unless the 32-bit value in eax fits an INTEGER's 16 bits.
+    fn emit_integer_range_check(&mut self) {
+        if self.opts.checks {
+            self.emit("    movsx r11d, ax");
+            self.emit("    cmp r11d, eax");
+            self.emit_check("jne", RtError::Overflow);
+        }
+    }
+
+    /// Overflow if the integer arithmetic just done in eax left `ty`'s range:
+    /// LONG through the overflow flag, INTEGER -- which is computed in 32
+    /// bits -- by whether the result still fits 16. GW-BASIC stops with
+    /// Overflow; this used to wrap silently.
+    fn emit_int_overflow_check(&mut self, ty: DataType) {
+        match ty {
+            DataType::Long if self.opts.checks => self.emit_check("jo", RtError::Overflow),
+            DataType::Integer => self.emit_integer_range_check(),
+            _ => {}
+        }
+    }
+
+    /// The overflow check for `+`, `-` or `*` just done in `ty`.
+    fn emit_arith_overflow_check(&mut self, ty: DataType) {
+        if ty.is_integer() {
+            self.emit_int_overflow_check(ty);
+        } else {
+            self.emit_float_overflow_check(ty);
+        }
+    }
+
+    /// Overflow if the float in xmm0 is infinite (or NaN): a SINGLE or DOUBLE
+    /// result too large for its type, which used to print as `inf`.
+    fn emit_float_overflow_check(&mut self, ty: DataType) {
+        if !self.opts.checks {
+            return;
+        }
+        if ty == DataType::Single {
+            self.emit("    movd r11d, xmm0");
+            self.emit("    shr r11d, 23");
+            self.emit("    and r11d, 0xFF");
+            self.emit("    cmp r11d, 0xFF");
+        } else {
+            self.emit("    movq r11, xmm0");
+            self.emit("    shr r11, 52");
+            self.emit("    and r11d, 0x7FF");
+            self.emit("    cmp r11d, 0x7FF");
+        }
+        self.emit_check("je", RtError::Overflow);
+    }
+
+    /// Zero to a negative power is Division by zero, as GW-BASIC says, rather
+    /// than pow()'s infinity. Base in xmm0, exponent in xmm1; both survive.
+    fn emit_pow_zero_check(&mut self) {
+        if !self.opts.checks {
+            return;
+        }
+        let fine = self.new_label("powok");
+        self.emit("    xorpd xmm2, xmm2");
+        self.emit("    ucomisd xmm0, xmm2");
+        emit!(self, "    jp {}", fine);
+        emit!(self, "    jne {}", fine);
+        self.emit("    ucomisd xmm1, xmm2");
+        self.emit_check("jb", RtError::DivideByZero);
+        self.emit_label(&fine);
+    }
+
+    /// Turn the flags of `ucomisd a, b` into BASIC's -1/0 for `a op b`, in eax.
+    ///
+    /// NaN is unordered, and IEEE says it compares false for everything but
+    /// `<>`. ucomisd reports unordered as ZF=PF=CF=1, which the plain `setb`,
+    /// `setbe` and `sete` read as true, so those three also require PF clear,
+    /// and `setne` also accepts PF set.
+    fn emit_float_setcc(&mut self, op: BinaryOp) {
+        match op {
+            BinaryOp::Gt => self.emit("    seta al"),
+            BinaryOp::Ge => self.emit("    setae al"),
+            BinaryOp::Lt | BinaryOp::Le | BinaryOp::Eq => {
+                let cc = match op {
+                    BinaryOp::Lt => "setb",
+                    BinaryOp::Le => "setbe",
+                    _ => "sete",
+                };
+                emit!(self, "    {} al", cc);
+                self.emit("    setnp cl");
+                self.emit("    and al, cl");
+            }
+            BinaryOp::Ne => {
+                self.emit("    setne al");
+                self.emit("    setp cl");
+                self.emit("    or al, cl");
+            }
+            _ => unreachable!("only comparisons"),
+        }
+        self.emit("    movzx eax, al");
+        self.emit("    neg eax"); // BASIC true is -1
+    }
+
+    /// Branch to `target` on the flags of `ucomisd a, b`: when `a op b` holds,
+    /// or when it does not if `!jump_if_true`. Unordered (NaN) makes every
+    /// comparison false except `<>`, as in `emit_float_setcc`.
+    fn emit_float_branch(&mut self, op: BinaryOp, jump_if_true: bool, target: &str) {
+        // (parity: where an unordered compare goes, ordered condition)
+        let holds_on_nan = op == BinaryOp::Ne;
+        let take_on_nan = holds_on_nan == jump_if_true;
+        let cc = match (op, jump_if_true) {
+            (BinaryOp::Eq, true) | (BinaryOp::Ne, false) => "je",
+            (BinaryOp::Eq, false) | (BinaryOp::Ne, true) => "jne",
+            (BinaryOp::Lt, true) | (BinaryOp::Ge, false) => "jb",
+            (BinaryOp::Lt, false) | (BinaryOp::Ge, true) => "jae",
+            (BinaryOp::Le, true) | (BinaryOp::Gt, false) => "jbe",
+            (BinaryOp::Le, false) | (BinaryOp::Gt, true) => "ja",
+            _ => unreachable!("only comparisons"),
+        };
+        // ja and jae are not taken on unordered, and jb, jbe, je are; jne is
+        // not. Add a parity branch only where that disagrees with what NaN
+        // must do.
+        let taken_on_nan = matches!(cc, "jb" | "jbe" | "je");
+        if take_on_nan && !taken_on_nan {
+            emit!(self, "    jp {}", target);
+            emit!(self, "    {} {}", cc, target);
+        } else if !take_on_nan && taken_on_nan {
+            let skip = self.new_label("nan");
+            emit!(self, "    jp {}", skip);
+            emit!(self, "    {} {}", cc, target);
+            self.emit_label(&skip);
+        } else {
+            emit!(self, "    {} {}", cc, target);
+        }
+    }
+
     /// Emit type-specific instruction for binary operations
     fn emit_typed(
         &mut self,
@@ -839,24 +998,6 @@ impl CodeGen {
             DataType::Integer | DataType::Long => self.emit(int_instr),
             DataType::Single => self.emit(single_instr),
             _ => self.emit(double_instr),
-        }
-    }
-
-    /// Convert float operands to integers (truncate). Used for IntDiv, Mod, logical ops.
-    fn emit_cvt_float_to_int(&mut self, work_type: DataType) {
-        if !work_type.is_integer() {
-            self.emit_typed(
-                work_type,
-                "",
-                "    cvttss2si eax, xmm0",
-                "    cvttsd2si eax, xmm0",
-            );
-            self.emit_typed(
-                work_type,
-                "",
-                "    cvttss2si ecx, xmm1",
-                "    cvttsd2si ecx, xmm1",
-            );
         }
     }
 
@@ -1280,7 +1421,8 @@ impl CodeGen {
         }
         // Built-in functions that return integers
         match upper.as_str() {
-            "LEN" | "ASC" | "INSTR" | "CINT" | "CLNG" => DataType::Long,
+            "CINT" => DataType::Integer,
+            "LEN" | "ASC" | "INSTR" | "CLNG" => DataType::Long,
             "EOF" | "LBOUND" | "UBOUND" | "POS" | "FRE" | "ERR" | "ERL" => DataType::Long,
             // CSNG converts to SINGLE; saying Double here made its result print
             // with a Double's digits.
@@ -1374,10 +1516,9 @@ impl CodeGen {
                     self.emit("    movsx eax, ax"); // sign-extend 16-bit to 32-bit
                 }
             }
-            // Long to Integer (truncation - just use lower 16 bits)
-            (DataType::Long, DataType::Integer) => {
-                // No-op in eax, value is truncated when stored
-            }
+            // Long to Integer: a value that does not fit 16 bits is Overflow,
+            // as GW-BASIC has it. It used to be truncated silently on store.
+            (DataType::Long, DataType::Integer) => self.emit_integer_range_check(),
             // Integer/Long to Single
             (DataType::Integer | DataType::Long, DataType::Single) => {
                 self.emit("    cvtsi2ss xmm0, eax");
@@ -1390,17 +1531,20 @@ impl CodeGen {
             (DataType::Single, DataType::Double) => {
                 self.emit("    cvtss2sd xmm0, xmm0");
             }
-            // Double to Single
+            // Double to Single: a value past SINGLE's range is Overflow
             (DataType::Double, DataType::Single) => {
                 self.emit("    cvtsd2ss xmm0, xmm0");
+                self.emit_float_overflow_check(DataType::Single);
             }
-            // Single to Integer/Long (truncate)
-            (DataType::Single, DataType::Integer | DataType::Long) => {
-                self.emit("    cvttss2si eax, xmm0");
-            }
-            // Double to Integer/Long (truncate)
-            (DataType::Double, DataType::Integer | DataType::Long) => {
-                self.emit("    cvttsd2si eax, xmm0");
+            // Single/Double to Integer/Long: round half to even (the MXCSR
+            // default, and what CINT does), and a value that does not fit is
+            // Overflow. This used to truncate, so `A% = 7.9` stored 7, and an
+            // out-of-range value became whatever cvttsd2si's "indefinite" was.
+            (DataType::Single | DataType::Double, DataType::Integer | DataType::Long) => {
+                self.emit_to_int64(from, "rax");
+                if to == DataType::Integer {
+                    self.emit_integer_range_check();
+                }
             }
             // String conversions are not supported implicitly
             (DataType::String, _) | (_, DataType::String) => {
@@ -1667,6 +1811,9 @@ impl CodeGen {
     fn gen_on_selector(&mut self, expr: &Expr) {
         self.gen_expr_to_long(expr);
         self.emit("    movsxd rax, eax");
+        // GW-BASIC's selector is a byte: 0 and one past the list fall
+        // through, but a value no byte holds is Illegal function call.
+        self.emit_arg_range_check("rax", 0, Some(255));
     }
 
     /// Jump to `targets[sel - 1]` through a table, `sel` (in `reg`) already
@@ -2827,16 +2974,18 @@ impl CodeGen {
                 // Numeric arguments arrive as f64 bit patterns; narrow to the
                 // declared type. rax/xmm0 are safe scratch: neither is an
                 // argument register on either ABI.
+                // The conversion is the ordinary one, so an argument rounds
+                // and range checks exactly as an assignment would.
                 DataType::Single => {
                     let p = fetch(self, place.ptr);
                     emit!(self, "    movq xmm0, {}", p);
-                    self.emit("    cvtsd2ss xmm0, xmm0");
+                    self.gen_coercion(DataType::Double, DataType::Single);
                     emit!(self, "    movss {}, xmm0", loc.at("DWORD PTR", 0));
                 }
                 DataType::Integer | DataType::Long => {
                     let p = fetch(self, place.ptr);
                     emit!(self, "    movq xmm0, {}", p);
-                    self.emit("    cvttsd2si eax, xmm0");
+                    self.gen_coercion(DataType::Double, place.ty);
                     let (size, reg) = if place.ty == DataType::Integer {
                         ("WORD PTR", "ax")
                     } else {
@@ -4208,6 +4357,9 @@ impl CodeGen {
                     UnaryOp::Neg => {
                         if operand_type.is_integer() {
                             self.emit("    neg eax");
+                            // -(-32768) does not fit an INTEGER, nor
+                            // -(-2147483648) a LONG.
+                            self.emit_int_overflow_check(operand_type);
                             operand_type
                         } else {
                             // Negate float by XORing sign bit
@@ -4243,15 +4395,9 @@ impl CodeGen {
                         // correctly bitwise and `NOT 12` was not.
                         //
                         // GW-BASIC complements a 16-bit two's-complement
-                        // integer; we use 32-bit, as the other three do.
-                        if !operand_type.is_integer() {
-                            self.emit_typed(
-                                operand_type,
-                                "",
-                                "    cvttss2si eax, xmm0",
-                                "    cvttsd2si eax, xmm0",
-                            );
-                        }
+                        // integer; we use 32-bit, as the other four do, and
+                        // convert a float operand the way they do.
+                        self.gen_coercion(operand_type, DataType::Long);
                         self.emit("    not eax");
                         DataType::Long
                     }
@@ -4371,19 +4517,10 @@ impl CodeGen {
             return DataType::Long;
         }
 
-        // For comparison/logical ops, we'll work in the promoted type but return Long
-        let work_type = if matches!(
-            op,
-            BinaryOp::Eq
-                | BinaryOp::Ne
-                | BinaryOp::Lt
-                | BinaryOp::Gt
-                | BinaryOp::Le
-                | BinaryOp::Ge
-                | BinaryOp::And
-                | BinaryOp::Or
-                | BinaryOp::Xor
-        ) {
+        // Comparisons work in the promoted type but return Long. The bitwise
+        // operators work in Long, like `\` and MOD: their operands are
+        // converted -- rounded and range checked -- on the way in.
+        let work_type = if Self::is_comparison(op) {
             self.promote_types(self.expr_type(left), self.expr_type(right), BinaryOp::Add)
         } else {
             result_type
@@ -4401,24 +4538,20 @@ impl CodeGen {
 
         // Generate operation
         match op {
-            BinaryOp::Add => self.emit_typed(
-                work_type,
-                "    add eax, ecx",
-                "    addss xmm0, xmm1",
-                "    addsd xmm0, xmm1",
-            ),
-            BinaryOp::Sub => self.emit_typed(
-                work_type,
-                "    sub eax, ecx",
-                "    subss xmm0, xmm1",
-                "    subsd xmm0, xmm1",
-            ),
-            BinaryOp::Mul => self.emit_typed(
-                work_type,
-                "    imul eax, ecx",
-                "    mulss xmm0, xmm1",
-                "    mulsd xmm0, xmm1",
-            ),
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                let (int, single, double) = match op {
+                    BinaryOp::Add => ("add eax, ecx", "addss xmm0, xmm1", "addsd xmm0, xmm1"),
+                    BinaryOp::Sub => ("sub eax, ecx", "subss xmm0, xmm1", "subsd xmm0, xmm1"),
+                    _ => ("imul eax, ecx", "mulss xmm0, xmm1", "mulsd xmm0, xmm1"),
+                };
+                self.emit_typed(
+                    work_type,
+                    &format!("    {}", int),
+                    &format!("    {}", single),
+                    &format!("    {}", double),
+                );
+                self.emit_arith_overflow_check(work_type);
+            }
             BinaryOp::Div => {
                 self.emit_cvt_to_double(work_type);
                 if self.opts.checks {
@@ -4431,15 +4564,14 @@ impl CodeGen {
                     self.emit_check("jz", RtError::DivideByZero);
                 }
                 self.emit("    divsd xmm0, xmm1");
+                self.emit_float_overflow_check(DataType::Double);
             }
             BinaryOp::IntDiv => {
-                self.emit_cvt_float_to_int(work_type);
                 self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
             }
             BinaryOp::Mod => {
-                self.emit_cvt_float_to_int(work_type);
                 self.emit_integer_divide_checks();
                 self.emit("    cdq");
                 self.emit("    idiv ecx");
@@ -4447,8 +4579,10 @@ impl CodeGen {
             }
             BinaryOp::Pow => {
                 self.emit_cvt_to_double(work_type);
+                self.emit_pow_zero_check();
                 self.emit_call_libc("pow");
                 self.emit_pow_domain_check();
+                self.emit_float_overflow_check(DataType::Double);
             }
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -4456,33 +4590,29 @@ impl CodeGen {
             | BinaryOp::Gt
             | BinaryOp::Le
             | BinaryOp::Ge => {
-                // (signed_setcc, unsigned_setcc) - signed for integers, unsigned for floats
-                let (signed, unsigned) = match op {
-                    BinaryOp::Eq => ("sete", "sete"),
-                    BinaryOp::Ne => ("setne", "setne"),
-                    BinaryOp::Lt => ("setl", "setb"),
-                    BinaryOp::Gt => ("setg", "seta"),
-                    BinaryOp::Le => ("setle", "setbe"),
-                    BinaryOp::Ge => ("setge", "setae"),
-                    _ => unreachable!(),
-                };
                 self.emit_typed(
                     work_type,
                     "    cmp eax, ecx",
                     "    ucomiss xmm0, xmm1",
                     "    ucomisd xmm0, xmm1",
                 );
-                let setcc = if work_type.is_integer() {
-                    signed
+                if work_type.is_integer() {
+                    let setcc = match op {
+                        BinaryOp::Eq => "sete",
+                        BinaryOp::Ne => "setne",
+                        BinaryOp::Lt => "setl",
+                        BinaryOp::Gt => "setg",
+                        BinaryOp::Le => "setle",
+                        _ => "setge",
+                    };
+                    emit!(self, "    {} al", setcc);
+                    self.emit("    movzx eax, al");
+                    self.emit("    neg eax");
                 } else {
-                    unsigned
-                };
-                emit!(self, "    {} al", setcc);
-                self.emit("    movzx eax, al");
-                self.emit("    neg eax");
+                    self.emit_float_setcc(op);
+                }
             }
             BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                self.emit_cvt_float_to_int(work_type);
                 let instr = match op {
                     BinaryOp::And => "and",
                     BinaryOp::Or => "or",
@@ -4496,12 +4626,10 @@ impl CodeGen {
             // they are built from the instructions already here rather than
             // given any of their own.
             BinaryOp::Eqv => {
-                self.emit_cvt_float_to_int(work_type);
                 self.emit("    xor eax, ecx");
                 self.emit("    not eax");
             }
             BinaryOp::Imp => {
-                self.emit_cvt_float_to_int(work_type);
                 self.emit("    not eax");
                 self.emit("    or eax, ecx");
             }
@@ -4534,11 +4662,11 @@ impl CodeGen {
     /// Anything that is not a comparison falls back to evaluating the
     /// condition as a value and testing it, exactly as before.
     fn gen_condition(&mut self, cond: &Expr, target: &str, jump_if_true: bool) {
-        // Complement rather than negate the mnemonic by hand: jae is exactly
-        // not-jb, jle is not-jg, and so on, including for the unordered case
-        // that ucomisd signals through CF -- so inverting the operator and
-        // inverting the branch agree on NaN, as they must to preserve what the
-        // setcc form did.
+        // Complement rather than negate the mnemonic by hand: jge is exactly
+        // not-jl, jle is not-jg, and so on. That holds for integers and string
+        // comparisons only; a float comparison can be unordered, and NaN makes
+        // both `<` and `>=` false, so emit_float_branch takes the sense
+        // separately.
         let effective = |op: BinaryOp| -> BinaryOp {
             if jump_if_true {
                 op
@@ -4555,20 +4683,15 @@ impl CodeGen {
             }
         };
 
-        // Integers and memcmp results read signed; ucomis* reports through CF
-        // and ZF, so a float comparison reads unsigned.
-        let jcc = |op: BinaryOp, signed: bool| -> &'static str {
-            match (op, signed) {
-                (BinaryOp::Eq, _) => "je",
-                (BinaryOp::Ne, _) => "jne",
-                (BinaryOp::Lt, true) => "jl",
-                (BinaryOp::Lt, false) => "jb",
-                (BinaryOp::Gt, true) => "jg",
-                (BinaryOp::Gt, false) => "ja",
-                (BinaryOp::Le, true) => "jle",
-                (BinaryOp::Le, false) => "jbe",
-                (BinaryOp::Ge, true) => "jge",
-                (BinaryOp::Ge, false) => "jae",
+        // Integers and memcmp results read signed.
+        let jcc = |op: BinaryOp| -> &'static str {
+            match op {
+                BinaryOp::Eq => "je",
+                BinaryOp::Ne => "jne",
+                BinaryOp::Lt => "jl",
+                BinaryOp::Gt => "jg",
+                BinaryOp::Le => "jle",
+                BinaryOp::Ge => "jge",
                 _ => unreachable!("guarded by is_comparison"),
             }
         };
@@ -4581,7 +4704,7 @@ impl CodeGen {
 
             if left_type == DataType::String && right_type == DataType::String {
                 self.gen_string_compare(left, right);
-                emit!(self, "    {} {}", jcc(effective(*op), true), target);
+                emit!(self, "    {} {}", jcc(effective(*op)), target);
                 return;
             }
 
@@ -4595,7 +4718,7 @@ impl CodeGen {
                         let ty = self.gen_expr(left);
                         self.gen_coercion(ty, work_type);
                         emit!(self, "    cmp eax, {}", n);
-                        emit!(self, "    {} {}", jcc(effective(*op), true), target);
+                        emit!(self, "    {} {}", jcc(effective(*op)), target);
                         return;
                     }
                 } else if work_type == DataType::Double
@@ -4604,7 +4727,7 @@ impl CodeGen {
                     self.gen_expr_to_double(left);
                     let operand = self.f64_operand(value);
                     emit!(self, "    ucomisd xmm0, {}", operand);
-                    emit!(self, "    {} {}", jcc(effective(*op), false), target);
+                    self.emit_float_branch(*op, jump_if_true, target);
                     return;
                 }
 
@@ -4615,25 +4738,32 @@ impl CodeGen {
                     "    ucomiss xmm0, xmm1",
                     "    ucomisd xmm0, xmm1",
                 );
-                emit!(self, "    {} {}", jcc(effective(*op), signed), target);
+                if signed {
+                    emit!(self, "    {} {}", jcc(effective(*op)), target);
+                } else {
+                    self.emit_float_branch(*op, jump_if_true, target);
+                }
                 return;
             }
         }
 
         // Not a comparison: evaluate it as a value and test that.
+        // A float is true when it is not zero -- NaN included.
         let cond_type = self.gen_expr(cond);
         if cond_type.is_integer() {
             self.emit("    test eax, eax");
+            emit!(
+                self,
+                "    {} {}",
+                if jump_if_true { "jne" } else { "je" },
+                target
+            );
         } else {
+            self.gen_coercion(cond_type, DataType::Double);
             self.emit("    xorpd xmm1, xmm1");
             self.emit("    ucomisd xmm0, xmm1");
+            self.emit_float_branch(BinaryOp::Ne, jump_if_true, target);
         }
-        emit!(
-            self,
-            "    {} {}",
-            if jump_if_true { "jne" } else { "je" },
-            target
-        );
     }
 
     /// Compare two strings, leaving memcmp-style flags set.
@@ -4721,20 +4851,15 @@ impl CodeGen {
         right: &Expr,
         work_type: DataType,
     ) -> bool {
-        // (signed, unsigned): integers compare signed, but ucomisd reports
-        // through CF and ZF, so a float comparison reads as unsigned.
-        let setcc = |op: BinaryOp, signed: bool| -> &'static str {
-            match (op, signed) {
-                (BinaryOp::Eq, _) => "sete",
-                (BinaryOp::Ne, _) => "setne",
-                (BinaryOp::Lt, true) => "setl",
-                (BinaryOp::Lt, false) => "setb",
-                (BinaryOp::Gt, true) => "setg",
-                (BinaryOp::Gt, false) => "seta",
-                (BinaryOp::Le, true) => "setle",
-                (BinaryOp::Le, false) => "setbe",
-                (BinaryOp::Ge, true) => "setge",
-                (BinaryOp::Ge, false) => "setae",
+        // Integers compare signed; a float comparison is emit_float_setcc's.
+        let setcc = |op: BinaryOp| -> &'static str {
+            match op {
+                BinaryOp::Eq => "sete",
+                BinaryOp::Ne => "setne",
+                BinaryOp::Lt => "setl",
+                BinaryOp::Gt => "setg",
+                BinaryOp::Le => "setle",
+                BinaryOp::Ge => "setge",
                 _ => unreachable!("guarded by is_comparison"),
             }
         };
@@ -4767,9 +4892,12 @@ impl CodeGen {
 
                 if let Some(instr) = arith {
                     emit!(self, "    {} eax, {}", instr, n);
+                    if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) {
+                        self.emit_int_overflow_check(work_type);
+                    }
                 } else if Self::is_comparison(op) {
                     emit!(self, "    cmp eax, {}", n);
-                    emit!(self, "    {} al", setcc(op, true));
+                    emit!(self, "    {} al", setcc(op));
                     self.emit("    movzx eax, al");
                     self.emit("    neg eax"); // BASIC true is -1
                 } else {
@@ -4800,9 +4928,15 @@ impl CodeGen {
                 let operand = self.f64_operand(value);
 
                 match op {
-                    BinaryOp::Add => emit!(self, "    addsd xmm0, {}", operand),
-                    BinaryOp::Sub => emit!(self, "    subsd xmm0, {}", operand),
-                    BinaryOp::Mul => emit!(self, "    mulsd xmm0, {}", operand),
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        let instr = match op {
+                            BinaryOp::Add => "addsd",
+                            BinaryOp::Sub => "subsd",
+                            _ => "mulsd",
+                        };
+                        emit!(self, "    {} xmm0, {}", instr, operand);
+                        self.emit_float_overflow_check(DataType::Double);
+                    }
                     BinaryOp::Div => {
                         // The divisor is known here, so the check is decided
                         // here too rather than being re-tested at run time.
@@ -4812,31 +4946,24 @@ impl CodeGen {
                             self.emit_check("jmp", RtError::DivideByZero);
                         }
                         emit!(self, "    divsd xmm0, {}", operand);
+                        self.emit_float_overflow_check(DataType::Double);
                     }
                     BinaryOp::Pow => {
                         emit!(self, "    movsd xmm1, {}", operand);
+                        // Only a negative exponent can divide by zero.
+                        if value < 0.0 {
+                            self.emit_pow_zero_check();
+                        }
                         self.emit_call_libc("pow");
                         self.emit_pow_domain_check();
+                        self.emit_float_overflow_check(DataType::Double);
                     }
-                    BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                        // Truncation to integer is left to the same conversion
-                        // the general path uses, so an out-of-range constant
-                        // behaves identically to one held in a register.
-                        emit!(self, "    movsd xmm1, {}", operand);
-                        self.emit_cvt_float_to_int(work_type);
-                        let instr = match op {
-                            BinaryOp::And => "and",
-                            BinaryOp::Or => "or",
-                            _ => "xor",
-                        };
-                        emit!(self, "    {} eax, ecx", instr);
-                    }
-                    _ => {
+                    _ if Self::is_comparison(op) => {
                         emit!(self, "    ucomisd xmm0, {}", operand);
-                        emit!(self, "    {} al", setcc(op, false));
-                        self.emit("    movzx eax, al");
-                        self.emit("    neg eax");
+                        self.emit_float_setcc(op);
                     }
+                    // The bitwise operators work in Long and never get here.
+                    _ => unreachable!("a Double work type is arithmetic or a comparison"),
                 }
                 true
             }
@@ -5859,11 +5986,12 @@ impl CodeGen {
                 self.gen_expr_to_double(e);
                 emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
-                emit!(self, "    je {}", body_label);
+                self.emit_float_branch(BinaryOp::Eq, true, body_label);
             }
             CaseClause::Range(lo, hi) => {
                 // Inclusive at both ends. The low bound is tested first, and a
-                // failure skips the high test.
+                // failure skips the high test -- as does an unordered (NaN)
+                // selector, which jb takes, so jbe below never sees one.
                 let skip = self.new_label("caseskip");
                 self.gen_expr_to_double(lo);
                 emit!(self, "    movsd xmm1, {}", sel);
@@ -5879,17 +6007,7 @@ impl CodeGen {
                 self.gen_expr_to_double(e);
                 emit!(self, "    movsd xmm1, {}", sel);
                 self.emit("    ucomisd xmm1, xmm0");
-                // Unsigned conditions, since ucomisd sets the carry flag.
-                let cc = match op {
-                    BinaryOp::Eq => "je",
-                    BinaryOp::Ne => "jne",
-                    BinaryOp::Lt => "jb",
-                    BinaryOp::Gt => "ja",
-                    BinaryOp::Le => "jbe",
-                    BinaryOp::Ge => "jae",
-                    _ => unreachable!("the parser only builds comparisons here"),
-                };
-                emit!(self, "    {} {}", cc, body_label);
+                self.emit_float_branch(*op, true, body_label);
             }
         }
     }
@@ -6036,6 +6154,10 @@ impl CodeGen {
                 self.emit_domain_check("jbe");
             }
             self.emit_call_libc(libc_fn);
+            // EXP is the one that can exceed DOUBLE's range.
+            if upper_name == "EXP" {
+                self.emit_float_overflow_check(DataType::Double);
+            }
             return;
         }
 
@@ -6135,11 +6257,7 @@ impl CodeGen {
                 self.emit("    mov r13, rdx"); // save len
                 let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
-                if count_type.is_integer() {
-                    emit!(self, "    movsxd {}, eax", arg2);
-                } else {
-                    emit!(self, "    cvttsd2si {}, xmm0", arg2);
-                }
+                self.emit_to_int64(count_type, arg2);
                 self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
@@ -6157,11 +6275,7 @@ impl CodeGen {
                 self.emit("    mov r13, rdx"); // save len
                 let count_type = self.gen_expr(&args[1]); // count - safe now
                 let arg2 = Self::arg_reg(2);
-                if count_type.is_integer() {
-                    emit!(self, "    movsxd {}, eax", arg2);
-                } else {
-                    emit!(self, "    cvttsd2si {}, xmm0", arg2);
-                }
+                self.emit_to_int64(count_type, arg2);
                 self.emit_arg_min_check(arg2, 0);
                 self.emit_arg_reg(0, "r12"); // ptr
                 self.emit_arg_reg(1, "r13"); // len
@@ -6184,21 +6298,13 @@ impl CodeGen {
                 self.emit("    mov r12, rax"); // save ptr
                 self.emit("    mov r13, rdx"); // save len
                 let pos_type = self.gen_expr(&args[1]); // start position - safe now
-                if pos_type.is_integer() {
-                    self.emit("    movsxd r14, eax"); // save start
-                } else {
-                    self.emit("    cvttsd2si r14, xmm0"); // save start
-                }
+                self.emit_to_int64(pos_type, "r14");
                 // String indexing is 1-based, so a start below 1 is illegal.
                 self.emit_arg_min_check("r14", 1);
                 let arg3 = Self::arg_reg(3);
                 if args.len() > 2 {
                     let len_type = self.gen_expr(&args[2]); // count - safe now
-                    if len_type.is_integer() {
-                        emit!(self, "    movsxd {}, eax", arg3);
-                    } else {
-                        emit!(self, "    cvttsd2si {}, xmm0", arg3);
-                    }
+                    self.emit_to_int64(len_type, arg3);
                     // Only a count the program actually wrote is checked: the
                     // -1 below is this compiler's sentinel for "the rest", and
                     // _rt_mid reads it as such.
@@ -6228,11 +6334,7 @@ impl CodeGen {
                 self.emit("    push rbx"); // save callee-saved reg
                 if let Some(start) = start_arg {
                     let start_type = self.gen_expr(start);
-                    if start_type.is_integer() {
-                        self.emit("    movsxd rbx, eax");
-                    } else {
-                        self.emit("    cvttsd2si rbx, xmm0");
-                    }
+                    self.emit_to_int64(start_type, "rbx");
                 } else {
                     self.emit("    mov ebx, 1");
                 }
@@ -6288,17 +6390,17 @@ impl CodeGen {
                 self.emit("    movzx eax, BYTE PTR [rax]");
                 // ASC returns integer in eax (Long type)
             }
+            // The ordinary conversion: round half to even, and Overflow when
+            // the result does not fit -- CINT an INTEGER, CLNG a LONG. CINT
+            // used to return a LONG, so CINT(40000) was 40000.
             "CINT" | "CLNG" => {
                 let arg_type = self.gen_expr(&args[0]);
-                // Convert to integer with rounding - result in eax
-                // BASIC CINT/CLNG round to nearest integer (not truncate)
-                if !arg_type.is_integer() {
-                    // Coerce to Double first (handles Single -> Double conversion)
-                    self.gen_coercion(arg_type, DataType::Double);
-                    // Use cvtsd2si which rounds using MXCSR mode (default: round-to-nearest)
-                    self.emit("    cvtsd2si eax, xmm0");
-                }
-                // Result is integer (Long) in eax
+                let to = if upper_name == "CINT" {
+                    DataType::Integer
+                } else {
+                    DataType::Long
+                };
+                self.gen_coercion(arg_type, to);
             }
             // String builders. These allocate, so the result outlives the call.
             "STRING$" => {
@@ -6684,12 +6786,7 @@ impl CodeGen {
         // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
         for (i, dim) in arr.dimensions.iter().enumerate() {
             let dim_type = self.gen_expr(dim);
-            if dim_type.is_integer() {
-                // Value already in eax, sign-extend to rax
-                self.emit("    movsxd rax, eax");
-            } else {
-                self.emit("    cvttsd2si rax, xmm0");
-            }
+            self.emit_to_int64(dim_type, "rax");
             self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
             emit!(self, "    mov {}, rax", loc.q(1 + i as i32));
         }
@@ -6810,12 +6907,7 @@ impl CodeGen {
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
         // Start with first index
         let idx_type = self.gen_expr(&indices[0]);
-        if idx_type.is_integer() {
-            // Already in eax, sign-extend to rax
-            self.emit("    movsxd rax, eax");
-        } else {
-            self.emit("    cvttsd2si rax, xmm0");
-        }
+        self.emit_to_int64(idx_type, "rax");
         // One unsigned compare catches both a negative index and one past the
         // end, since a negative value wraps to a huge unsigned one. The stored
         // bound is already the element count (declared bound + 1).
@@ -6833,11 +6925,7 @@ impl CodeGen {
             self.emit("    mov QWORD PTR [rsp], rax");
             // Evaluate next index
             let idx_type = self.gen_expr(idx_expr);
-            if idx_type.is_integer() {
-                self.emit("    movsxd rcx, eax");
-            } else {
-                self.emit("    cvttsd2si rcx, xmm0");
-            }
+            self.emit_to_int64(idx_type, "rcx");
             let bound = self.array_bound_operand(name, &loc, i);
             if self.opts.checks {
                 emit!(self, "    cmp rcx, {}", bound);

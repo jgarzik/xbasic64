@@ -724,7 +724,8 @@ RETURN
 }
 
 /// A selector outside the list runs nothing and continues, as in GW-BASIC --
-/// zero, past the end, and negative alike.
+/// zero and past the end alike. A negative one is Illegal function call;
+/// see test_on_selector_range.
 #[test]
 fn test_on_gosub_out_of_range_falls_through() {
     let output = compile_and_run(
@@ -734,7 +735,7 @@ ON 0 GOSUB Only
 PRINT Hit$
 ON 5 GOSUB Only
 PRINT Hit$
-ON -3 GOSUB Only
+ON 255 GOSUB Only
 PRINT Hit$
 ON 1 GOSUB Only
 PRINT Hit$
@@ -880,8 +881,8 @@ RETURN
     .unwrap();
     assert_eq!(
         crate::common::lines(&output),
-        vec!["two", "one"],
-        "4/2 selects the second; 1.9 truncates to 1"
+        vec!["two", "two"],
+        "4/2 selects the second; 1.9 rounds to 2"
     );
 }
 

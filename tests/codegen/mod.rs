@@ -711,12 +711,11 @@ fn test_constant_bounds_need_no_frame_slots() {
     );
 }
 
-/// The truncation above is not decorative: the program must still wrap.
-///
-/// 300 * 300 is 90000, which does not fit in an INTEGER; GW-BASIC's INTEGER
-/// arithmetic wraps to 16 bits, giving 24464.
+/// INTEGER arithmetic is checked at 16 bits: 300 * 300 is 90000, which does
+/// not fit an INTEGER, and GW-BASIC stops with Overflow rather than wrap. This
+/// used to give 24464, and the same product printed directly gave 90000.
 #[test]
-fn test_integer_multiply_wraps_to_16_bits() {
+fn test_integer_multiply_overflows_at_16_bits() {
     let src = "\
 DIM X AS INTEGER
 DIM Y AS LONG
@@ -724,8 +723,9 @@ X = 300
 Y = X * X
 PRINT Y
 ";
-    let out = crate::common::compile_and_run(src).expect("the program must run");
-    assert_eq!(out.trim(), "24464");
+    let run = crate::common::compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr {}", run.stderr);
+    assert!(run.stderr.contains("Overflow"), "stderr {}", run.stderr);
 }
 
 /// Each runtime helper is emitted into a section of its own.

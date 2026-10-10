@@ -50,7 +50,7 @@ A# = 3.7: B% = A#: PRINT B%
     assert_eq!(lines[5], "-4", "cint -3.9");
     assert_eq!(lines[6], "42", "int to long");
     assert_eq!(lines[7], "42", "int to double");
-    assert_eq!(lines[8], "3", "double to int truncates");
+    assert_eq!(lines[8], "4", "double to int rounds");
 }
 
 #[test]
@@ -461,9 +461,8 @@ PRINT Y
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    // Assignment to an integer truncates here; LANGREF records that as a
-    // deliberate divergence from GW-BASIC, which rounds.
-    assert_eq!(lines, &["3", "3"], "7/2 and 3.7 both truncate to 3");
+    // Assignment to an integer rounds half to even, as in QuickBASIC.
+    assert_eq!(lines, &["4", "4"], "7/2 is 3.5 and rounds to 4, 3.7 to 4");
 }
 
 /// A suffix always wins over the default.
@@ -480,7 +479,7 @@ PRINT X#
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, &["3", "3.7"], "X is INTEGER, X# is DOUBLE");
+    assert_eq!(lines, &["4", "3.7"], "X is INTEGER, X# is DOUBLE");
 }
 
 /// Each of the five spellings, over its own letter range.
@@ -508,8 +507,8 @@ PRINT LEN(T)
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines[0], "3", "DEFINT");
-    assert_eq!(lines[1], "100000", "DEFLNG");
+    assert_eq!(lines[0], "4", "DEFINT");
+    assert_eq!(lines[1], "100001", "DEFLNG");
     assert_eq!(lines[2], ".33333334", "DEFSNG carries ~7 digits");
     assert_eq!(
         lines[3], ".3333333333333333",
@@ -554,7 +553,7 @@ PRINT A; B; C; E; F
     .unwrap();
     assert_eq!(
         output.trim(),
-        "1  1.7  1  1  1.7",
+        "2  1.7  2  2  1.7",
         "A, C and E are INTEGER; B and F stay DOUBLE"
     );
 }
@@ -578,8 +577,8 @@ Show 4.6
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        &["9", "4"],
-        "array elements and parameters both default"
+        &["10", "5"],
+        "array elements and parameters both default, and round"
     );
 }
 

@@ -110,14 +110,14 @@ Check "single", STR$(S!), "1.5"
 Check "double keeps its digits", STR$(D#), ".3333333333333333"
 Check "string", T$, "text"
 Check "unsuffixed is double", STR$(1 / 3), ".3333333333333333"
-Check "integer truncates on store", STR$(CINT(2.6)), "3"
+Check "CINT rounds", STR$(CINT(2.6)), "3"
 Check "widening in an expression", STR$(I% + S!), "301.5"
 Check "CLNG", STR$(CLNG(2.5)), "2"
 Check "CSNG", STR$(CSNG(1.5)), "1.5"
 Check "CDBL", STR$(CDBL(2)), "2"
 DIM DeclaredInt AS INTEGER
 DeclaredInt = 7.9
-Check "DIM AS INTEGER truncates", STR$(DeclaredInt), "7"
+Check "DIM AS INTEGER rounds", STR$(DeclaredInt), "8"
 
 ' ---------------------------------------------------------------------------
 ' CONST
@@ -158,7 +158,7 @@ Check "string array", Names$(3), "three"
 Check "string array untouched", Names$(1), ""
 
 Typed%(2) = 7.6
-Check "typed array truncates", STR$(Typed%(2)), "7"
+Check "typed array rounds", STR$(Typed%(2)), "8"
 
 DIM Growable(2)
 Growable(0) = 1
@@ -409,7 +409,7 @@ Check "FUNCTION", STR$(Square(7)), "49"
 Check "FUNCTION recursion", STR$(Fact(6)), "720"
 Check "FUNCTION two arguments", STR$(AddUp(3, 4)), "7"
 Check "FUNCTION returning a string", Shout$("hi"), "HI!"
-Check "FUNCTION AS INTEGER truncates", STR$(HalfInt(7)), "3"
+Check "FUNCTION AS INTEGER rounds half to even", STR$(HalfInt(7)), "4"
 
 Arg = 5
 Doubler Arg

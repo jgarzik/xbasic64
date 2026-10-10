@@ -181,11 +181,30 @@ INTEGER → LONG → SINGLE → DOUBLE
 
 The result takes the wider type. String/numeric mixing is not allowed; use `VAL()` and `STR$()` for explicit conversion.
 
+A value converted to an INTEGER or LONG -- by assignment, `INPUT`, `READ`, an
+argument, a subscript, a string position, or as an operand of `\`, `MOD` or a
+bitwise operator -- **rounds half to even**, QuickBASIC's rule and what `CINT`
+does: `A% = 7.9` gives 8, `A% = 2.5` gives 2 and `A% = 3.5` gives 4.
+
+Every result that does not fit its type is `Overflow` (error 6), as in
+GW-BASIC:
+
+- INTEGER arithmetic is checked at 16 bits and LONG at 32: with `X% = 300`,
+  `X% * X%` is `Overflow`, not 90000 or a wrapped value
+- a value converted to an INTEGER or LONG that does not fit it, so
+  `A% = 40000` and `CINT(40000)` are both `Overflow`
+- a SINGLE or DOUBLE result too large for its type, such as `1E308 * 10` or
+  `EXP(1000)`, rather than an infinity
+
+`--unsafe` removes these checks with the others, and the results then wrap.
+
 ### Division Semantics
 
 Following GW-BASIC conventions:
 - `/` (division) always produces a **Double** result
-- `\` (integer division) produces a **Long** result
+- `\` (integer division) produces a **Long** result; its operands are rounded
+  to LONG first, so `7.6 \ 2` is `8 \ 2`
+- `0 ^` a negative number is `Division by zero`, as in GW-BASIC
 
 ```basic
 PRINT 7 / 2       ' Prints 3.5
@@ -292,8 +311,8 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `IMP`    | Bitwise implication   |
 
 These operate bitwise on integers, allowing both logical tests and bit
-manipulation. Their operands are converted to integers first, and the result is
-an integer:
+manipulation. Their operands are converted to LONG first -- rounded, and
+`Overflow` outside its range -- and the result is a LONG:
 
 ```basic
 IF A > 0 AND B > 0 THEN PRINT "Both positive"
@@ -661,9 +680,10 @@ PRINT "erasing"
 RETURN
 ```
 
-The selector is truncated to an integer. A value that matches nothing -- zero,
-negative, or past the end of the list -- runs no subroutine and continues with
-the next statement.
+The selector is rounded to an integer, as any conversion is. A value that
+matches nothing -- zero, or past the end of the list -- runs no subroutine and
+continues with the next statement. As in GW-BASIC, the selector must fit a
+byte: a negative one, or one above 255, is `Illegal function call`.
 
 ### ON ERROR GOTO
 
@@ -1105,8 +1125,8 @@ it.
 
 | Function   | Description                              |
 |------------|------------------------------------------|
-| `CINT(x)`  | Convert to Integer (with rounding)       |
-| `CLNG(x)`  | Convert to Long (with rounding)          |
+| `CINT(x)`  | Convert to Integer, rounding half to even |
+| `CLNG(x)`  | Convert to Long, rounding half to even    |
 | `CSNG(x)`  | Convert to Single                        |
 | `CDBL(x)`  | Convert to Double                        |
 
@@ -1450,12 +1470,18 @@ author can act on. A statement ahead of the first line number does the same.
 
 Checked: array subscripts (against every dimension, and against the lower
 bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
-run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
-overflows, `SQR` of a negative number, `LOG` of a non-positive number, a file
-number outside 1 to 15, `GOSUB` nested deeper than the return stack holds, a
-`RETURN` with no `GOSUB` of its own scope to go back to, allocation failure, a random-access operation on a file not opened `FOR
-RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
-few bytes, and a `LOCK` another process already holds.
+run, division by zero for `/`, `\` and `MOD`, every arithmetic result and
+conversion that does not fit its type, `SQR` of a negative number, `LOG` of a
+non-positive number, a file number outside 1 to 15, `GOSUB` nested deeper than
+the return stack holds, a `RETURN` with no `GOSUB` of its own scope to go back
+to, `READ` past the last `DATA` item, allocation failure, each way `OPEN` can
+fail, a file used against the mode it was opened in, `FIELD` widths that
+overrun the record, a `CV` conversion given too few bytes, and a `LOCK` another
+process already holds.
+
+A comparison involving NaN follows IEEE: it is false, except `<>`, which is
+true. Arithmetic never produces one in a checked program -- each way to is an
+error -- so this matters under `--unsafe`, or for a NaN read from outside.
 
 The message names the fault, and each carries GW-BASIC's number for it:
 
@@ -1464,7 +1490,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | 3   | `RETURN without GOSUB`   | A `RETURN` no `GOSUB` of its scope is waiting for |
 | 4   | `Out of DATA`            | A `READ` after the last `DATA` item          |
 | 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive, an argument out of range |
-| 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
+| 6   | `Overflow`               | A result or conversion that does not fit its type |
 | 7   | `Out of memory`          | A string or array allocation that failed     |
 | 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
 | 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
@@ -1579,18 +1605,14 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 These are places where a GW-BASIC program will behave differently here. They
 are choices, not oversights.
 
-7. **Assignment to an integer truncates** - `A% = 7.9` gives 7, where GW-BASIC
-   rounds to 8. `CINT` does round, half to even, as QuickBASIC does, so use
-   `A% = CINT(X)` when rounding is what is wanted.
-
-8. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
+7. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
    elements on first use. Here an array with no `DIM` anywhere is a compile
    error, because the implicit version silently hides a typo; one whose `DIM`
    has not run yet is `Array used before DIM` at run time.
 
-9. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
+8. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
    `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
 
-10. **`LOC` on a sequential file counts 128-byte blocks**, which is what
+9. **`LOC` on a sequential file counts 128-byte blocks**, which is what
     GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
     because the number is useful.

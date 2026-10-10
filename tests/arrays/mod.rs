@@ -88,8 +88,8 @@ PRINT A%(0) + A%(2)
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        vec!["3", "100000", "3.5", "3.5", "3", "5"],
-        "typed elements keep their declared type; INTEGER truncates"
+        vec!["3", "100000", "3.5", "3.5", "4", "5"],
+        "typed elements keep their declared type; INTEGER rounds"
     );
 }
 
