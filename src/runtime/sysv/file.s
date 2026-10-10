@@ -161,6 +161,37 @@ _rt_file_open:
     jmp .Lopen_done
 .Lopen_ok:
 
+    # A directory opens for reading -- only the first read fails, with
+    # EISDIR -- so OPEN "." FOR INPUT used to succeed, EOF() answered -1 at
+    # once, and INPUT # said "Input past end of file", naming the wrong
+    # problem. It is "Path/File access error" (75), as opening one for writing
+    # already is: those modes fail in fopen itself, so only INPUT is checked.
+    test r14d, r14d
+    jnz .Lopen_store
+    mov r12, rax            # the FILE*; the name is not needed any more
+    sub rsp, 144            # struct stat, which is 144 bytes on x86-64 Linux
+    mov rdi, rax
+    call fileno
+    mov edi, eax
+    mov rsi, rsp
+    call fstat
+    mov ecx, DWORD PTR [rsp + 24]       # st_mode
+    add rsp, 144
+    test eax, eax
+    jnz .Lopen_not_dir      # fstat failed: nothing is known, so carry on
+    and ecx, 0xF000         # S_IFMT
+    cmp ecx, 0x4000         # S_IFDIR
+    jne .Lopen_not_dir
+    mov rdi, r12
+    call fclose
+    lea rdi, [rip + _err_access]
+    xor esi, esi
+    call _rt_error          # returns only when trapped
+    jmp .Lopen_done
+.Lopen_not_dir:
+    mov rax, r12
+.Lopen_store:
+
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax

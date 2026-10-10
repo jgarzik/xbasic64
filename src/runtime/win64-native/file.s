@@ -2058,9 +2058,24 @@ _rt_file_lof:
     lea rcx, [rip + _err_pathnotfound]
     jmp .Lopen_err_go
 .Lopen_err_perm:
-    lea rcx, [rip + _err_permission]
     cmp eax, 5                          # ERROR_ACCESS_DENIED
+    jne .Lopen_err_perm_other
+    # CreateFile refuses a directory with access denied, but a directory is
+    # not a file to be denied: it is "Path/File access error" (75), which is
+    # what the System V tree reports for one in every mode.
+    sub rsp, 32             # shadow space
+    lea rcx, [rip + _file_name_buf]
+    call GetFileAttributesA
+    add rsp, 32
+    lea rcx, [rip + _err_permission]
+    cmp eax, -1                         # INVALID_FILE_ATTRIBUTES
     je .Lopen_err_go
+    test eax, 0x10                      # FILE_ATTRIBUTE_DIRECTORY
+    jz .Lopen_err_go
+    lea rcx, [rip + _err_access]
+    jmp .Lopen_err_go
+.Lopen_err_perm_other:
+    lea rcx, [rip + _err_permission]
     cmp eax, 32                         # ERROR_SHARING_VIOLATION
     je .Lopen_err_go
     cmp eax, 19                         # ERROR_WRITE_PROTECT

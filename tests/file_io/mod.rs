@@ -772,16 +772,53 @@ RESUME NEXT
     );
 }
 
-/// A directory is not a file. Linux says EISDIR (75, Path/File access error);
-/// Windows says access denied (70). Either is right; "File not found" was not.
+/// A directory is not a file: opening one is "Path/File access error" (75).
+/// Linux says EISDIR. Windows says access denied, which was reported as
+/// "Permission denied" (70) until the runtime learned to ask whether the name
+/// is a directory; "File not found" was never right.
 #[test]
 fn test_open_of_a_directory_is_an_access_error() {
     let output = compile_and_run(
-        "ON ERROR GOTO 100\nOPEN \".\" FOR OUTPUT AS #1\nEND\n100 PRINT ERR\nRESUME NEXT\n",
+        "ON ERROR GOTO 100\nOPEN \".\" FOR OUTPUT AS #1\nOPEN \".\" FOR APPEND AS #1\nOPEN \".\" FOR RANDOM AS #1\nEND\n100 PRINT ERR\nRESUME NEXT\n",
     )
     .unwrap();
-    let err = crate::common::lines(&output)[0].to_string();
-    assert!(err == "75" || err == "70", "ERR was {err}");
+    assert_eq!(crate::common::lines(&output), vec!["75", "75", "75"]);
+}
+
+/// Opening a directory FOR INPUT is "Path/File access error" (75), as opening
+/// it for output is.
+///
+/// On Linux fopen(".", "r") succeeds -- only the first read fails, with
+/// EISDIR -- so the OPEN went through, EOF() answered -1 at once and the first
+/// INPUT # said "Input past end of file", which names the wrong problem. The
+/// number is left free, so a later OPEN on it works. Unix only: on Windows
+/// opening a directory as a file already fails in the open itself.
+#[cfg(unix)]
+#[test]
+fn test_open_of_a_directory_for_input_is_an_access_error() {
+    let output = compile_and_run(
+        r#"
+ON ERROR GOTO 100
+OPEN "." FOR INPUT AS #1
+PRINT "after"
+OPEN "f.txt" FOR OUTPUT AS #1
+PRINT #1, 7
+CLOSE #1
+OPEN "f.txt" FOR INPUT AS #1
+INPUT #1, A
+PRINT A
+END
+100 PRINT ERR
+RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["75", "after", "7"]);
+
+    let run = compile_and_run_raw("10 PRINT \"x\"\n20 OPEN \".\" FOR INPUT AS #1\n", "")
+        .expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert_eq!(run.stderr.trim(), "?Path/File access error in 20");
 }
 
 /// Reading a file opened for writing, or writing one opened for reading, is
