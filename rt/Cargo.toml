@@ -16,3 +16,6 @@ rust-version = "1.96"
 [lib]
 path = "src/lib.rs"
 doctest = false
+
+[dev-dependencies]
+tempfile = "3"

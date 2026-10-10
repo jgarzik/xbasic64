@@ -489,9 +489,8 @@ mod tests {
     /// Whole statements, to a file, as the asm runtime printed them.
     #[test]
     fn statements_reuse_the_format() {
-        let dir = std::env::temp_dir().join(format!("xbrt-using-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("using.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("using.txt");
         let name = path.to_str().unwrap();
         unsafe { crate::file::_rt_file_open(name.as_ptr(), name.len() as i64, 1, 6) };
         let start = |f: &str| unsafe { _rt_using_start(6, f.as_ptr(), f.len() as i64) };

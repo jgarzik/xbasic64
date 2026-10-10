@@ -635,3 +635,6 @@ dependencies = [
 [[package]]
 name = "xbasic64-rt"
 version = "1.0.2"
+dependencies = [
+ "tempfile",
+]

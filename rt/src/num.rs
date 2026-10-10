@@ -365,6 +365,10 @@ pub(crate) mod testing {
     //! in parallel in this one.
 
     /// Whether this is the child process `expect_fatal` started.
+    /// Where a child process's test keeps its files: the parent's
+    /// directory, which the parent removes.
+    pub const TMP_VAR: &str = "XBASIC64_RT_TMP";
+
     pub fn in_child() -> bool {
         std::env::var_os("XBASIC64_RT_CHILD").is_some()
     }
@@ -372,9 +376,13 @@ pub(crate) mod testing {
     /// Run the test `name` (its full path) in a child process, and require
     /// that it end with the fatal report `msg`.
     pub fn expect_fatal(name: &str, msg: &str) {
+        // The child's scratch directory, removed here: the child exits
+        // without unwinding.
+        let tmp = tempfile::tempdir().unwrap();
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([name, "--exact", "--nocapture", "--test-threads=1"])
             .env("XBASIC64_RT_CHILD", "1")
+            .env(TMP_VAR, tmp.path())
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);

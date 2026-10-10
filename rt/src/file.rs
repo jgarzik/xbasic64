@@ -1008,10 +1008,18 @@ mod tests {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn temp(name: &str) -> String {
-        let dir = std::env::temp_dir().join(format!("xbrt-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name).to_str().unwrap().to_string()
+    /// A path for `name` in a fresh directory, removed when the guard is
+    /// dropped. A test running in a child process uses the directory its
+    /// parent made instead, and the parent removes it: the child may end
+    /// with a fatal error, which exits without dropping anything.
+    fn temp(name: &str) -> (Option<tempfile::TempDir>, String) {
+        if let Some(dir) = std::env::var_os(crate::num::testing::TMP_VAR) {
+            let path = std::path::Path::new(&dir).join(name);
+            return (None, path.to_str().unwrap().to_string());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name).to_str().unwrap().to_string();
+        (Some(dir), path)
     }
 
     fn open(name: &str, mode: i64, n: i64) {
@@ -1114,7 +1122,7 @@ mod tests {
     #[test]
     fn sequential_round_trip() {
         let _g = serial();
-        let path = temp("seq.txt");
+        let (_dir, path) = temp("seq.txt");
         open(&path, OUTPUT, 1);
         put(1, "abc");
         assert_eq!(col(1), 3);
@@ -1163,7 +1171,7 @@ mod tests {
     #[test]
     fn numeric_fields_end_at_a_blank() {
         let _g = serial();
-        let path = temp("nums.txt");
+        let (_dir, path) = temp("nums.txt");
         std::fs::write(&path, " 1  2  3 \n 4 , 5\r\nx 6 y\r\nnext\n").unwrap();
         open(&path, INPUT, 3);
         let num = || {
@@ -1187,7 +1195,7 @@ mod tests {
     #[test]
     fn width_wraps_lines() {
         let _g = serial();
-        let path = temp("width.txt");
+        let (_dir, path) = temp("width.txt");
         open(&path, OUTPUT, 4);
         unsafe { _rt_width(4, 5) };
         put(4, "abcdefghijkl");
@@ -1207,7 +1215,7 @@ mod tests {
     #[test]
     fn random_files() {
         let _g = serial();
-        let path = temp("random.dat");
+        let (_dir, path) = temp("random.dat");
         let _ = std::fs::remove_file(&path);
         unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 5, 8) };
         assert!(!stream(5).is_null());
@@ -1264,7 +1272,7 @@ mod tests {
     fn a_huge_field_width_is_field_overflow() {
         use crate::num::testing::*;
         if in_child() {
-            let path = temp("hugefield.dat");
+            let (_dir, path) = temp("hugefield.dat");
             unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 6, 8) };
             unsafe { _rt_field_reset(6) };
             let a = unsafe { _rt_field_next(6, 3) };
@@ -1295,7 +1303,7 @@ mod tests {
     #[test]
     fn a_field_window_outlives_its_file() {
         let _g = serial();
-        let path = temp("window.dat");
+        let (_dir, path) = temp("window.dat");
         let _ = std::fs::remove_file(&path);
         unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 7, 4) };
         unsafe { _rt_field_reset(7) };
