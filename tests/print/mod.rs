@@ -69,15 +69,24 @@ fn test_print_using_numeric() {
 }
 
 /// Leading and trailing sign fields.
+///
+/// A trailing `-` is a column of its own after the digits, as in GW-BASIC and
+/// QuickBASIC: a negative number puts its minus there and a positive one a
+/// blank, so the digits of both line up. A positive used to be padded on the
+/// left instead -- `"   5"` beside `"  5-"` -- which put its digits one column
+/// to the right of a negative's.
 #[test]
 fn test_print_using_signs() {
-    let output = compile_and_run("PRINT USING \"+###\"; 42\nPRINT USING \"+###\"; -42\nPRINT USING \"###-\"; -42\nPRINT USING \"###-\"; 42\nPRINT USING \"####\"; -42\n").unwrap();
+    let output = compile_and_run("PRINT USING \"+###\"; 42\nPRINT USING \"+###\"; -42\nPRINT USING \"###-\"; -42\nPRINT USING \"###-\"; 42\nPRINT USING \"####\"; -42\nPRINT USING \"###-|\"; 5\nPRINT USING \"###-|\"; -5\nPRINT USING \"###-|\"; 0\n").unwrap();
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines[0], " +42", "+ shows a sign for positives");
     assert_eq!(lines[1], " -42");
     assert_eq!(lines[2], " 42-", "trailing sign");
-    assert_eq!(lines[3], "  42", "- shows nothing for positives");
+    assert_eq!(lines[3], " 42 ", "- leaves its column blank for positives");
     assert_eq!(lines[4], " -42");
+    assert_eq!(lines[5], "  5 |", "digits line up with a negative's");
+    assert_eq!(lines[6], "  5-|");
+    assert_eq!(lines[7], "  0 |", "zero is not negative");
 }
 
 /// Comma grouping, currency and fill characters.

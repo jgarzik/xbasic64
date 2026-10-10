@@ -161,6 +161,37 @@ _rt_file_open:
     jmp .Lopen_done
 .Lopen_ok:
 
+    # A directory opens for reading -- only the first read fails, with
+    # EISDIR -- so OPEN "." FOR INPUT used to succeed, EOF() answered -1 at
+    # once, and INPUT # said "Input past end of file", naming the wrong
+    # problem. It is "Path/File access error" (75), as opening one for writing
+    # already is: those modes fail in fopen itself, so only INPUT is checked.
+    test r14d, r14d
+    jnz .Lopen_store
+    mov r12, rax            # the FILE*; the name is not needed any more
+    sub rsp, 144            # struct stat, which is 144 bytes on x86-64 Linux
+    mov rdi, rax
+    call fileno
+    mov edi, eax
+    mov rsi, rsp
+    call fstat
+    mov ecx, DWORD PTR [rsp + 24]       # st_mode
+    add rsp, 144
+    test eax, eax
+    jnz .Lopen_not_dir      # fstat failed: nothing is known, so carry on
+    and ecx, 0xF000         # S_IFMT
+    cmp ecx, 0x4000         # S_IFDIR
+    jne .Lopen_not_dir
+    mov rdi, r12
+    call fclose
+    lea rdi, [rip + _err_access]
+    xor esi, esi
+    call _rt_error          # returns only when trapped
+    jmp .Lopen_done
+.Lopen_not_dir:
+    mov rax, r12
+.Lopen_store:
+
     # Store FILE* in handle table: _file_handles[file_number] = rax
     lea rcx, [rip + _file_handles]
     mov [rcx + rbx*8], rax
@@ -676,24 +707,6 @@ _rt_file_print_newline:
     ret
 
 
-# _rt_file_read_field - Read one INPUT # field
-# INPUT # reads comma-delimited fields, not whole lines. Reading a line per
-# variable made `INPUT #1, A, B` on "10,20" yield 10 twice, and reading through
-# fscanf("%lf") was worse: it stopped at the comma without consuming it, so
-# every later read failed on the same character.
-#
-# Leading blanks and line breaks are skipped. A field either is quoted, in
-# which case it runs to the closing quote and everything up to the next
-# delimiter is discarded, or runs to the next comma, newline or end of file
-# with trailing blanks trimmed. The delimiter is consumed.
-#
-# Arguments:
-#   rdi = file number
-#
-# Returns:
-#   rax = pointer to the field (in _file_input_buf), rdx = its length
-#
-# Note: uses a static buffer, so the result is valid only until the next read.
 # _rt_file_getc - Read one byte
 # Arguments: rdi = file number
 # Returns:   eax = the byte, or -1 at end of file or on a file that is not open
@@ -714,6 +727,33 @@ _rt_file_getc:
     leave
     ret
 
+# _rt_file_read_field - Read one INPUT # field
+# INPUT # reads comma-delimited fields, not whole lines. Reading a line per
+# variable made `INPUT #1, A, B` on "10,20" yield 10 twice, and reading through
+# fscanf("%lf") was worse: it stopped at the comma without consuming it, so
+# every later read failed on the same character.
+#
+# Leading blanks and line breaks are skipped. A field either is quoted, in
+# which case it runs to the closing quote and everything up to the next
+# delimiter is discarded, or runs to the next comma, newline or end of file
+# with trailing blanks trimmed. The delimiter is consumed.
+#
+# An unquoted field read for a number also ends at a blank, as GW-BASIC's
+# INPUT # does: `PRINT #1, 1; 2; 3` writes " 1  2  3 " on one line, and that is
+# three numbers. Running to the comma, with the blanks inside left for
+# _rt_scan_number to skip as VAL does, read it as 123 and the next INPUT #
+# found nothing left. The blanks after such a number are separators, and so is
+# a comma or line break that follows them, so " 1 , 2" is still two numbers;
+# anything else is the start of the next field, and is put back.
+#
+# Arguments:
+#   rdi = file number
+#   esi = 1 for a numeric item, 0 for a string
+#
+# Returns:
+#   rax = pointer to the field (in _file_input_buf), rdx = its length
+#
+# Note: uses a static buffer, so the result is valid only until the next read.
 .globl _rt_file_read_field
 _rt_file_read_field:
     push rbp
@@ -721,10 +761,11 @@ _rt_file_read_field:
     push rbx
     push r12
     push r13
-    sub rsp, 8
+    push r14
 
     mov ebx, edi                # file number, reloaded before every read
     xor r12d, r12d              # length written so far
+    mov r14d, esi               # numeric item
 
     # INPUT # needs a file that is open, and open for reading. _rt_file_getc
     # answers end-of-file for one that is not, so this read an empty field.
@@ -772,10 +813,59 @@ _rt_file_read_field:
     je .Lfield_trim
     cmp eax, 10
     je .Lfield_trim
+    test r14d, r14d
+    jnz .Lfield_num_char
     cmp eax, 13
     je .Lfield_plain_next
     mov r13d, eax
     jmp .Lfield_plain_store
+
+.Lfield_num_char:
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9                  # tab
+    je .Lfield_num_blanks
+    cmp eax, 13
+    je .Lfield_num_cr
+    mov r13d, eax
+    jmp .Lfield_plain_store
+
+.Lfield_num_blanks:
+    # The number has ended at a blank. More blanks, then a comma or a line
+    # break, all belong to this field's delimiter.
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9
+    je .Lfield_num_blanks
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, ','
+    je .Lfield_done
+    cmp eax, 10
+    je .Lfield_done
+    cmp eax, 13
+    je .Lfield_num_cr
+    jmp .Lfield_unread
+
+.Lfield_num_cr:
+    # A CR ends the number, and the LF of a CRLF goes with it: left behind, it
+    # would be an empty line to a LINE INPUT # that follows.
+    mov edi, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, 10
+    je .Lfield_done
+
+.Lfield_unread:
+    # Not a separator: the next field starts here.
+    mov edi, eax
+    lea rax, [rip + _file_handles]
+    mov rsi, [rax + rbx*8]
+    call ungetc
+    jmp .Lfield_done
 
 .Lfield_trim:
     # Drop trailing blanks, which are separators rather than data.
@@ -828,7 +918,7 @@ _rt_file_read_field:
     mov BYTE PTR [rax + r12], 0
     mov rdx, r12
 
-    add rsp, 8
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -851,6 +941,7 @@ _rt_file_input_number:
     push rbp
     mov rbp, rsp
 
+    mov esi, 1                      # a number ends at a blank
     call _rt_file_read_field
     mov rdi, rax
     mov rsi, rdx
@@ -870,6 +961,7 @@ _rt_file_input_number:
 # Returns:   rax = pointer, rdx = length
 .globl _rt_file_input_string
 _rt_file_input_string:
+    xor esi, esi                    # a string runs to its comma
     jmp _rt_file_read_field
 
 # _rt_file_line_input - LINE INPUT #: read a whole line
@@ -1086,7 +1178,7 @@ _mk_buf: .skip 16
 #
 # Arguments:
 #   rdi = filename pointer, rsi = filename length
-#   rdx = file number, rcx = record length
+#   rdx = file number, rcx = record length, 1 to 32767
 #
 # Returns: nothing
 .globl _rt_file_open_random
@@ -1102,6 +1194,16 @@ _rt_file_open_random:
     mov r13, rsi            # filename len
     mov ebx, edx            # file number
     mov r14, rcx            # record length
+
+    # A record length outside 1..MAX_RECLEN is an Illegal function call, as in
+    # GW-BASIC, refused before anything is created. It used to be fixed up
+    # silently -- 40000 cut to 32767, 0 or less made 128 -- so a program that
+    # computed its length wrongly ran on with records it never asked for. A
+    # missing LEN clause is not 0 here: codegen passes the default, 128.
+    cmp r14, 1
+    jl .Lrandom_badlen
+    cmp r14, MAX_RECLEN
+    jg .Lrandom_badlen
 
     # The same refusals as a sequential OPEN. This one stored a NULL handle
     # for a file it could not open, and silently replaced an open one.
@@ -1152,15 +1254,6 @@ _rt_file_open_random:
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
 
-    # Clamp the record length into 1..MAX_RECLEN.
-    cmp r14, 1
-    jge .Lrandom_len_ok
-    mov r14, 128
-.Lrandom_len_ok:
-    cmp r14, MAX_RECLEN
-    jle .Lrandom_len_set
-    mov r14, MAX_RECLEN
-.Lrandom_len_set:
     lea rcx, [rip + _file_reclen]
     mov [rcx + rbx*8], r14
 
@@ -1210,6 +1303,12 @@ _rt_file_open_random:
 # epilogue with a harmless result.
 .Lrandom_nomem:
     lea rdi, [rip + _err_memory]
+    xor esi, esi
+    call _rt_error
+    jmp .Lrandom_open_done
+
+.Lrandom_badlen:
+    lea rdi, [rip + _err_domain]
     xor esi, esi
     call _rt_error
     jmp .Lrandom_open_done
@@ -1883,8 +1982,9 @@ _rt_file_lof:
 # PRINT # and LINE INPUT # used to load the NULL handle and hand it straight to
 # fprintf/fgets, so `PRINT #3, "x"` on an unopened number died with SIGSEGV --
 # no message, exit 139. _rt_file_getc and _rt_file_eof already guarded; these
-# did not. The line number is unknown here (these helpers are not given one),
-# and _rt_error prints a bare message for 0.
+# did not. These helpers are not given the line, so they pass 0 and
+# _rt_error reports the one generated code stored in _err_line before the
+# call.
 #
 # These four are reached by `call`, from inside helpers with different frames,
 # and tail-call _rt_error: when a handler traps the error, _rt_error returns
@@ -1894,8 +1994,8 @@ _rt_file_lof:
     xor esi, esi
     jmp _rt_error
 
-# The line number is not passed to _rt_file_open, so the OPEN errors report
-# without one; _rt_error prints a bare message for 0.
+# The line number is not passed to _rt_file_open either, so the OPEN errors
+# pass 0 as well and report _err_line's.
 .Lopen_already:
     lea rdi, [rip + _err_alreadyopen]
     xor esi, esi

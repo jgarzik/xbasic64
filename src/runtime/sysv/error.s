@@ -128,7 +128,8 @@ _err_pending: .skip 8       # 1 from a trapped error until its handler runs;
                             # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
-_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_line:    .skip 8       # the line now running: codegen stores it per statement
+                            # when trapping, else before each call that can fail
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
 
 .text
@@ -155,35 +156,58 @@ _rt_erl:
 #   rdi = error number
 #   rsi = BASIC line number, or 0 when unknown
 #
-# Returns: never -- tail-calls _rt_error with the matching message.
+# Returns: only when a handler traps the error, as _rt_error does.
+#
+# ERR is n itself, not the number the message maps back to: every number the
+# table does not list shares "Unprintable error", so looking the message up
+# made ERR 0 for all of them, and `ERROR 200 ... IF ERR = 200` -- the GW-BASIC
+# way to raise an error of a program's own -- failed silently.
 .globl _rt_error_num
 _rt_error_num:
+    mov rdx, rdi                    # ERR, whatever the message
     lea rax, [rip + _err_codes]
 .Lnum_scan:
     mov rcx, QWORD PTR [rax]        # message, or 0 at the end
     test rcx, rcx
     jz .Lnum_unknown
-    cmp QWORD PTR [rax + 8], rdi
+    cmp QWORD PTR [rax + 8], rdx
     je .Lnum_found
     add rax, 16
     jmp .Lnum_scan
 .Lnum_found:
     mov rdi, rcx
-    jmp _rt_error
+    jmp .Lerror_raise
 .Lnum_unknown:
     lea rdi, [rip + _err_unprintable]
-    jmp _rt_error
+    jmp .Lerror_raise
 
 
 # _rt_error - Report a runtime error and terminate
 # Arguments:
 #   rdi = message pointer (NUL-terminated)
-#   rsi = BASIC line number, or 0 when unknown
+#   rsi = BASIC line number, or 0 for the one in _err_line
 #
 # Returns: only when a handler traps the error, with _err_pending set.
 # Otherwise never (exit code 1).
 .globl _rt_error
 _rt_error:
+    # ERR is the number this message carries. Unknown text reports 0 rather
+    # than inventing a code.
+    lea rcx, [rip + _err_codes]
+.Ltrap_scan:
+    mov rdx, QWORD PTR [rcx]
+    test rdx, rdx
+    jz .Ltrap_scan_done             # rdx = 0: not listed
+    cmp rdx, rdi
+    je .Ltrap_found
+    add rcx, 16
+    jmp .Ltrap_scan
+.Ltrap_found:
+    mov rdx, QWORD PTR [rcx + 8]
+.Ltrap_scan_done:
+
+# The common path, with rdx = the number ERR is to report.
+.Lerror_raise:
     # An error already on its way to the handler wins. Its helper may carry on
     # to the end of what it was doing -- printing the rest of a number to the
     # same unopened file, say -- and each step fails the same way; the first
@@ -200,23 +224,6 @@ _rt_error:
     cmp QWORD PTR [rip + _err_active], 0
     jne _rt_fatal
 
-    # ERR is the number this message carries. Unknown text reports 0 rather
-    # than inventing a code.
-    lea rcx, [rip + _err_codes]
-.Ltrap_scan:
-    mov rdx, QWORD PTR [rcx]
-    test rdx, rdx
-    jz .Ltrap_unknown
-    cmp rdx, rdi
-    je .Ltrap_found
-    add rcx, 16
-    jmp .Ltrap_scan
-.Ltrap_found:
-    mov rdx, QWORD PTR [rcx + 8]
-    jmp .Ltrap_store
-.Ltrap_unknown:
-    xor edx, edx
-.Ltrap_store:
     mov QWORD PTR [rip + _err_code], rdx
     # Snapshot the line as well. The handler is ordinary module-level code, so
     # its own statements overwrite _err_line the moment it starts running --
@@ -255,6 +262,14 @@ _rt_fatal:
     # otherwise clobber them, since rcx/rdx/rsi/rdi are all caller-saved.
     mov rbx, rdi            # message
     mov r12, rsi            # line number
+
+    # Most helpers are given no line and pass 0, so "?File not found" used to
+    # print with none. Generated code stores the line in _err_line before
+    # every call that can fail, so that is the line this error happened on.
+    test r12, r12
+    jnz .Lerr_have_line
+    mov r12, QWORD PTR [rip + _err_line]
+.Lerr_have_line:
 
     # Flush stdout first, so output written before the error is not lost when
     # the process exits.

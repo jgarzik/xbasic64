@@ -137,7 +137,8 @@ _err_pending: .skip 8       # 1 from a trapped error until its handler runs;
                             # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
-_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_line:    .skip 8       # the line now running: codegen stores it per statement
+                            # when trapping, else before each call that can fail
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
 
 .text
@@ -164,34 +165,55 @@ _rt_erl:
 #   rcx = error number
 #   rdx = BASIC line number, or 0 when unknown
 #
-# Returns: never -- tail-calls _rt_error with the matching message.
+# Returns: only when a handler traps the error, as _rt_error does.
+#
+# ERR is n itself, not the number the message maps back to; see the System V
+# twin.
 .globl _rt_error_num
 _rt_error_num:
+    mov r9, rcx                     # ERR, whatever the message
     lea rax, [rip + _err_codes]
 .Lnum_scan:
     mov r8, QWORD PTR [rax]         # message, or 0 at the end
     test r8, r8
     jz .Lnum_unknown
-    cmp QWORD PTR [rax + 8], rcx
+    cmp QWORD PTR [rax + 8], r9
     je .Lnum_found
     add rax, 16
     jmp .Lnum_scan
 .Lnum_found:
     mov rcx, r8
-    jmp _rt_error
+    jmp .Lerror_raise
 .Lnum_unknown:
     lea rcx, [rip + _err_unprintable]
-    jmp _rt_error
+    jmp .Lerror_raise
 
 # _rt_error - Report a runtime error and terminate
 # Arguments (Win64):
 #   rcx = message pointer (NUL-terminated)
-#   rdx = BASIC line number, or 0 when unknown
+#   rdx = BASIC line number, or 0 for the one in _err_line
 #
 # Returns: only when a handler traps the error, with _err_pending set.
 # Otherwise never (exit code 1).
 .globl _rt_error
 _rt_error:
+    # ERR is the number this message carries. Unknown text reports 0 rather
+    # than inventing a code.
+    lea r8, [rip + _err_codes]
+.Ltrap_scan:
+    mov r9, QWORD PTR [r8]
+    test r9, r9
+    jz .Ltrap_scan_done             # r9 = 0: not listed
+    cmp r9, rcx
+    je .Ltrap_found
+    add r8, 16
+    jmp .Ltrap_scan
+.Ltrap_found:
+    mov r9, QWORD PTR [r8 + 8]
+.Ltrap_scan_done:
+
+# The common path, with r9 = the number ERR is to report.
+.Lerror_raise:
     # An error already on its way to the handler wins. Its helper may carry on
     # to the end of what it was doing -- printing the rest of a number to the
     # same unopened file, say -- and each step fails the same way; the first
@@ -211,23 +233,6 @@ _rt_error:
     cmp QWORD PTR [rip + _err_active], 0
     jne _rt_fatal
 
-    # ERR is the number this message carries. Unknown text reports 0 rather
-    # than inventing a code.
-    lea r8, [rip + _err_codes]
-.Ltrap_scan:
-    mov r9, QWORD PTR [r8]
-    test r9, r9
-    jz .Ltrap_unknown
-    cmp r9, rcx
-    je .Ltrap_found
-    add r8, 16
-    jmp .Ltrap_scan
-.Ltrap_found:
-    mov r9, QWORD PTR [r8 + 8]
-    jmp .Ltrap_store
-.Ltrap_unknown:
-    xor r9d, r9d
-.Ltrap_store:
     mov QWORD PTR [rip + _err_code], r9
     # Snapshot the line as well. The handler is ordinary module-level code, so
     # its own statements overwrite _err_line the moment it starts running --
@@ -265,6 +270,13 @@ _rt_fatal:
 
     mov rbx, rcx            # message
     mov rsi, rdx            # line number
+
+    # A helper given no line passes 0; _err_line holds it. See the System V
+    # twin.
+    test rsi, rsi
+    jnz .Lerr_have_line
+    mov rsi, QWORD PTR [rip + _err_line]
+.Lerr_have_line:
 
     # sprintf(_err_buf, fmt, message [, line])
     lea rcx, [rip + _err_buf]

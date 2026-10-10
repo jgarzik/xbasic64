@@ -757,8 +757,14 @@ _rt_file_getc:
 # delimiter is discarded, or runs to the next comma, newline or end of file
 # with trailing blanks trimmed. The delimiter is consumed.
 #
+# An unquoted field read for a number also ends at a blank, as GW-BASIC's
+# INPUT # does; see the System V twin. Putting back the character that starts
+# the next field is a step back of one byte: reads here go straight to the
+# handle a byte at a time, so there is no buffer to push it into.
+#
 # Arguments:
 #   rcx = file number
+#   edx = 1 for a numeric item, 0 for a string
 #
 # Returns:
 #   rax = pointer to the field (in _file_input_buf), rdx = its length
@@ -771,10 +777,12 @@ _rt_file_read_field:
     push rbx
     push rsi
     push r12
-    sub rsp, 40                 # three pushes plus the return address
+    push r13
+    sub rsp, 32                 # shadow space; four pushes keep it aligned
 
     mov ebx, ecx                # file number, reloaded before every read
     xor r12d, r12d              # length written so far
+    mov r13d, edx               # numeric item
 
     # INPUT # needs a file that is open, and open for reading. _rt_file_getc
     # answers end-of-file for one that is not, so this read an empty field.
@@ -820,10 +828,62 @@ _rt_file_read_field:
     je .Lfield_trim
     cmp eax, CHAR_LF
     je .Lfield_trim
+    test r13d, r13d
+    jnz .Lfield_num_char
     cmp eax, CHAR_CR
     je .Lfield_plain_next
     mov esi, eax
     jmp .Lfield_plain_store
+
+.Lfield_num_char:
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9                  # tab
+    je .Lfield_num_blanks
+    cmp eax, CHAR_CR
+    je .Lfield_num_cr
+    mov esi, eax
+    jmp .Lfield_plain_store
+
+.Lfield_num_blanks:
+    # The number has ended at a blank. More blanks, then a comma or a line
+    # break, all belong to this field's delimiter.
+    mov ecx, ebx
+    call _rt_file_getc
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9
+    je .Lfield_num_blanks
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, ','
+    je .Lfield_done
+    cmp eax, CHAR_LF
+    je .Lfield_done
+    cmp eax, CHAR_CR
+    je .Lfield_num_cr
+    jmp .Lfield_unread
+
+.Lfield_num_cr:
+    # A CR ends the number, and the LF of a CRLF goes with it: left behind, it
+    # would be an empty line to a LINE INPUT # that follows.
+    mov ecx, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, CHAR_LF
+    je .Lfield_done
+
+.Lfield_unread:
+    # Not a separator: the next field starts here, so step back over it.
+    # SetFilePointer(h, -1, NULL, FILE_CURRENT)
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    mov edx, -1
+    xor r8d, r8d
+    mov r9d, 1                  # FILE_CURRENT
+    call SetFilePointer
+    jmp .Lfield_done
 
 .Lfield_trim:
     # Drop trailing blanks, which are separators rather than data.
@@ -874,7 +934,8 @@ _rt_file_read_field:
     mov BYTE PTR [rax + r12], 0
     mov rdx, r12
 
-    add rsp, 40
+    add rsp, 32
+    pop r13
     pop r12
     pop rsi
     pop rbx
@@ -896,6 +957,7 @@ _rt_file_input_number:
     mov rbp, rsp
     sub rsp, 32                 # shadow space
 
+    mov edx, 1                  # a number ends at a blank
     call _rt_file_read_field
     mov rcx, rax
     call _rt_scan_number        # rdx is the field's length already
@@ -915,6 +977,7 @@ _rt_file_input_number:
 # Returns:   rax = pointer, rdx = length
 .globl _rt_file_input_string
 _rt_file_input_string:
+    xor edx, edx                # a string runs to its comma
     jmp _rt_file_read_field
 
 # _rt_file_line_input - LINE INPUT #: read a whole line
@@ -1137,7 +1200,7 @@ _file_pos: .skip 8
 #
 # Arguments:
 #   rcx = filename pointer, rdx = filename length
-#   r8  = file number, r9 = record length
+#   r8  = file number, r9 = record length, 1 to 32767
 .globl _rt_file_open_random
 _rt_file_open_random:
     push rbp
@@ -1154,6 +1217,13 @@ _rt_file_open_random:
     mov rsi, rdx            # filename len
     mov ebx, r8d            # file number
     mov r14, r9             # record length
+
+    # A record length outside 1..MAX_RECLEN is an Illegal function call,
+    # refused before anything is created; see the System V twin.
+    cmp r14, 1
+    jl .Lwrandom_badlen
+    cmp r14, MAX_RECLEN
+    jg .Lwrandom_badlen
 
     # The same refusals as a sequential OPEN. This one stored
     # INVALID_HANDLE_VALUE for a file it could not open, and silently
@@ -1206,15 +1276,6 @@ _rt_file_open_random:
     lea rcx, [rip + _file_col]
     mov QWORD PTR [rcx + rbx*8], 0
 
-    # Clamp the record length into 1..MAX_RECLEN.
-    cmp r14, 1
-    jge .Lwrandom_len_ok
-    mov r14, 128
-.Lwrandom_len_ok:
-    cmp r14, MAX_RECLEN
-    jle .Lwrandom_len_set
-    mov r14, MAX_RECLEN
-.Lwrandom_len_set:
     lea rcx, [rip + _file_reclen]
     mov [rcx + rbx*8], r14
 
@@ -1266,6 +1327,12 @@ _rt_file_open_random:
 # epilogue with a harmless result.
 .Lwrandom_nomem:
     lea rcx, [rip + _err_memory]
+    xor edx, edx
+    call _rt_error
+    jmp .Lwrandom_open_done
+
+.Lwrandom_badlen:
+    lea rcx, [rip + _err_domain]
     xor edx, edx
     call _rt_error
     jmp .Lwrandom_open_done
@@ -1953,9 +2020,9 @@ _rt_file_lof:
 #
 # PRINT # and LINE INPUT # used to hand the NULL handle straight to WriteFile
 # and ReadFile. The System V build died with SIGSEGV on the same programs;
-# _rt_file_getc and _rt_file_eof already guarded and these did not. The line
-# number is unknown here (these helpers are not given one), and _rt_error
-# prints a bare message for 0.
+# _rt_file_getc and _rt_file_eof already guarded and these did not. These
+# helpers are not given the line, so they pass 0 and _rt_error reports the
+# one generated code stored in _err_line before the call.
 #
 # These four are reached by `call`, from inside helpers with different frames,
 # and tail-call _rt_error: when a handler traps the error, _rt_error returns
@@ -1965,8 +2032,8 @@ _rt_file_lof:
     xor edx, edx
     jmp _rt_error
 
-# The line number is not passed to _rt_file_open, so the OPEN errors report
-# without one; _rt_error prints a bare message for 0.
+# The line number is not passed to _rt_file_open either, so the OPEN errors
+# pass 0 as well and report _err_line's.
 .Lopen_badname:
     lea rcx, [rip + _err_badname]
     xor edx, edx
@@ -1995,9 +2062,24 @@ _rt_file_lof:
     lea rcx, [rip + _err_pathnotfound]
     jmp .Lopen_err_go
 .Lopen_err_perm:
-    lea rcx, [rip + _err_permission]
     cmp eax, 5                          # ERROR_ACCESS_DENIED
+    jne .Lopen_err_perm_other
+    # CreateFile refuses a directory with access denied, but a directory is
+    # not a file to be denied: it is "Path/File access error" (75), which is
+    # what the System V tree reports for one in every mode.
+    sub rsp, 32             # shadow space
+    lea rcx, [rip + _file_name_buf]
+    call GetFileAttributesA
+    add rsp, 32
+    lea rcx, [rip + _err_permission]
+    cmp eax, -1                         # INVALID_FILE_ATTRIBUTES
     je .Lopen_err_go
+    test eax, 0x10                      # FILE_ATTRIBUTE_DIRECTORY
+    jz .Lopen_err_go
+    lea rcx, [rip + _err_access]
+    jmp .Lopen_err_go
+.Lopen_err_perm_other:
+    lea rcx, [rip + _err_permission]
     cmp eax, 32                         # ERROR_SHARING_VIOLATION
     je .Lopen_err_go
     cmp eax, 19                         # ERROR_WRITE_PROTECT
