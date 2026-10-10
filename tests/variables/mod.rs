@@ -248,19 +248,38 @@ PRINT I$; J$
     assert_eq!(lines, &["2  1", "4  3", "6  5", "8  7", "yx"]);
 }
 
-/// SWAP between different numeric types converts, as an assignment would.
+/// SWAP between different numeric types is refused, as QuickBASIC refuses it
+/// ("Type mismatch"). It used to convert each value as an assignment would,
+/// so `SWAP A%, B#` with B# = 2.5 quietly lost the half.
 #[test]
 fn test_swap_between_numeric_types() {
-    let output = compile_and_run(
+    let err = crate::common::compile_only("A% = 1\nB# = 2.5\nSWAP A%, B#\n")
+        .expect_err("SWAP of an INTEGER and a DOUBLE must be refused");
+    assert!(
+        err.contains("'A%' is an INTEGER and 'B#' is a DOUBLE"),
+        "got:\n{}",
+        err.stderr
+    );
+}
+
+/// A dot is part of a name, as in GW-BASIC, unless the part before it is a
+/// record variable.
+#[test]
+fn test_dotted_names() {
+    let out = compile_and_run(
         r#"
-A% = 1
-B# = 2.5
-SWAP A%, B#
-PRINT A%
-PRINT B#
+TYPE PT
+X AS INTEGER
+END TYPE
+DIM P AS PT, Q(2) AS PT
+MY.VAR = 3
+A.B$ = "s"
+P.X = 4
+Q(1).X = 5
+X.1 = 6
+PRINT MY.VAR; A.B$; P.X; Q(1).X; X.1
 "#,
     )
     .unwrap();
-    let lines = crate::common::lines(&output);
-    assert_eq!(lines, &["2", "1"], "A% takes CINT(2.5), B# takes 1");
+    assert_eq!(out.trim(), "3 s 4  5  6");
 }

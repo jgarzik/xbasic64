@@ -1,22 +1,23 @@
 //! BASIC-to-x86_64 Compiler
 //!
 //! Compiles 1980s-era BASIC programs to x86-64 executables.
-//! Supports Linux (system `as` and `cc`) and Windows (Clang and MSVC `link.exe`).
+//! Code generation is Cranelift, which writes the object file; the program is
+//! linked with `cc` on Linux and MSVC `link.exe` on Windows.
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-mod abi;
 mod codegen;
 mod lexer;
 mod parser;
+#[cfg(test)]
+mod rtbuild;
+mod rtsig;
 mod runtime;
 mod sema;
-mod using;
 
 use clap::Parser;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
@@ -32,11 +33,12 @@ struct Args {
     #[arg(short, long)]
     output: Option<String>,
 
-    /// Emit assembly only (don't assemble or link)
+    /// Write the program's Cranelift IR to `<output>.clif` instead of
+    /// compiling it. The runtime is prebuilt, so it is not included.
     #[arg(short = 'S')]
     asm_only: bool,
 
-    /// Disable runtime safety checks (array bounds, division by zero)
+    /// Disable runtime safety checks (array bounds, division by zero, overflow)
     ///
     /// Named `no_checks` because `unsafe` is a Rust keyword.
     #[arg(long = "unsafe")]
@@ -114,7 +116,7 @@ fn main() {
             input_file,
             &errors
                 .iter()
-                .map(|e| (e.line, e.to_string(), None))
+                .map(|e| (e.line, e.to_string(), e.error.note().map(str::to_string)))
                 .collect::<Vec<_>>(),
         ),
     };
@@ -122,27 +124,32 @@ fn main() {
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
     let (symbols, diagnostics) = sema::analyze(&mut program, !args.no_checks);
-    if !diagnostics.is_empty() {
-        report(
-            input_file,
-            &diagnostics
-                .iter()
-                .map(|d| (d.line, d.message.clone(), d.note.clone()))
-                .collect::<Vec<_>>(),
-        );
+    for d in diagnostics.iter().filter(|d| d.warning) {
+        eprintln!("{}: warning: {}", locate(input_file, d.line), d.message);
+        if let Some(note) = &d.note {
+            eprintln!("{}: note: {}", locate(input_file, d.line), note);
+        }
+    }
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| !d.warning)
+        .map(|d| (d.line, d.message.clone(), d.note.clone()))
+        .collect();
+    if !errors.is_empty() {
+        report(input_file, &errors);
     }
 
     // Generate code
-    let mut codegen = codegen::CodeGen::default();
     let opts = codegen::Options {
         checks: !args.no_checks,
     };
-    let mut full_asm = codegen.generate(&program, symbols, opts);
-
-    // Append the runtime rather than `format!("{}\n{}", ..)`, which would build
-    // a third copy of an assembly text that reaches 145 MB on a large program.
-    full_asm.push('\n');
-    full_asm.push_str(&runtime::generate_runtime());
+    let output = match codegen::generate(&program, symbols, opts, args.asm_only) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{}: error: {}", input_file, e);
+            std::process::exit(1);
+        }
+    };
 
     // Determine output file names - put temp files next to output
     let input_path = Path::new(&input_file);
@@ -164,55 +171,36 @@ fn main() {
     let exe_path = Path::new(&exe_file);
     let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
     let exe_stem = exe_path.file_stem().unwrap().to_str().unwrap();
-    let asm_file = exe_dir
-        .join(format!("{}.s", exe_stem))
-        .to_string_lossy()
-        .to_string();
     let obj_file = exe_dir
         .join(format!("{}.o", exe_stem))
         .to_string_lossy()
         .to_string();
-
-    // Write assembly
-    match fs::File::create(&asm_file) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(full_asm.as_bytes()) {
-                eprintln!("Error writing assembly: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Err(e) => {
-            eprintln!("Error creating assembly file: {}", e);
-            std::process::exit(1);
-        }
-    }
+    let rt_file = exe_dir
+        .join(format!("{}.rt.o", exe_stem))
+        .to_string_lossy()
+        .to_string();
 
     if args.asm_only {
-        println!("Assembly written to {}", asm_file);
+        let clif_file = exe_dir
+            .join(format!("{}.clif", exe_stem))
+            .to_string_lossy()
+            .to_string();
+        if let Err(e) = fs::write(&clif_file, output.clif.as_bytes()) {
+            eprintln!("Error writing {}: {}", clif_file, e);
+            std::process::exit(1);
+        }
+        println!("Cranelift IR written to {}", clif_file);
         return;
     }
 
-    // Assemble - use clang on Windows, GNU as elsewhere
-    #[cfg(windows)]
-    let as_status = Command::new("clang")
-        .args(["-c", "-o", &obj_file, &asm_file])
-        .status();
-
-    #[cfg(not(windows))]
-    let as_status = Command::new("as")
-        .args(["-o", &obj_file, &asm_file])
-        .status();
-
-    match as_status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("Assembler failed with status: {}", status);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Failed to run assembler: {}", e);
-            std::process::exit(1);
-        }
+    if let Err(e) = fs::write(&obj_file, &output.object) {
+        eprintln!("Error writing the object file: {}", e);
+        std::process::exit(1);
+    }
+    // The runtime, assembled when the compiler was built.
+    if let Err(e) = fs::write(&rt_file, runtime::OBJECT) {
+        eprintln!("Error writing the runtime object: {}", e);
+        std::process::exit(1);
     }
 
     // Link - Windows uses link.exe with UCRT, others use cc
@@ -225,6 +213,7 @@ fn main() {
         .args([
             &format!("/OUT:{}", exe_file),
             &obj_file,
+            &rt_file,
             "/SUBSYSTEM:CONSOLE",
             // Discard the runtime helpers this program never calls. Each is
             // emitted into a COMDAT section of its own for exactly this;
@@ -249,6 +238,7 @@ fn main() {
             "-o",
             &exe_file,
             &obj_file,
+            &rt_file,
             "-lm",
             "-no-pie",
             "-Wl,--gc-sections",
@@ -286,8 +276,8 @@ fn main() {
     }
 
     // Clean up temporary files
-    let _ = fs::remove_file(&asm_file);
     let _ = fs::remove_file(&obj_file);
+    let _ = fs::remove_file(&rt_file);
 
     println!("Compiled {} -> {}", input_file, exe_file);
 }

@@ -130,7 +130,13 @@ pub enum DataTypeWord {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Literals
+    /// A whole number: an INTEGER if it fits 16 bits, otherwise a LONG.
     Integer(i64),
+    /// A whole number written as a LONG (`5&`, `&HFFFF&`), whatever its size.
+    Long(i64),
+    /// A number written as a SINGLE (`1.5!`), already rounded to one.
+    Single(f64),
+    /// A DOUBLE: any number with a point or exponent, or written with `#`.
     Float(f64),
     String(String),
 
@@ -264,6 +270,11 @@ impl<'a> Lexer<'a> {
         self.chars.peek().copied()
     }
 
+    /// The character `n` places ahead, without consuming anything.
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.chars.clone().nth(n)
+    }
+
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek() {
             if c == ' ' || c == '\t' || c == '\r' {
@@ -285,26 +296,25 @@ impl<'a> Lexer<'a> {
     }
 
     /// Scan a string literal. The opening quote is already consumed.
-    fn read_string(&mut self) -> Result<String, String> {
+    ///
+    /// GW-BASIC's rules: the first quote ends it, so `"a""b"` is two strings
+    /// side by side (PRINT shows `ab`) -- there is no escape, and a quote is
+    /// written `CHR$(34)`. A string the line ends inside closes there, which
+    /// is how `PRINT "Hello` is written in many a listing. The newline is
+    /// left for `next_token`, which owns `at_line_start`.
+    fn read_string(&mut self) -> String {
         let mut s = String::new();
-        loop {
-            match self.advance() {
-                Some('"') => {
-                    // Check for escaped quote ""
-                    if self.peek() == Some('"') {
-                        self.advance();
-                        s.push('"');
-                    } else {
-                        break;
-                    }
+        while let Some(c) = self.peek() {
+            match c {
+                '"' => {
+                    self.advance();
+                    break;
                 }
-                Some('\n') | None => {
-                    return Err("Unterminated string".to_string());
-                }
-                Some(c) => s.push(c),
+                '\n' => break,
+                _ => s.push(self.advance().unwrap()),
             }
         }
-        Ok(s)
+        s
     }
 
     /// Scan the operand of a `DATA` statement as raw source text.
@@ -361,10 +371,10 @@ impl<'a> Lexer<'a> {
                 is_float = true;
                 s.push(self.advance().unwrap());
                 // Handle optional sign after exponent
-                if let Some(sign) = self.peek() {
-                    if sign == '+' || sign == '-' {
-                        s.push(self.advance().unwrap());
-                    }
+                if let Some(sign) = self.peek()
+                    && (sign == '+' || sign == '-')
+                {
+                    s.push(self.advance().unwrap());
                 }
             } else {
                 break;
@@ -373,6 +383,18 @@ impl<'a> Lexer<'a> {
 
         // Replace D with E for parsing
         let s = s.replace(['d', 'D'], "e");
+
+        // A type suffix, as GW-BASIC allows: `5%`, `5&`, `1.5!`, `1.5#`. `&`
+        // before H, O, B or a digit starts a radix literal instead, which no
+        // number is followed by.
+        let suffix = match (self.peek(), self.peek_at(1)) {
+            (Some(c @ ('%' | '!' | '#')), _) => Some(c),
+            (Some('&'), next) if !next.is_some_and(|n| n.is_ascii_alphanumeric()) => Some('&'),
+            _ => None,
+        };
+        if suffix.is_some() {
+            self.advance();
+        }
 
         // `parse::<f64>()` answers `inf` for a literal too large to represent
         // rather than failing, so an overflow used to slip through as a silent
@@ -385,28 +407,64 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        if is_float {
-            return match s.parse::<f64>() {
+        match suffix {
+            Some(c @ ('%' | '&')) => {
+                // The lexer sees no sign, so only the top of the range can be
+                // exceeded here; -32768% is -(32768%), which is refused, as it
+                // is in GW-BASIC.
+                let (name, hi) = if c == '%' {
+                    ("INTEGER", i64::from(i16::MAX))
+                } else {
+                    ("LONG", i64::from(i32::MAX))
+                };
+                if is_float {
+                    return Err(format!(
+                        "'{}{}' is an {} and cannot have a fraction or exponent",
+                        s, c, name
+                    ));
+                }
+                match s.parse::<i64>() {
+                    Ok(n) if n <= hi => Ok(if c == '%' {
+                        Token::Integer(n)
+                    } else {
+                        Token::Long(n)
+                    }),
+                    _ => Err(format!("'{}{}' does not fit an {}", s, c, name)),
+                }
+            }
+            Some('!') => match s.parse::<f64>() {
+                Ok(v) if (v as f32).is_finite() => Ok(Token::Single(f64::from(v as f32))),
+                Ok(_) => Err(format!("'{}!' does not fit a SINGLE", s)),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            },
+            Some(_) => match s.parse::<f64>() {
                 Ok(v) => finite(v, &s),
                 Err(_) => Err(format!("malformed number '{}'", s)),
-            };
-        }
-
-        match s.parse::<i32>() {
-            Ok(n) => Ok(Token::Integer(n as i64)),
-            // Outside LONG range: widen to Double, as MS BASIC does, rather
-            // than truncating to 32 bits.
-            Err(_) => match s.parse::<f64>() {
+            },
+            None if is_float => match s.parse::<f64>() {
                 Ok(v) => finite(v, &s),
-                Err(_) => Err(format!("number '{}' is too large", s)),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            },
+            None => match s.parse::<i32>() {
+                Ok(n) => Ok(Token::Integer(n as i64)),
+                // Outside LONG range: widen to Double, as MS BASIC does, rather
+                // than truncating to 32 bits.
+                Err(_) => match s.parse::<f64>() {
+                    Ok(v) => finite(v, &s),
+                    Err(_) => Err(format!("number '{}' is too large", s)),
+                },
             },
         }
     }
 
     /// Scan the digits of a radix literal (`&H`, `&O`, `&B`, or bare `&`).
     ///
-    /// GW-BASIC treats these as 32-bit values, so `&HFFFFFFFF` is -1. An empty
-    /// digit run or an out-of-range value is an error; both used to yield 0.
+    /// QuickBASIC's widths: a value that fits 16 bits is an INTEGER, read as
+    /// two's complement, so `&HFFFF` is -1 and `&H8000` is -32768; one that
+    /// fits 32 bits is a LONG, likewise, so `&HFFFFFFFF` is -1. A trailing `&`
+    /// makes it a LONG whatever its size (`&HFFFF&` is 65535), and `%` insists
+    /// on an INTEGER. An empty digit run or an out-of-range value is an error;
+    /// both used to yield 0, and the suffix used to be ignored.
     fn read_radix(&mut self, radix: u32, sigil: &str) -> Result<Token, String> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
@@ -422,13 +480,22 @@ impl<'a> Lexer<'a> {
                 sigil
             ));
         }
-        // An optional type suffix may follow the digits, e.g. &HFFFF&
-        if matches!(self.peek(), Some('%') | Some('&')) {
-            self.advance();
-        }
-        match u32::from_str_radix(&s, radix) {
-            Ok(v) => Ok(Token::Integer(v as i32 as i64)),
-            Err(_) => Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        let suffix = match self.peek() {
+            Some(c @ ('%' | '&')) => {
+                self.advance();
+                Some(c)
+            }
+            _ => None,
+        };
+        let v = match u32::from_str_radix(&s, radix) {
+            Ok(v) => v,
+            Err(_) => return Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        };
+        match suffix {
+            Some('&') => Ok(Token::Long(i64::from(v as i32))),
+            Some(_) if v > 0xFFFF => Err(format!("{}{}% does not fit an INTEGER", sigil, s)),
+            _ if v <= 0xFFFF => Ok(Token::Integer(i64::from(v as u16 as i16))),
+            _ => Ok(Token::Long(i64::from(v as i32))),
         }
     }
 
@@ -443,8 +510,12 @@ impl<'a> Lexer<'a> {
         let mut s = String::new();
         s.push(first.to_ascii_uppercase());
 
+        // A dot belongs to the name, as in GW-BASIC (`MY.VAR`), when a letter
+        // or digit follows it. The parser splits it again where the part
+        // before the dot is a record variable (`P.X`).
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            let dotted = c == '.' && self.peek_at(1).is_some_and(|n| n.is_ascii_alphanumeric());
+            if c.is_ascii_alphanumeric() || c == '_' || dotted {
                 s.push(self.advance().unwrap().to_ascii_uppercase());
             } else {
                 break;
@@ -452,10 +523,10 @@ impl<'a> Lexer<'a> {
         }
 
         // Check for type suffix
-        if let Some(c) = self.peek() {
-            if c == '%' || c == '&' || c == '!' || c == '#' || c == '$' {
-                s.push(self.advance().unwrap());
-            }
+        if let Some(c) = self.peek()
+            && (c == '%' || c == '&' || c == '!' || c == '#' || c == '$')
+        {
+            s.push(self.advance().unwrap());
         }
 
         s
@@ -494,30 +565,29 @@ impl<'a> Lexer<'a> {
         }
 
         // Check for line number at start of line
-        if self.at_line_start {
-            if let Some(c) = self.peek() {
+        if self.at_line_start
+            && let Some(c) = self.peek()
+            && c.is_ascii_digit()
+        {
+            let mut num = String::new();
+            while let Some(c) = self.peek() {
                 if c.is_ascii_digit() {
-                    let mut num = String::new();
-                    while let Some(c) = self.peek() {
-                        if c.is_ascii_digit() {
-                            num.push(self.advance().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    self.at_line_start = false;
-                    self.skip_whitespace();
-                    // A number too large to represent used to become label 0,
-                    // so the program silently defined a label nobody wrote and
-                    // every GOTO to it failed separately -- past LONG range the
-                    // same digits lex as a Double. Every other numeric form in
-                    // this lexer refuses to guess; so does this one.
-                    return match num.parse::<u32>() {
-                        Ok(n) => Ok(Token::LineNumber(n)),
-                        Err(_) => Err(format!("line number '{}' is too large", num)),
-                    };
+                    num.push(self.advance().unwrap());
+                } else {
+                    break;
                 }
             }
+            self.at_line_start = false;
+            self.skip_whitespace();
+            // A number too large to represent used to become label 0,
+            // so the program silently defined a label nobody wrote and
+            // every GOTO to it failed separately -- past LONG range the
+            // same digits lex as a Double. Every other numeric form in
+            // this lexer refuses to guess; so does this one.
+            return match num.parse::<u32>() {
+                Ok(n) => Ok(Token::LineNumber(n)),
+                Err(_) => Err(format!("line number '{}' is too large", num)),
+            };
         }
         self.at_line_start = false;
 
@@ -533,7 +603,10 @@ impl<'a> Lexer<'a> {
                 Ok(Token::Newline)
             }
 
-            '"' => Ok(Token::String(self.read_string()?)),
+            '"' => Ok(Token::String(self.read_string())),
+
+            // GW-BASIC's shorthand for PRINT.
+            '?' => Ok(Token::Print),
 
             '\'' => {
                 self.skip_comment();
@@ -563,7 +636,19 @@ impl<'a> Lexer<'a> {
             ':' => Ok(Token::Colon),
             '#' => Ok(Token::Hash),
 
-            '=' => Ok(Token::Eq),
+            // GW-BASIC accepts either order: `=>`, `=<` and `><` are `>=`,
+            // `<=` and `<>`.
+            '=' => match self.peek() {
+                Some('>') => {
+                    self.advance();
+                    Ok(Token::Ge)
+                }
+                Some('<') => {
+                    self.advance();
+                    Ok(Token::Le)
+                }
+                _ => Ok(Token::Eq),
+            },
             '<' => {
                 if self.peek() == Some('>') {
                     self.advance();
@@ -579,6 +664,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some('=') {
                     self.advance();
                     Ok(Token::Ge)
+                } else if self.peek() == Some('<') {
+                    self.advance();
+                    Ok(Token::Ne)
                 } else {
                     Ok(Token::Gt)
                 }
@@ -727,18 +815,41 @@ mod tests {
     }
 
     #[test]
-    fn test_string_escaped_quote() {
-        let mut lexer = Lexer::new("X$ = \"He said \"\"Hi\"\"\"");
+    fn test_doubled_quote_is_two_strings() {
+        let mut lexer = Lexer::new("PRINT \"a\"\"b\"");
         let tokens = lexer.tokenize().unwrap();
-        assert_eq!(tokens[2], Token::String("He said \"Hi\"".to_string()));
+        assert_eq!(tokens[1], Token::String("a".to_string()));
+        assert_eq!(tokens[2], Token::String("b".to_string()));
     }
 
     #[test]
     fn test_string_unterminated() {
-        let mut lexer = Lexer::new("X$ = \"unterminated");
-        let result = lexer.tokenize();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unterminated"));
+        let mut lexer = Lexer::new("X$ = \"open\nPRINT");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[2], Token::String("open".to_string()));
+        assert_eq!(tokens[3], Token::Newline);
+        assert_eq!(tokens[4], Token::Print);
+    }
+
+    #[test]
+    fn test_legacy_operators_and_print() {
+        let mut lexer = Lexer::new("? A => B =< C >< D");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Print);
+        assert_eq!(tokens[2], Token::Ge);
+        assert_eq!(tokens[4], Token::Le);
+        assert_eq!(tokens[6], Token::Ne);
+    }
+
+    #[test]
+    fn test_dotted_names() {
+        let mut lexer = Lexer::new("MY.VAR$ = P.X + A(1).F + .5");
+        let tokens = lexer.tokenize().unwrap();
+        assert_eq!(tokens[0], Token::Ident("MY.VAR$".to_string()));
+        assert_eq!(tokens[2], Token::Ident("P.X".to_string()));
+        assert_eq!(tokens[8], Token::Dot);
+        assert_eq!(tokens[9], Token::Ident("F".to_string()));
+        assert_eq!(tokens[11], Token::Float(0.5));
     }
 
     // Identifier Tests

@@ -1,6 +1,7 @@
 # BASIC Runtime: String Functions (Win64 Native - Pure Win32 API)
 #
-# String manipulation functions. Uses HeapAlloc instead of malloc.
+# String manipulation functions. Every string they allocate comes from
+# malloc, since generated code frees the strings it owns with free.
 # Keeps UCRT functions: strtod, sprintf, memcpy, memcmp
 #
 # String Representation:
@@ -13,7 +14,7 @@
 #
 # Memory Management:
 #   - Substring functions return pointers into original string (no allocation)
-#   - String concatenation uses HeapAlloc(GetProcessHeap(), 0, size)
+#   - String concatenation allocates with malloc
 #   - Conversion functions (STR$, CHR$, HEX$, OCT$) format into a scratch
 #     buffer and return a heap copy of it, so that two of them in one
 #     expression cannot alias; see the System V tree for the failure
@@ -39,21 +40,260 @@ _chr_buf: .skip 2           # Scratch for CHR$(); never returned
 
 .text
 
-# _rt_val - Convert string to number (VAL function)
+# _rt_val - VAL: the number a string begins with
+#
+# See the System V twin.
+#
 # Arguments:
 #   rcx = pointer to string
-#   rdx = length (ignored - strtod reads until non-numeric)
+#   rdx = length
 #
 # Returns:
-#   xmm0 = parsed double value
+#   xmm0 = the value
 .globl _rt_val
 _rt_val:
     push rbp
     mov rbp, rsp
-    sub rsp, 32             # Shadow space
-    xor rdx, rdx            # endptr = NULL
-    call strtod             # returns double in xmm0
+    sub rsp, 32                     # shadow space
+    call _rt_scan_number
+    test edx, edx
+    jnz .Lval_overflow
     leave
+    ret
+.Lval_overflow:
+    lea rcx, [rip + _err_overflow]
+    xor edx, edx
+    call _rt_error                  # returns only when trapped
+    xorpd xmm0, xmm0
+    leave
+    ret
+
+# _rt_scan_number - Read a number the way GW-BASIC's VAL and INPUT do
+#
+# Shared by VAL, INPUT, INPUT # and READ, so they all accept the same text:
+# leading blanks; blanks inside the number, which are ignored ("1 2" is 12);
+# a sign; digits with at most one point; an exponent spelled E or D, with an
+# optional sign; or &H, &O, &B or a bare & followed by digits, which are an
+# INTEGER when they fit 16 bits and a LONG when they fit 32 -- two's
+# complement, as a literal. Scanning stops at the first character that cannot
+# continue the number. strtod saw the text directly before, so VAL accepted
+# "inf", "nan" and "0x1F", read past the end of a LEFT$ view, and knew no D.
+#
+# Arguments:
+#   rcx = pointer, rdx = length
+#
+# Returns:
+#   xmm0 = the value, 0 when there is no number
+#   rax  = characters consumed, up to the last that belongs to the number;
+#          0 when there is no number at all
+#   edx  = 1 when the value is too large for a DOUBLE, else 0
+.globl _rt_scan_number
+_rt_scan_number:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 56             # shadow space + endptr slot; 16-byte aligned
+    mov r12, rcx            # the text
+    mov r13, rdx            # its length
+    xor ebx, ebx            # index into the text
+    xor r15d, r15d          # consumed: just past the last character used
+    xor r14d, r14d          # length of the copy in _scan_buf
+    xor r8d, r8d            # stage: 0 sign, 1 mantissa, 2 exponent sign, 3 exponent
+    xor r9d, r9d            # a point has been seen
+
+.Lsn_lead:
+    cmp rbx, r13
+    jae .Lsn_none
+    movzx eax, BYTE PTR [r12 + rbx]
+    cmp al, 32
+    je .Lsn_lead_next
+    cmp al, 9
+    je .Lsn_lead_next
+    cmp al, 38              # '&'
+    je .Lsn_radix
+    lea r10, [rip + _scan_buf]
+    jmp .Lsn_loop
+.Lsn_lead_next:
+    inc rbx
+    jmp .Lsn_lead
+
+.Lsn_loop:
+    cmp rbx, r13
+    jae .Lsn_convert
+    cmp r14, 120            # the copy's room; a longer number has no more precision
+    jae .Lsn_convert
+    movzx eax, BYTE PTR [r12 + rbx]
+    cmp al, 32              # blanks inside a number are skipped
+    je .Lsn_next
+    cmp al, 9
+    je .Lsn_next
+    cmp al, 48
+    jb .Lsn_not_digit
+    cmp al, 57
+    ja .Lsn_not_digit
+    # A digit: in the mantissa, or the exponent once it has begun.
+    cmp r8d, 2
+    jb .Lsn_mant_digit
+    mov r8d, 3
+    jmp .Lsn_take
+.Lsn_mant_digit:
+    mov r8d, 1
+    jmp .Lsn_take
+.Lsn_not_digit:
+    cmp al, 43              # '+'
+    je .Lsn_sign
+    cmp al, 45              # '-'
+    je .Lsn_sign
+    cmp al, 46              # '.'
+    je .Lsn_point
+    or al, 32               # fold case for the exponent letters
+    cmp al, 101             # 'e'
+    je .Lsn_exp
+    cmp al, 100             # 'd'
+    je .Lsn_exp
+    jmp .Lsn_convert
+.Lsn_sign:
+    cmp r8d, 0              # a sign begins the number ...
+    je .Lsn_sign_ok
+    cmp r8d, 2              # ... or its exponent, and nothing else
+    jne .Lsn_convert
+.Lsn_sign_ok:
+    inc r8d
+    mov BYTE PTR [r10 + r14], al
+    inc r14
+    jmp .Lsn_next
+.Lsn_point:
+    cmp r8d, 1
+    ja .Lsn_convert         # no point in an exponent
+    test r9d, r9d
+    jnz .Lsn_convert        # nor a second one
+    mov r9d, 1
+    mov r8d, 1
+    jmp .Lsn_take
+.Lsn_exp:
+    cmp r8d, 1              # only after some of the mantissa
+    jne .Lsn_convert
+    mov r8d, 2
+    mov al, 101             # strtod's spelling
+    mov BYTE PTR [r10 + r14], al
+    inc r14
+    jmp .Lsn_next
+.Lsn_take:
+    mov BYTE PTR [r10 + r14], al
+    inc r14
+    lea r15, [rbx + 1]
+.Lsn_next:
+    inc rbx
+    jmp .Lsn_loop
+
+.Lsn_convert:
+    mov BYTE PTR [r10 + r14], 0
+    test r15, r15
+    jz .Lsn_none
+    lea rcx, [rip + _scan_buf]
+    lea rdx, [rsp + 40]     # &endptr
+    call strtod
+    mov rcx, QWORD PTR [rsp + 40]
+    lea rax, [rip + _scan_buf]
+    cmp rcx, rax
+    je .Lsn_none            # "+", "." and the like are no number
+    # Infinity is the only way past DOUBLE's range.
+    movq rax, xmm0
+    shr rax, 52
+    and eax, 0x7FF
+    xor edx, edx
+    cmp eax, 0x7FF
+    jne .Lsn_done
+    mov edx, 1
+    xorpd xmm0, xmm0
+    jmp .Lsn_done
+
+.Lsn_radix:
+    inc rbx                 # past '&'
+    mov ecx, 8              # a bare & is octal
+    cmp rbx, r13
+    jae .Lsn_radix_digits
+    movzx eax, BYTE PTR [r12 + rbx]
+    or al, 32
+    cmp al, 104             # 'h'
+    jne .Lsn_radix_o
+    mov ecx, 16
+    inc rbx
+    jmp .Lsn_radix_digits
+.Lsn_radix_o:
+    cmp al, 111             # 'o'
+    jne .Lsn_radix_b
+    inc rbx
+    jmp .Lsn_radix_digits
+.Lsn_radix_b:
+    cmp al, 98              # 'b'
+    jne .Lsn_radix_digits
+    mov ecx, 2
+    inc rbx
+.Lsn_radix_digits:
+    xor r10d, r10d          # the value
+    xor r11d, r11d          # 1 once it no longer fits 32 bits
+.Lsn_radix_loop:
+    cmp rbx, r13
+    jae .Lsn_radix_end
+    movzx eax, BYTE PTR [r12 + rbx]
+    sub eax, 48
+    cmp eax, 9
+    jbe .Lsn_radix_have     # 0-9
+    movzx eax, BYTE PTR [r12 + rbx]
+    or al, 32
+    sub eax, 87             # 'a' -> 10
+    cmp eax, 10
+    jb .Lsn_radix_end
+.Lsn_radix_have:
+    cmp eax, ecx
+    jae .Lsn_radix_end      # not a digit of this radix
+    imul r10, rcx
+    add r10, rax
+    mov rax, r10
+    shr rax, 32
+    jz .Lsn_radix_fits
+    mov r11d, 1
+    and r10d, r10d          # keep it bounded; the overflow is recorded
+.Lsn_radix_fits:
+    inc rbx
+    lea r15, [rbx]
+    jmp .Lsn_radix_loop
+.Lsn_radix_end:
+    test r15, r15
+    jz .Lsn_none
+    mov edx, r11d
+    test edx, edx
+    jnz .Lsn_radix_zero
+    cmp r10, 0xFFFF
+    ja .Lsn_radix_long
+    movsx eax, r10w         # up to 16 bits: an INTEGER, two's complement
+    cvtsi2sd xmm0, eax
+    jmp .Lsn_done
+.Lsn_radix_long:
+    cvtsi2sd xmm0, r10d     # up to 32: a LONG, two's complement
+    jmp .Lsn_done
+.Lsn_radix_zero:
+    xorpd xmm0, xmm0
+    jmp .Lsn_done
+
+.Lsn_none:
+    xorpd xmm0, xmm0
+    xor r15d, r15d
+    xor edx, edx
+.Lsn_done:
+    mov rax, r15
+    add rsp, 56
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
     ret
 
 # _rt_str - Convert number to string (STR$ function)
@@ -72,8 +312,7 @@ _rt_str:
     push rbp
     mov rbp, rsp
     sub rsp, 32             # shadow space
-    lea rcx, [rip + _fmt_g_table]
-    xor edx, edx
+    xor ecx, ecx                    # a DOUBLE
     call _rt_fmt_basic              # includes the sign position's blank
     lea rcx, [rip + _num_buf]
     mov rdx, rax            # length
@@ -93,8 +332,7 @@ _rt_str_single:
     push rbp
     mov rbp, rsp
     sub rsp, 32             # shadow space
-    lea rcx, [rip + _fmt_g_single_table]
-    mov edx, 1
+    mov ecx, 1                      # a SINGLE
     call _rt_fmt_basic
     lea rcx, [rip + _num_buf]
     mov rdx, rax
@@ -274,6 +512,8 @@ _rt_instr:
     lea rcx, [rip + _err_domain]
     xor edx, edx
     call _rt_error
+    xor eax, eax            # "not found" when a handler traps it
+    jmp .Linstr_done
 
 .Linstr_done:
     add rsp, 40
@@ -315,15 +555,10 @@ _rt_strcat:
     mov r14, r8             # right ptr
     mov r15, r9             # right len
 
-    # Get process heap handle
-    call GetProcessHeap
-    mov rsi, rax            # save heap handle
-
-    # HeapAlloc(hHeap, 0, size)
-    mov rcx, rax            # hHeap
-    xor rdx, rdx            # dwFlags = 0
-    lea r8, [r13 + r15 + 1] # dwBytes = left_len + right_len + 1
-    call HeapAlloc
+    # malloc(left_len + right_len + 1). malloc rather than HeapAlloc,
+    # because generated code frees the result with free.
+    lea rcx, [r13 + r15 + 1]
+    call malloc
 
     mov rdi, rax            # save result ptr
 

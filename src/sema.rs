@@ -32,6 +32,10 @@ use std::collections::{HashMap, HashSet};
 ///
 /// The table is 16 pointers wide and slot 0 is the console, so a program may
 /// use 1 through 15.
+/// The most variables one INPUT statement may read; the runtime's field table
+/// (`MAX_INPUT_FIELDS` in input.s) holds this many.
+pub const MAX_INPUT_VARS: usize = 64;
+
 pub const MAX_FILE_NUM: i64 = 15;
 
 /// Builtin functions, with the argument counts they accept.
@@ -126,17 +130,12 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "INKEY$ needs raw console input, which is not implemented yet",
     ),
     ("INPUT$", "INPUT$ is not implemented yet"),
-    ("WIDTH", "console width control is not implemented yet"),
     ("CSRLIN", "console cursor position is not implemented yet"),
     ("VIEW", "console windowing is not implemented yet"),
     ("SLEEP", "SLEEP is not implemented yet"),
-    (
-        "SHARED",
-        "SHARED is not implemented; module-level names are already global",
-    ),
-    ("STATIC", "STATIC is not implemented yet"),
     ("SHELL", "SHELL is not implemented yet"),
     ("ENVIRON$", "ENVIRON$ is not implemented yet"),
+    ("ENVIRON", "ENVIRON is not implemented yet"),
     ("KILL", "KILL is not implemented yet"),
     ("NAME", "NAME is not implemented yet"),
     ("FILES", "FILES is not implemented yet"),
@@ -186,8 +185,32 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("STICK", "joystick input is not supported"),
     ("STRIG", "joystick input is not supported"),
     ("KEY", "KEY is not implemented yet"),
+    ("ERDEV", "device error codes are specific to MS-DOS drivers"),
+    (
+        "EXTERR",
+        "extended error codes are specific to MS-DOS; use ERR and ERL",
+    ),
+    (
+        "ERDEV$",
+        "device error codes are specific to MS-DOS drivers",
+    ),
+    (
+        "IOCTL",
+        "device control strings are specific to MS-DOS drivers",
+    ),
+    (
+        "IOCTL$",
+        "device control strings are specific to MS-DOS drivers",
+    ),
+    ("MOTOR", "there is no cassette motor to control"),
+    ("COM", "serial-port event trapping is not supported"),
+    ("PCOPY", "video pages are not supported"),
     ("LPRINT", "LPRINT is not implemented yet"),
     ("LPOS", "LPOS is not implemented yet"),
+    (
+        "LCOPY",
+        "LCOPY copies the screen to a printer, which is not supported",
+    ),
     (
         "CHAIN",
         "a compiled program cannot load another program's code",
@@ -199,6 +222,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("MERGE", "MERGE is an interpreter command"),
     ("LIST", "LIST is an interpreter command"),
     ("LLIST", "LLIST is an interpreter command"),
+    ("DELETE", "DELETE is an interpreter command"),
     ("NEW", "NEW is an interpreter command"),
     ("EDIT", "EDIT is an interpreter command"),
     ("RENUM", "RENUM is an interpreter command"),
@@ -280,6 +304,12 @@ impl RecordInfo {
 pub struct ArrayInfo {
     pub rank: usize,
     pub line: u32,
+    /// Some DIM or REDIM of it gives a lower bound (`1 TO 10`), so a
+    /// subscript has to have the lower bound taken off. Under OPTION BASE 1
+    /// every array has one too; codegen checks that itself.
+    pub has_lower: bool,
+    /// No DIM declares it: it was created by being used, as GW-BASIC does.
+    pub implicit: bool,
 }
 
 /// Which scope a name was declared in.
@@ -294,20 +324,16 @@ pub enum Scope {
 pub struct Symbols {
     pub procs: HashMap<String, ProcInfo>,
     pub arrays: HashMap<(Scope, String), ArrayInfo>,
-    /// Named labels (`Retry:`) available as branch targets.
-    pub labels: HashSet<String>,
-    /// Numeric line-number labels available as branch targets.
-    pub lines: HashSet<u32>,
-    /// The subset of both that sit at module level.
+    /// Named labels (`Retry:`) available as branch targets, and the scope
+    /// each one is in.
     ///
-    /// `labels` and `lines` are one flat program-wide set, so a target inside
-    /// a `SUB` is indistinguishable from a module-level one. That is harmless
-    /// for `GOTO`, which cannot cross a frame boundary at run time anyway
-    /// because sema rejects it earlier -- but an `ON ERROR` handler is jumped
-    /// to *after* the unwind has restored main's frame, so a handler inside a
-    /// procedure would run with the wrong `rbp` and read main's locals.
-    pub module_labels: HashSet<String>,
-    pub module_lines: HashSet<u32>,
+    /// A branch may not leave its scope: module code and each procedure have
+    /// their own frame, so code reached across the boundary would run with the
+    /// wrong one. An `ON ERROR` handler and a `RESUME` target must be at
+    /// module level.
+    pub labels: HashMap<String, Scope>,
+    /// Numeric line-number labels available as branch targets, likewise.
+    pub lines: HashMap<u32, Scope>,
     /// CONST names and their folded values.
     pub consts: HashMap<String, Literal>,
     /// Lowest legal subscript, set by OPTION BASE. Defaults to 0.
@@ -316,9 +342,71 @@ pub struct Symbols {
     pub records: HashMap<String, RecordInfo>,
     /// Variables declared with `DIM ... AS`, by (scope, upper-case name).
     pub typed_vars: HashMap<(Scope, String), TypeRef>,
+    /// Module-level scalars and arrays `DIM SHARED` makes visible inside every
+    /// procedure.
+    pub shared_all: NameSets,
+    /// Per procedure, the module-level names its SHARED statements use.
+    pub proc_shared: HashMap<String, NameSets>,
+    /// Per procedure, the locals its STATIC statements keep between calls.
+    pub proc_static: HashMap<String, NameSets>,
+    /// Procedures declared `SUB name STATIC`, whose every local is static.
+    pub static_procs: HashSet<String>,
+    /// FUNCTIONs written as `DEF FN`, which see every module-level name.
+    pub def_fns: HashSet<String>,
+}
+
+/// Upper-case names of scalars and of arrays, which BASIC keeps apart: `A`
+/// and `A()` are different things.
+#[derive(Debug, Default, Clone)]
+pub struct NameSets {
+    pub vars: HashSet<String>,
+    pub arrays: HashSet<String>,
+}
+
+impl NameSets {
+    fn insert(&mut self, name: &str, array: bool) {
+        let upper = name.to_uppercase();
+        if array {
+            self.arrays.insert(upper);
+        } else {
+            self.vars.insert(upper);
+        }
+    }
+
+    fn contains(&self, name: &str, array: bool) -> bool {
+        let upper = name.to_uppercase();
+        if array {
+            self.arrays.contains(&upper)
+        } else {
+            self.vars.contains(&upper)
+        }
+    }
 }
 
 impl Symbols {
+    /// Whether procedure `proc` uses the module-level `name` (an array when
+    /// `array`) rather than a local of its own, as QuickBASIC decides it: the
+    /// module DIMs it SHARED, or the procedure says SHARED. A DEF FN is part
+    /// of the module and sees everything. A procedure used to see every name
+    /// the module used.
+    pub fn shares(&self, proc: &str, name: &str, array: bool) -> bool {
+        self.def_fns.contains(&proc.to_uppercase())
+            || self.shared_all.contains(name, array)
+            || self
+                .proc_shared
+                .get(&proc.to_uppercase())
+                .is_some_and(|s| s.contains(name, array))
+    }
+
+    /// Whether procedure `proc`'s own `name` keeps its value between calls.
+    pub fn is_static(&self, proc: &str, name: &str, array: bool) -> bool {
+        self.static_procs.contains(&proc.to_uppercase())
+            || self
+                .proc_static
+                .get(&proc.to_uppercase())
+                .is_some_and(|s| s.contains(name, array))
+    }
+
     /// Size of a declared type, in 8-byte words.
     ///
     /// A string field is a (pointer, length) pair, so two words; a fixed-length
@@ -339,9 +427,12 @@ impl Symbols {
     /// Look up a variable's declared type, preferring the current scope.
     pub fn typed_var(&self, scope: &Scope, name: &str) -> Option<&TypeRef> {
         let upper = name.to_uppercase();
-        if let Scope::Proc(_) = scope {
+        if let Scope::Proc(p) = scope {
             if let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone())) {
                 return Some(t);
+            }
+            if !self.shares(p, &upper, false) {
+                return None;
             }
         }
         self.typed_vars.get(&(Scope::Module, upper))
@@ -355,12 +446,15 @@ impl Symbols {
         self.typed_vars.get(&(scope.clone(), name.to_uppercase()))
     }
 
-    /// Look up an array visible from `scope`: a procedure-local declaration
-    /// shadows a module-level one of the same name.
+    /// Look up an array visible from `scope`: a procedure's own, or a
+    /// module-level one it shares.
     pub fn lookup_array(&self, scope: &Scope, name: &str) -> Option<&ArrayInfo> {
-        if let Scope::Proc(_) = scope {
+        if let Scope::Proc(p) = scope {
             if let Some(info) = self.arrays.get(&(scope.clone(), name.to_string())) {
                 return Some(info);
+            }
+            if !self.shares(p, name, true) {
+                return None;
             }
         }
         self.arrays.get(&(Scope::Module, name.to_string()))
@@ -375,6 +469,8 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional follow-up line, e.g. a spelling suggestion.
     pub note: Option<String>,
+    /// Worth saying, but the program is still compiled.
+    pub warning: bool,
 }
 
 /// Analyze a program: collect its symbols, resolve `A(1)`, and report problems.
@@ -399,7 +495,6 @@ pub fn analyze(program: &mut Program, checks: bool) -> (Symbols, Vec<Diagnostic>
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
-    a.check_gosub_scope_when_trapping(&program.statements);
     a.check_resume_has_a_handler(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
@@ -509,7 +604,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             _ => {}
         }
         match e {
-            Expr::Unary { operand, .. } => expr(operand, table, procs),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => expr(operand, table, procs),
             Expr::Binary { left, right, .. } => {
                 expr(left, table, procs);
                 expr(right, table, procs);
@@ -556,22 +651,33 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
                     *var = renamed;
                 }
             }
-            StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+            StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
                 for d in decls.iter_mut() {
                     // A declarator with an `AS` clause states its own type.
-                    if d.ty.is_none() {
-                        if let Some(renamed) = defaulted(&d.name, table, procs) {
-                            d.name = renamed;
-                        }
+                    if d.ty.is_none()
+                        && let Some(renamed) = defaulted(&d.name, table, procs)
+                    {
+                        d.name = renamed;
                     }
                 }
             }
-            StmtKind::Sub { params, .. } | StmtKind::Function { params, .. } => {
+            StmtKind::Shared(items) | StmtKind::Static(items) => {
+                for item in items.iter_mut() {
+                    if item.ty.is_none()
+                        && let Some(renamed) = defaulted(&item.name, table, procs)
+                    {
+                        item.name = renamed;
+                    }
+                }
+            }
+            StmtKind::Sub { params, .. }
+            | StmtKind::Function { params, .. }
+            | StmtKind::Declare { params, .. } => {
                 for p in params.iter_mut() {
-                    if p.ty.is_none() {
-                        if let Some(renamed) = defaulted(&p.name, table, procs) {
-                            p.name = renamed;
-                        }
+                    if p.ty.is_none()
+                        && let Some(renamed) = defaulted(&p.name, table, procs)
+                    {
+                        p.name = renamed;
                     }
                 }
             }
@@ -613,7 +719,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             | StmtKind::DoLoop { .. }
             | StmtKind::Goto(_)
             | StmtKind::Gosub(_)
-            | StmtKind::Return
+            | StmtKind::Return(_)
             | StmtKind::OnGoto { .. }
             | StmtKind::OnGosub { .. }
             | StmtKind::Call { .. }
@@ -634,6 +740,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             | StmtKind::Stop
             | StmtKind::Open { .. }
             | StmtKind::Close { .. }
+            | StmtKind::Width { .. }
             | StmtKind::GetPut { .. }
             | StmtKind::Lock { .. } => {}
         }
@@ -666,7 +773,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
 }
 
 /// Call `f` for every statement in `stmts`, nested bodies included.
-fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+pub(crate) fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
     for stmt in stmts {
         f(stmt);
         for body in child_bodies(stmt) {
@@ -682,7 +789,7 @@ fn walk_stmts(stmts: &[Stmt], f: &mut impl FnMut(&Stmt)) {
 /// carries one must fail to compile here rather than be silently skipped.
 /// Nested statement bodies are *not* visited -- the caller walks those itself,
 /// because it has to change scope on the way in.
-fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
+pub(crate) fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
     /// Every expression an assignment target can hold: its subscripts.
     fn lvalue(lv: &mut LValue, f: &mut impl FnMut(&mut Expr)) {
         if let Some(indices) = &mut lv.indices {
@@ -730,11 +837,12 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         StmtKind::While { condition, .. } => f(condition),
         StmtKind::DoLoop { condition, .. } => condition.iter_mut().for_each(&mut *f),
         StmtKind::OnGoto { expr, .. } | StmtKind::OnGosub { expr, .. } => f(expr),
-        StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+        StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
             for d in decls {
                 if let Some(dims) = &mut d.dimensions {
                     dims.iter_mut().for_each(&mut *f);
                 }
+                d.lowers.iter_mut().flatten().for_each(&mut *f);
             }
         }
         StmtKind::Call { args, .. } => args.iter_mut().for_each(&mut *f),
@@ -794,7 +902,11 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
             f(file_num);
             reclen.iter_mut().for_each(&mut *f);
         }
-        StmtKind::Close { file_num } => file_num.iter_mut().for_each(&mut *f),
+        StmtKind::Close(file_nums) => file_nums.iter_mut().for_each(&mut *f),
+        StmtKind::Width { file_num, width } => {
+            file_num.iter_mut().for_each(&mut *f);
+            f(width);
+        }
         StmtKind::Field { file_num, fields } => {
             f(file_num);
             for slice in fields {
@@ -828,7 +940,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::LabelName(_)
         | StmtKind::Goto(_)
         | StmtKind::Gosub(_)
-        | StmtKind::Return
+        | StmtKind::Return(_)
         | StmtKind::Sub { .. }
         | StmtKind::Function { .. }
         | StmtKind::ExitLoop { .. }
@@ -839,6 +951,9 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
         | StmtKind::Beep
         | StmtKind::Erase(_)
         | StmtKind::Data(_)
+        | StmtKind::Shared(_)
+        | StmtKind::Static(_)
+        | StmtKind::Declare { .. }
         | StmtKind::Restore(_)
         | StmtKind::Cls
         | StmtKind::End
@@ -860,6 +975,12 @@ struct Analyzer {
     checks: bool,
     /// Whether an OPTION BASE has already been seen.
     seen_option_base: bool,
+    /// Set by `const_eval` when a fold failed because the value overflowed its
+    /// type, so the caller can say so rather than "not constant".
+    fold_overflowed: std::cell::Cell<bool>,
+    /// Array parameters, (procedure, name), that the body never subscripts,
+    /// so whose number of dimensions no call can be checked against.
+    unranked_array_params: HashSet<(String, String)>,
 }
 
 impl Analyzer {
@@ -868,6 +989,7 @@ impl Analyzer {
             line,
             message: message.into(),
             note: None,
+            warning: false,
         });
     }
 
@@ -876,6 +998,21 @@ impl Analyzer {
             line,
             message: message.into(),
             note: Some(note.into()),
+            warning: false,
+        });
+    }
+
+    fn warning_with_note(
+        &mut self,
+        line: u32,
+        message: impl Into<String>,
+        note: impl Into<String>,
+    ) {
+        self.diagnostics.push(Diagnostic {
+            line,
+            message: message.into(),
+            note: Some(note.into()),
+            warning: true,
         });
     }
 
@@ -890,17 +1027,18 @@ impl Analyzer {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::Label(n) => {
-                    self.symbols.lines.insert(*n);
-                    if scope == &Scope::Module {
-                        self.symbols.module_lines.insert(*n);
+                    if self.symbols.lines.insert(*n, scope.clone()).is_some() {
+                        self.error(stmt.line, format!("duplicate line number {}", n));
                     }
                 }
                 StmtKind::LabelName(name) => {
-                    if !self.symbols.labels.insert(name.clone()) {
+                    if self
+                        .symbols
+                        .labels
+                        .insert(name.clone(), scope.clone())
+                        .is_some()
+                    {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
-                    }
-                    if scope == &Scope::Module {
-                        self.symbols.module_labels.insert(name.clone());
                     }
                 }
                 StmtKind::TypeDef { name, fields } => {
@@ -978,19 +1116,77 @@ impl Analyzer {
                     if self.symbols.consts.contains_key(&upper) {
                         self.error(stmt.line, format!("'{}' is already defined", name));
                     }
+                    self.fold_overflowed.set(false);
                     match self.const_eval(value) {
                         Some(lit) => {
                             self.symbols.consts.insert(upper, lit);
                         }
+                        None if self.fold_overflowed.get() => self.error(
+                            stmt.line,
+                            format!("Overflow: CONST '{}' does not fit its type", name),
+                        ),
                         None => self.error(
                             stmt.line,
                             format!("CONST '{}' must have a constant value", name),
                         ),
                     }
                 }
+                StmtKind::Shared(items) | StmtKind::Static(items) => {
+                    let what = if matches!(stmt.kind, StmtKind::Shared(_)) {
+                        "SHARED"
+                    } else {
+                        "STATIC"
+                    };
+                    let Scope::Proc(proc) = scope else {
+                        self.error(
+                            stmt.line,
+                            format!("{} belongs inside a SUB or FUNCTION", what),
+                        );
+                        continue;
+                    };
+                    let sets = if what == "SHARED" {
+                        self.symbols
+                            .proc_shared
+                            .entry(proc.to_uppercase())
+                            .or_default()
+                    } else {
+                        self.symbols
+                            .proc_static
+                            .entry(proc.to_uppercase())
+                            .or_default()
+                    };
+                    for item in items {
+                        sets.insert(&item.name, item.array);
+                    }
+                    // A STATIC name with a type is a typed local like DIM AS.
+                    if what == "STATIC" {
+                        for item in items {
+                            if let (Some(ty), false) = (&item.ty, item.array) {
+                                self.symbols
+                                    .typed_vars
+                                    .insert((scope.clone(), item.name.to_uppercase()), ty.clone());
+                            }
+                        }
+                    }
+                }
                 // REDIM may also introduce an array, so both are collected.
-                StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
+                StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
                     let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
+                    let preserve = matches!(stmt.kind, StmtKind::Redim { preserve: true, .. });
+                    if let StmtKind::Dim { shared: true, .. } = &stmt.kind {
+                        if scope == &Scope::Module {
+                            for decl in decls {
+                                self.symbols
+                                    .shared_all
+                                    .insert(&decl.name, decl.dimensions.is_some());
+                            }
+                        } else {
+                            self.error(
+                                stmt.line,
+                                "DIM SHARED belongs at module level; inside a procedure, use SHARED",
+                            );
+                        }
+                    }
                     for decl in decls {
                         let key = (scope.clone(), decl.name.to_uppercase());
 
@@ -1011,10 +1207,10 @@ impl Analyzer {
                                     ),
                                 );
                             }
-                            if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(normalized(r)) {
-                                    self.error(stmt.line, format!("undefined TYPE '{}'", r));
-                                }
+                            if let TypeRef::Record(r) = ty
+                                && !self.symbols.records.contains_key(normalized(r))
+                            {
+                                self.error(stmt.line, format!("undefined TYPE '{}'", r));
                             }
                             if self.symbols.typed_vars.contains_key(&key) && !is_redim {
                                 self.error(
@@ -1041,20 +1237,36 @@ impl Analyzer {
                                     format!("array '{}' is already declared", decl.name),
                                 );
                             } else if prev.rank != dims.len() {
-                                self.error(
-                                    stmt.line,
-                                    format!(
-                                        "REDIM of '{}' must keep its {} dimension(s)",
-                                        decl.name, prev.rank
-                                    ),
+                                let rank = format!(
+                                    "{} dimension{}",
+                                    prev.rank,
+                                    if prev.rank == 1 { "" } else { "s" }
                                 );
+                                // PRESERVE may change only the last dimension's
+                                // upper bound -- QuickBASIC's rule, since that is
+                                // the change that keeps every element where it
+                                // was -- and codegen checks that at run time.
+                                // The rank is the part sema can see.
+                                let message = if preserve {
+                                    format!(
+                                        "REDIM PRESERVE of '{}' must keep its {}; only the last one's upper bound may change",
+                                        decl.name, rank
+                                    )
+                                } else {
+                                    format!("REDIM of '{}' must keep its {}", decl.name, rank)
+                                };
+                                self.error(stmt.line, message);
                             }
                         }
+                        let has_lower = decl.lowers.iter().any(Option::is_some)
+                            || self.symbols.arrays.get(&key).is_some_and(|a| a.has_lower);
                         self.symbols.arrays.insert(
                             key,
                             ArrayInfo {
                                 rank: dims.len(),
                                 line: stmt.line,
+                                has_lower,
+                                implicit: false,
                             },
                         );
                     }
@@ -1086,6 +1298,7 @@ impl Analyzer {
                             );
                         }
                     }
+                    self.check_variable_length_strings(name, params, ret_ty.as_ref(), stmt.line);
                     if scope != &Scope::Module {
                         self.error(
                             stmt.line,
@@ -1109,20 +1322,52 @@ impl Analyzer {
                             line: stmt.line,
                         },
                     );
+                    if matches!(
+                        stmt.kind,
+                        StmtKind::Sub {
+                            is_static: true,
+                            ..
+                        } | StmtKind::Function {
+                            is_static: true,
+                            ..
+                        }
+                    ) {
+                        self.symbols.static_procs.insert(name.to_uppercase());
+                    }
+                    if matches!(stmt.kind, StmtKind::Function { def_fn: true, .. }) {
+                        self.symbols.def_fns.insert(name.to_uppercase());
+                    }
+                    // An array parameter is an array of the procedure's own,
+                    // as many dimensions as the body subscripts it with -- the
+                    // declaration (`A()`) does not say. Its bounds are the
+                    // caller's, so it may have a lower bound.
+                    for p in params.iter().filter(|p| p.array) {
+                        let rank = subscript_count(body, &p.name);
+                        self.symbols.arrays.insert(
+                            (Scope::Proc(name.clone()), p.name.to_uppercase()),
+                            ArrayInfo {
+                                rank: rank.unwrap_or(1),
+                                line: stmt.line,
+                                has_lower: true,
+                                implicit: false,
+                            },
+                        );
+                        if rank.is_none() {
+                            self.unranked_array_params
+                                .insert((name.to_uppercase(), p.name.to_uppercase()));
+                        }
+                    }
                     // A parameter with an AS clause is a typed variable inside
                     // the body, so field access on it resolves.
-                    for p in params {
+                    for p in params.iter().filter(|p| !p.array) {
                         if let Some(ty) = &p.ty {
-                            if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(normalized(r)) {
-                                    self.error(
-                                        stmt.line,
-                                        format!(
-                                            "parameter '{}' uses undefined TYPE '{}'",
-                                            p.name, r
-                                        ),
-                                    );
-                                }
+                            if let TypeRef::Record(r) = ty
+                                && !self.symbols.records.contains_key(normalized(r))
+                            {
+                                self.error(
+                                    stmt.line,
+                                    format!("parameter '{}' uses undefined TYPE '{}'", p.name, r),
+                                );
                             }
                             self.symbols.typed_vars.insert(
                                 (Scope::Proc(name.clone()), p.name.to_uppercase()),
@@ -1158,7 +1403,7 @@ impl Analyzer {
         let mut first_return = None;
         walk_stmts(stmts, &mut |stmt| match &stmt.kind {
             StmtKind::Gosub(_) | StmtKind::OnGosub { .. } => has_gosub = true,
-            StmtKind::Return if first_return.is_none() => first_return = Some(stmt.line),
+            StmtKind::Return(_) if first_return.is_none() => first_return = Some(stmt.line),
             _ => {}
         });
         if let (false, Some(line)) = (has_gosub, first_return) {
@@ -1190,54 +1435,6 @@ impl Analyzer {
                 line,
                 "RESUME without an error handler".to_string(),
                 "RESUME ends an ON ERROR handler; this program has no ON ERROR".to_string(),
-            );
-        }
-    }
-
-    /// A trapping program may not GOSUB from inside a procedure.
-    ///
-    /// The GOSUB stack is deliberately left alone by a trap, because that is
-    /// what lets a handler -- and later RESUME -- return correctly from a
-    /// subroutine the error interrupted. That is right for a module-level
-    /// GOSUB and unsafe for one inside a procedure: its return address is a
-    /// label in a frame the unwind has discarded, so a later RETURN would jump
-    /// into dead code with main's `rbp`.
-    ///
-    /// Refused rather than worked around. Vintage listings, which are what
-    /// error trapping is for, have no procedures at all.
-    fn check_gosub_scope_when_trapping(&mut self, stmts: &[Stmt]) {
-        let mut traps = false;
-        walk_stmts(stmts, &mut |stmt| {
-            if matches!(stmt.kind, StmtKind::OnError(_)) {
-                traps = true;
-            }
-        });
-        if !traps {
-            return;
-        }
-        let mut offenders = Vec::new();
-        for stmt in stmts {
-            let (StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. }) =
-                &stmt.kind
-            else {
-                continue;
-            };
-            walk_stmts(body, &mut |s| {
-                if matches!(s.kind, StmtKind::Gosub(_) | StmtKind::OnGosub { .. }) {
-                    offenders.push((s.line, name.clone()));
-                }
-            });
-        }
-        for (line, name) in offenders {
-            self.error_with_note(
-                line,
-                format!(
-                    "GOSUB inside '{}' is not allowed in a program that uses ON ERROR",
-                    name
-                ),
-                "a trapped error unwinds out of the procedure, leaving the GOSUB's return \
-                 address pointing into a frame that no longer exists"
-                    .to_string(),
             );
         }
     }
@@ -1303,7 +1500,11 @@ impl Analyzer {
     /// firing. Both would have been invisible except as lost performance.
     fn resolve_array_accesses(&mut self, stmts: &mut [Stmt], scope: &Scope) {
         for stmt in stmts {
-            for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+            if let StmtKind::Call { name, args } = &mut stmt.kind {
+                Self::resolve_args(&self.symbols, name, args, scope);
+            } else {
+                for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+            }
 
             // Nested bodies, entering procedure scope where there is one.
             match &mut stmt.kind {
@@ -1338,6 +1539,23 @@ impl Analyzer {
         }
     }
 
+    /// Rewrite the arguments of a call to `name`. One in parentheses keeps
+    /// them only for a by-reference scalar parameter of a user procedure,
+    /// where they make it a copy; for any other parameter, and a builtin's,
+    /// they are only grouping, so a record or array is still passed itself.
+    fn resolve_args(symbols: &Symbols, name: &str, args: &mut [Expr], scope: &Scope) {
+        let params = symbols.procs.get(normalized(name)).map(|p| &p.params[..]);
+        for (i, a) in args.iter_mut().enumerate() {
+            let by_ref = params
+                .and_then(|ps| ps.get(i))
+                .is_some_and(|p| !p.byval && !p.array && !matches!(p.ty, Some(TypeRef::Record(_))));
+            match a {
+                Expr::Paren(inner) if by_ref => Self::resolve_expr(symbols, inner, scope),
+                _ => Self::resolve_expr(symbols, a, scope),
+            }
+        }
+    }
+
     /// Rewrite one expression tree, innermost first.
     fn resolve_expr(symbols: &Symbols, expr: &mut Expr, scope: &Scope) {
         match expr {
@@ -1353,10 +1571,12 @@ impl Analyzer {
                     Self::resolve_expr(symbols, i, scope);
                 }
             }
-            Expr::FnCall { args, .. } => {
-                for a in args.iter_mut() {
-                    Self::resolve_expr(symbols, a, scope);
-                }
+            Expr::FnCall { name, args } => Self::resolve_args(symbols, name, args, scope),
+            // Only grouping, which the tree already records.
+            Expr::Paren(inner) => {
+                Self::resolve_expr(symbols, inner, scope);
+                *expr = std::mem::replace(&mut **inner, Expr::Literal(Literal::Integer(0)));
+                return;
             }
         }
 
@@ -1412,15 +1632,24 @@ impl Analyzer {
                         why.to_string(),
                     );
                 }
+                if indices.is_none() {
+                    self.reject_const_target(name, line, "an assignment");
+                }
                 if let Some(idx) = indices {
                     self.check_array_use(name, idx.len(), scope, line);
                     for e in idx {
                         self.check_expr(e, scope, line);
                         self.require_numeric(e, scope, line, "an array subscript");
                     }
-                    // An array element is typed like a scalar of the same name.
-                    self.check_assign_types(name, value, scope, line);
+                    // An array element is typed by its array's AS clause, or
+                    // its name's suffix.
+                    let is_string = self.declared_type(name, scope) == Some(DataType::String);
+                    self.check_assign_types(name, is_string, value, scope, line);
                 } else if let Some(target_ty) = self.symbols.typed_var(scope, name).cloned() {
+                    if !matches!(target_ty, TypeRef::Record(_)) {
+                        let is_string = matches!(target_ty, TypeRef::FixedString(_));
+                        self.check_assign_types(name, is_string, value, scope, line);
+                    }
                     if let TypeRef::Record(rname) = &target_ty {
                         // The source may be another record variable, or an
                         // element of an array of the same record type.
@@ -1445,7 +1674,8 @@ impl Analyzer {
                         }
                     }
                 } else {
-                    self.check_assign_types(name, value, scope, line);
+                    let is_string = self.scalar_is_string(name, scope);
+                    self.check_assign_types(name, is_string, value, scope, line);
                 }
             }
             StmtKind::FieldAssign { target, value } => {
@@ -1458,15 +1688,21 @@ impl Analyzer {
                         field: f.clone(),
                     };
                 }
-                if let Some(ty) = self.check_field_path(&e, scope, line) {
-                    if matches!(ty, TypeRef::Record(_)) {
-                        self.error(line, "cannot assign to a whole record; assign its fields");
-                    }
+                if let Some(ty) = self.check_field_path(&e, scope, line)
+                    && matches!(ty, TypeRef::Record(_))
+                {
+                    self.error(line, "cannot assign to a whole record; assign its fields");
                 }
             }
             StmtKind::Call { name, args } => {
                 self.check_call(name, args, scope, line, true);
             }
+            StmtKind::Declare {
+                name,
+                is_function,
+                params,
+                ret_ty,
+            } => self.check_declare(name, *is_function, params, ret_ty.as_ref(), scope, line),
             StmtKind::Print {
                 file_num,
                 items,
@@ -1474,12 +1710,14 @@ impl Analyzer {
                 ..
             } => {
                 if let Some(file_num) = file_num {
-                    if using.is_some() {
-                        self.error(line, "PRINT # USING is not supported");
-                    }
                     self.check_file_num(file_num, scope, line);
-                } else {
-                    self.check_using(using.as_ref(), line);
+                }
+                // The format is read at run time, so any string will do.
+                if let Some(fmt) = using {
+                    self.check_expr(fmt, scope, line);
+                    if self.expr_is_string(fmt, scope) == Some(false) {
+                        self.error(line, "PRINT USING needs a string format");
+                    }
                 }
                 for item in items {
                     if let PrintItem::Expr(e) = item {
@@ -1492,8 +1730,17 @@ impl Analyzer {
                 if let Some(file_num) = file_num {
                     self.check_file_num(file_num, scope, line);
                 }
+                // The console form checks a whole line against every variable
+                // before storing any, in a table of this many fields.
+                if vars.len() > MAX_INPUT_VARS {
+                    self.error(
+                        line,
+                        format!("INPUT reads at most {} variables at once", MAX_INPUT_VARS),
+                    );
+                }
                 for var in vars {
                     self.check_lvalue(var, scope, line);
+                    self.reject_const_lvalue(var, line, "INPUT");
                 }
             }
             StmtKind::LineInput { file_num, var, .. } => {
@@ -1501,6 +1748,7 @@ impl Analyzer {
                     self.check_file_num(file_num, scope, line);
                 }
                 self.check_lvalue(var, scope, line);
+                self.reject_const_lvalue(var, line, "LINE INPUT");
                 // Codegen reads a string and stores it as-is, so a numeric
                 // target used to be handed a pointer to reinterpret as a
                 // double.
@@ -1517,6 +1765,7 @@ impl Analyzer {
             StmtKind::Read(vars) => {
                 for var in vars {
                     self.check_lvalue(var, scope, line);
+                    self.reject_const_lvalue(var, line, "READ");
                 }
             }
             StmtKind::If {
@@ -1540,6 +1789,7 @@ impl Analyzer {
                 if var.ends_with('$') {
                     self.error(line, "a FOR control variable must be numeric");
                 }
+                self.reject_const_target(var, line, "a FOR loop");
                 self.check_expr(start, scope, line);
                 self.require_numeric(start, scope, line, "a FOR start value");
                 self.check_expr(end, scope, line);
@@ -1585,45 +1835,37 @@ impl Analyzer {
                     self.check(body, scope);
                 }
             }
-            StmtKind::Goto(target) => self.check_target(target, line, "GOTO"),
-            StmtKind::Gosub(target) => self.check_target(target, line, "GOSUB"),
+            StmtKind::Goto(target) => self.check_target(target, scope, line, "GOTO"),
+            StmtKind::Gosub(target) => self.check_target(target, scope, line, "GOSUB"),
+            StmtKind::Return(Some(target)) => self.check_target(target, scope, line, "RETURN"),
             StmtKind::OnGoto { expr, targets } => {
                 self.check_expr(expr, scope, line);
                 for t in targets {
-                    self.check_target(t, line, "ON ... GOTO");
+                    self.check_target(t, scope, line, "ON ... GOTO");
                 }
             }
             StmtKind::OnGosub { expr, targets } => {
                 self.check_expr(expr, scope, line);
                 for t in targets {
-                    self.check_target(t, line, "ON ... GOSUB");
+                    self.check_target(t, scope, line, "ON ... GOSUB");
                 }
             }
-            StmtKind::Restore(Some(target)) => self.check_target(target, line, "RESTORE"),
-            StmtKind::Dim { decls } => {
+            StmtKind::Restore(Some(target)) => self.check_restore_target(target, line),
+            StmtKind::Dim { decls, .. } => {
                 for decl in decls {
                     for d in decl.dimensions.iter().flatten() {
                         self.check_expr(d, scope, line);
                     }
-                }
-            }
-            StmtKind::Redim { decls, preserve } => {
-                for decl in decls {
-                    let dims = decl.dimensions.as_deref().unwrap_or(&[]);
-                    for d in dims {
+                    for d in decl.lowers.iter().flatten() {
                         self.check_expr(d, scope, line);
                     }
-                    // Only the last dimension may change under PRESERVE, which
-                    // is QuickBASIC's own rule: any other change would need the
-                    // elements remapped rather than the block simply grown.
-                    if *preserve && dims.len() > 1 {
-                        self.error(
-                            line,
-                            format!(
-                                "REDIM PRESERVE of '{}' may only change its last dimension",
-                                decl.name
-                            ),
-                        );
+                }
+            }
+            StmtKind::Redim { decls, .. } => {
+                for decl in decls {
+                    let dims = decl.dimensions.as_deref().unwrap_or(&[]);
+                    for d in dims.iter().chain(decl.lowers.iter().flatten()) {
+                        self.check_expr(d, scope, line);
                     }
                 }
             }
@@ -1647,6 +1889,7 @@ impl Analyzer {
             }
             StmtKind::Swap(a, b) => {
                 for t in [a, b] {
+                    self.reject_const_lvalue(t, line, "SWAP");
                     if let Some(indices) = &t.indices {
                         self.check_array_use(&t.name, indices.len(), scope, line);
                         for e in indices {
@@ -1659,10 +1902,26 @@ impl Analyzer {
                 // carries no suffix, so a string field and a numeric one both
                 // looked non-string and the mismatch reached codegen, which
                 // stored a string pointer into an INTEGER slot and crashed.
-                let a_str = self.expr_is_string(&lvalue_as_expr(a), scope);
-                let b_str = self.expr_is_string(&lvalue_as_expr(b), scope);
-                if a_str.is_some() && b_str.is_some() && a_str != b_str {
-                    self.error(line, "SWAP requires both values to be the same type");
+                //
+                // And the whole type, not only string against number, which
+                // is QuickBASIC's rule: `SWAP A%, B#` converted each value as
+                // an assignment would, losing B#'s fraction, and a record
+                // against a number reached codegen. A fixed-length string and
+                // a variable-length one are both strings, and two records
+                // match when they are of one TYPE.
+                if let (Some(ta), Some(tb)) = (self.swap_type(a, scope), self.swap_type(b, scope))
+                    && !same_swap_type(&ta, &tb)
+                {
+                    self.error(
+                        line,
+                        format!(
+                            "SWAP requires both values to be the same type, but '{}' is {} and '{}' is {}",
+                            lvalue_text(a),
+                            describe_type(&ta),
+                            lvalue_text(b),
+                            describe_type(&tb)
+                        ),
+                    );
                 }
             }
             StmtKind::Open {
@@ -1674,15 +1933,23 @@ impl Analyzer {
                 }
                 self.check_file_num(file_num, scope, line);
             }
-            StmtKind::Close {
-                file_num: Some(file_num),
-            } => {
-                self.check_file_num(file_num, scope, line);
+            StmtKind::Close(file_nums) => {
+                for file_num in file_nums {
+                    self.check_file_num(file_num, scope, line);
+                }
+            }
+            StmtKind::Width { file_num, width } => {
+                if let Some(file_num) = file_num {
+                    self.check_file_num(file_num, scope, line);
+                }
+                self.check_expr(width, scope, line);
+                self.require_numeric(width, scope, line, "a width");
             }
             StmtKind::Field { file_num, fields } => {
                 self.check_file_num(file_num, scope, line);
                 for f in fields {
                     self.check_expr(&f.width, scope, line);
+                    self.reject_const_lvalue(&f.target, line, "FIELD");
                     // A field names a slice of the record buffer, so only a
                     // string variable can hold one.
                     if !f.target.name.ends_with('$') {
@@ -1706,6 +1973,7 @@ impl Analyzer {
             } => {
                 self.check_expr(value, scope, line);
                 let word = if *right { "RSET" } else { "LSET" };
+                self.reject_const_lvalue(target, line, word);
                 if !target.name.ends_with('$') {
                     self.error(
                         line,
@@ -1758,10 +2026,12 @@ impl Analyzer {
                     );
                 }
                 if let ResumeTarget::At(t) = target {
-                    self.check_target(t, line, "RESUME");
+                    self.check_target(t, scope, line, "RESUME");
                     let at_module_scope = match t {
-                        GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
-                        GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                        GotoTarget::Line(n) => self.symbols.lines.get(n) == Some(&Scope::Module),
+                        GotoTarget::Label(name) => {
+                            self.symbols.labels.get(name) == Some(&Scope::Module)
+                        }
                     };
                     if !at_module_scope {
                         self.error_with_note(
@@ -1798,10 +2068,12 @@ impl Analyzer {
                 let Some(target) = target else {
                     return; // GOTO 0 names no line to check
                 };
-                self.check_target(target, line, "ON ERROR GOTO");
+                self.check_target(target, scope, line, "ON ERROR GOTO");
                 let at_module_scope = match target {
-                    GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
-                    GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                    GotoTarget::Line(n) => self.symbols.lines.get(n) == Some(&Scope::Module),
+                    GotoTarget::Label(name) => {
+                        self.symbols.labels.get(name) == Some(&Scope::Module)
+                    }
                 };
                 if !at_module_scope {
                     self.error_with_note(
@@ -1827,6 +2099,9 @@ impl Analyzer {
                     self.check_numeric_operand(e, scope, line, "RANDOMIZE");
                 }
             }
+            StmtKind::MidAssign { target, .. } => {
+                self.reject_const_lvalue(target, line, "MID$");
+            }
             StmtKind::Erase(names) => {
                 for name in names {
                     if self.symbols.lookup_array(scope, name).is_none() {
@@ -1844,44 +2119,124 @@ impl Analyzer {
     /// Fold a constant expression, or return None when it is not constant.
     ///
     /// Small on purpose: literals, references to earlier CONSTs, and the
-    /// arithmetic that appears in real constant declarations.
+    /// arithmetic that appears in real constant declarations. It folds in the
+    /// types the program's own arithmetic uses, so `300 * 300` is an INTEGER
+    /// product and overflows, as it would at run time -- the fold used to
+    /// widen it to 90000. An overflow sets `fold_overflowed` and yields None.
     fn const_eval(&self, e: &Expr) -> Option<Literal> {
+        let overflow = || {
+            self.fold_overflowed.set(true);
+            None
+        };
         match e {
             Expr::Literal(l) => Some(l.clone()),
             Expr::Variable(n) => self.symbols.consts.get(normalized(n)).cloned(),
-            Expr::Unary { op, operand } => {
-                let v = self.const_eval(operand)?;
-                match (op, v) {
-                    (UnaryOp::Neg, Literal::Integer(n)) => Some(Literal::Integer(-n)),
-                    (UnaryOp::Neg, Literal::Float(f)) => Some(Literal::Float(-f)),
-                    _ => None,
-                }
-            }
+            Expr::Paren(inner) => self.const_eval(inner),
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match self.const_eval(operand)? {
+                // Typed by size, so -32768 comes back an INTEGER.
+                Literal::Integer(n) => Some(Literal::Integer(-n)),
+                Literal::Long(n) if n == i64::from(i32::MIN) => overflow(),
+                Literal::Long(n) => Some(Literal::Long(-n)),
+                Literal::Single(f) => Some(Literal::Single(-f)),
+                Literal::Float(f) => Some(Literal::Float(-f)),
+                Literal::String(_) => None,
+            },
             Expr::Binary { op, left, right } => {
                 let (l, r) = (self.const_eval(left)?, self.const_eval(right)?);
-                let (a, b) = match (&l, &r) {
-                    (Literal::Integer(a), Literal::Integer(b)) => {
-                        // Integer arithmetic stays integer where it can.
-                        return match op {
-                            BinaryOp::Add => Some(Literal::Integer(a.checked_add(*b)?)),
-                            BinaryOp::Sub => Some(Literal::Integer(a.checked_sub(*b)?)),
-                            BinaryOp::Mul => Some(Literal::Integer(a.checked_mul(*b)?)),
-                            BinaryOp::IntDiv if *b != 0 => Some(Literal::Integer(a / b)),
-                            BinaryOp::Mod if *b != 0 => Some(Literal::Integer(a % b)),
-                            BinaryOp::Div if *b != 0 => Some(Literal::Float(*a as f64 / *b as f64)),
-                            _ => None,
-                        };
-                    }
-                    (Literal::Integer(a), Literal::Float(b)) => (*a as f64, *b),
-                    (Literal::Float(a), Literal::Integer(b)) => (*a, *b as f64),
-                    (Literal::Float(a), Literal::Float(b)) => (*a, *b),
-                    _ => return None,
+                let (lt, rt) = (l.numeric_type()?, r.numeric_type()?);
+                let (a, b) = (l.as_f64()?, r.as_f64()?);
+                let int_of = |x: &Literal| match x {
+                    Literal::Integer(n) | Literal::Long(n) => Some(*n),
+                    _ => None,
                 };
                 match op {
-                    BinaryOp::Add => Some(Literal::Float(a + b)),
-                    BinaryOp::Sub => Some(Literal::Float(a - b)),
-                    BinaryOp::Mul => Some(Literal::Float(a * b)),
-                    BinaryOp::Div if b != 0.0 => Some(Literal::Float(a / b)),
+                    BinaryOp::Div => {
+                        if b == 0.0 {
+                            return None;
+                        }
+                        let q = a / b;
+                        if q.is_finite() {
+                            Some(Literal::Float(q))
+                        } else {
+                            overflow()
+                        }
+                    }
+                    // `\` and MOD convert their operands to LONG, rounding.
+                    BinaryOp::IntDiv | BinaryOp::Mod => {
+                        let round = |x: f64| {
+                            let r = x.round_ties_even();
+                            (r >= f64::from(i32::MIN) && r <= f64::from(i32::MAX))
+                                .then_some(r as i64)
+                        };
+                        let (Some(x), Some(y)) = (round(a), round(b)) else {
+                            return overflow();
+                        };
+                        if y == 0 {
+                            return None;
+                        }
+                        let v = if *op == BinaryOp::IntDiv {
+                            x / y
+                        } else {
+                            x % y
+                        };
+                        if i32::try_from(v).is_err() {
+                            return overflow();
+                        }
+                        Some(Literal::Long(v))
+                    }
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        let ty = [lt, rt]
+                            .into_iter()
+                            .max_by_key(|t| match t {
+                                DataType::Integer => 0,
+                                DataType::Long => 1,
+                                DataType::Single => 2,
+                                _ => 3,
+                            })
+                            .expect("two types");
+                        match ty {
+                            DataType::Integer | DataType::Long => {
+                                let (x, y) = (int_of(&l)?, int_of(&r)?);
+                                let v = match op {
+                                    BinaryOp::Add => x + y,
+                                    BinaryOp::Sub => x - y,
+                                    _ => x * y,
+                                };
+                                if ty == DataType::Integer {
+                                    if i16::try_from(v).is_err() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Integer(v))
+                                } else {
+                                    if i32::try_from(v).is_err() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Long(v))
+                                }
+                            }
+                            _ => {
+                                let v = match op {
+                                    BinaryOp::Add => a + b,
+                                    BinaryOp::Sub => a - b,
+                                    _ => a * b,
+                                };
+                                if ty == DataType::Single {
+                                    let v = v as f32;
+                                    if !v.is_finite() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Single(f64::from(v)))
+                                } else if v.is_finite() {
+                                    Some(Literal::Float(v))
+                                } else {
+                                    overflow()
+                                }
+                            }
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -1913,17 +2268,24 @@ impl Analyzer {
             // A constant dimension is checked here; a computed one is checked
             // at run time, where reading past the descriptor used to return
             // whatever happened to follow it.
-            if let Some(Literal::Integer(n)) = self.const_eval(dim) {
-                if n < 1 || n as usize > rank {
-                    return Some(format!(
-                        "'{}' has {} dimension{}, so dimension {} does not exist",
-                        arr,
-                        rank,
-                        if rank == 1 { "" } else { "s" },
-                        n
-                    ));
-                }
+            if let Some(Literal::Integer(n) | Literal::Long(n)) = self.const_eval(dim)
+                && (n < 1 || n as usize > rank)
+            {
+                return Some(format!(
+                    "'{}' has {} dimension{}, so dimension {} does not exist",
+                    arr,
+                    rank,
+                    if rank == 1 { "" } else { "s" },
+                    n
+                ));
             }
+            return None;
+        }
+
+        // FRE takes either: `FRE("")` is GW-BASIC's usual spelling, and the
+        // argument only chooses which figure to report. Codegen evaluates it
+        // and answers the same plausible number for both.
+        if name == "FRE" {
             return None;
         }
 
@@ -2046,6 +2408,29 @@ impl Analyzer {
         self.reject_record_value(&e, scope, line);
     }
 
+    /// Refuse a statement that stores into a CONST, named `by` in the message.
+    ///
+    /// A CONST is replaced by its value wherever it is read, so a store into
+    /// one compiled and went nowhere: `CONST MAX = 100: MAX = 5: PRINT MAX`
+    /// printed 100. QuickBASIC refuses every such store ("Duplicate
+    /// definition"), and so does this.
+    fn reject_const_target(&mut self, name: &str, line: u32, by: &str) {
+        if self.symbols.consts.contains_key(&name.to_uppercase()) {
+            self.error(
+                line,
+                format!("'{}' is a CONST and cannot be changed by {}", name, by),
+            );
+        }
+    }
+
+    /// [`Self::reject_const_target`] for a target that may be an array
+    /// element or a record field, neither of which is the CONST itself.
+    fn reject_const_lvalue(&mut self, target: &LValue, line: u32, by: &str) {
+        if target.indices.is_none() && target.fields.is_empty() {
+            self.reject_const_target(&target.name, line, by);
+        }
+    }
+
     /// A file number must be numeric, and within the runtime's handle table.
     ///
     /// The table holds slots 1-15; slot 0 is the console. Nothing checked the
@@ -2061,11 +2446,11 @@ impl Analyzer {
     /// inside it twice.
     fn check_file_num_value(&mut self, e: &Expr, scope: &Scope, line: u32) {
         self.require_numeric(e, scope, line, "a file number");
-        if let Some(n) = self.const_eval(e).and_then(|l| match l {
-            Literal::Integer(n) => Some(n),
-            Literal::Float(f) => Some(f as i64),
-            Literal::String(_) => None,
-        }) && !(1..=MAX_FILE_NUM).contains(&n)
+        if let Some(n) = self
+            .const_eval(e)
+            .and_then(|l| l.as_f64())
+            .map(|f| f.round_ties_even() as i64)
+            && !(1..=MAX_FILE_NUM).contains(&n)
         {
             self.error(
                 line,
@@ -2074,30 +2459,38 @@ impl Analyzer {
         }
     }
 
-    /// A PRINT USING format must be a string literal, since it is parsed at
-    /// compile time into a sequence of runtime calls.
-    fn check_using(&mut self, using: Option<&Expr>, line: u32) {
-        match using {
-            None => {}
-            Some(Expr::Literal(Literal::String(_))) => {}
-            Some(_) => self.error(
-                line,
-                "PRINT USING requires a literal format string".to_string(),
+    /// Check a branch target exists, and is in the scope branching to it.
+    fn check_target(&mut self, target: &GotoTarget, scope: &Scope, line: u32, what: &str) {
+        let (found, shown) = match target {
+            GotoTarget::Line(n) => (self.symbols.lines.get(n).cloned(), format!("line {}", n)),
+            GotoTarget::Label(name) => (
+                self.symbols.labels.get(name).cloned(),
+                format!("'{}'", name),
             ),
-        }
-    }
-
-    /// Check a branch target exists.
-    fn check_target(&mut self, target: &GotoTarget, line: u32, what: &str) {
-        match target {
-            GotoTarget::Line(n) => {
-                if !self.symbols.lines.contains(n) {
+        };
+        match found {
+            Some(at) if &at == scope => {}
+            Some(at) => {
+                let place = |s: &Scope| match s {
+                    Scope::Module => "module-level code".to_string(),
+                    Scope::Proc(p) => format!("'{}'", p),
+                };
+                self.error_with_note(
+                    line,
+                    format!("{} target {} is in another scope", what, shown),
+                    format!(
+                        "it is in {}, and this is in {}; a branch cannot leave a SUB or FUNCTION",
+                        place(&at),
+                        place(scope)
+                    ),
+                );
+            }
+            None => match target {
+                GotoTarget::Line(n) => {
                     self.error(line, format!("{} target line {} does not exist", what, n));
                 }
-            }
-            GotoTarget::Label(name) => {
-                if !self.symbols.labels.contains(name) {
-                    let known: Vec<&str> = self.symbols.labels.iter().map(|s| s.as_str()).collect();
+                GotoTarget::Label(name) => {
+                    let known: Vec<&str> = self.symbols.labels.keys().map(|s| s.as_str()).collect();
                     match closest(name, &known) {
                         Some(sug) => self.error_with_note(
                             line,
@@ -2109,16 +2502,38 @@ impl Analyzer {
                         }
                     }
                 }
-            }
+            },
+        }
+    }
+
+    /// Check a RESTORE target exists. It names a place in the DATA, which is
+    /// one list for the whole program, so it may be in any scope.
+    fn check_restore_target(&mut self, target: &GotoTarget, line: u32) {
+        let exists = match target {
+            GotoTarget::Line(n) => self.symbols.lines.contains_key(n),
+            GotoTarget::Label(name) => self.symbols.labels.contains_key(name),
+        };
+        if !exists {
+            self.check_target(target, &Scope::Module, line, "RESTORE");
         }
     }
 
     /// Check a call, either as a statement (`is_stmt`) or in an expression.
     fn check_call(&mut self, name: &str, args: &[Expr], scope: &Scope, line: u32, is_stmt: bool) {
-        for a in args {
-            self.check_expr(a, scope, line);
-        }
         let upper = name.to_uppercase();
+        // An argument for an array parameter names a whole array, `A()`, and
+        // is checked as one below rather than as an element reference.
+        let array_params: Vec<bool> = self
+            .symbols
+            .procs
+            .get(&upper)
+            .map(|p| p.params.iter().map(|q| q.array).collect())
+            .unwrap_or_default();
+        for (i, a) in args.iter().enumerate() {
+            if array_params.get(i) != Some(&true) {
+                self.check_expr(a, scope, line);
+            }
+        }
 
         // An array indexed in an expression parses as a call when the DIM was
         // not seen first, so resolve against arrays before reporting.
@@ -2139,6 +2554,28 @@ impl Analyzer {
                 })
                 .collect();
             let (expected, is_function) = (proc.params.len(), proc.is_function);
+            // An array parameter takes an array, written `A()` or `A`, with
+            // the dimensions the procedure uses it with.
+            let param_arrays: Vec<Option<(String, String)>> = proc
+                .params
+                .iter()
+                .map(|p| p.array.then(|| (p.name.clone(), name.to_uppercase())))
+                .collect();
+            // A by-reference parameter given a variable shares that variable,
+            // so the two must be the same type -- QuickBASIC's "Parameter type
+            // mismatch". Anything else is evaluated into a temporary.
+            let param_types: Vec<Option<DataType>> = proc
+                .params
+                .iter()
+                .map(|p| {
+                    (!p.byval && !p.array && !matches!(p.ty, Some(TypeRef::Record(_)))).then(|| {
+                        match &p.ty {
+                            Some(t) => DataType::from_type_ref(t),
+                            None => DataType::from_suffix(&p.name),
+                        }
+                    })
+                })
+                .collect();
 
             // A record parameter takes the address of the caller's variable,
             // so the argument has to be a record lvalue of the same type --
@@ -2178,30 +2615,56 @@ impl Analyzer {
             }
 
             for (i, arg) in args.iter().enumerate() {
-                if matches!(param_records.get(i), Some(Some(_))) {
+                if let Some(Some((pname, pproc))) = param_arrays.get(i) {
+                    self.check_array_argument(arg, pname, pproc, scope, line, i + 1, name);
+                    continue;
+                }
+                if let Some(Some(want)) = param_types.get(i)
+                    && let Some(got) = self.lvalue_type(arg, scope)
+                    && got != *want
+                {
+                    self.error_with_note(
+                        line,
+                        format!(
+                            "argument {} of '{}' is passed by reference, so it must be {}, not {}",
+                            i + 1,
+                            name,
+                            type_name(*want),
+                            type_name(got)
+                        ),
+                        "pass an expression instead -- CINT(X), X + 0 -- or declare the parameter BYVAL"
+                            .to_string(),
+                    );
+                }
+            }
+
+            for (i, arg) in args.iter().enumerate() {
+                if matches!(param_records.get(i), Some(Some(_)))
+                    || matches!(param_arrays.get(i), Some(Some(_)))
+                {
                     continue;
                 }
                 let Some(want_string) = param_strings.get(i).copied() else {
                     break;
                 };
-                if let Some(is_string) = self.expr_is_string(arg, scope) {
-                    if is_string != want_string {
-                        let (got, wanted) = if is_string {
-                            ("string", "numeric")
-                        } else {
-                            ("numeric", "string")
-                        };
-                        self.error(
-                            line,
-                            format!(
-                                "argument {} of '{}' is {}, but a {} value was given",
-                                i + 1,
-                                name,
-                                wanted,
-                                got
-                            ),
-                        );
-                    }
+                if let Some(is_string) = self.expr_is_string(arg, scope)
+                    && is_string != want_string
+                {
+                    let (got, wanted) = if is_string {
+                        ("string", "numeric")
+                    } else {
+                        ("numeric", "string")
+                    };
+                    self.error(
+                        line,
+                        format!(
+                            "argument {} of '{}' is {}, but a {} value was given",
+                            i + 1,
+                            name,
+                            wanted,
+                            got
+                        ),
+                    );
                 }
             }
 
@@ -2281,8 +2744,14 @@ impl Analyzer {
             return;
         }
 
-        // `NAME(...)` is ambiguous between a call and an array reference, so
-        // say both rather than guessing which the user meant.
+        // In an expression, `NAME(...)` that is neither a procedure nor a
+        // builtin is an array -- created by this use if no DIM declares it,
+        // as GW-BASIC does.
+        if !is_stmt && !args.is_empty() {
+            self.check_array_use(&upper, args.len(), scope, line);
+            return;
+        }
+
         let what = if is_stmt {
             "subroutine"
         } else if args.is_empty() {
@@ -2303,6 +2772,221 @@ impl Analyzer {
         }
     }
 
+    /// A DECLARE must match the procedure it declares: the same kind, the
+    /// same parameters -- each of the same type, passing and arrayness -- and
+    /// the same result type.
+    fn check_declare(
+        &mut self,
+        name: &str,
+        is_function: bool,
+        params: &[Param],
+        ret_ty: Option<&TypeRef>,
+        scope: &Scope,
+        line: u32,
+    ) {
+        self.check_variable_length_strings(name, params, ret_ty, line);
+        if scope != &Scope::Module {
+            self.error(line, "DECLARE belongs at module level");
+            return;
+        }
+        let Some(proc) = self.symbols.procs.get(&name.to_uppercase()) else {
+            self.error(line, format!("'{}' is declared but never defined", name));
+            return;
+        };
+        let def_line = proc.line;
+        let mut problems = Vec::new();
+        if proc.is_function != is_function {
+            problems.push(format!(
+                "it is defined as a {}",
+                if proc.is_function { "FUNCTION" } else { "SUB" }
+            ));
+        }
+        if proc.params.len() != params.len() {
+            problems.push(format!(
+                "it is defined with {} parameter{}",
+                proc.params.len(),
+                if proc.params.len() == 1 { "" } else { "s" }
+            ));
+        } else {
+            let ty = |p: &Param| match &p.ty {
+                Some(t) => DataType::from_type_ref(t),
+                None => DataType::from_suffix(&p.name),
+            };
+            for (i, (d, p)) in params.iter().zip(&proc.params).enumerate() {
+                if ty(d) != ty(p) || d.byval != p.byval || d.array != p.array {
+                    problems.push(format!("parameter {} differs from its definition", i + 1));
+                }
+            }
+        }
+        let declared = ret_ty.map(DataType::from_type_ref);
+        let defined = proc.ret_ty.as_ref().map(DataType::from_type_ref);
+        if is_function && proc.is_function && declared.is_some() && declared != defined {
+            problems.push("its result type differs".to_string());
+        }
+        for p in problems {
+            self.error_with_note(
+                line,
+                format!("DECLARE of '{}' does not match: {}", name, p),
+                format!("'{}' is defined on line {}", name, def_line),
+            );
+        }
+    }
+
+    /// Refuse a fixed-length string as a parameter or a FUNCTION result.
+    ///
+    /// QuickBASIC requires both to be variable-length. The parameter was
+    /// accepted and its width ignored -- the callee saw whatever length the
+    /// caller passed -- and the result failed later, as a type mismatch on
+    /// the assignment to the FUNCTION's name, which named the wrong line.
+    fn check_variable_length_strings(
+        &mut self,
+        name: &str,
+        params: &[Param],
+        ret_ty: Option<&TypeRef>,
+        line: u32,
+    ) {
+        for p in params {
+            if let Some(TypeRef::FixedString(n @ 1..)) = p.ty {
+                self.error_with_note(
+                    line,
+                    format!(
+                        "parameter '{}' of '{}' is declared AS STRING * {}, but a parameter must be a variable-length string",
+                        p.name, name, n
+                    ),
+                    format!("declare it {} AS STRING", p.name),
+                );
+            }
+        }
+        if let Some(TypeRef::FixedString(n @ 1..)) = ret_ty {
+            self.error_with_note(
+                line,
+                format!(
+                    "the result of '{}' is declared AS STRING * {}, but a FUNCTION's result must be a variable-length string",
+                    name, n
+                ),
+                "declare it AS STRING".to_string(),
+            );
+        }
+    }
+
+    /// The type of `arg` when it is a variable, array element or field --
+    /// something a by-reference parameter would share -- or None for any
+    /// other expression.
+    /// The type a variable or an array's elements hold: the `AS` clause it
+    /// was declared with, or its name's suffix. None for a record.
+    fn declared_type(&self, name: &str, scope: &Scope) -> Option<DataType> {
+        match self.symbols.typed_var(scope, name) {
+            Some(TypeRef::Record(_)) => None,
+            Some(t) => Some(DataType::from_type_ref(t)),
+            None => Some(DataType::from_suffix(name)),
+        }
+    }
+
+    fn lvalue_type(&self, arg: &Expr, scope: &Scope) -> Option<DataType> {
+        match arg {
+            Expr::Variable(n) => {
+                // A FUNCTION's name is a call, evaluated into a temporary as
+                // codegen's `lvalue_addr` does.
+                if self.symbols.consts.contains_key(normalized(n))
+                    || is_zero_arg_builtin(n)
+                    || self.symbols.procs.contains_key(&n.to_uppercase())
+                {
+                    return None;
+                }
+                Some(match self.symbols.typed_var(scope, n) {
+                    Some(TypeRef::Record(_)) => return None,
+                    Some(t) => DataType::from_type_ref(t),
+                    None => DataType::from_suffix(n),
+                })
+            }
+            Expr::ArrayAccess { name, .. } => self.declared_type(name, scope),
+            Expr::FnCall { name, args }
+                if !args.is_empty()
+                    && self
+                        .symbols
+                        .lookup_array(scope, &name.to_uppercase())
+                        .is_some() =>
+            {
+                self.declared_type(name, scope)
+            }
+            _ => None,
+        }
+    }
+
+    /// Check an argument for array parameter `pname` of `proc`: it must name
+    /// an array, as `A()` or `A`, used with the same number of dimensions.
+    #[allow(clippy::too_many_arguments)]
+    fn check_array_argument(
+        &mut self,
+        arg: &Expr,
+        pname: &str,
+        proc: &str,
+        scope: &Scope,
+        line: u32,
+        position: usize,
+        callee: &str,
+    ) {
+        let given = match arg {
+            Expr::Variable(n) => Some(n.to_uppercase()),
+            Expr::FnCall { name, args }
+            | Expr::ArrayAccess {
+                name,
+                indices: args,
+            } if args.is_empty() => Some(name.to_uppercase()),
+            _ => None,
+        };
+        let Some(arr) = given else {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' must be an array, written {}()",
+                    position, callee, pname
+                ),
+            );
+            return;
+        };
+        // An array argument the caller never declared is created, as a use
+        // of it would be.
+        let want = self
+            .symbols
+            .arrays
+            .get(&(Scope::Proc(proc.to_string()), pname.to_uppercase()))
+            .map(|a| a.rank);
+        if self.symbols.lookup_array(scope, &arr).is_none() {
+            self.check_array_use(&arr, want.unwrap_or(1), scope, line);
+        }
+        let got = self.symbols.lookup_array(scope, &arr).map(|a| a.rank);
+        if DataType::from_suffix(&arr) != DataType::from_suffix(pname) {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' is an array of the wrong type for {}()",
+                    position, callee, pname
+                ),
+            );
+        }
+        let checkable = !self
+            .unranked_array_params
+            .contains(&(proc.to_string(), pname.to_uppercase()));
+        if checkable
+            && let (Some(want), Some(got)) = (want, got)
+            && want != got
+        {
+            self.error(
+                line,
+                format!(
+                    "argument {} of '{}' has {} dimension{}, but {}() is used with {}",
+                    position,
+                    callee,
+                    got,
+                    if got == 1 { "" } else { "s" },
+                    pname,
+                    want
+                ),
+            );
+        }
+    }
+
     /// Check an array is declared and indexed with the right number of
     /// subscripts.
     fn check_array_use(&mut self, name: &str, given: usize, scope: &Scope, line: u32) {
@@ -2310,7 +2994,7 @@ impl Analyzer {
         match self.symbols.lookup_array(scope, &upper) {
             Some(info) => {
                 if info.rank != given {
-                    let (rank, decl_line) = (info.rank, info.line);
+                    let (rank, decl_line, implicit) = (info.rank, info.line, info.implicit);
                     self.error_with_note(
                         line,
                         format!(
@@ -2321,15 +3005,50 @@ impl Analyzer {
                             given,
                             if given == 1 { " was" } else { "s were" }
                         ),
-                        format!("'{}' is declared on line {}", name, decl_line),
+                        if implicit {
+                            format!(
+                                "'{}' was created by its first use, on line {}",
+                                name, decl_line
+                            )
+                        } else {
+                            format!("'{}' is declared on line {}", name, decl_line)
+                        },
                     );
                 }
             }
+            // An array no DIM declares is created by its first use, with as
+            // many dimensions as that use has subscripts, each 0 (or the
+            // OPTION BASE) to 10 -- GW-BASIC's rule. It belongs to the scope
+            // that uses it. This used to be refused.
+            //
+            // So a mistyped function -- SQRT(4) -- is quietly an array, as it
+            // is in GW-BASIC. A name close to a function or procedure is worth
+            // a warning, though not a refusal.
             None => {
-                self.error_with_note(
-                    line,
-                    format!("array '{}' is used but never declared", name),
-                    format!("add a DIM {}(...) before using it", name),
+                let mut known: Vec<&str> = self.symbols.procs.keys().map(|s| s.as_str()).collect();
+                known.extend(BUILTINS.iter().map(|(n, _, _)| *n));
+                // Short names are left alone: any one-letter array is "close"
+                // to any one-letter procedure.
+                if upper.trim_end_matches(['$', '%', '&', '!', '#']).len() >= 3
+                    && let Some(sug) = closest(&upper, &known).map(str::to_string)
+                {
+                    self.warning_with_note(
+                        line,
+                        format!(
+                            "'{}' is not a function, so it is an array, created by this use",
+                            name
+                        ),
+                        format!("did you mean '{}'?", sug),
+                    );
+                }
+                self.symbols.arrays.insert(
+                    (scope.clone(), upper),
+                    ArrayInfo {
+                        rank: given,
+                        line,
+                        has_lower: false,
+                        implicit: true,
+                    },
                 );
             }
         }
@@ -2337,23 +3056,33 @@ impl Analyzer {
 
     /// Reject assigning a string to a numeric variable or vice versa. These
     /// used to reach codegen and abort it with a panic.
-    fn check_assign_types(&mut self, name: &str, value: &Expr, scope: &Scope, line: u32) {
-        let target_is_string = name.ends_with('$');
-        if let Some(value_is_string) = self.expr_is_string(value, scope) {
-            if target_is_string != value_is_string {
-                let (from, to) = if value_is_string {
-                    ("string", "numeric")
-                } else {
-                    ("numeric", "string")
-                };
-                self.error(
-                    line,
-                    format!(
-                        "type mismatch: cannot assign {} value to {} variable '{}'",
-                        from, to, name
-                    ),
-                );
-            }
+    ///
+    /// The caller says whether the target is a string, since a suffix is not
+    /// the only way to be one: `DIM S AS STRING`, and a FUNCTION declared
+    /// `AS STRING` whose result is assigned to its name.
+    fn check_assign_types(
+        &mut self,
+        name: &str,
+        target_is_string: bool,
+        value: &Expr,
+        scope: &Scope,
+        line: u32,
+    ) {
+        if let Some(value_is_string) = self.expr_is_string(value, scope)
+            && target_is_string != value_is_string
+        {
+            let (from, to) = if value_is_string {
+                ("string", "numeric")
+            } else {
+                ("numeric", "string")
+            };
+            self.error(
+                line,
+                format!(
+                    "type mismatch: cannot assign {} value to {} variable '{}'",
+                    from, to, name
+                ),
+            );
         }
     }
 
@@ -2397,6 +3126,11 @@ impl Analyzer {
                 }
             }
             Expr::Unary { operand, .. } => self.check_expr(operand, scope, line),
+            // A value, so not a whole record.
+            Expr::Paren(inner) => {
+                self.check_expr(inner, scope, line);
+                self.reject_record_value(inner, scope, line);
+            }
             Expr::Binary { op, left, right } => {
                 self.check_expr(left, scope, line);
                 self.check_expr(right, scope, line);
@@ -2526,13 +3260,13 @@ impl Analyzer {
             // one: `DIM S AS STRING * 4` says so with no suffix at all, and
             // without consulting that, `LEN(S)` and `S = "xy"` were both
             // rejected as numeric.
-            Expr::Variable(name) | Expr::ArrayAccess { name, .. } => {
-                Some(match self.symbols.typed_var(scope, name) {
-                    Some(t) => matches!(t, TypeRef::FixedString(_)),
-                    None => name.ends_with('$'),
-                })
-            }
+            Expr::Variable(name) => Some(self.scalar_is_string(name, scope)),
+            Expr::ArrayAccess { name, .. } => Some(match self.symbols.typed_var(scope, name) {
+                Some(t) => matches!(t, TypeRef::FixedString(_)),
+                None => name.ends_with('$'),
+            }),
             Expr::Unary { .. } => Some(false),
+            Expr::Paren(inner) => self.expr_is_string(inner, scope),
             Expr::Binary { op, left, .. } => {
                 if matches!(
                     op,
@@ -2562,7 +3296,9 @@ impl Analyzer {
             }
             Expr::FnCall { name, .. } => {
                 let upper = name.to_uppercase();
-                if self.symbols.lookup_array(scope, &upper).is_some()
+                if let Some(ty) = self.function_result(&upper) {
+                    Some(matches!(ty, TypeRef::FixedString(_)))
+                } else if self.symbols.lookup_array(scope, &upper).is_some()
                     || self.symbols.procs.contains_key(&upper)
                     || builtin(&upper).is_some()
                 {
@@ -2572,6 +3308,61 @@ impl Analyzer {
                 }
             }
         }
+    }
+
+    /// The type of a SWAP operand, as codegen will store it, or None when it
+    /// does not resolve (a bad field path, already reported elsewhere).
+    ///
+    /// An array element is typed by its array's AS clause, or its name's
+    /// suffix.
+    fn swap_type(&self, target: &LValue, scope: &Scope) -> Option<TypeRef> {
+        let declared = self.symbols.typed_var(scope, &target.name);
+        let mut ty = match (&target.indices, declared) {
+            (_, Some(t)) => t.clone(),
+            (Some(_), _) => suffix_type(&target.name),
+            (None, None) => match self.function_result(&target.name.to_uppercase()) {
+                Some(t) => t.clone(),
+                None => suffix_type(&target.name),
+            },
+        };
+        for field in &target.fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            ty = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())?
+                .field(field)?
+                .ty
+                .clone();
+        }
+        Some(ty)
+    }
+
+    /// Whether the scalar `name` holds a string.
+    ///
+    /// A `$` suffix says so, and so does a declaration without one: `DIM S AS
+    /// STRING`, or a FUNCTION declared `AS STRING`, whose name is its result
+    /// inside the body and a call outside it. Judging by the suffix alone
+    /// refused `F = "x"` in `FUNCTION F AS STRING` as a type mismatch.
+    fn scalar_is_string(&self, name: &str, scope: &Scope) -> bool {
+        match self.symbols.typed_var(scope, name) {
+            Some(t) => matches!(t, TypeRef::FixedString(_)),
+            None => match self.function_result(&name.to_uppercase()) {
+                Some(t) => matches!(t, TypeRef::FixedString(_)),
+                None => name.ends_with('$'),
+            },
+        }
+    }
+
+    /// The declared result type of the FUNCTION `upper`, when it has one.
+    fn function_result(&self, upper: &str) -> Option<&TypeRef> {
+        self.symbols
+            .procs
+            .get(upper)
+            .filter(|p| p.is_function)
+            .and_then(|p| p.ret_ty.as_ref())
     }
 }
 
@@ -2680,4 +3471,118 @@ fn edit_distance(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// How many subscripts `body` gives `name` the first time it subscripts it.
+///
+/// An array parameter (`A()`) does not declare its dimensions, so its uses
+/// say: QuickBASIC infers them the same way.
+fn subscript_count(body: &[Stmt], name: &str) -> Option<usize> {
+    fn in_expr(e: &Expr, name: &str) -> Option<usize> {
+        match e {
+            Expr::ArrayAccess { name: n, indices }
+            | Expr::FnCall {
+                name: n,
+                args: indices,
+            } if n.eq_ignore_ascii_case(name) && !indices.is_empty() => Some(indices.len()),
+            Expr::ArrayAccess { indices, .. } | Expr::FnCall { args: indices, .. } => {
+                indices.iter().find_map(|i| in_expr(i, name))
+            }
+            Expr::Binary { left, right, .. } => {
+                in_expr(left, name).or_else(|| in_expr(right, name))
+            }
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => in_expr(operand, name),
+            Expr::Field { base, .. } => in_expr(base, name),
+            Expr::Literal(_) | Expr::Variable(_) => None,
+        }
+    }
+    fn in_lvalue(lv: &LValue, name: &str) -> Option<usize> {
+        match &lv.indices {
+            Some(ix) if lv.name.eq_ignore_ascii_case(name) => Some(ix.len()),
+            _ => None,
+        }
+    }
+    let mut found = None;
+    walk_stmts(body, &mut |stmt| {
+        if found.is_some() {
+            return;
+        }
+        found = match &stmt.kind {
+            StmtKind::Let {
+                name: n,
+                indices: Some(ix),
+                ..
+            } if n.eq_ignore_ascii_case(name) => Some(ix.len()),
+            StmtKind::Input { vars, .. } | StmtKind::Read(vars) => {
+                vars.iter().find_map(|v| in_lvalue(v, name))
+            }
+            StmtKind::LineInput { var, .. } => in_lvalue(var, name),
+            StmtKind::Swap(a, b) => in_lvalue(a, name).or_else(|| in_lvalue(b, name)),
+            _ => None,
+        };
+        if found.is_none() {
+            let mut stmt = stmt.clone();
+            for_each_expr_mut(&mut stmt, &mut |e| {
+                if found.is_none() {
+                    found = in_expr(e, name);
+                }
+            });
+        }
+    });
+    found
+}
+
+/// The declared-type form of the type a name's suffix gives it.
+fn suffix_type(name: &str) -> TypeRef {
+    match DataType::from_suffix(name) {
+        DataType::Integer => TypeRef::Integer,
+        DataType::Long => TypeRef::Long,
+        DataType::Single => TypeRef::Single,
+        DataType::Double => TypeRef::Double,
+        // Width 0: a plain string, as `TypeRef::FixedString` documents.
+        DataType::String => TypeRef::FixedString(0),
+    }
+}
+
+/// Whether SWAP may exchange values of these two types: the same type, with
+/// every string alike whatever its width, and records alike by TYPE.
+fn same_swap_type(a: &TypeRef, b: &TypeRef) -> bool {
+    match (a, b) {
+        (TypeRef::FixedString(_), TypeRef::FixedString(_)) => true,
+        (TypeRef::Record(x), TypeRef::Record(y)) => x.eq_ignore_ascii_case(y),
+        _ => a == b,
+    }
+}
+
+/// A declared type in words, for diagnostics: "an INTEGER", "a TYPE R record".
+fn describe_type(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Record(r) => format!("a TYPE {} record", r.to_uppercase()),
+        t => type_name(DataType::from_type_ref(t)).to_string(),
+    }
+}
+
+/// An assignment target as the program wrote it, near enough to recognise:
+/// `A(...)` for an element, with any field path.
+fn lvalue_text(target: &LValue) -> String {
+    let mut text = target.name.clone();
+    if target.indices.is_some() {
+        text.push_str("(...)");
+    }
+    for field in &target.fields {
+        text.push('.');
+        text.push_str(field);
+    }
+    text
+}
+
+/// The BASIC name of a numeric or string type, for diagnostics.
+fn type_name(t: DataType) -> &'static str {
+    match t {
+        DataType::Integer => "an INTEGER",
+        DataType::Long => "a LONG",
+        DataType::Single => "a SINGLE",
+        DataType::Double => "a DOUBLE",
+        DataType::String => "a STRING",
+    }
 }

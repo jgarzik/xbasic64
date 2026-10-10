@@ -13,7 +13,9 @@ This document describes the BASIC dialect supported by xbasic64, a native code c
 - [File I/O](#file-io)
 - [Random-Access Files](#random-access-files)
 - [Procedures](#procedures)
+- [Runtime Errors](#runtime-errors)
 - [Limitations](#limitations)
+- [Compatibility Notes](#compatibility-notes)
 
 ---
 
@@ -41,7 +43,9 @@ Line numbers are optional and appear at the start of a line:
 20 GOTO 10
 ```
 
-Line numbers serve as labels for `GOTO` and `GOSUB` targets.
+Line numbers serve as labels for `GOTO` and `GOSUB` targets. Each number may
+appear once; GW-BASIC replaces a line typed twice, but in a file the second is
+a mistake, and is refused.
 
 ### Labels
 
@@ -57,9 +61,11 @@ PRINT "done"
 
 A label definition must be the first thing on its line, though a statement may
 follow it there (`Finish: PRINT "done"`). Labels are case-insensitive, like
-every other name, and are accepted wherever a line number is: `GOTO`, `GOSUB`,
-`ON...GOTO` and `RESTORE`. A name already declared as a `SUB` is read as a call
-to it rather than as a label definition.
+every other name, and are accepted by `GOTO`, `GOSUB`, `ON...GOTO`,
+`ON...GOSUB`, `ON ERROR GOTO`, `RESUME`, `RETURN`, `RESTORE` and `IF ... GOTO`.
+After `THEN` or `ELSE` only a line number is an implied `GOTO`: a bare name
+there is a SUB call, so write `THEN GOTO label`. A name already declared as a
+`SUB` is read as a call to it rather than as a label definition.
 
 ### Statement Separators
 
@@ -98,21 +104,42 @@ The examples in this reference use the two-word form throughout.
 
 Variable and procedure names:
 - Start with a letter (A-Z, a-z)
-- Followed by letters, digits, or underscore
+- Followed by letters, digits, underscore, or a dot followed by a letter or
+  digit (`MY.VAR`, as GW-BASIC allows)
 - Case-insensitive (`MyVar` and `MYVAR` are the same)
-- May end with a type suffix (`%`, `&`, `!`, `#`, `$`)
+- May end with a type suffix (`%`, `&`, `!`, `#`, `$`); a keyword with a
+  suffix is a name, so `Line$` and `Print%` are variables
+
+A dotted name is a field of a record instead when the part before the first
+dot is a record variable: with `DIM P AS Point`, `P.X` is the field `X` of `P`.
+
+Keywords are words of their own. GW-BASIC's cruncher works the same way: a
+keyword immediately followed by a letter, digit or dot is part of a longer name,
+so `FORI=1TO9` is not a `FOR` loop -- it is an assignment to `FORI` followed by
+`TO9`, and refused.
 
 ### Literals
 
 **Integers:**
 ```basic
 A = 42          ' Decimal
-B = -17         ' Negative
+B = -17         ' Negative: unary minus applied to 17
 C = &HFF        ' Hexadecimal (255)
 D = &O377       ' Octal (255)
 E = &377        ' Octal too: a bare & introduces octal
 F = &B1010      ' Binary (10)
 ```
+
+A whole number is an INTEGER if it fits 16 bits, a LONG if it fits 32, and a
+DOUBLE beyond that. This matters because INTEGER arithmetic is checked at 16
+bits: with `X% = 300`, `X% * 300` is `Overflow`, as in QuickBASIC, where
+`X% * 300&` is 90000.
+
+A hexadecimal, octal or binary literal of up to 16 bits is an INTEGER, read as
+two's complement, so `&HFFFF` is -1 and `&H8000` is -32768; one of up to 32
+bits is a LONG, likewise, so `&HFFFFFFFF` is -1. Write `&` after it for a LONG
+whatever its size: `&HFFFF&` is 65535; `%` insists on an INTEGER. One wider
+than 32 bits is refused.
 
 **Floating-point:**
 ```basic
@@ -122,11 +149,30 @@ C = 1E+10
 D = 2.5D-3      ' Double precision
 ```
 
+A number with a point or an exponent is a DOUBLE.
+
+**Type suffixes** may follow any number, as in GW-BASIC: `%` makes it an
+INTEGER, `&` a LONG, `!` a SINGLE and `#` a DOUBLE. A value the type cannot
+hold -- `32768%`, `1.5%`, `1E39!` -- is refused when the program is compiled.
+
+```basic
+A& = 5&         ' LONG
+B! = 2.5!       ' SINGLE: rounded to a SINGLE's precision
+C# = 100#       ' DOUBLE
+```
+
+A `CONST` is folded in these types too, so `CONST A = 300 * 300` is an
+`Overflow`, and `CONST A = 300 * 300&` is 90000.
+
 **Strings:**
 ```basic
 A$ = "Hello, World!"
-B$ = "She said ""Hi"""   ' Embedded quote
+B$ = "She said " + CHR$(34) + "Hi" + CHR$(34)   ' Embedded quote
 ```
+
+As in GW-BASIC, the first `"` ends a string, so a quote inside one is written
+`CHR$(34)`; `PRINT "a""b"` prints two strings side by side, `ab`. A string
+that the line ends inside is closed there: `PRINT "Hello` prints `Hello`.
 
 ---
 
@@ -179,11 +225,36 @@ INTEGER → LONG → SINGLE → DOUBLE
 
 The result takes the wider type. String/numeric mixing is not allowed; use `VAL()` and `STR$()` for explicit conversion.
 
+A value converted to an INTEGER or LONG -- by assignment, `INPUT`, `READ`, an
+argument, a subscript, a string position, or as an operand of `\`, `MOD` or a
+bitwise operator -- **rounds half to even**, QuickBASIC's rule and what `CINT`
+does: `A% = 7.9` gives 8, `A% = 2.5` gives 2 and `A% = 3.5` gives 4.
+
+Every result that does not fit its type is `Overflow` (error 6), as in
+GW-BASIC:
+
+- INTEGER arithmetic is checked at 16 bits and LONG at 32: with `X% = 300`,
+  `X% * X%` is `Overflow`, not 90000 or a wrapped value
+- a value converted to an INTEGER or LONG that does not fit it, so
+  `A% = 40000` and `CINT(40000)` are both `Overflow`
+- a SINGLE or DOUBLE result too large for its type, such as `1E308 * 10` or
+  `EXP(1000)`, rather than an infinity
+
+`--unsafe` removes these checks with the others. LONG arithmetic and a store
+into an INTEGER then wrap, a float converted to an integer saturates, an
+INTEGER intermediate result is kept at 32 bits until it is stored, and a float
+that overflows becomes an infinity.
+
 ### Division Semantics
 
 Following GW-BASIC conventions:
 - `/` (division) always produces a **Double** result
-- `\` (integer division) produces a **Long** result
+- `\` (integer division) produces a **Long** result; its operands are rounded
+  to LONG first, so `7.6 \ 2` is `8 \ 2`
+- `0 ^` a negative number is `Division by zero`, as in GW-BASIC, and a `^`
+  with no real result, such as `(-8) ^ (1 / 3)`, is `Illegal function call`
+- `MOD` produces a **Long** too, its operands rounded the same way, and its
+  result has the dividend's sign: `-7 MOD 2` is -1
 
 ```basic
 PRINT 7 / 2       ' Prints 3.5
@@ -222,7 +293,23 @@ DIM Matrix(5, 5)         ' 6x6 elements
 DIM Cube(3, 3, 3)        ' 4x4x4 elements
 ```
 
-**Array indices start at 0** by default.
+**Array indices start at 0** by default. A dimension may name its own lower
+bound, as in QuickBASIC:
+
+```basic
+DIM Year(1980 TO 1989)   ' 10 elements, 1980 to 1989
+DIM Grid(-5 TO 5, 1 TO 3)
+```
+
+An array no `DIM` declares is **created by its first use**, as in GW-BASIC:
+with as many dimensions as that use has subscripts, each running from the
+`OPTION BASE` to 10. The same happens to a declared array used before its
+`DIM` has run, or after `ERASE`. A `DIM` of an array that already exists -- by
+an earlier `DIM`, or by a use -- is `Duplicate definition` (10); `REDIM` may
+resize one, unless it is locked (see [ERASE](#beep-erase-and-system)). Two
+`DIM` statements naming one array are refused when compiling, even on paths
+that cannot both run. Since a mistyped function would quietly become such an
+array, a name close to a function or procedure draws a warning.
 
 Arrays can hold any type:
 ```basic
@@ -232,15 +319,33 @@ DIM Values%(50)          ' Integer array
 
 ### Scope
 
-- **Global by default**: a name used anywhere at module level is global, and
-  refers to the same storage inside every procedure
-- **Local in procedures**: a name used only inside a `SUB` or `FUNCTION` is
-  local to it, and starts fresh (0 or `""`) on every call, so recursion works
-- **Parameters shadow**: a parameter, and a `FUNCTION`'s return
-  pseudo-variable, are always local even when a global shares the name
+Scope follows QuickBASIC:
 
-The first two rules together mean that assigning to `X` inside a procedure
-writes the global `X` if and only if `X` also appears at module level.
+- **Module-level names stay at module level.** A `SUB` or `FUNCTION` sees one
+  only when it is shared -- by `DIM SHARED` at module level, for every
+  procedure, or by a `SHARED` statement inside the procedure, for that one.
+- **A procedure's other names are its own**, and start fresh (0 or `""`) on
+  every call, so recursion works -- even when the module has a name the same.
+- **`STATIC`** inside a procedure keeps the names it lists from one call to the
+  next; `SUB name STATIC` (or `FUNCTION`) does that for every local.
+- **A parameter**, and a `FUNCTION`'s return pseudo-variable, are always local.
+- **`CONST`s and `DEF FN`** belong to the whole program; a `DEF FN` sees every
+  module-level name.
+
+```basic
+DIM SHARED Total          ' every procedure sees Total
+Count = 5                 ' only the module does
+SUB Add(N)
+    SHARED Count          ' ...and now this procedure too
+    STATIC Calls          ' kept between calls
+    Calls = Calls + 1
+    Total = Total + N
+END SUB
+```
+
+`SHARED` lists names, and `A()` for an array: `SHARED X, Names$(), R AS P`.
+`DIM SHARED` takes the same forms as `DIM`, and a plain name -- `DIM SHARED X`
+-- shares a scalar.
 
 Unassigned variables read as `0` or `""`; they are never left holding whatever
 was previously in memory.
@@ -258,7 +363,7 @@ was previously in memory.
 | `*`      | Multiplication        | `A * B`        |
 | `/`      | Division (→ Double)   | `A / B`        |
 | `\`      | Integer division (→ Long) | `A \ B`    |
-| `MOD`    | Modulo                | `A MOD B`      |
+| `MOD`    | Modulo (→ Long)       | `A MOD B`      |
 | `^`      | Exponentiation        | `A ^ B`        |
 | `-`      | Unary negation        | `-A`           |
 
@@ -272,6 +377,8 @@ was previously in memory.
 | `>`      | Greater than          |
 | `<=`     | Less than or equal    |
 | `>=`     | Greater than or equal |
+
+GW-BASIC's reversed spellings `=<`, `=>` and `><` mean `<=`, `>=` and `<>`.
 
 Comparisons return `-1` (true) or `0` (false).
 
@@ -290,8 +397,10 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 | `IMP`    | Bitwise implication   |
 
 These operate bitwise on integers, allowing both logical tests and bit
-manipulation. Their operands are converted to integers first, and the result is
-an integer:
+manipulation. Their operands are converted to LONG first -- rounded, and
+`Overflow` outside its range -- and the result is a LONG. This is QuickBASIC's
+range; GW-BASIC converts to INTEGER, where `40000 AND 1` is `Overflow`. The
+operands of `\` and `MOD` follow the same rule:
 
 ```basic
 IF A > 0 AND B > 0 THEN PRINT "Both positive"
@@ -315,16 +424,21 @@ FullName$ = First$ + " " + Last$
 From highest to lowest:
 1. `^` (exponentiation)
 2. `-` (unary negation)
-3. `*`, `/`, `\`, `MOD`
-4. `+`, `-`
-5. `=`, `<>`, `<`, `>`, `<=`, `>=`
-6. `NOT`
-7. `AND`
-8. `OR`, `XOR`
-9. `EQV`
-10. `IMP`
+3. `*`, `/`
+4. `\` (integer division)
+5. `MOD`
+6. `+`, `-`
+7. `=`, `<>`, `<`, `>`, `<=`, `>=`
+8. `NOT`
+9. `AND`
+10. `OR`
+11. `XOR`
+12. `EQV`
+13. `IMP`
 
-Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
+This is GW-BASIC's and QuickBASIC's table. Because `^` binds tighter than unary
+negation, `-2 ^ 2` is `-(2 ^ 2)` = -4. Because `\` and `MOD` sit below `*`,
+`6 \ 2 * 3` is `6 \ 6` = 1, and `10 - 7 MOD 4` is 7.
 
 Operators of equal precedence associate left to right, `^` included: `2 ^ 3 ^ 2`
 is `(2 ^ 3) ^ 2` = 64, and `100 - 10 - 5` is 85.
@@ -372,6 +486,7 @@ PRINT X; Y; Z             ' Semicolon: items adjoin
 PRINT A, B, C             ' Comma: next 14-column print zone
 PRINT "Value: "; X
 PRINT                     ' Print blank line
+? "Hello"                 ' ? is GW-BASIC's shorthand for PRINT
 ```
 
 **A number carries its own spacing**, as in GW-BASIC: a blank where the minus
@@ -379,13 +494,42 @@ sign would go if it is not negative, and a blank after it. So `PRINT 1; 2; 3`
 writes ` 1  2  3 `, and `PRINT 1; -2; 3` writes ` 1 -2  3 ` -- the minus takes
 the leading blank's place. A string is written exactly as it is.
 
-A value below one drops its leading zero (`.5`, not `0.5`), and an exponent is
-spelled with `D` for a DOUBLE and `E` for a SINGLE: `1D+20`, `1.5E-10`.
+An INTEGER or LONG is written in full. A SINGLE or DOUBLE is rounded to the
+digits its type carries -- 7 significant digits for a SINGLE, 16 for a DOUBLE -- and
+written in fixed point when that shows it in at most that many digits, as
+GW-BASIC and QuickBASIC do. Otherwise it gets an exponent, spelled `E` for a
+SINGLE and `D` for a DOUBLE, with at least two digits:
 
-A comma moves to the start of the next 14-column zone, padding with blanks; if
-the line is already past the last zone it moves to the next line. `WRITE` and
-`PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
-meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
+```basic
+PRINT .1 + .2       ' .3
+PRINT 1 / 3         ' .3333333333333333
+PRINT 1.1E-6!       ' .0000011: seven digits after the point
+PRINT 1.1E-7!       ' 1.1E-07: eight would be needed
+PRINT 12345678!     ' 1.234568E+07
+PRINT 1E16          ' 1D+16
+```
+
+Trailing zeros are dropped, and a value below one has no leading zero (`.5`,
+not `0.5`). `STR$` gives what `PRINT` writes, less the blank after it.
+
+A comma moves to the start of the next 14-column zone, padding with blanks.
+
+`WIDTH w` sets the line length console output wraps at, and `WIDTH #n, w` that
+of file `n`; `w` is 1 to 255, and 255 means no limit, which is where every
+program and every newly opened file starts. Under a width, text that runs past
+the end of the line continues on the next, a number that does not fit on the
+rest of the line moves to the next one whole, and a comma whose zone would not
+fit starts a new line -- as in GW-BASIC, whose screen started at 80.
+
+```basic
+WIDTH 40
+PRINT STRING$(50, "*")    ' 40 stars, then 10 on the next line
+```
+
+`WRITE` and `PRINT USING` text wraps at the width like any other, but neither
+uses print zones or moves a number whole -- `WRITE` pads nothing, because its
+output is meant to be read back by `INPUT`, and `PRINT USING` lays out its
+own.
 
 Semicolon at end suppresses newline:
 ```basic
@@ -394,12 +538,15 @@ PRINT "Enter value: ";
 
 ### PRINT USING
 
-Formatted output. The format is a string literal:
+Formatted output. The format is any string expression, read as the statement
+runs, and `PRINT #n, USING` writes to a file:
 
 ```basic
 PRINT USING "###.##"; 3.14159       '   3.14
 PRINT USING "Total: ###"; 42        ' Total:  42
-PRINT USING "## and ##"; 1; 2       '   1 and  2
+PRINT USING "## and ##"; 1; 2       '  1 and  2
+F$ = "$$#,###.##"
+PRINT USING F$; 1234.5              '  $1,234.50
 ```
 
 Numeric fields:
@@ -426,7 +573,9 @@ String fields:
 
 `_` emits the next character literally. A value too wide for its field is
 printed in full, preceded by `%`. If values remain after the format is
-exhausted, the format restarts.
+exhausted, the format restarts; after the last value, its text is printed up
+to the next field. A value of the wrong kind for its field is `Type mismatch`
+(13), and a format with no field for a value is `Illegal function call`.
 
 A field is at most 255 characters wide with at most 40 fractional digits;
 a format asking for more is clamped to those.
@@ -444,6 +593,17 @@ INPUT "X, Y: ", X, Y      ' Multiple values
 
 The separator decides the question mark: a `;` after the prompt adds `? `, a
 `,` suppresses it, and a prompt-less `INPUT` prints `? ` on its own.
+
+`INPUT` reads one line and splits it on commas, as GW-BASIC does: `INPUT A, B$`
+takes `3, hello` from a single line. A field may be quoted, which lets it hold
+a comma or keep its blanks; an unquoted one has its surrounding blanks dropped.
+A number is read as `VAL` reads one, and an empty field is 0 or `""`.
+
+Each field must suit its variable before any is stored. Text where a number
+belongs, a number too large for the variable (`40000` for an INTEGER), a quoted
+number, or too few fields prints `?Redo from start`, and the statement asks
+again, prompt and all. More fields than variables prints `?Extra ignored`.
+When the input has ended, every variable reads as empty.
 
 A `;` *before* the prompt is accepted and ignored:
 
@@ -482,11 +642,13 @@ Both branches take a list of statements separated by colons. Everything after
 IF X > 0 THEN Y = 1 : PRINT "Positive" ELSE Y = 0 : PRINT "Not positive"
 ```
 
-A bare line number after `THEN` or `ELSE` is an implied `GOTO`:
+A bare line number after `THEN` or `ELSE` is an implied `GOTO`, and GW-BASIC's
+`IF ... GOTO` needs no `THEN`:
 
 ```basic
 10 IF X < 0 THEN 90
-20 IF X = 0 THEN 90 ELSE 80
+20 IF X > 100 GOTO 90
+30 IF X = 0 THEN 90 ELSE 80
 80 PRINT "Positive"
 90 PRINT "Done"
 ```
@@ -522,8 +684,11 @@ END SELECT
 Case expressions can be:
 - Single values: `CASE 1`
 - Ranges: `CASE 1 TO 10`
-- Comparisons: `CASE IS > 100`
-- Lists: `CASE 1, 2, 3`
+- Comparisons: `CASE IS > 100` -- the `IS` is required
+- Lists of any of these: `CASE 0, 11 TO 12, IS < -5`
+
+A string selector takes string cases, compared as the relational operators
+compare strings: `CASE "a" TO "f"`, `CASE IS >= "m"`.
 
 ### FOR...NEXT
 
@@ -538,10 +703,16 @@ FOR J = 10 TO 1 STEP -1
     PRINT J
 NEXT J
 
-FOR K = 0 TO 1 STEP 0.1
+FOR K = 0 TO 1 STEP 0.25
     PRINT K
 NEXT K
 ```
+
+The counter counts in its own type, so a step past that type's range is
+`Overflow`, as in QuickBASIC: `FOR I% = 32765 TO 32767` prints its three
+values and then stops with Overflow rather than wrapping. A fractional step
+accumulates rounding error, as any repeated addition does: `STEP 0.1` from 0
+reaches .9999999999999999, not 1.
 
 The loop variable name after `NEXT` is optional, and a bare `NEXT` closes the
 innermost open loop:
@@ -606,6 +777,12 @@ Unconditional jump to line number or label:
 20 GOTO 10
 ```
 
+A branch stays in its own scope -- module-level code, or one `SUB` or
+`FUNCTION` -- for every form: `GOTO`, `GOSUB`, `ON ... GOTO`, `ON ... GOSUB`.
+Each scope has its own frame, so code reached across the boundary would run with
+the wrong one. `RESTORE` is the exception: it names a place in the `DATA`, which
+is one list for the whole program.
+
 ### GOSUB / RETURN
 
 Call subroutine and return:
@@ -617,6 +794,24 @@ END
 
 1000 PRINT "In subroutine"
 1010 RETURN
+```
+
+A `RETURN` goes back only to a `GOSUB` made in the same scope: main's
+`RETURN` to main's `GOSUB`, a procedure's to its own. Reaching one with no such
+`GOSUB` outstanding -- typically by falling into a subroutine -- is the
+runtime error `RETURN without GOSUB`. A program with no `GOSUB` anywhere is
+refused at compile time instead.
+
+`RETURN line` ends the subroutine as `RETURN` does, but continues at `line`
+rather than after the `GOSUB`. The line must be in the same scope as the
+`RETURN`.
+
+```basic
+10 GOSUB 100
+20 PRINT "not reached"
+30 PRINT "continued at 30"
+40 END
+100 RETURN 30
 ```
 
 ### ON...GOTO / ON...GOSUB
@@ -648,15 +843,17 @@ PRINT "erasing"
 RETURN
 ```
 
-The selector is truncated to an integer. A value that matches nothing -- zero,
-negative, or past the end of the list -- runs no subroutine and continues with
-the next statement.
+The selector is rounded to an integer, as any conversion is. A value that
+matches nothing -- zero, or past the end of the list -- runs no subroutine and
+continues with the next statement. As in GW-BASIC, the selector must fit a
+byte: a negative one, or one above 255, is `Illegal function call`.
 
 ### ON ERROR GOTO
 
-`ON ERROR GOTO n` installs an error handler. From then on a runtime error
-jumps to line `n` instead of stopping the program, with `ERR` holding the
-error's number and `ERL` the line it happened on.
+`ON ERROR GOTO n` installs an error handler, at a line number or a label.
+From then on a runtime error jumps there instead of stopping the program, with
+`ERR` holding the error's number and `ERL` the line it happened on (see
+[Error Functions](#error-functions)).
 
 ```basic
 10 ON ERROR GOTO 900
@@ -683,20 +880,21 @@ The rules, which are GW-BASIC's:
   program. Without that, a handler that faults would call itself forever.
 - Trapping stays suspended while the handler runs. Executing an `ON ERROR`
   statement again re-arms it, so a handler that ends in `GOTO` rather than
-  returning must re-arm to keep trapping.
+  returning must re-arm to keep trapping. A handler that does carries on as
+  the program, loops and all.
+- `ON ERROR GOTO 0` inside a handler stops the program with the error being
+  handled, as in GW-BASIC: it is how a handler gives up on one.
 - The handler must be **module-level** code, and `ON ERROR` itself may not
-  appear inside a `SUB` or `FUNCTION`: a trapped error unwinds out of every
-  procedure before the handler runs.
-- A `GOSUB` in progress survives, so a handler can `RETURN` from a subroutine
-  the error interrupted. For the same reason a `GOSUB` *inside* a procedure is
-  refused in a program that traps -- its return address would point into a
-  frame the unwind discarded.
+  appear inside a `SUB` or `FUNCTION`. An error raised inside a procedure is
+  still trapped: the handler runs with the procedure still active, as in
+  QuickBASIC, so it can `RESUME` back into it.
+- A `GOSUB` in progress survives, so a handler can `RETURN` from a module-level
+  subroutine the error interrupted, and carry on after its `GOSUB`.
 - `--unsafe` and `ON ERROR` are refused together. `--unsafe` removes the checks
   that raise most trappable errors, so the handler would look right and never
   run.
 
-A program that never uses `ON ERROR` is compiled exactly as before, and pays
-nothing for the feature.
+A program that never uses `ON ERROR` pays nothing for the feature.
 
 ### RESUME
 
@@ -725,17 +923,29 @@ The statement, not the line: on line 30 above, `RESUME` returns to
 at line 40. Where the failing statement is the last in a `FOR` or `WHILE` body,
 `RESUME NEXT` continues the loop rather than leaving it.
 
-Two rules follow from where a handler runs:
+`RESUME` must be module-level code, like the handler it ends.
 
-- `RESUME` must be module-level code, like the handler it ends.
-- After an error raised **inside a `SUB` or `FUNCTION`**, a bare `RESUME` or
-  `RESUME NEXT` stops the program with `RESUME cannot return into a SUB or
-  FUNCTION`: the unwind discarded that frame, so there is nothing to go back
-  to. `RESUME n` still works, and is the way out.
+After an error raised **inside a `SUB` or `FUNCTION`**, `RESUME` and
+`RESUME NEXT` go back into that procedure, to the statement that failed or the
+one after it, as QuickBASIC does. `RESUME n` leaves every procedure in between
+and continues at line `n`; any `GOSUB` they made is forgotten with them.
 
-`RESUME` outside a handler stops the program with `RESUME without error`.
-Neither of these two is trappable -- a handler that caught its own failing
-`RESUME` would be re-entered by it forever.
+```basic
+10 ON ERROR GOTO 100
+20 CALL Halve(0)
+30 END
+100 PRINT "error"; ERR
+110 RESUME NEXT
+SUB Halve(N)
+  PRINT 1 / N
+  PRINT "still in Halve"
+END SUB
+```
+
+`RESUME` outside a handler is `RESUME without error`: a compile error in a
+program with no `ON ERROR`, and otherwise a run-time stop. It is never
+trappable -- a handler that caught its own failing `RESUME` would be
+re-entered by it forever.
 
 ### DIM
 
@@ -746,7 +956,13 @@ DIM A(100)           ' 1D array, indices 0-100
 DIM B(10, 20)        ' 2D array
 DIM C(5, 5, 5)       ' 3D array
 DIM Names$(50)       ' String array
+DIM D(1 TO 12)       ' indices 1-12
 ```
+
+`LBOUND(A, n)` and `UBOUND(A, n)` give dimension `n`'s bounds; `n` defaults
+to 1. An array used without a `DIM`, and what a `DIM` executed twice does,
+are described under [Arrays](#arrays). A `DIM` or `REDIM` that fails --
+`Subscript out of range`, `Out of memory` -- leaves the array as it was.
 
 ### DATA / READ / RESTORE
 
@@ -771,6 +987,13 @@ DATA hello, World, "a,b", "  padded  "
 DATA 1,,3
 ```
 
+What an item is depends on what reads it, as in GW-BASIC. `READ` into a string
+gives the item as written -- `DATA 007` reads as `"007"`, and a quoted item
+without its quotes. `READ` into a number reads the item as `VAL` does, so
+`&HFF` and `1D3` work, but the whole item must be a number: a quoted item, or
+text that is not a number, is `Syntax error` (2), and an empty item is 0.
+`READ` past the last item is `Out of DATA` (4).
+
 A colon ends a DATA statement, so another statement may follow it on the same
 line.
 
@@ -793,8 +1016,26 @@ SYSTEM                ' End the program, as END does
 ```
 
 `ERASE` is recognised only before a name, so `Erase` remains usable as a label
-or a variable elsewhere. Its argument must be an array that is DIMed somewhere
--- a name that is not one is a mistake, not a statement that does nothing.
+or a variable elsewhere. It takes a list, `ERASE A, B$`, and each name must be
+an array -- DIMed somewhere, or created by a use -- since a name that is not one
+is a mistake, not a statement that does nothing.
+
+An array is **locked** while a procedure call that was passed one of its
+elements by reference is running, as QuickBASIC's "array temporarily locked":
+`ERASE` or `REDIM` of it then is `Duplicate definition` (10), trappable like
+any other error, since it would free the element the parameter refers to. A
+`BYVAL` element, or an element inside an expression, is a copy and locks
+nothing, and the lock comes off when the call returns. `--unsafe` removes this
+check with the others.
+
+```basic
+SUB Wipe(X)
+    SHARED Z()
+    ERASE Z       ' Duplicate definition: X is Z(1)
+END SUB
+DIM SHARED Z(3)
+Wipe Z(1)
+```
 
 ### LOCATE and COLOR
 
@@ -810,10 +1051,14 @@ COLOR 7               ' Foreground only
 PRINT "positioned"
 ```
 
-Colours are GW-BASIC's 0-15, where 8-15 are the bright half. GW-BASIC's third
-`COLOR` argument sets the border, which a terminal has no equivalent for, and is
-refused rather than ignored. `LOCATE` with no row asks for row 1, since the row
-is not tracked the way the column is.
+Colours are GW-BASIC's: 0 black, 1 blue, 2 green, 3 cyan, 4 red, 5 magenta,
+6 brown, 7 white, and 8-15 the bright half of each. A foreground of 16-31 is
+the same colour blinking. A background is 0-15. GW-BASIC's third `COLOR`
+argument sets the border, which a terminal has no equivalent for, and is
+refused rather than ignored.
+
+An omitted argument leaves that setting as it was, for both statements. A
+value out of range, or a row or column below 1, is `Illegal function call`.
 
 `POS(0)` gives the column the next character will be written to, counting from 1:
 
@@ -824,7 +1069,8 @@ PRINT POS(0)          ' 4
 
 ### SWAP
 
-Exchange two values of the same type, including array elements:
+Exchange two values of the same type, including array elements and whole
+records:
 
 ```basic
 DIM Items(10)
@@ -832,10 +1078,16 @@ SWAP A, B
 SWAP Items(I), Items(J)
 ```
 
+The two must be the same type -- `SWAP A%, B#` is refused, as in QuickBASIC --
+except that a fixed-length string may swap with an ordinary one, and keeps its
+width.
+
 ### CONST
 
-A named constant, folded at compile time. It may be used anywhere a literal
-can, including as an array bound:
+A named constant, folded at compile time. It may be used anywhere an expression
+can, including as an array bound, and as the length in `STRING * n`. It cannot
+be assigned to. `DATA` items and `OPTION BASE` take literals only, as in
+GW-BASIC:
 
 ```basic
 CONST MAX = 100
@@ -877,8 +1129,8 @@ END SUB
 
 ### REDIM
 
-Resize an existing array. `REDIM` alone clears it; `REDIM PRESERVE` keeps the
-existing elements and zeroes the new ones:
+Resize an array, or create it if it does not exist yet. `REDIM` alone clears
+it; `REDIM PRESERVE` keeps the existing elements and zeroes the new ones:
 
 ```basic
 DIM Items(10)
@@ -886,7 +1138,11 @@ REDIM Items(20)             ' cleared
 REDIM PRESERVE Items(30)    ' contents kept
 ```
 
-Only the last dimension may change under `PRESERVE`.
+Only the last dimension's upper bound may change under `PRESERVE`; changing
+another dimension is `Subscript out of range`, even under `--unsafe`. After
+`ERASE` there is nothing to keep, and every element starts as 0 or `""`.
+`REDIM` of a locked array is `Duplicate definition` (see
+[ERASE](#beep-erase-and-system)).
 
 ### OPTION BASE
 
@@ -896,6 +1152,9 @@ Set the lowest legal subscript. It must appear before any `DIM`, and only once:
 OPTION BASE 1
 DIM Items(10)     ' subscripts 1 to 10
 ```
+
+It is the lower bound of every dimension that does not name its own. The
+value is 0 or 1, written as a number.
 
 ### DEF FN
 
@@ -908,7 +1167,8 @@ PRINT FNArea(3, 4)
 
 ### TYPE
 
-A user-defined record. Fields may be any built-in type or another record:
+A user-defined record. Fields may be any numeric type, a fixed-length string
+(`STRING * n`, where `n` may be a `CONST`), or another record:
 
 ```basic
 TYPE Point
@@ -930,7 +1190,7 @@ People(0).Name = "Bob"
 ```
 
 Assigning one record to another copies it. A record may be passed to a
-procedure, where it arrives by value:
+procedure, by reference like any other variable, or by value with `BYVAL`:
 
 ```basic
 TYPE Person
@@ -942,13 +1202,15 @@ SUB Show(P AS Person)
 END SUB
 ```
 
-`AS` also gives an ordinary variable, parameter or `FUNCTION` result a
-declared type:
+`AS` also gives an ordinary variable, an array, a parameter or a `FUNCTION`
+result a declared type. A plain `AS STRING` is a variable-length string, as a
+`$` suffix is; a variable or array may also be `STRING * n`, but a parameter or
+result may not, as in QuickBASIC:
 
 ```basic
 DIM Count AS INTEGER
 
-SUB Log(Level AS INTEGER, Text AS STRING * 80)
+SUB Log(Level AS INTEGER, Text AS STRING)
     PRINT Level; Text
 END SUB
 
@@ -957,12 +1219,24 @@ FUNCTION Total AS DOUBLE
 END FUNCTION
 
 FUNCTION Half(X) AS INTEGER
-    Half = X / 2        ' Half(7) is 3, not 3.5
+    Half = X / 2        ' Half(7) is 4, not 3.5: rounded, halves to even
 END FUNCTION
 ```
 
 A declared result type must not contradict a type suffix on the name, and
 a `SUB` -- having no result -- cannot be declared `AS` anything.
+
+A `STRING * n` -- a variable, an array element, a record field or a
+procedure's local -- is always `n` characters long. Until it is first
+assigned it holds `n` copies of `CHR$(0)`, as in QuickBASIC; an assignment
+pads a shorter value with spaces and cuts a longer one to `n`:
+
+```basic
+DIM Code AS STRING * 4
+PRINT LEN(Code); ASC(Code)      ' 4  0
+Code = "ab"
+PRINT "["; Code; "]"            ' [ab  ]
+```
 
 One `DIM` may mix declarators freely:
 
@@ -983,8 +1257,13 @@ Terminate program:
 
 ```basic
 END     ' Normal termination
-STOP    ' Terminate (historically for debugging)
+STOP    ' Report where, then terminate
 ```
+
+`STOP` writes `Break in` and the line number to standard error, as GW-BASIC
+does -- the source line when the program has no line numbers -- and then ends
+the program normally, with exit status 0. GW-BASIC would return to its prompt
+and allow `CONT`; a compiled program has neither.
 
 ---
 
@@ -1006,11 +1285,11 @@ STOP    ' Terminate (historically for debugging)
 | `EXP(x)`   | e raised to power x                      |
 | `LOG(x)`   | Natural logarithm                        |
 | `RND`      | Random number 0 ≤ r < 1                  |
-| `FRE(x)`   | Free memory; a large constant here       |
+| `FRE(x)`   | Free memory; a constant here (x may be a number or a string) |
 
-**Numeric output:** `PRINT` writes the shortest decimal that reads back as the
-same value, so a `DOUBLE` shows its full precision (`PRINT 1 / 3` gives
-`0.3333333333333333`) and a `SINGLE` shows only the ~7 digits it carries.
+**Numeric output:** `PRINT` shows 16 significant digits of a `DOUBLE`
+(`PRINT 1 / 3` gives `.3333333333333333`) and 7 of a `SINGLE`; see
+[PRINT](#print).
 
 **RND behavior:** the argument selects between three behaviours.
 
@@ -1062,6 +1341,17 @@ nobody to ask, so it takes the clock.
 
 **String indexing is 1-based** for `MID$` and `INSTR`.
 
+`VAL` reads the number a string begins with, as GW-BASIC does: blanks are
+ignored wherever they are (`VAL("1 2")` is 12), an exponent may be spelled `E`
+or `D`, `&H` and `&O` work as they do in a literal (`VAL("&HFFFF")` is -1), and
+the number ends where the text stops being one (`VAL("12abc")` is 12). Text
+that does not begin with a number is 0; one too large for a DOUBLE is
+`Overflow`.
+
+`HEX$` and `OCT$` show a negative number as two's complement in its own type's
+width, as QuickBASIC does: `HEX$(-1)` is `FFFF`, since -1 is an INTEGER, and
+`HEX$(-1&)` is `FFFFFFFF`. Any other type is converted to a LONG first.
+
 `MID$` may also be assigned to, overwriting characters in place. The target's
 length never changes:
 
@@ -1070,26 +1360,28 @@ A$ = "hello"
 MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 ```
 
+`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
+is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
+it.
+
 ### Error Functions
 
 | Function | Returns                                                      |
 |----------|--------------------------------------------------------------|
 | `ERR`    | The number of the trapped error, 0 before any is trapped      |
-| `ERL`    | The line it happened on, 0 if the program has no line numbers |
+| `ERL`    | The line it happened on                                       |
 
-Both are only meaningful inside an `ON ERROR` handler. `ERL` reports the BASIC
-line number, as the error messages do.
-
-`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
-is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
-it.
+Both are only meaningful inside an `ON ERROR` handler. `ERL` reports a BASIC
+line number, as the error messages do: the last one at or before the failing
+statement, or -- in a program without line numbers, or before the first one --
+the source file's line.
 
 ### Type Conversion Functions
 
 | Function   | Description                              |
 |------------|------------------------------------------|
-| `CINT(x)`  | Convert to Integer (with rounding)       |
-| `CLNG(x)`  | Convert to Long (with rounding)          |
+| `CINT(x)`  | Convert to Integer, rounding half to even |
+| `CLNG(x)`  | Convert to Long, rounding half to even    |
 | `CSNG(x)`  | Convert to Single                        |
 | `CDBL(x)`  | Convert to Double                        |
 
@@ -1097,7 +1389,7 @@ it.
 
 | Function      | Description                                    |
 |---------------|------------------------------------------------|
-| `TIMER`       | Seconds since midnight, UTC, fractional (Double) |
+| `TIMER`       | Seconds since midnight, local time, fractional (Double) |
 | `LBOUND(a[,d])` | Lowest subscript of an array, of dimension d |
 | `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
 | `EOF(n)`      | True once file n has been read to the end      |
@@ -1122,8 +1414,9 @@ holds, and back. See [Random-Access Files](#random-access-files).
 | `CVS(s$)`  | Those 4 bytes back as a number                  |
 | `CVD(s$)`  | Those 8 bytes back as a number                  |
 
-`TIMER` counts fractional seconds since midnight UTC on every platform, so
-subtracting two readings times a section of code.
+`TIMER` counts fractional seconds since local midnight -- the clock `TIME$`
+reads, through the same C library, so both honour `TZ` -- and subtracting two
+readings times a section of code.
 
 `LBOUND` and `UBOUND` take an array *name*, of any element type. The
 dimension may be any numeric expression; asking for one the array does
@@ -1146,9 +1439,22 @@ OPEN "filename.txt" FOR APPEND AS #1   ' Write mode (append)
 OPEN "data.dat" FOR RANDOM AS #1 LEN = 64   ' Fixed-length records
 ```
 
+GW-BASIC's short form takes the mode as a letter -- `"O"`, `"I"`, `"A"` or
+`"R"` -- then the file number and the name, and for `"R"` the record length:
+
+```basic
+OPEN "O", #1, "filename.txt"           ' FOR OUTPUT AS #1
+OPEN "R", #2, "data.dat", 64           ' FOR RANDOM AS #2 LEN = 64
+```
+
+The `#` before a file number is optional in `OPEN`, `CLOSE`, `FIELD`, `GET`,
+`PUT`, `LOCK` and `UNLOCK` (`OPEN "f" FOR INPUT AS 1`, `CLOSE 1`), as in
+GW-BASIC. `PRINT #` and the other reading and writing statements need it.
+
 `FOR RANDOM` opens for reading *and* writing, and creates the file when it
 does not exist. `LEN =` gives the record length in bytes; without it the record
-is 128 bytes, as in GW-BASIC. The largest record is 32767 bytes.
+is 128 bytes, as in GW-BASIC. A length outside 1 to 32767 is `Illegal function
+call`.
 
 File numbers range from `#1` to `#15`; the runtime has a handle slot for each.
 One outside that range is refused at compile time, or reported as
@@ -1158,7 +1464,9 @@ One outside that range is refused at compile time, or reported as
 
 ```basic
 CLOSE #1          ' Close specific file
+CLOSE #1, #2      ' Close several
 CLOSE             ' Close all files
+RESET             ' Close all files, as GW-BASIC spells it
 ```
 
 A file number may be any numeric expression, not only a literal:
@@ -1191,7 +1499,10 @@ LINE INPUT #1, Text$  ' Read entire line
 
 `INPUT #` reads one comma-delimited field per variable, skipping leading
 blanks and line breaks, so several fields may come from one line and one
-field may span several. A field wrapped in quotes may contain commas.
+field may span several. A field wrapped in quotes may contain commas, and two
+commas with nothing between them are an empty field, 0 or `""`. A number ends
+at a blank as well, as in GW-BASIC, so the ` 1  2  3 ` that `PRINT #1, 1; 2; 3`
+writes reads back as three numbers; it is read as `VAL` reads a string.
 `LINE INPUT #` takes a whole line, commas and all.
 
 Reading past the end of a file is an error (`Input past end of file`), as is
@@ -1385,18 +1696,63 @@ Return value is assigned to the function name within the function body.
 
 ### Parameters
 
-Parameters are passed **by value**:
+Parameters are passed **by reference**, as in QuickBASIC: a variable, array
+element or record field given as an argument is changed by what the procedure
+does to its parameter. `BYVAL` passes a copy instead, and an argument that is
+any other expression -- `A + 0`, `CINT(B#)`, a literal -- is a copy whatever
+the parameter says. So is a variable in parentheses, `(A)`: QuickBASIC's way
+to protect one variable at one call. A call statement without `CALL` takes
+its arguments without parentheses, so `Double (A)` -- or `Double(A)` -- passes
+the expression `(A)`; only a list, `Double(A, B)`, is an argument list. A
+record or array argument in parentheses is still passed itself.
 
 ```basic
 SUB Double(X)
-    X = X * 2       ' Only affects local copy
-    PRINT X
+    X = X * 2
+END SUB
+SUB Show(BYVAL X)
+    X = 0           ' only the copy
 END SUB
 
 A = 5
-Double A            ' Prints 10
-PRINT A             ' Prints 5 (unchanged)
+Double A            ' A is now 10
+Show A              ' A is still 10
+Double A + 0        ' an expression: A is still 10
+Double (A)          ' in parentheses: A is still 10
 ```
+
+The parameter *is* the caller's storage, not a copy that goes back at the
+end: a write through it is seen at once through every other name for the same
+storage -- the same variable passed twice, a SHARED name, an error handler that
+runs while the procedure is active.
+
+The one exception is a fixed-length string -- a `STRING * n` variable, array
+element or record field -- given to an ordinary string parameter. As in
+QuickBASIC, the procedure works on a variable-length copy, which is copied
+back when it returns, padded with spaces or cut to the width as an assignment
+would be; until then the original keeps its value. A procedure that ends in
+an error, never to return, is not copied back.
+
+A variable passed by reference must be the parameter's type -- an INTEGER
+variable for an INTEGER parameter -- as QuickBASIC requires; to pass another
+type, pass an expression, such as `(A%)`, which is converted.
+
+An **array parameter** is written `name()`, and takes an array, written the
+same way, by reference: the procedure works on the caller's elements and
+bounds, and a `REDIM` or `ERASE` in it reaches the caller. It has as many
+dimensions as the procedure subscripts it with.
+
+```basic
+SUB Fill(V(), N)
+    FOR I = LBOUND(V) TO UBOUND(V): V(I) = N: NEXT I
+END SUB
+DIM Scores(10)
+Fill Scores(), 1
+```
+
+`DECLARE SUB name (params)` and `DECLARE FUNCTION name (params) [AS type]`
+state a procedure's signature ahead of it, as QuickBASIC modules do; each is
+checked against the definition.
 
 ### Recursion
 
@@ -1430,46 +1786,64 @@ quote, so it reports the source line instead, which is the only number its
 author can act on. A statement ahead of the first line number does the same.
 
 Checked: array subscripts (against every dimension, and against the lower
-bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
-run, division by zero for `/`, `\` and `MOD`, a `\` or `MOD` whose quotient
-overflows, `SQR` of a negative number, `LOG` of a non-positive number, a file
-number outside 1 to 15, `GOSUB` nested deeper than the return stack holds,
-allocation failure, a random-access operation on a file not opened `FOR
-RANDOM`, `FIELD` widths that overrun the record, a `CV` conversion given too
-few bytes, and a `LOCK` another process already holds.
+bound), a `DIM` of an array that already exists, division by zero for `/`, `\` and `MOD`, every arithmetic result and
+conversion that does not fit its type, `SQR` of a negative number, `LOG` of a
+non-positive number, a file number outside 1 to 15, `GOSUB` nested deeper than
+the return stack holds, a `RETURN` with no `GOSUB` of its own scope to go back
+to, `READ` past the last `DATA` item, allocation failure, each way `OPEN` can
+fail, a file used against the mode it was opened in, `FIELD` widths that
+overrun the record, a `CV` conversion given too few bytes, and a `LOCK` another
+process already holds.
+
+A comparison involving NaN follows IEEE: it is false, except `<>`, which is
+true. Arithmetic never produces one in a checked program -- each way to is an
+error -- so this matters under `--unsafe`, or for a NaN read from outside.
 
 The message names the fault, and each carries GW-BASIC's number for it:
 
 | No. | Message                  | Cause                                        |
 |-----|--------------------------|----------------------------------------------|
-| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive |
-| 6   | `Overflow`               | A `\` or `MOD` whose quotient does not fit   |
+| 2   | `Syntax error`           | `READ` of text that is not a number into a numeric variable |
+| 3   | `RETURN without GOSUB`   | A `RETURN` no `GOSUB` of its scope is waiting for |
+| 4   | `Out of DATA`            | A `READ` after the last `DATA` item          |
+| 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive, an argument out of range |
+| 6   | `Overflow`               | A result or conversion that does not fit its type |
 | 7   | `Out of memory`          | A string or array allocation that failed     |
 | 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
 | 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
-| 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
+| 10  | `Duplicate definition`   | A `DIM` of an array that already exists; `ERASE` or `REDIM` of a locked one |
 | 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
+| 13  | `Type mismatch`          | A `PRINT USING` value of the wrong kind for its field |
 | 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
-| 52  | `Bad file number`        | A file number outside 1 to 15                |
-| 53  | `File not found`         | Opening a file that is not there             |
-| 54  | `Bad file mode`          | `FIELD`, `GET` or `PUT` on a non-random file |
+| 52  | `Bad file number`        | A file number outside 1 to 15, or not open   |
+| 53  | `File not found`         | Opening a file for `INPUT` that is not there |
+| 54  | `Bad file mode`          | Writing a file opened for reading, reading one opened for writing, or `FIELD`, `GET` or `PUT` on a non-random file |
 | 55  | `File already open`      | `OPEN` on a file number already in use       |
 | 62  | `Input past end of file` | Reading past the end of an input file        |
-| 70  | `Permission denied`      | A `LOCK` someone else already holds          |
+| 64  | `Bad file name`          | `OPEN` of an empty or malformed name         |
+| 70  | `Permission denied`      | A file the program may not open that way, or a `LOCK` someone else holds |
+| 75  | `Path/File access error` | Any other `OPEN` failure, such as a directory |
+| 76  | `Path not found`         | Creating a file in a directory that is not there |
 
 ### ERROR
 
 `ERROR n` raises the error numbered `n`, exactly as if the runtime had raised
 it. The number must be 1 to 255; one the table above does not list is raised as
-`Unprintable error`, which is GW-BASIC's own wording.
+`Unprintable error`, which is GW-BASIC's own wording, and a handler sees it as
+`ERR`, so a program may number errors of its own: `ERROR 200`, then
+`IF ERR = 200` in the handler.
 
 ```basic
 10 IF Total < 0 THEN ERROR 5
 20 PRINT "fine"
 ```
 
-Two numbers appear twice above. `ERROR 7` and `ERROR 9` raise the first message
-listed for each -- `Out of memory` and `Subscript out of range`.
+One number appears twice above: `ERROR 7` raises the first message listed for
+it, `Out of memory`.
+
+`RESUME without error` -- a `RESUME` with no error to return from -- has no
+number, and is never trapped: a handler that caught its own failing `RESUME`
+would be re-entered by it forever.
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:
@@ -1495,9 +1869,10 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`
-- **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
+- **Console control** -- `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
+- **Operating system** -- `SHELL`, `ENVIRON`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
+- **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`, `LCOPY`
+- **Odds and ends** -- `INPUT$`
 
 ### Out of scope
 
@@ -1505,17 +1880,24 @@ written. Programs using them are refused today.
 `CIRCLE`, `DRAW`, `PAINT`, `POINT`, `VIEW`, `WINDOW`, `PALETTE`, `PMAP`. These
 need a display this compiler does not provide.
 
-**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`, `USR`,
-`INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`. There is no fixed address worth naming
+**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`,
+`VARSEG`, `USR`, `INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`, `PCOPY`. There is no fixed address worth naming
 in a 64-bit hosted program: the video buffer is not memory, addresses are
 randomised, and the pages are protected. A `POKE` that appeared to work would be
 the worst outcome available, so these are refused rather than emulated.
 
 **Commands to the interpreter** -- `RUN`, `LIST`, `LOAD`, `SAVE`, `MERGE`,
-`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `TRON`, `TROFF`, `CLEAR`.
+`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `LLIST`, `TRON`, `TROFF`, `CLEAR`.
 These operate on program text that a compiled program no longer has.
 
 **Program chaining** -- `CHAIN` and `COMMON` need separate compilation.
+
+**MS-DOS devices** -- `ERDEV`, `ERDEV$`, `EXTERR`, `IOCTL`, `IOCTL$`, `MOTOR`, the
+light pen (`PEN`) and joysticks (`STICK`, `STRIG`).
+
+**Event trapping** -- `ON TIMER`, `ON KEY`, `ON COM`, `ON PEN`, `ON PLAY`,
+`ON STRIG` and their `ON`/`OFF`/`STOP` switches. These would interrupt the
+program between statements, which compiled code has no point to do.
 
 Everything else GW-BASIC provides that is missing here is listed above as not
 yet implemented. Each refused name says which of the two it is.
@@ -1524,7 +1906,6 @@ yet implemented. Each refused name says which of the two it is.
 
 - Single module: no `COMMON`, and no separate compilation
 - A `FUNCTION` cannot return a `TYPE` record; pass one to a `SUB` instead
-- `PRINT USING` has no file form -- `PRINT #n, USING` is refused
 
 ---
 
@@ -1535,33 +1916,24 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 1. **Default type is Double** - Unsuffixed variables are `#` (Double), not Single
 2. **Division always returns Double** - Use `\` for integer division
 3. **Boolean true is -1** - Comparisons return -1 (true) or 0 (false)
-4. **Array indices start at 0** - `DIM A(10)` creates 11 elements (0-10)
+4. **Array indices start at 0** by default - `DIM A(10)` creates 11 elements
+   (0-10); `OPTION BASE 1` and `DIM A(1 TO 10)` change that
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
-6. **Parameters are by-value only** - No `BYREF` support, records included:
-   a record argument is passed as the address of the caller's copy, which the
-   callee copies into a local, so changes to it do not escape
+6. **Parameters are by reference**, as in QuickBASIC; `BYVAL` passes a copy,
+   as does an argument in parentheses, `(A)`
 
 ### Deliberate Differences from GW-BASIC
 
 These are places where a GW-BASIC program will behave differently here. They
-are choices, not oversights, and each is checked by a test.
+are choices, not oversights.
 
-7. **Numbers print bare** - GW-BASIC pads a number with a leading space for the
-   sign and a trailing one; `PRINT 42` here writes `42` and nothing else.
-   `STR$` matches `PRINT` exactly, so it also omits GW-BASIC's leading space
-   and round-trips through `VAL`.
+1. **Bare `RANDOMIZE` seeds from the clock.** GW-BASIC asks the operator for a
+   seed; a compiled program has nobody to ask.
+2. **`FRE` returns a constant.** A compiled program has no BASIC string heap to
+   report on; listings use `FRE` to test for room, which there always is.
+3. **`DEF FN` is compiled, not interpreted.** A `DEF FN` may be used before the
+   line that defines it, and defining it twice is refused.
 
-8. **Assignment to an integer truncates** - `A% = 7.9` gives 7, where GW-BASIC
-   rounds to 8. `CINT` does round, half to even, as QuickBASIC does, so use
-   `A% = CINT(X)` when rounding is what is wanted.
-
-9. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
-   elements on first use. Here that is `Array used before DIM`, because the
-   implicit version silently hides a typo.
-
-10. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
-    `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
-
-11. **`LOC` on a sequential file counts 128-byte blocks**, which is what
-    GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
-    because the number is useful.
+`LOC` on a sequential file counts 128-byte blocks, which is what GW-BASIC
+reported on MS-DOS; it is kept for compatibility rather than because the
+number is useful.

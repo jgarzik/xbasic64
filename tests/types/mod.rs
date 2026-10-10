@@ -50,7 +50,7 @@ A# = 3.7: B% = A#: PRINT B%
     assert_eq!(lines[5], "-4", "cint -3.9");
     assert_eq!(lines[6], "42", "int to long");
     assert_eq!(lines[7], "42", "int to double");
-    assert_eq!(lines[8], "3", "double to int truncates");
+    assert_eq!(lines[8], "4", "double to int rounds");
 }
 
 #[test]
@@ -239,7 +239,9 @@ fn test_whole_record_assignment() {
     assert_eq!(lines, vec!["3  4", "3"], "A kept its own copy");
 }
 
-/// Arrays of records, including a nested field and a string field.
+/// Arrays of records, including a nested field and a string field. The
+/// fixed-length field holds its full width, padded with spaces, as it does in
+/// a record that is not an array element.
 #[test]
 fn test_arrays_of_records() {
     let output = compile_and_run(
@@ -247,7 +249,13 @@ fn test_arrays_of_records() {
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["Alice 30", "Bob 25"]);
+    assert_eq!(
+        lines,
+        vec![
+            format!("{:<20} 30", "Alice").as_str(),
+            format!("{:<20} 25", "Bob").as_str()
+        ]
+    );
 }
 
 /// A record array indexed by a loop variable.
@@ -264,7 +272,7 @@ fn test_record_array_in_loop() {
 #[test]
 fn test_record_visible_in_procedure() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB Bump\nG.X = G.X + 1\nEND SUB\nG.X = 5\nBump\nBump\nPRINT G.X\n",
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM SHARED G AS P\nSUB Bump\nG.X = G.X + 1\nEND SUB\nG.X = 5\nBump\nBump\nPRINT G.X\n",
     )
     .unwrap();
     assert_eq!(output.trim(), "7");
@@ -289,7 +297,7 @@ fn test_local_record_is_fresh_each_call() {
 #[test]
 fn test_record_storage_does_not_leak_between_procedures() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM G AS P\nSUB First(G AS P)\nPRINT G.X\nEND SUB\nSUB Second\nPRINT G.X\nEND SUB\nG.X = 7\nSecond\n",
+        "TYPE P\nX AS INTEGER\nEND TYPE\nDIM SHARED G AS P\nSUB First(G AS P)\nPRINT G.X\nEND SUB\nSUB Second\nPRINT G.X\nEND SUB\nG.X = 7\nSecond\n",
     )
     .unwrap();
     assert_eq!(output.trim(), "7");
@@ -311,11 +319,15 @@ fn test_local_records_in_sibling_procedures() {
 #[test]
 fn test_record_parameters() {
     let output = compile_and_run(
-        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\n",
+        "TYPE P\nX AS INTEGER\nY AS INTEGER\nEND TYPE\nSUB Show(V AS P)\nPRINT V.X; V.Y\nV.X = 99\nEND SUB\nSUB Look(BYVAL V AS P)\nV.Y = 0\nEND SUB\nDIM A AS P\nA.X = 7\nA.Y = 8\nShow(A)\nPRINT A.X\nLook A\nPRINT A.Y\n",
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["7  8", "7"], "the caller's record is unchanged");
+    assert_eq!(
+        lines,
+        vec!["7  8", "99", "8"],
+        "by reference the caller's record changes; BYVAL, it does not"
+    );
 }
 
 /// A record parameter mixed with ordinary ones, and a nested record.
@@ -344,7 +356,7 @@ fn test_as_typed_variables() {
 #[test]
 fn test_as_typed_parameters_and_result() {
     let output = compile_and_run(
-        "SUB T(N AS INTEGER, S AS STRING * 10)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
+        "SUB T(N AS INTEGER, S AS STRING)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
     )
     .unwrap();
     let lines = crate::common::lines(&output);
@@ -461,9 +473,8 @@ PRINT Y
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    // Assignment to an integer truncates here; LANGREF records that as a
-    // deliberate divergence from GW-BASIC, which rounds.
-    assert_eq!(lines, &["3", "3"], "7/2 and 3.7 both truncate to 3");
+    // Assignment to an integer rounds half to even, as in QuickBASIC.
+    assert_eq!(lines, &["4", "4"], "7/2 is 3.5 and rounds to 4, 3.7 to 4");
 }
 
 /// A suffix always wins over the default.
@@ -480,7 +491,7 @@ PRINT X#
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, &["3", "3.7"], "X is INTEGER, X# is DOUBLE");
+    assert_eq!(lines, &["4", "3.7"], "X is INTEGER, X# is DOUBLE");
 }
 
 /// Each of the five spellings, over its own letter range.
@@ -508,9 +519,9 @@ PRINT LEN(T)
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines[0], "3", "DEFINT");
-    assert_eq!(lines[1], "100000", "DEFLNG");
-    assert_eq!(lines[2], ".33333334", "DEFSNG carries ~7 digits");
+    assert_eq!(lines[0], "4", "DEFINT");
+    assert_eq!(lines[1], "100001", "DEFLNG");
+    assert_eq!(lines[2], ".3333333", "DEFSNG carries 7 digits");
     assert_eq!(
         lines[3], ".3333333333333333",
         "DEFDBL carries full precision"
@@ -554,7 +565,7 @@ PRINT A; B; C; E; F
     .unwrap();
     assert_eq!(
         output.trim(),
-        "1  1.7  1  1  1.7",
+        "2  1.7  2  2  1.7",
         "A, C and E are INTEGER; B and F stay DOUBLE"
     );
 }
@@ -578,8 +589,8 @@ Show 4.6
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        &["9", "4"],
-        "array elements and parameters both default"
+        &["10", "5"],
+        "array elements and parameters both default, and round"
     );
 }
 
@@ -597,4 +608,378 @@ PRINT MID$("hello", 2, 3)
     .unwrap();
     let lines = crate::common::lines(&output);
     assert_eq!(lines, &["4", "4", "ell"]);
+}
+
+/// Assigning one element of an array of records to another, or to and from
+/// a record variable, copies the whole record -- string fields included --
+/// so the two never share a string.
+#[test]
+fn test_record_element_assignment_copies() {
+    let output = compile_and_run(
+        "TYPE R\nN AS STRING * 5\nV AS INTEGER\nEND TYPE\nDIM P(3) AS R\nDIM Q AS R\n\
+         P(1).N = \"one\": P(1).V = 1\nP(2) = P(1)\nP(1).N = \"uno\"\nQ = P(2)\nP(3) = Q\nQ.N = \"q\"\n\
+         PRINT P(1).N; P(1).V; P(2).N; P(2).V; P(3).N; P(3).V; Q.N\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "uno   1 one   1 one   1 q");
+}
+
+/// SWAP exchanges whole records -- variables, array elements and nested
+/// record fields -- and a fixed-length string keeps its width when it swaps
+/// with an ordinary string.
+#[test]
+fn test_swap_records_and_fixed_strings() {
+    let output = compile_and_run(
+        "TYPE P\nX AS INTEGER\nN AS STRING * 4\nEND TYPE\nDIM Q AS P, R AS P, A(2) AS P\n\
+         Q.X = 1: Q.N = \"q\": R.X = 2: R.N = \"r\"\nSWAP Q, R\nPRINT Q.X; Q.N; R.X; R.N\n\
+         A(1) = Q: SWAP A(1), R: PRINT A(1).X; R.X\n\
+         DIM F AS STRING * 3\nF = \"abc\": S$ = \"longer\"\nSWAP F, S$\nPRINT \"[\"; F; \"][\"; S$; \"]\"; LEN(F)\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["2 r    1 q", "1  2", "[lon][abc] 3"]
+    );
+}
+
+/// A fixed-length string's width may be a CONST, as QuickBASIC allows.
+///
+/// The parser took only a number after `STRING *`, so `CONST W = 20: DIM S AS
+/// STRING * W` -- the usual way to keep a record's widths in one place -- was
+/// "Expected a positive length after STRING *, got identifier 'W'".
+#[test]
+fn test_fixed_length_string_width_from_a_const() {
+    let output = compile_and_run(
+        r#"
+CONST W = 5
+CONST NW% = 3
+DIM S AS STRING * W
+S = "ab"
+PRINT "["; S; "]"; LEN(S)
+TYPE R
+  N AS STRING * NW%
+  V AS INTEGER
+END TYPE
+DIM P AS R
+P.N = "abcdef": P.V = 7
+PRINT "["; P.N; "]"; P.V
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), &["[ab   ] 5", "[abc] 7"]);
+}
+
+/// The CONST must come first and be a positive whole number, and saying
+/// which rule was broken is the point.
+#[test]
+fn test_fixed_length_string_width_const_rules() {
+    let cases = [
+        (
+            "DIM S AS STRING * W\nCONST W = 5\n",
+            "not a CONST defined before",
+        ),
+        ("DIM S AS STRING * W\n", "not a CONST defined before"),
+        (
+            "CONST W = 0\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = -4\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = 2.5\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = \"x\"\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = 4\nTYPE R\nN AS STRING * Z\nEND TYPE\n",
+            "not a CONST defined before",
+        ),
+    ];
+    for (source, expected) in cases {
+        let err =
+            crate::common::compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains(expected),
+            "{source:?}: expected {expected:?}, got:\n{}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// A plain `AS STRING` is a variable-length string, exactly what a `$` suffix
+/// is, for a variable, an array, a parameter and a FUNCTION result.
+///
+/// It was refused everywhere with "A STRING field needs a fixed length",
+/// which is the rule for a TYPE field and only for one.
+#[test]
+fn test_plain_as_string_is_a_variable_length_string() {
+    let output = compile_and_run(
+        r#"
+DIM S AS STRING
+S = "hi"
+S = S + " there"
+PRINT S; LEN(S); UCASE$(S); MID$(S, 4)
+IF S = "hi there" THEN PRINT "equal"
+DIM A$(2) AS STRING
+A$(1) = "one": A$(2) = A$(1) + "+"
+PRINT A$(1); A$(2); LEN(A$(0))
+DIM T$
+T$ = S
+SWAP S, T$
+PRINT S
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &["hi there 8 HI THEREthere", "equal", "oneone+ 0", "hi there"]
+    );
+}
+
+#[test]
+fn test_plain_as_string_parameters_and_result() {
+    let output = compile_and_run(
+        r#"
+SUB Shout (T AS STRING)
+  T = UCASE$(T) + "!"
+END SUB
+SUB Keep (BYVAL T AS STRING)
+  T = "lost"
+  PRINT T
+END SUB
+FUNCTION Twice (T AS STRING) AS STRING
+  Twice = T + T
+END FUNCTION
+FUNCTION Greet AS STRING
+  Greet = "hello"
+END FUNCTION
+A$ = "hey"
+Shout A$
+PRINT A$
+DIM B AS STRING
+B = "bee"
+Shout B
+PRINT B
+Keep B
+PRINT B
+PRINT Twice("ab"); LEN(Twice(B)); Greet; UCASE$(Greet)
+C$ = Twice(Greet)
+PRINT C$
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &[
+            "HEY!",
+            "BEE!",
+            "lost",
+            "BEE!",
+            "abab 8 helloHELLO",
+            "hellohello"
+        ]
+    );
+}
+
+/// A string is a string whichever way it was declared, so a number cannot be
+/// stored in one declared `AS STRING`, nor a string in one declared `AS
+/// INTEGER` -- the declared type used to go unchecked on assignment.
+#[test]
+fn test_declared_types_are_checked_on_assignment() {
+    for (source, expected) in [
+        (
+            "DIM S AS STRING\nS = 5\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "DIM S AS STRING * 4\nS = 5\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "DIM N AS INTEGER\nN = \"x\"\n",
+            "cannot assign string value to numeric",
+        ),
+        (
+            "FUNCTION F AS STRING\nF = 1\nEND FUNCTION\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "FUNCTION F AS STRING\nF = \"x\"\nEND FUNCTION\nX = F\n",
+            "cannot assign string value to numeric",
+        ),
+        // An array's elements have its declared type.
+        (
+            "DIM A(3) AS STRING\nA(1) = 5\n",
+            "cannot assign numeric value to string",
+        ),
+    ] {
+        let err =
+            crate::common::compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains(expected),
+            "{source:?}: expected {expected:?}, got:\n{}",
+            err.stderr
+        );
+    }
+}
+
+/// Only a TYPE field needs a fixed length, and the message still says so.
+#[test]
+fn test_plain_as_string_field_is_refused() {
+    let err = crate::common::compile_only(
+        "TYPE R\nN AS STRING\nV AS INTEGER\nEND TYPE\nDIM P AS R\nP.V = 1\n",
+    )
+    .expect_err("a TYPE field needs a fixed length");
+    assert!(
+        err.contains("A STRING field needs a fixed length"),
+        "got:\n{}",
+        err.stderr
+    );
+    // One diagnostic, not a cascade: the rest of the TYPE still parses.
+    assert!(err.contains("1 error"), "got:\n{}", err.stderr);
+}
+
+/// A fixed-length string has its width from the start, as in QuickBASIC,
+/// which fills it with CHR$(0) until it is first assigned: a variable, an
+/// array element, a record field, and a procedure's local alike.
+#[test]
+fn test_unassigned_fixed_length_string_has_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 3
+END TYPE
+DIM F AS STRING * 5
+DIM A(2) AS STRING * 4
+DIM T AS R
+DIM U(1) AS R
+PRINT LEN(F); LEN(A(1)); LEN(T.N); LEN(U(0).N)
+PRINT ASC(F); ASC(T.N); ASC(MID$(A(2), 4))
+F = "ab"
+PRINT "["; F; "]"
+SUB S
+  DIM L AS STRING * 6
+  PRINT LEN(L)
+END SUB
+S
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["5  4  3  3", "0  0  0", "[ab   ]", "6"]
+    );
+}
+
+/// A scalar declared `AS INTEGER`, `AS LONG`, `AS SINGLE` or `AS DOUBLE`
+/// has its declared type whatever its name says, wherever it lives: an SSA
+/// value when nothing else can reach it, memory when something can.
+#[test]
+fn test_typed_scalars_keep_their_declared_type() {
+    let run = |src: &str| crate::common::compile_and_run_raw(src, "").expect("must compile");
+
+    // An unsuffixed INTEGER rounds half to even, and overflows past 32767.
+    let r = run("DIM X AS INTEGER\nX = 2.5: PRINT X\nX = 3.5: PRINT X\nX = 40000: PRINT X\n");
+    assert_eq!(r.lines(), &["2", "4"]);
+    assert!(r.stderr.contains("Overflow in 4"), "{:?}", r.stderr);
+    assert_eq!(r.exit_code, Some(1));
+
+    let r = run("DIM L AS LONG\nL = 2147483647: PRINT L\nL = L + 1: PRINT L\n");
+    assert_eq!(r.lines(), &["2147483647"]);
+    assert!(r.stderr.contains("Overflow in 3"), "{:?}", r.stderr);
+    assert_eq!(r.exit_code, Some(1));
+
+    let out =
+        compile_and_run("DIM F AS SINGLE, D AS DOUBLE\nF = 1 / 3: D = 1 / 3: PRINT F: PRINT D\n")
+            .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &[".3333333", ".3333333333333333"]
+    );
+}
+
+/// Typed scalars through GOTO into a loop, recursion, FOR, SWAP, INPUT and
+/// READ, and a DIM run again in a loop -- which never re-zeroes.
+#[test]
+fn test_typed_scalars_in_control_flow() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "DIM K AS INTEGER, N AS LONG\nGOTO 20\n10 N = N + 100\n20 FOR K = 1 TO 3\n\
+             30 N = N + K\n40 NEXT K\nIF N < 100 THEN GOTO 10\nPRINT N; K\n",
+            &["112  4"],
+        ),
+        // Each call has a T of its own, starting at 0.
+        (
+            "PRINT F(4)\nFUNCTION F(N%)\nDIM T AS LONG\nT = T + N%\n\
+             IF N% > 1 THEN T = T + F(N% - 1)\nF = T\nEND FUNCTION\n",
+            &["10"],
+        ),
+        (
+            "CALL P: CALL P\nSUB P\nDIM X AS INTEGER\nPRINT X\nX = 5\nEND SUB\n",
+            &["0", "0"],
+        ),
+        (
+            "DIM K AS LONG\nFOR K = 1 TO 10: S = S + K: NEXT\nPRINT S; K\n",
+            &["55  11"],
+        ),
+        (
+            "DIM A AS INTEGER, B AS INTEGER\nA = 1: B = 2: SWAP A, B: PRINT A; B\n\
+             C% = 9: SWAP A, C%: PRINT A; C%\n",
+            &["2  1", "9  2"],
+        ),
+        (
+            "DIM Z AS LONG, G AS SINGLE\nREAD Z, G: PRINT Z; G\nDATA 123456, 2.5\n",
+            &["123456  2.5"],
+        ),
+        (
+            "FOR I = 1 TO 3\nDIM X AS INTEGER\nX = X + 1\nPRINT X\nNEXT\n",
+            &["1", "2", "3"],
+        ),
+    ];
+    for (src, want) in cases {
+        let out = compile_and_run(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+        assert_eq!(&crate::common::lines(&out), want, "{src}");
+    }
+
+    let out = crate::common::compile_and_run_with_stdin(
+        "DIM X AS INTEGER, Y AS SINGLE\nINPUT X, Y\nPRINT X; Y\n",
+        "7.5, 2.25\n",
+    )
+    .unwrap();
+    // Windows ends the line with CRLF.
+    assert!(
+        out.replace("\r\n", "\n").ends_with(" 8  2.25 \n"),
+        "{out:?}"
+    );
+}
+
+/// Typed scalars something else can reach stay in memory and behave so: one
+/// passed by reference sees the SUB's change, a DIM SHARED one the SUB's
+/// update, and a STATIC one keeps its value between calls.
+#[test]
+fn test_reachable_typed_scalars() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "DIM X AS INTEGER\nX = 5: CALL P(X): PRINT X\nSUB P(A AS INTEGER)\nA = A * 2\nEND SUB\n",
+            &["10"],
+        ),
+        (
+            "DIM SHARED X AS LONG\nX = 7: CALL P: PRINT X\nSUB P\nX = X + 1\nEND SUB\n",
+            &["8"],
+        ),
+        (
+            "CALL P: CALL P: CALL P\nSUB P\nSTATIC N AS INTEGER\nN = N + 1: PRINT N\nEND SUB\n",
+            &["1", "2", "3"],
+        ),
+    ];
+    for (src, want) in cases {
+        let out = compile_and_run(src).unwrap_or_else(|e| panic!("{src}\n{e}"));
+        assert_eq!(&crate::common::lines(&out), want, "{src}");
+    }
 }

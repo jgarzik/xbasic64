@@ -17,16 +17,55 @@
 .equ STD_ERROR_HANDLE, -12
 
 .data
+# Named by generated code, which is a separate object: the program's
+# checks pass these messages to _rt_error, and its trapping code reads
+# and writes the state below.
+.globl _err_fmt_line
+.globl _err_fmt_bare
+.globl _err_syntax
+.globl _err_subscript
+.globl _err_typemismatch
+.globl _err_div0
+.globl _err_domain
+.globl _err_overflow
+.globl _err_dupdef
+.globl _err_memory
+.globl _err_gosub
+.globl _err_noreturn
+.globl _err_outofdata
+.globl _err_badfile
+.globl _err_badmode
+.globl _err_fieldovf
+.globl _err_permission
+.globl _err_notfound
+.globl _err_alreadyopen
+.globl _err_pastend
+.globl _err_badname
+.globl _err_access
+.globl _err_pathnotfound
+.globl _err_unprintable
+.globl _err_resnoerr
+.globl _err_handler
+.globl _err_pending
+.globl _err_active
+.globl _err_line
+
 _err_fmt_line: .asciz "?%s in %lld\r\n"
 _err_fmt_bare: .asciz "?%s\r\n"
+_stop_fmt_line: .asciz "Break in %lld\r\n"
+_stop_fmt_bare: .asciz "Break\r\n"
 
+_err_syntax:    .asciz "Syntax error"
 _err_subscript: .asciz "Subscript out of range"
+_err_typemismatch: .asciz "Type mismatch"
 _err_div0:      .asciz "Division by zero"
 _err_domain:    .asciz "Illegal function call"
 _err_overflow:  .asciz "Overflow"
-_err_undim:     .asciz "Array used before DIM"
+_err_dupdef:    .asciz "Duplicate definition"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
+_err_noreturn:  .asciz "RETURN without GOSUB"
+_err_outofdata: .asciz "Out of DATA"
 _err_badfile:   .asciz "Bad file number"
 _err_badmode:   .asciz "Bad file mode"
 _err_fieldovf:  .asciz "FIELD overflow"
@@ -34,12 +73,14 @@ _err_permission: .asciz "Permission denied"
 _err_notfound: .asciz "File not found"
 _err_alreadyopen: .asciz "File already open"
 _err_pastend: .asciz "Input past end of file"
+_err_badname: .asciz "Bad file name"
+_err_access: .asciz "Path/File access error"
+_err_pathnotfound: .asciz "Path not found"
 
 _err_unprintable: .asciz "Unprintable error"
 # RESUME's own failures. Never trapped -- a handler that trapped them would be
 # re-entered by its own RESUME, forever.
 _err_resnoerr: .asciz "RESUME without error"
-_err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 
 # GW-BASIC's own error numbers, so that a listing's `IF ERR = 53` means what it
 # meant in 1983. Pairs of (message, number), terminated by a zero message.
@@ -54,20 +95,27 @@ _err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 # two messages share a number the first one listed is the one ERROR n raises.
 .p2align 3
 _err_codes:
+    .quad _err_syntax,      2
+    .quad _err_noreturn,    3
+    .quad _err_outofdata,   4
     .quad _err_domain,      5
     .quad _err_overflow,    6
     .quad _err_memory,      7
     .quad _err_gosub,       7
     .quad _err_subscript,   9
-    .quad _err_undim,       9
+    .quad _err_dupdef,      10
     .quad _err_div0,        11
+    .quad _err_typemismatch, 13
     .quad _err_fieldovf,    50
     .quad _err_badfile,     52
     .quad _err_notfound,    53
     .quad _err_badmode,     54
     .quad _err_alreadyopen, 55
     .quad _err_pastend,     62
+    .quad _err_badname,     64
     .quad _err_permission,  70
+    .quad _err_access,      75
+    .quad _err_pathnotfound, 76
     .quad 0, 0
 
 # Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
@@ -84,50 +132,16 @@ _err_bytes_written: .skip 8
 # what .bss gives for free.
 .bss
 .p2align 3
-_err_handler: .skip 8       # where to jump, 0 = trapping off
+_err_handler: .skip 8       # which ON ERROR target, numbered from 1; 0 = trapping off
+_err_pending: .skip 8       # 1 from a trapped error until its handler runs;
+                            # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
-_err_line:    .skip 8       # the line now running; codegen stores it per statement
+_err_line:    .skip 8       # the line now running: codegen stores it per statement
+                            # when trapping, else before each call that can fail
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
-_err_stmt:    .skip 8       # index of the module-level statement now running
-_err_resume:  .skip 8       # _err_stmt as it was when trapped; -1 = not resumable
-_err_depth:   .skip 8       # procedure nesting, so an error inside one is known
-# rsp, rbx, rbp, r12, r13, r14, r15, rdi, rsi. Win64 calls rdi and rsi
-# callee-saved where System V does not, so this tree saves two more; the
-# offsets are otherwise the same in both.
-_err_ctx:     .skip 80
 
 .text
-
-# _rt_trap_capture - Record what a trapped error must restore
-#
-# Called once from main's prologue when the program contains ON ERROR. Taking
-# it here rather than in codegen keeps the register set -- which differs
-# between the ABIs -- in the tree that knows about it.
-#
-# The values saved are the ones the C runtime handed main, because main's
-# prologue has not touched a callee-saved register yet. Restoring them on a
-# trap therefore leaves main's eventual `leave; ret` exactly as clean as it is
-# without trapping.
-#
-# xmm6-xmm15 are callee-saved here too, but nothing in this tree touches them
-# and codegen's only user of xmm6+ is FOR-loop register promotion, which is
-# switched off in a program that traps.
-#
-# Arguments: none      Returns: nothing
-.globl _rt_trap_capture
-_rt_trap_capture:
-    lea rax, [rsp + 8]      # the caller's rsp, past our return address
-    mov QWORD PTR [rip + _err_ctx + 0], rax
-    mov QWORD PTR [rip + _err_ctx + 8], rbx
-    mov QWORD PTR [rip + _err_ctx + 16], rbp
-    mov QWORD PTR [rip + _err_ctx + 24], r12
-    mov QWORD PTR [rip + _err_ctx + 32], r13
-    mov QWORD PTR [rip + _err_ctx + 40], r14
-    mov QWORD PTR [rip + _err_ctx + 48], r15
-    mov QWORD PTR [rip + _err_ctx + 56], rdi
-    mov QWORD PTR [rip + _err_ctx + 64], rsi
-    ret
 
 # _rt_err - ERR: the number of the error that was trapped
 #
@@ -151,35 +165,62 @@ _rt_erl:
 #   rcx = error number
 #   rdx = BASIC line number, or 0 when unknown
 #
-# Returns: never -- tail-calls _rt_error with the matching message.
+# Returns: only when a handler traps the error, as _rt_error does.
+#
+# ERR is n itself, not the number the message maps back to; see the System V
+# twin.
 .globl _rt_error_num
 _rt_error_num:
+    mov r9, rcx                     # ERR, whatever the message
     lea rax, [rip + _err_codes]
 .Lnum_scan:
     mov r8, QWORD PTR [rax]         # message, or 0 at the end
     test r8, r8
     jz .Lnum_unknown
-    cmp QWORD PTR [rax + 8], rcx
+    cmp QWORD PTR [rax + 8], r9
     je .Lnum_found
     add rax, 16
     jmp .Lnum_scan
 .Lnum_found:
     mov rcx, r8
-    jmp _rt_error
+    jmp .Lerror_raise
 .Lnum_unknown:
     lea rcx, [rip + _err_unprintable]
-    jmp _rt_error
+    jmp .Lerror_raise
 
 # _rt_error - Report a runtime error and terminate
 # Arguments (Win64):
 #   rcx = message pointer (NUL-terminated)
-#   rdx = BASIC line number, or 0 when unknown
+#   rdx = BASIC line number, or 0 for the one in _err_line
 #
-# Returns: never unless a handler is armed, in which case it does not return
-# *here* either -- it abandons every frame between this one and main and jumps
-# to the handler.
+# Returns: only when a handler traps the error, with _err_pending set.
+# Otherwise never (exit code 1).
 .globl _rt_error
 _rt_error:
+    # ERR is the number this message carries. Unknown text reports 0 rather
+    # than inventing a code.
+    lea r8, [rip + _err_codes]
+.Ltrap_scan:
+    mov r9, QWORD PTR [r8]
+    test r9, r9
+    jz .Ltrap_scan_done             # r9 = 0: not listed
+    cmp r9, rcx
+    je .Ltrap_found
+    add r8, 16
+    jmp .Ltrap_scan
+.Ltrap_found:
+    mov r9, QWORD PTR [r8 + 8]
+.Ltrap_scan_done:
+
+# The common path, with r9 = the number ERR is to report.
+.Lerror_raise:
+    # An error already on its way to the handler wins. Its helper may carry on
+    # to the end of what it was doing -- printing the rest of a number to the
+    # same unopened file, say -- and each step fails the same way; the first
+    # failure is the one the handler hears about.
+    cmp QWORD PTR [rip + _err_pending], 0
+    jne .Ltrap_return
+
     # Trapping only when ON ERROR armed one and no handler is already running:
     # GW-BASIC does not trap an error raised inside a handler, which is also
     # what stops handler -> error -> handler from looping forever.
@@ -192,23 +233,6 @@ _rt_error:
     cmp QWORD PTR [rip + _err_active], 0
     jne _rt_fatal
 
-    # ERR is the number this message carries. Unknown text reports 0 rather
-    # than inventing a code.
-    lea r8, [rip + _err_codes]
-.Ltrap_scan:
-    mov r9, QWORD PTR [r8]
-    test r9, r9
-    jz .Ltrap_unknown
-    cmp r9, rcx
-    je .Ltrap_found
-    add r8, 16
-    jmp .Ltrap_scan
-.Ltrap_found:
-    mov r9, QWORD PTR [r8 + 8]
-    jmp .Ltrap_store
-.Ltrap_unknown:
-    xor r9d, r9d
-.Ltrap_store:
     mov QWORD PTR [rip + _err_code], r9
     # Snapshot the line as well. The handler is ordinary module-level code, so
     # its own statements overwrite _err_line the moment it starts running --
@@ -216,33 +240,17 @@ _rt_error:
     mov r9, QWORD PTR [rip + _err_line]
     mov QWORD PTR [rip + _err_erl], r9
 
-    # And what RESUME would go back to. The handler is ordinary module-level
-    # code, so its own statements overwrite _err_stmt the moment it starts;
-    # -1 when the error came from inside a procedure, whose frame the unwind
-    # below discards, leaving nothing for a bare RESUME to return to.
-    mov r9, QWORD PTR [rip + _err_stmt]
-    cmp QWORD PTR [rip + _err_depth], 0
-    je .Ltrap_resumable
-    mov r9, -1
-.Ltrap_resumable:
-    mov QWORD PTR [rip + _err_resume], r9
-    mov QWORD PTR [rip + _err_depth], 0
     mov QWORD PTR [rip + _err_active], 1
 
-    # Abandon every frame between here and main. ERL is already set: codegen
-    # stores the line at each statement, which is the only way the file
-    # helpers can report one -- seven of their error sites have no line to
-    # pass and say so in their own comments.
-    mov rbx, QWORD PTR [rip + _err_ctx + 8]
-    mov rbp, QWORD PTR [rip + _err_ctx + 16]
-    mov r12, QWORD PTR [rip + _err_ctx + 24]
-    mov r13, QWORD PTR [rip + _err_ctx + 32]
-    mov r14, QWORD PTR [rip + _err_ctx + 40]
-    mov r15, QWORD PTR [rip + _err_ctx + 48]
-    mov rdi, QWORD PTR [rip + _err_ctx + 56]
-    mov rsi, QWORD PTR [rip + _err_ctx + 64]
-    mov rsp, QWORD PTR [rip + _err_ctx + 0]
-    jmp rax
+    # Return to whoever raised it. Generated code tests _err_pending after
+    # every call that can fail; the statement's fault block then calls the
+    # handler, on top of whatever faulted, and RESUMEs from what it returns.
+    # A runtime helper that called this returns first, through its own
+    # epilogue. Nothing is abandoned, so there is no register state to
+    # restore.
+    mov QWORD PTR [rip + _err_pending], 1
+.Ltrap_return:
+    ret
 
 # _rt_fatal - Report and exit, without consulting the handler
 #
@@ -262,6 +270,13 @@ _rt_fatal:
 
     mov rbx, rcx            # message
     mov rsi, rdx            # line number
+
+    # A helper given no line passes 0; _err_line holds it. See the System V
+    # twin.
+    test rsi, rsi
+    jnz .Lerr_have_line
+    mov rsi, QWORD PTR [rip + _err_line]
+.Lerr_have_line:
 
     # sprintf(_err_buf, fmt, message [, line])
     lea rcx, [rip + _err_buf]
@@ -290,3 +305,39 @@ _rt_fatal:
 
     mov ecx, 1
     call ExitProcess
+    ud2                     # exit does not return
+
+# _rt_stop - STOP: say where, and end the program
+#
+# See the System V twin. Console output here is written straight through, so
+# there is nothing to flush first.
+#
+# Arguments: rcx = BASIC line number, or 0 when unknown
+# Returns: never (exit code 0)
+.globl _rt_stop
+_rt_stop:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40             # shadow space + the 5th WriteFile argument
+    lea rdx, [rip + _stop_fmt_bare]
+    test rcx, rcx
+    jz .Lstop_fmt
+    lea rdx, [rip + _stop_fmt_line]
+.Lstop_fmt:
+    mov r8, rcx             # the line, if the format wants it
+    lea rcx, [rip + _err_buf]
+    call sprintf
+    mov rbx, rax            # length
+    mov ecx, STD_ERROR_HANDLE
+    call GetStdHandle
+    mov rcx, rax
+    lea rdx, [rip + _err_buf]
+    mov r8, rbx
+    lea r9, [rip + _err_bytes_written]
+    mov QWORD PTR [rsp + 32], 0
+    call WriteFile
+    add rsp, 40
+    pop rbx
+    leave
+    jmp _rt_end

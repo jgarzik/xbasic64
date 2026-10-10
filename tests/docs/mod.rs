@@ -24,7 +24,10 @@ fn basic_blocks(markdown: &str) -> Vec<String> {
                 }
             }
             Some(body) => {
-                if line.trim_start().starts_with("```") {
+                // Only a bare fence closes a block, as CommonMark has it: a
+                // line such as "``` text" leaves the block open, so text was
+                // once swallowed into an example that this then compiled.
+                if line.trim() == "```" {
                     blocks.push(std::mem::take(body));
                     current = None;
                 } else {

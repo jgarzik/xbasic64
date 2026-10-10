@@ -10,7 +10,7 @@ xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBA
 
 - **Nostalgia**: Write and run classic BASIC programs on modern hardware
 - **Education**: Learn compiler design with a simple, readable Rust codebase
-- **Simplicity**: Direct AST-to-assembly compilation with no intermediate representation
+- **Simplicity**: The AST is lowered straight to Cranelift IR, which emits native code
 
 ## Features
 
@@ -28,8 +28,8 @@ xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBA
   conversion family
 - `DATA`/`READ`/`RESTORE` for inline data
 - Formatted output with `PRINT USING`
-- Runtime checks for out-of-range subscripts and division by zero, with
-  `--unsafe` to remove them
+- Runtime checks for out-of-range subscripts, division by zero and arithmetic
+  overflow, with `--unsafe` to remove them
 - Diagnostics that name the file, line and problem rather than failing at link
   time, including a reason for every GW-BASIC keyword the compiler does not
   provide, so a program using one is refused rather than quietly misbehaving
@@ -51,7 +51,7 @@ xbasic64 program.bas
 # Specify output file
 xbasic64 program.bas -o myprogram
 
-# Emit assembly only (no linking)
+# Write the program's Cranelift IR to program.clif instead of compiling it
 xbasic64 -S program.bas
 
 # Omit the runtime safety checks
@@ -83,28 +83,31 @@ Save as `fib.bas`, compile with `xbasic64 fib.bas`, and run `./fib`.
 The compiler is a four-stage pipeline:
 
 ```
-Source → Lexer → Parser → Semantic Analysis → Code Generator → Assembly → Executable
-              (tokens)   (AST)              (symbols)        (x86-64)
+Source → Lexer → Parser → Semantic Analysis → Code Generator → Object → Executable
+              (tokens)   (AST)              (symbols)     (Cranelift IR)
 ```
 
 1. **Lexer** - Tokenizes BASIC source (case-insensitive keywords, line numbers, type suffixes)
 2. **Parser** - Recursive descent parser producing an AST
 3. **Semantic analysis** - Resolves names, checks types and argument counts, and
    reports problems with a source line
-4. **Code Generator** - Direct AST-to-x86-64 assembly translation
+4. **Code Generator** - Lowers the AST to Cranelift IR; Cranelift does instruction
+   selection and register allocation and writes the object file
 
-The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability.
+The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability. It is assembled once, when the compiler is built, and linked beside each program.
 
 Key design choices:
-- No IR—direct AST to assembly for simplicity
-- System V AMD64 ABI for libc interoperability
+- No IR of its own: the AST is lowered directly to Cranelift's
+- Each platform's standard ABI, for libc interoperability
 - GW-BASIC type semantics (division always returns Double)
 
 ## Requirements
 
-- Rust toolchain
-- Linux: system assembler (`as`) and C compiler/linker (`cc`) with libc
-- Windows: Clang (used to assemble) and the MSVC linker (`link.exe`)
+- Rust 1.96 or later
+- Linux: the system assembler (`as`) to build the compiler, which assembles
+  its runtime library; the C compiler/linker (`cc`) with libc to link programs
+- Windows: Clang to build the compiler (it assembles the runtime), and the MSVC
+  linker (`link.exe`) to link programs
 
 ## Platforms
 

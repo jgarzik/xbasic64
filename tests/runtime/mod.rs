@@ -200,7 +200,8 @@ fn test_end_labels_bound_their_own_data() {
 /// class of defect sat latent in the System V tree.
 ///
 /// On entry `rsp` is 8 (mod 16), because the caller's `call` pushed a return
-/// address. Walking each function linearly is sound because none of them
+/// address -- for a local label some helper `call`s as well as for a function.
+/// Walking each function linearly is sound because none of them
 /// changes `rsp` inside a branch that rejoins at a different depth; a
 /// `lea rsp, ...` restores a frame, after which the model stops trusting
 /// itself rather than reporting a guess.
@@ -213,6 +214,14 @@ fn test_runtime_calls_are_stack_aligned() {
             let mut func = String::new();
             let mut offset: i64 = 8;
             let mut unknown = false;
+            // Local labels some helper reaches by `call`: shared tails such as
+            // `.Lopen_failed` are entered with a return address pushed, like a
+            // function, whatever the code above them left rsp at.
+            let called: std::collections::HashSet<&str> = text
+                .lines()
+                .filter_map(|l| l.split('#').next()?.trim().strip_prefix("call .L"))
+                .map(|t| t.trim())
+                .collect();
 
             for (i, raw) in text.lines().enumerate() {
                 let line = raw.split('#').next().unwrap_or("").trim();
@@ -227,7 +236,10 @@ fn test_runtime_calls_are_stack_aligned() {
                 // A top-level label reopening the current function resets the
                 // model; a local `.L` label is inside one and does not.
                 if let Some(name) = line.strip_suffix(':') {
-                    if name == func {
+                    let entered_by_call = name
+                        .strip_prefix(".L")
+                        .is_some_and(|local| called.contains(local));
+                    if name == func || entered_by_call {
                         offset = 8;
                         unknown = false;
                     }
@@ -243,17 +255,18 @@ fn test_runtime_calls_are_stack_aligned() {
                         (offset - n.trim().parse::<i64>().expect("literal reserve")).rem_euclid(16);
                 } else if let Some(n) = line.strip_prefix("add rsp, ") {
                     offset = (offset + n.trim().parse::<i64>().expect("literal release")) % 16;
-                } else if let Some(target) = line.strip_prefix("call ") {
-                    if !unknown && offset != 0 {
-                        problems.push(format!(
-                            "{}:{}: in {}: call {} with rsp % 16 == {} (want 0)",
-                            path,
-                            i + 1,
-                            func,
-                            target.trim(),
-                            offset
-                        ));
-                    }
+                } else if let Some(target) = line.strip_prefix("call ")
+                    && !unknown
+                    && offset != 0
+                {
+                    problems.push(format!(
+                        "{}:{}: in {}: call {} with rsp % 16 == {} (want 0)",
+                        path,
+                        i + 1,
+                        func,
+                        target.trim(),
+                        offset
+                    ));
                 }
             }
         }
@@ -293,12 +306,7 @@ fn test_helpers_preserve_callee_saved_registers() {
     //
     // `_rt_random_prepare` returns four values in callee-saved registers: it is
     // reached only from GET and PUT, which save them for it.
-    //
-    // `_rt_error` writes the whole callee-saved set on its trapping path, which
-    // is the opposite of clobbering it -- the values come from `_err_ctx` and
-    // are main's, and the path ends in a jump to the handler rather than a
-    // return, so there is no caller left to preserve anything for.
-    const PRIVATE_CONVENTION: &[&str] = &["_rt_random_prepare", "_rt_error"];
+    const PRIVATE_CONVENTION: &[&str] = &["_rt_random_prepare"];
 
     let mut problems = Vec::new();
 

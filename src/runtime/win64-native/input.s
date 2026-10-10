@@ -1,32 +1,44 @@
-# BASIC Runtime: Input Functions (Win64 Native - Pure Win32 API)
+# BASIC Runtime: Console Input (INPUT, LINE INPUT) - Win64 Native
 #
-# Keyboard input functions using Win32 API (ReadFile) instead of libc scanf.
-# Uses UCRT strtod for number parsing.
+# INPUT reads a whole line and splits it on commas, as GW-BASIC and QuickBASIC
+# do: a field may be quoted, which lets it hold a comma; an unquoted one has
+# its surrounding blanks dropped. Every field is checked against the variable
+# it is for before any is stored: a number must be one and nothing else (read
+# by _rt_scan_number, as VAL reads one) and must fit the variable's type; a
+# quoted field is a string only. A line that fails any of that, or has too few
+# fields, prints "?Redo from start" and asks again -- prompt and all. More
+# fields than variables print "?Extra ignored". At the end of the input every
+# variable reads as empty, rather than the statement waiting forever.
+#
+# This replaced a reader per variable: scanf("%lf") for a number, which left
+# what followed the number for the next INPUT, and the whole raw line for a
+# string, so `INPUT A$, B$` read two lines and a comma meant nothing.
+
 #
 # Win64 ABI:
 #   - Integer args: rcx, rdx, r8, r9 (then stack)
 #   - 32-byte shadow space required before every call
 #   - Callee-saved: rbx, rbp, rdi, rsi, r12-r15
-#
 
 # Win32 API Constants
 .equ STD_INPUT_HANDLE, -10
+.equ MAX_INPUT_FIELDS, 64       # sema refuses an INPUT with more variables
 
-# ASCII character codes
-.equ CHAR_LF, 10
-.equ CHAR_CR, 13
-
-# Buffer size constants
-.equ INPUT_BUF_SIZE, 1024
-.equ MAX_INPUT_LEN, 1023            # INPUT_BUF_SIZE - 1 (for null terminator)
+.data
+_in_redo:  .asciz "?Redo from start"
+_in_extra: .asciz "?Extra ignored"
 
 # All zero-filled, so .bss rather than .data -- see data_defs.s. The .text
 # below restores the section for the code that follows.
 .bss
 .p2align 3
 _stdin_handle: .skip 8
-_input_buf: .skip 1024           # Buffer for string input
 _bytes_read: .skip 8             # For ReadFile output parameter
+_input_fptr: .skip 8 * MAX_INPUT_FIELDS     # where each field starts
+_input_flen: .skip 8 * MAX_INPUT_FIELDS     # and its length
+_input_vals: .skip 8 * MAX_INPUT_FIELDS     # a numeric field's value
+_input_buf: .skip 1024           # the line read
+_rl_char: .skip 8                # one byte from ReadFile
 
 .text
 
@@ -46,141 +58,353 @@ _rt_init_input:
     leave
     ret
 
-# _rt_input_string - Read a line of text from stdin
-# Reads characters until newline (which is not included in result).
-# Uses a static buffer, so the returned pointer is only valid until the next
-# call to _rt_input_string.
+# _rt_con_read_line - Read one line from stdin into _input_buf
+#
+# A byte at a time, so a line is all that is taken: reading the most ReadFile
+# would give took every line a pipe had ready, and the next INPUT found none.
+# The newline is consumed and not kept, as is a CR before it. A line longer
+# than the buffer keeps its first 1023 characters. The console's column is 0
+# afterwards.
 #
 # Arguments: none
-#
 # Returns:
-#   rax = pointer to string data (in _input_buf)
-#   rdx = length of string
+#   rax = length (the text is also NUL-terminated)
+#   edx = 1 when the input had ended and nothing was read, else 0
+.globl _rt_con_read_line
+_rt_con_read_line:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 48             # shadow space + the 5th ReadFile argument
+    xor ebx, ebx            # length
+    xor r12d, r12d          # 1 once anything, even a newline, was read
+.Lrl_loop:
+    mov rcx, QWORD PTR [rip + _stdin_handle]
+    lea rdx, [rip + _rl_char]
+    mov r8d, 1
+    lea r9, [rip + _bytes_read]
+    mov QWORD PTR [rsp + 32], 0
+    call ReadFile
+    test eax, eax
+    jz .Lrl_end_input       # a broken pipe is the end of the input too
+    cmp DWORD PTR [rip + _bytes_read], 0
+    je .Lrl_end_input
+    movzx eax, BYTE PTR [rip + _rl_char]
+    mov r12d, 1
+    cmp eax, 10
+    je .Lrl_done
+    cmp eax, 13
+    je .Lrl_loop            # a CR before the newline is not text
+    cmp rbx, 1023
+    jae .Lrl_loop           # past the buffer: dropped
+    lea rcx, [rip + _input_buf]
+    mov BYTE PTR [rcx + rbx], al
+    inc rbx
+    jmp .Lrl_loop
+.Lrl_end_input:
+    xor edx, edx
+    test r12d, r12d
+    jnz .Lrl_finish         # a last line without a newline still counts
+    mov edx, 1
+    jmp .Lrl_finish
+.Lrl_done:
+    xor edx, edx
+.Lrl_finish:
+    lea rcx, [rip + _input_buf]
+    mov BYTE PTR [rcx + rbx], 0
+    lea rcx, [rip + _file_col]
+    mov QWORD PTR [rcx], 0
+    mov rax, rbx
+    add rsp, 48
+    pop r12
+    pop rbx
+    leave
+    ret
+
+# _rt_input_string - LINE INPUT: one whole line, as typed
+#
+# Arguments: none
+# Returns:
+#   rax = pointer to the line (in _input_buf, valid until the next read)
+#   rdx = its length; 0 at the end of the input
 .globl _rt_input_string
 _rt_input_string:
     push rbp
     mov rbp, rsp
-    sub rsp, 48             # Shadow space + stack args
-
-    # Clear buffer
+    sub rsp, 32             # shadow space
+    call _rt_con_read_line
+    mov rdx, rax
     lea rax, [rip + _input_buf]
-    mov BYTE PTR [rax], 0
-
-    # Get stdin handle
-    lea rax, [rip + _stdin_handle]
-    mov rcx, [rax]          # handle → rcx (1st arg)
-
-    # ReadFile(handle, buffer, maxlen, &bytesRead, NULL)
-    lea rdx, [rip + _input_buf]     # buffer → rdx (2nd arg)
-    mov r8, MAX_INPUT_LEN                     # max bytes → r8 (3rd arg)
-    lea r9, [rip + _bytes_read]     # &bytesRead → r9 (4th arg)
-    mov QWORD PTR [rsp + 32], 0     # NULL → 5th arg (stack)
-    call ReadFile
-
-    # Get number of bytes read
-    lea rax, [rip + _bytes_read]
-    mov rdx, [rax]          # rdx = bytes read
-
-    # Strip trailing CR/LF
-    lea rax, [rip + _input_buf]
-    test rdx, rdx
-    jz .Linput_str_done
-
-    # Check for trailing LF
-    mov cl, BYTE PTR [rax + rdx - 1]
-    cmp cl, CHAR_LF         # LF?
-    jne .Lcheck_cr
-    dec rdx
-    mov BYTE PTR [rax + rdx], 0
-    test rdx, rdx
-    jz .Linput_str_done
-
-.Lcheck_cr:
-    # Check for trailing CR
-    mov cl, BYTE PTR [rax + rdx - 1]
-    cmp cl, CHAR_CR         # CR?
-    jne .Linput_str_done
-    dec rdx
-    mov BYTE PTR [rax + rdx], 0
-
-.Linput_str_done:
-    # Null-terminate
-    lea rax, [rip + _input_buf]
-    mov BYTE PTR [rax + rdx], 0
-
-    # Return: rax = pointer, rdx = length
     leave
     ret
 
-# _rt_input_number - Read a numeric value from stdin
-# Reads a double-precision floating point number. Uses strtod from UCRT.
+# _rt_input_line - INPUT: read and check one line for a whole statement
 #
-# Arguments: none
+# Afterwards _rt_input_field_num and _rt_input_field_str hand out the values.
 #
-# Returns:
-#   xmm0 = the number read (double)
-.globl _rt_input_number
-_rt_input_number:
+# Arguments:
+#   rcx = prompt pointer, rdx = prompt length (0 for none), already including
+#         the "? " when the statement asks for one
+#   r8  = the variables' types, one character each: '$' string, 'I' INTEGER,
+#         'L' LONG, 'S' SINGLE, 'D' DOUBLE
+#   r9  = how many variables there are
+# Returns: nothing
+.globl _rt_input_line
+_rt_input_line:
     push rbp
     mov rbp, rsp
     push rbx
-    push rsi
-    sub rsp, 48             # Shadow space + stack args
+    push r12
+    push r13
+    push r14
+    push r15
+    sub rsp, 88             # [rbp-48] prompt, [rbp-56] its length,
+                            # [rbp-64] line length, [rbp-72] field quoted,
+                            # [rbp-80] field length; shadow space below
+    mov QWORD PTR [rbp - 48], rcx
+    mov QWORD PTR [rbp - 56], rdx
+    mov r12, r8             # types
+    mov r13, r9             # how many
 
-.Linput_num_try:
-    # Clear buffer
-    lea rax, [rip + _input_buf]
-    mov BYTE PTR [rax], 0
+.Lin_ask:
+    mov r8, QWORD PTR [rbp - 56]
+    test r8, r8
+    jz .Lin_read
+    xor ecx, ecx            # the console
+    mov rdx, QWORD PTR [rbp - 48]
+    call _rt_file_print_string
+.Lin_read:
+    call _rt_con_read_line
+    mov QWORD PTR [rbp - 64], rax
+    test edx, edx
+    jnz .Lin_end_input
+    xor r14d, r14d          # which field
+    xor r15d, r15d          # where in the line
+    lea rbx, [rip + _input_buf]
 
-    # Get stdin handle
-    lea rax, [rip + _stdin_handle]
-    mov rcx, [rax]          # handle
+.Lin_field:
+    # Leading blanks are not part of a field.
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_unquoted
+    movzx eax, BYTE PTR [rbx + r15]
+    cmp al, 32
+    je .Lin_skip
+    cmp al, 9
+    je .Lin_skip
+    cmp al, 34              # '"'
+    jne .Lin_unquoted
 
-    # ReadFile(handle, buffer, maxlen, &bytesRead, NULL)
-    lea rdx, [rip + _input_buf]
-    mov r8, MAX_INPUT_LEN
-    lea r9, [rip + _bytes_read]
-    mov QWORD PTR [rsp + 32], 0
-    call ReadFile
+    # A quoted field runs to the closing quote; only blanks may follow it.
+    inc r15
+    lea rax, [rbx + r15]
+    lea rcx, [rip + _input_fptr]
+    mov QWORD PTR [rcx + r14*8], rax
+    mov rcx, r15            # where it starts
+.Lin_quoted:
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_quoted_end     # no closing quote: the rest of the line
+    cmp BYTE PTR [rbx + r15], 34
+    je .Lin_quoted_end
+    inc r15
+    jmp .Lin_quoted
+.Lin_quoted_end:
+    mov rax, r15
+    sub rax, rcx
+    lea rcx, [rip + _input_flen]
+    mov QWORD PTR [rcx + r14*8], rax
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_quoted_flag
+    inc r15                 # past the closing quote
+.Lin_quoted_after:
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_quoted_flag
+    movzx eax, BYTE PTR [rbx + r15]
+    cmp al, 44              # ','
+    je .Lin_quoted_flag
+    cmp al, 32
+    je .Lin_quoted_blank
+    cmp al, 9
+    jne .Lin_redo           # text after a quoted field
+.Lin_quoted_blank:
+    inc r15
+    jmp .Lin_quoted_after
+.Lin_quoted_flag:
+    mov QWORD PTR [rbp - 72], 1
+    jmp .Lin_check
+.Lin_skip:
+    inc r15
+    jmp .Lin_field
 
-    # Null-terminate the input
-    lea rax, [rip + _bytes_read]
-    mov rcx, [rax]          # bytes read
-    test rcx, rcx
-    jz .Linput_num_eof      # no input left: yield 0
-    lea rax, [rip + _input_buf]
-    mov BYTE PTR [rax + rcx], 0
+.Lin_unquoted:
+    # An unquoted field runs to the next comma, less its trailing blanks.
+    mov QWORD PTR [rbp - 72], 0
+    lea rax, [rbx + r15]
+    lea rcx, [rip + _input_fptr]
+    mov QWORD PTR [rcx + r14*8], rax
+    mov rcx, r15
+.Lin_unq_scan:
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_unq_end
+    cmp BYTE PTR [rbx + r15], 44
+    je .Lin_unq_end
+    inc r15
+    jmp .Lin_unq_scan
+.Lin_unq_end:
+    mov rdx, r15
+.Lin_trim:
+    cmp rdx, rcx
+    jbe .Lin_trimmed
+    movzx eax, BYTE PTR [rbx + rdx - 1]
+    cmp al, 32
+    je .Lin_trim_one
+    cmp al, 9
+    jne .Lin_trimmed
+.Lin_trim_one:
+    dec rdx
+    jmp .Lin_trim
+.Lin_trimmed:
+    sub rdx, rcx
+    lea rax, [rip + _input_flen]
+    mov QWORD PTR [rax + r14*8], rdx
 
-    # Parse number using strtod(buffer, &end)
-    lea rcx, [rip + _input_buf]
-    lea rdx, [rbp - 32]     # endptr
-    call strtod
-
-    # strtod leaves endptr at the start when nothing parsed. Reject that and
-    # ask again, as GW-BASIC does; without this, text silently yielded 0.
-    mov rax, QWORD PTR [rbp - 32]
-    lea rcx, [rip + _input_buf]
-    cmp rax, rcx
-    je .Linput_num_redo
-
-    add rsp, 48
-    pop rsi
-    pop rbx
-    leave
-    ret
-
-.Linput_num_redo:
-    lea rcx, [rip + _redo_msg]
-    lea rdx, [rip + _redo_msg_end]
-    sub rdx, rcx            # length, from the data's own labels
-    call _rt_con_string
-    jmp .Linput_num_try
-
-.Linput_num_eof:
+.Lin_check:
+    movzx eax, BYTE PTR [r12 + r14]
+    cmp al, 36              # '$': any text will do
+    je .Lin_next
+    cmp QWORD PTR [rbp - 72], 0
+    jne .Lin_redo           # a quoted field is not a number
+    lea rax, [rip + _input_flen]
+    mov rdx, QWORD PTR [rax + r14*8]
+    test rdx, rdx
+    jz .Lin_zero            # an empty field is 0
+    mov QWORD PTR [rbp - 80], rdx
+    lea rax, [rip + _input_fptr]
+    mov rcx, QWORD PTR [rax + r14*8]
+    call _rt_scan_number
+    test edx, edx
+    jnz .Lin_redo           # too large for a DOUBLE
+    cmp rax, QWORD PTR [rbp - 80]
+    jne .Lin_redo           # not a number, or not only one
+    # It must fit the variable, rounded as an assignment rounds.
+    movzx eax, BYTE PTR [r12 + r14]
+    cmp al, 73              # 'I'
+    je .Lin_fit_integer
+    cmp al, 76              # 'L'
+    je .Lin_fit_long
+    cmp al, 83              # 'S'
+    je .Lin_fit_single
+    jmp .Lin_store
+.Lin_fit_integer:
+    cvtsd2si rax, xmm0
+    movsx rcx, ax
+    cmp rcx, rax
+    jne .Lin_redo
+    jmp .Lin_store
+.Lin_fit_long:
+    cvtsd2si rax, xmm0
+    movsxd rcx, eax
+    cmp rcx, rax
+    jne .Lin_redo
+    jmp .Lin_store
+.Lin_fit_single:
+    cvtsd2ss xmm1, xmm0
+    movd eax, xmm1
+    shr eax, 23
+    and eax, 0xFF
+    cmp eax, 0xFF
+    je .Lin_redo
+    jmp .Lin_store
+.Lin_zero:
     xorpd xmm0, xmm0
-    add rsp, 48
-    pop rsi
+.Lin_store:
+    lea rax, [rip + _input_vals]
+    movsd QWORD PTR [rax + r14*8], xmm0
+
+.Lin_next:
+    inc r14
+    cmp r15, QWORD PTR [rbp - 64]
+    jae .Lin_at_end
+    inc r15                 # past the comma
+    cmp r14, r13
+    jb .Lin_field
+    # Every variable has its value and the line goes on.
+    lea rcx, [rip + _in_extra]
+    call .Lin_say
+    jmp .Lin_done
+.Lin_at_end:
+    cmp r14, r13
+    jb .Lin_redo            # too few fields
+    jmp .Lin_done
+
+.Lin_redo:
+    lea rcx, [rip + _in_redo]
+    call .Lin_say
+    jmp .Lin_ask
+
+.Lin_end_input:
+    # Nothing more to read: every variable gets an empty value.
+    xor r14d, r14d
+.Lin_empty:
+    cmp r14, r13
+    jae .Lin_done
+    lea rax, [rip + _input_flen]
+    mov QWORD PTR [rax + r14*8], 0
+    lea rax, [rip + _input_vals]
+    mov QWORD PTR [rax + r14*8], 0
+    inc r14
+    jmp .Lin_empty
+
+.Lin_done:
+    add rsp, 88
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     leave
     ret
 
+# Write the message at rcx on a line of its own. Reached by `call` from
+# _rt_input_line's aligned body.
+.Lin_say:
+    push rbx
+    sub rsp, 32             # shadow space; rsp is 16-byte aligned
+    mov rbx, rcx
+    call lstrlenA
+    mov r8, rax
+    mov rdx, rbx
+    xor ecx, ecx
+    call _rt_file_print_string
+    xor ecx, ecx
+    call _rt_file_print_newline
+    add rsp, 32
+    pop rbx
+    ret
+
+# _rt_input_field_num - The value INPUT read for numeric variable `k`
+# Arguments: rcx = k     Returns: xmm0 = the value
+.globl _rt_input_field_num
+_rt_input_field_num:
+    lea rax, [rip + _input_vals]
+    movsd xmm0, QWORD PTR [rax + rcx*8]
+    ret
+
+# _rt_input_field_str - The text INPUT read for string variable `k`
+#
+# A copy, since the line buffer is reused by the next read.
+#
+# Arguments: rcx = k     Returns: rax = pointer, rdx = length
+.globl _rt_input_field_str
+_rt_input_field_str:
+    lea rax, [rip + _input_flen]
+    mov rdx, QWORD PTR [rax + rcx*8]
+    test rdx, rdx
+    jz .Lin_field_empty
+    lea rax, [rip + _input_fptr]
+    mov rcx, QWORD PTR [rax + rcx*8]
+    jmp _rt_strdup
+.Lin_field_empty:
+    xor eax, eax
+    xor edx, edx
+    ret

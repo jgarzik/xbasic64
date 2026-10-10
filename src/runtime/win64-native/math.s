@@ -23,9 +23,15 @@ _cls_seq: .ascii "\033[2J\033[H"
 # depend on which one ran.
 _cls_seq_end:
 _locate_fmt: .asciz "\033[%d;%dH"
+_locate_row_fmt: .asciz "\033[%dd"
+_locate_col_fmt: .asciz "\033[%dG"
 _date_fmt: .asciz "%m-%d-%Y"
 _time_fmt: .asciz "%H:%M:%S"
-_color_fmt: .asciz "\033[%d;%dm"
+_color_fmt: .asciz "\033[%d;%d;%dm"
+_color_fg_fmt: .asciz "\033[%d;%dm"
+_color_bg_fmt: .asciz "\033[%dm"
+# GW-BASIC colour 0-7 -> ANSI colour: black blue green cyan red magenta brown white
+_gw_to_ansi: .byte 0, 4, 2, 6, 1, 5, 3, 7
 _esc_buf: .skip 32
 
 # Zero-filled scratch, so .bss rather than .data -- see data_defs.s. The
@@ -40,7 +46,8 @@ _cls_bytes_written: .skip 8
 # Returns a pseudo-random number in the range [0, 1).
 #
 # Arguments:
-#   xmm0 = seed parameter (currently ignored)
+#   xmm0 = the argument, as GW-BASIC reads it: RND(0) repeats the last
+#          number, RND(<0) reseeds from the value first, RND(>0) is the next
 #
 # Returns:
 #   xmm0 = random double in [0, 1)
@@ -195,9 +202,10 @@ _rt_pos:
 #
 # Written as an ANSI escape, the same way _rt_cls clears the screen. The column
 # tracker is updated to match, so that a following TAB or PRINT zone counts from
-# where the cursor actually is.
+# where the cursor actually is. An omitted coordinate stays where it is: CUP
+# moves both, VPA only the row, CHA only the column.
 #
-# Arguments: rcx = row (1-based), rdx = column (1-based)
+# Arguments: rcx = row (1-based), rdx = column (1-based); -1 = omitted
 # Returns: nothing
 .globl _rt_locate
 _rt_locate:
@@ -207,16 +215,32 @@ _rt_locate:
     push r12
     sub rsp, 48             # shadow space + the 5th WriteFile argument
 
-    mov r12, rdx            # column, kept for the tracker
-
-    # sprintf(_esc_buf, _locate_fmt, row, col)
+    mov r12, rdx            # column, kept for the tracker; -1 = unmoved
+    test rcx, rcx
+    js .Lwlocate_col_only
+    test rdx, rdx
+    js .Lwlocate_row_only
     mov r8, rcx             # row
     mov r9, rdx             # col
     lea rcx, [rip + _esc_buf]
     lea rdx, [rip + _locate_fmt]
     call sprintf
+    jmp .Lwlocate_write
+.Lwlocate_row_only:
+    mov r8, rcx
+    lea rcx, [rip + _esc_buf]
+    lea rdx, [rip + _locate_row_fmt]
+    call sprintf
+    jmp .Lwlocate_write
+.Lwlocate_col_only:
+    test rdx, rdx
+    js .Lwlocate_done       # neither: nothing moves
+    mov r8, rdx
+    lea rcx, [rip + _esc_buf]
+    lea rdx, [rip + _locate_col_fmt]
+    call sprintf
+.Lwlocate_write:
     mov rbx, rax            # length written
-
     mov ecx, STD_OUTPUT_HANDLE
     call GetStdHandle
     mov rcx, rax
@@ -227,10 +251,12 @@ _rt_locate:
     call WriteFile
 
     # The tracker counts characters before the cursor, so column 1 is 0.
+    test r12, r12
+    js .Lwlocate_done
     dec r12
     lea rax, [rip + _file_col]
     mov QWORD PTR [rax], r12
-
+.Lwlocate_done:
     add rsp, 48
     pop r12
     pop rbx
@@ -241,9 +267,12 @@ _rt_locate:
 #
 # GW-BASIC numbers 0-15 with 8-15 as the bright half; ANSI splits that into two
 # ranges, 30-37 and 90-97 for the foreground and 40-47 and 100-107 for the
-# background. Values outside 0-15 are left to the terminal.
+# background. The eight hues are in a different order (GW-BASIC's 1 is blue,
+# ANSI's red), so they go through _gw_to_ansi. A foreground of 16-31 is the same
+# colour blinking, so every foreground also sets or clears blink (SGR 5 / 25).
+# An omitted one is left as it was.
 #
-# Arguments: rcx = foreground, rdx = background
+# Arguments: rcx = foreground 0-31, rdx = background 0-15; -1 = omitted
 # Returns: nothing
 .globl _rt_color
 _rt_color:
@@ -251,39 +280,64 @@ _rt_color:
     mov rbp, rsp
     push rbx
     push r12
-    sub rsp, 48             # shadow space + the 5th WriteFile argument
+    sub rsp, 48             # shadow space + a 5th argument
 
-    # Foreground: 0-7 -> 30-37, 8-15 -> 90-97
-    mov rax, rcx
-    cmp rax, 8
-    jl .Lwcolor_fg_normal
-    sub rax, 8
-    add rax, 90
-    jmp .Lwcolor_fg_done
-.Lwcolor_fg_normal:
-    add rax, 30
-.Lwcolor_fg_done:
-    mov r12, rax
-
-    # Background: 0-7 -> 40-47, 8-15 -> 100-107
-    mov rax, rdx
-    cmp rax, 8
-    jl .Lwcolor_bg_normal
-    sub rax, 8
-    add rax, 100
-    jmp .Lwcolor_bg_done
-.Lwcolor_bg_normal:
-    add rax, 40
+    # Background: 0-7 -> 40-47, 8-15 -> 100-107; -1 stays negative
+    mov r10, rcx            # foreground, out of the way of the table
+    mov r12, rdx
+    lea r11, [rip + _gw_to_ansi]
+    test r12, r12
+    js .Lwcolor_bg_done
+    mov rax, r12
+    and eax, 7
+    movzx eax, BYTE PTR [r11 + rax]
+    cmp r12, 8
+    lea r12, [rax + 40]
+    jl .Lwcolor_bg_done
+    add r12, 100 - 40
 .Lwcolor_bg_done:
 
-    # sprintf(_esc_buf, _color_fmt, fg, bg)
-    mov r9, rax             # background
-    mov r8, r12             # foreground
+    mov rax, r10
+    test rax, rax
+    js .Lwcolor_bg_only
+
+    # Foreground: 16-31 blink; then 0-7 -> 30-37, 8-15 -> 90-97
+    mov r8d, 25             # blink off
+    cmp rax, 16
+    jl .Lwcolor_steady
+    mov r8d, 5              # blink on
+    sub rax, 16
+.Lwcolor_steady:
+    mov r10, rax
+    and eax, 7
+    movzx eax, BYTE PTR [r11 + rax]
+    add eax, 30
+    cmp r10, 8
+    jl .Lwcolor_fg_done
+    add eax, 90 - 30
+.Lwcolor_fg_done:
+    mov r9, rax
     lea rcx, [rip + _esc_buf]
+    test r12, r12
+    js .Lwcolor_fg_only
+    mov QWORD PTR [rsp + 32], r12
     lea rdx, [rip + _color_fmt]
     call sprintf
-    mov rbx, rax
+    jmp .Lwcolor_write
+.Lwcolor_fg_only:
+    lea rdx, [rip + _color_fg_fmt]
+    call sprintf
+    jmp .Lwcolor_write
 
+.Lwcolor_bg_only:
+    test r12, r12
+    js .Lwcolor_done        # neither: nothing changes
+    mov r8, r12
+    lea rcx, [rip + _esc_buf]
+    lea rdx, [rip + _color_bg_fmt]
+    call sprintf
+.Lwcolor_write:
+    mov rbx, rax            # length written
     mov ecx, STD_OUTPUT_HANDLE
     call GetStdHandle
     mov rcx, rax
@@ -293,6 +347,7 @@ _rt_color:
     mov QWORD PTR [rsp + 32], 0
     call WriteFile
 
+.Lwcolor_done:
     add rsp, 48
     pop r12
     pop rbx
@@ -340,44 +395,42 @@ _rt_randomize:
     leave
     ret
 
-# _rt_timer - TIMER: seconds since midnight, UTC
+# _rt_timer - TIMER: seconds since local midnight
 # This used to return GetTickCount64() / 1000, which is seconds since the
 # machine booted -- not what LANGREF documents, not what the System V runtime
 # returns, and not what any BASIC program expects. A CI runner three minutes
 # old reported 208.437 where the time of day was wanted.
 #
-# GetSystemTime gives UTC, matching the System V twin, with millisecond
-# resolution. SYSTEMTIME is eight WORDs: wYear, wMonth, wDayOfWeek, wDay,
-# wHour, wMinute, wSecond, wMilliseconds.
+# Midnight is local, the clock TIME$ reads -- and through the same CRT, so both
+# honour TZ. GetSystemTime (UTC) and GetLocalTime (the system zone, ignoring
+# TZ) would each disagree with TIME$ somewhere. _ftime64 gives the seconds and
+# the milliseconds from one reading, so they cannot straddle a second:
+# struct __timeb64 is { __time64_t time; unsigned short millitm; ... }.
 #
 # Arguments: none
 #
 # Returns:
-#   xmm0 = seconds since midnight (double, 0 <= t < 86400)
-.equ ST_HOUR,   8
-.equ ST_MINUTE, 10
-.equ ST_SECOND, 12
-.equ ST_MSEC,   14
-
+#   xmm0 = seconds since midnight (double, 0 <= t < 86401 across a leap second)
 .globl _rt_timer
 _rt_timer:
     push rbp
     mov rbp, rsp
-    sub rsp, 48             # shadow space, then a 16-byte SYSTEMTIME above it
+    sub rsp, 48             # shadow space, then a 16-byte __timeb64 above it
 
     lea rcx, [rsp + 32]
-    call GetSystemTime
+    call _ftime64
 
-    movzx eax, WORD PTR [rsp + 32 + ST_HOUR]
-    imul eax, eax, 3600
-    movzx ecx, WORD PTR [rsp + 32 + ST_MINUTE]
-    imul ecx, ecx, 60
-    add eax, ecx
-    movzx ecx, WORD PTR [rsp + 32 + ST_SECOND]
-    add eax, ecx
-    cvtsi2sd xmm0, eax
+    lea rcx, [rsp + 32]     # &tb.time is a 64-bit time_t *
+    call localtime          # struct tm *: tm_sec, tm_min, tm_hour are ints
+    mov ecx, DWORD PTR [rax + 8]
+    imul ecx, ecx, 3600
+    mov edx, DWORD PTR [rax + 4]
+    imul edx, edx, 60
+    add ecx, edx
+    add ecx, DWORD PTR [rax]
+    cvtsi2sd xmm0, ecx
 
-    movzx ecx, WORD PTR [rsp + 32 + ST_MSEC]
+    movzx ecx, WORD PTR [rsp + 32 + 8]
     cvtsi2sd xmm1, ecx
     mov rax, 0x408F400000000000     # 1000.0
     movq xmm2, rax

@@ -69,15 +69,24 @@ fn test_print_using_numeric() {
 }
 
 /// Leading and trailing sign fields.
+///
+/// A trailing `-` is a column of its own after the digits, as in GW-BASIC and
+/// QuickBASIC: a negative number puts its minus there and a positive one a
+/// blank, so the digits of both line up. A positive used to be padded on the
+/// left instead -- `"   5"` beside `"  5-"` -- which put its digits one column
+/// to the right of a negative's.
 #[test]
 fn test_print_using_signs() {
-    let output = compile_and_run("PRINT USING \"+###\"; 42\nPRINT USING \"+###\"; -42\nPRINT USING \"###-\"; -42\nPRINT USING \"###-\"; 42\nPRINT USING \"####\"; -42\n").unwrap();
+    let output = compile_and_run("PRINT USING \"+###\"; 42\nPRINT USING \"+###\"; -42\nPRINT USING \"###-\"; -42\nPRINT USING \"###-\"; 42\nPRINT USING \"####\"; -42\nPRINT USING \"###-|\"; 5\nPRINT USING \"###-|\"; -5\nPRINT USING \"###-|\"; 0\n").unwrap();
     let lines: Vec<&str> = output.lines().collect();
     assert_eq!(lines[0], " +42", "+ shows a sign for positives");
     assert_eq!(lines[1], " -42");
     assert_eq!(lines[2], " 42-", "trailing sign");
-    assert_eq!(lines[3], "  42", "- shows nothing for positives");
+    assert_eq!(lines[3], " 42 ", "- leaves its column blank for positives");
     assert_eq!(lines[4], " -42");
+    assert_eq!(lines[5], "  5 |", "digits line up with a negative's");
+    assert_eq!(lines[6], "  5-|");
+    assert_eq!(lines[7], "  0 |", "zero is not negative");
 }
 
 /// Comma grouping, currency and fill characters.
@@ -169,16 +178,73 @@ fn test_locate_and_color_emit_escapes() {
     );
 }
 
-/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does.
+/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does: VPA
+/// moves the row and nothing else.
 #[test]
 fn test_locate_row_only() {
     let out = crate::common::compile_and_run_raw("LOCATE 7\n", "").expect("should compile");
     out.assert_ran_to_completion("LOCATE with a row only");
+    assert_eq!(out.stdout, "\u{1b}[7d", "row given, column preserved");
+}
+
+/// And with only a column, the row stays: CHA moves the column alone. It used
+/// to go to row 1.
+#[test]
+fn test_locate_column_only() {
+    let out = crate::common::compile_and_run_raw("LOCATE , 10\nPRINT POS(0)\n", "")
+        .expect("should compile");
+    out.assert_ran_to_completion("LOCATE with a column only");
     assert!(
-        out.stdout.contains("\u{1b}[7;"),
-        "row given, column preserved: {:?}",
+        out.stdout.starts_with("\u{1b}[10G"),
+        "column given, row preserved: {:?}",
         out.stdout
     );
+    assert!(
+        out.stdout.trim_end().ends_with("10"),
+        "POS follows the cursor: {:?}",
+        out.stdout
+    );
+}
+
+/// COLOR sets only what it is given. A foreground also states blink, which
+/// 16-31 turn on; an omitted background is left alone instead of turning black.
+/// And the hues are GW-BASIC's: 1 is blue and 4 red, where ANSI has them the
+/// other way round -- COLOR 1 used to print red.
+#[test]
+fn test_color_sets_only_what_it_is_given() {
+    for (source, expected) in [
+        ("COLOR 14\n", "\u{1b}[25;93m"),
+        ("COLOR , 1\n", "\u{1b}[44m"),
+        ("COLOR 14, 1\n", "\u{1b}[25;93;44m"),
+        ("COLOR 7, 9\n", "\u{1b}[25;37;104m"),
+        ("COLOR 4, 6\n", "\u{1b}[25;31;43m"),
+        ("COLOR 30\n", "\u{1b}[5;93m"),
+        ("COLOR 16, 0\n", "\u{1b}[5;30;40m"),
+    ] {
+        let out = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        out.assert_ran_to_completion(source);
+        assert_eq!(out.stdout, expected, "{source:?}");
+    }
+}
+
+/// Values a screen cannot show are Illegal function call, as in GW-BASIC.
+#[test]
+fn test_locate_and_color_arguments_are_range_checked() {
+    for source in [
+        "COLOR 32\n",
+        "COLOR -1\n",
+        "COLOR , 16\n",
+        "LOCATE 0\n",
+        "LOCATE , 0\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
 }
 
 /// `POS(0)` reports the column the next character will go to, counting from 1.
@@ -373,4 +439,222 @@ fn test_print_using_is_unaffected() {
     let out = crate::common::compile_and_run_raw("PRINT USING \"###.##\"; 3.5\n", "")
         .expect("should compile");
     assert_eq!(out.stdout.lines().next().unwrap(), "  3.50");
+}
+
+/// Numbers print as GW-BASIC prints them: rounded to 7 significant digits for
+/// a SINGLE and 16 for a DOUBLE, in fixed point when that fits in so many
+/// digits and with an E (SINGLE) or D (DOUBLE) exponent otherwise.
+///
+/// The thresholds are QuickBASIC's documented ones: 1.1E-6 shows as .0000011,
+/// 1.1E-7 as 1.1E-07. This used to print the shortest decimal that read back
+/// exactly -- 17 digits for a DOUBLE, `.1 + .2` as .30000000000000004 -- and
+/// any whole number in full, whatever its type.
+#[test]
+fn test_numbers_print_with_gw_basic_digits() {
+    let output = compile_and_run(
+        r#"
+PRINT .1 + .2
+X! = 1.1E-6: PRINT X!
+X! = 1.1E-7: PRINT X!
+X! = 1234567: PRINT X!
+X! = 12345678: PRINT X!
+X! = 1E7: PRINT X!
+X! = 2 / 3: PRINT X!
+PRINT 1E15
+PRINT 1E16
+PRINT 1.5E-300
+PRINT 1.1E-15
+PRINT 1.1E-16
+PRINT 9.9999999999999999
+X! = -1E-10: PRINT X!
+PRINT 1E100
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            ".3",
+            ".0000011",
+            "1.1E-07",
+            "1234567",
+            "1.234568E+07",
+            "1E+07",
+            ".6666667",
+            "1000000000000000",
+            "1D+16",
+            "1.5D-300",
+            ".0000000000000011",
+            "1.1D-16",
+            "10",
+            "-1E-10",
+            "1D+100"
+        ]
+    );
+}
+
+/// WIDTH sets the line length output wraps at, as in GW-BASIC: long text is
+/// cut and continued, a number that does not fit moves to the next line whole,
+/// and a comma past the last full zone starts a new line. 255 means no limit,
+/// which is also where every program and every file starts.
+#[test]
+fn test_width_wraps_output() {
+    let output = compile_and_run(
+        r#"
+WIDTH 10
+PRINT "abcdefghijklmnopqrstuvwxyz"
+PRINT "12345"; 678
+PRINT "12345"; 6789
+PRINT "1234567890"
+PRINT "a", "b"
+WIDTH 30
+PRINT "a", "b", "c"
+WIDTH 255
+PRINT STRING$(300, "x")
+"#,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "abcdefghij",
+            "klmnopqrst",
+            "uvwxyz",
+            "12345 678 ",
+            "12345",
+            " 6789 ",
+            "1234567890",
+            "a",
+            "b",
+            "a             b",
+            "c",
+            &"x".repeat(300),
+        ]
+    );
+}
+
+/// WIDTH applies to a file by number, and OPEN starts a file without one.
+#[test]
+fn test_width_on_a_file() {
+    let output = compile_and_run(
+        r#"
+OPEN "w.txt" FOR OUTPUT AS #1
+WIDTH #1, 4
+PRINT #1, "abcdefgh"
+CLOSE #1
+OPEN "w.txt" FOR APPEND AS #1
+PRINT #1, "abcdefgh"
+CLOSE #1
+OPEN "w.txt" FOR INPUT AS #1
+WHILE NOT EOF(1)
+LINE INPUT #1, A$
+PRINT A$
+WEND
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["abcd", "efgh", "abcdefgh"]
+    );
+}
+
+/// A width outside 1-255 is Illegal function call; a file not open is Bad file
+/// number.
+#[test]
+fn test_width_arguments_are_checked() {
+    for (source, msg) in [
+        ("WIDTH 0\n", "Illegal function call"),
+        ("WIDTH 256\n", "Illegal function call"),
+        ("WIDTH #2, 40\n", "Bad file number"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
+    }
+}
+
+/// The format of PRINT USING may be any string expression, read as the
+/// statement runs, and `PRINT #n, USING` writes to a file. Both used to be
+/// refused, because the format was parsed when compiling.
+#[test]
+fn test_print_using_with_a_computed_format_and_a_file() {
+    let output = compile_and_run(
+        r###"
+F$ = "##.##"
+PRINT USING F$; 3.14159
+PRINT USING "[" + "&" + "]"; "ok"
+FOR W = 2 TO 4
+PRINT USING STRING$(W, "#"); 7
+NEXT W
+OPEN "u.txt" FOR OUTPUT AS #1
+PRINT #1, USING "Total: $$###.##"; 12.5
+PRINT #1, USING F$; 1; 2;
+PRINT #1, "!"
+CLOSE #1
+OPEN "u.txt" FOR INPUT AS #1
+LINE INPUT #1, A$
+LINE INPUT #1, B$
+PRINT A$
+PRINT B$
+"###,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            " 3.14",
+            "[ok]",
+            " 7",
+            "  7",
+            "   7",
+            "Total:   $12.50",
+            " 1.00 2.00!"
+        ]
+    );
+}
+
+/// The text after the last value stops at the next field, as GW-BASIC's does,
+/// and widths and digits are clamped to what the runtime lays out.
+#[test]
+fn test_print_using_stops_at_the_next_unused_field() {
+    let wide = "#".repeat(600);
+    let output = compile_and_run(&format!(
+        "PRINT USING \"A=## B=## C\"; 5\nPRINT USING \"{wide}\"; 1\nPRINT USING \"#.{}\"; 1\n",
+        "#".repeat(200)
+    ))
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "A= 5 B=");
+    assert_eq!(lines[1].len(), 255, "a width is at most 255");
+    assert_eq!(
+        lines[2],
+        format!("1.{}", "0".repeat(40)),
+        "at most 40 decimals"
+    );
+}
+
+/// A value of the wrong kind for its field is Type mismatch (13), and a format
+/// with no field to put a value in is Illegal function call, as in GW-BASIC.
+#[test]
+fn test_print_using_errors() {
+    for (source, msg) in [
+        ("PRINT USING \"##\"; \"text\"\n", "Type mismatch"),
+        ("PRINT USING \"&\"; 5\n", "Type mismatch"),
+        ("PRINT USING \"no fields\"; 5\n", "Illegal function call"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
+    }
+}
+
+/// GW-BASIC's spellings: `?` for PRINT, a doubled quote ending one string and
+/// starting the next, and a string the line ends inside.
+#[test]
+fn test_legacy_print_forms() {
+    let out = compile_and_run("? \"a\"\"b\"\n?1+1\nPRINT \"open\nPRINT \"next\"\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["ab", "2", "open", "next"]);
 }

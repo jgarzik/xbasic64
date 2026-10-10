@@ -14,9 +14,8 @@
 # Returns a pseudo-random number in the range [0, 1).
 #
 # Arguments:
-#   xmm0 = seed parameter (currently ignored, BASIC convention)
-#          In GW-BASIC: RND(0) repeats last, RND(<0) reseeds, RND(>0) next
-#          We simplify: always return next random number.
+#   xmm0 = the argument, as GW-BASIC reads it: RND(0) repeats the last
+#          number, RND(<0) reseeds from the value first, RND(>0) is the next
 #
 # Returns:
 #   xmm0 = random double in [0, 1)
@@ -212,7 +211,11 @@ _rt_pos:
 # tracker is updated to match, so that a following TAB or PRINT zone counts from
 # where the cursor actually is.
 #
-# Arguments: rdi = row (1-based), rsi = column (1-based)
+# Either coordinate may be omitted, and an omitted one stays where it is, as in
+# GW-BASIC: CUP moves both, VPA only the row, CHA only the column. An omitted
+# row used to mean row 1.
+#
+# Arguments: rdi = row (1-based), rsi = column (1-based); -1 = omitted
 # Returns: nothing
 .globl _rt_locate
 _rt_locate:
@@ -222,17 +225,35 @@ _rt_locate:
     sub rsp, 8              # keep rsp 16-byte aligned across the call
 
     mov rbx, rsi            # remember the column
+    test rdi, rdi
+    js .Llocate_col_only
+    test rsi, rsi
+    js .Llocate_row_only
     mov rdx, rsi
     mov rsi, rdi
     lea rdi, [rip + _locate_fmt]
     xor eax, eax
     call printf
+    jmp .Llocate_track
+.Llocate_row_only:
+    mov rsi, rdi
+    lea rdi, [rip + _locate_row_fmt]
+    xor eax, eax
+    call printf
+    jmp .Llocate_done       # the column has not moved
+.Llocate_col_only:
+    test rsi, rsi
+    js .Llocate_done        # neither: nothing moves
+    lea rdi, [rip + _locate_col_fmt]
+    xor eax, eax
+    call printf
 
+.Llocate_track:
     # The tracker counts characters before the cursor, so column 1 is 0.
     dec rbx
     lea rax, [rip + _file_col]
     mov QWORD PTR [rax], rbx
-
+.Llocate_done:
     add rsp, 8
     pop rbx
     leave
@@ -242,62 +263,99 @@ _rt_locate:
 #
 # GW-BASIC numbers 0-15 with 8-15 as the bright half; ANSI splits that into two
 # ranges, 30-37 and 90-97 for the foreground and 40-47 and 100-107 for the
-# background. Values outside 0-15 are left to the terminal.
+# background. The eight hues are in a different order: GW-BASIC's 1 is blue and
+# 4 red, ANSI's the other way round, so COLOR 1 used to print red. A foreground
+# of 16-31 is the same colour blinking, so every
+# foreground also sets or clears blink (SGR 5 / 25).
 #
-# Arguments: rdi = foreground, rsi = background
+# Either may be omitted, and an omitted one is left as it was. An omitted
+# background used to mean black.
+#
+# Arguments: rdi = foreground 0-31, rsi = background 0-15; -1 = omitted
 # Returns: nothing
 .globl _rt_color
 _rt_color:
     push rbp
     mov rbp, rsp
     push rbx
-    sub rsp, 8              # keep rsp 16-byte aligned across the call
+    push r12
 
-    # Foreground: 0-7 -> 30-37, 8-15 -> 90-97
-    mov rax, rdi
-    cmp rax, 8
-    jl .Lcolor_fg_normal
-    sub rax, 8
-    add rax, 90
-    jmp .Lcolor_fg_done
-.Lcolor_fg_normal:
-    add rax, 30
-.Lcolor_fg_done:
-    mov rbx, rax
-
-    # Background: 0-7 -> 40-47, 8-15 -> 100-107
-    mov rax, rsi
-    cmp rax, 8
-    jl .Lcolor_bg_normal
-    sub rax, 8
-    add rax, 100
-    jmp .Lcolor_bg_done
-.Lcolor_bg_normal:
-    add rax, 40
+    # Background: 0-7 -> 40-47, 8-15 -> 100-107; -1 stays negative
+    mov r12, rsi
+    test r12, r12
+    js .Lcolor_bg_done
+    lea rcx, [rip + _gw_to_ansi]
+    mov rax, r12
+    and eax, 7
+    movzx eax, BYTE PTR [rcx + rax]
+    cmp r12, 8
+    lea r12, [rax + 40]
+    jl .Lcolor_bg_done
+    add r12, 100 - 40
 .Lcolor_bg_done:
 
-    mov rdx, rax
-    mov rsi, rbx
+    mov rbx, rdi
+    test rbx, rbx
+    js .Lcolor_bg_only
+
+    # Foreground: 16-31 blink; then 0-7 -> 30-37, 8-15 -> 90-97
+    mov esi, 25             # blink off
+    cmp rbx, 16
+    jl .Lcolor_steady
+    mov esi, 5              # blink on
+    sub rbx, 16
+.Lcolor_steady:
+    lea rcx, [rip + _gw_to_ansi]
+    mov rax, rbx
+    and eax, 7
+    movzx eax, BYTE PTR [rcx + rax]
+    cmp rbx, 8
+    lea rbx, [rax + 30]
+    jl .Lcolor_fg_done
+    add rbx, 90 - 30
+.Lcolor_fg_done:
+    mov rdx, rbx
+    test r12, r12
+    js .Lcolor_fg_only
+    mov rcx, r12
     lea rdi, [rip + _color_fmt]
     xor eax, eax
     call printf
+    jmp .Lcolor_done
+.Lcolor_fg_only:
+    lea rdi, [rip + _color_fg_fmt]
+    xor eax, eax
+    call printf
+    jmp .Lcolor_done
 
-    add rsp, 8
+.Lcolor_bg_only:
+    test r12, r12
+    js .Lcolor_done         # neither: nothing changes
+    mov rsi, r12
+    lea rdi, [rip + _color_bg_fmt]
+    xor eax, eax
+    call printf
+
+.Lcolor_done:
+    pop r12
     pop rbx
     leave
     ret
 
-# _rt_timer - TIMER: seconds since midnight, UTC
+# _rt_timer - TIMER: seconds since local midnight
 # GW-BASIC's TIMER counts fractional seconds since midnight, so this uses
 # gettimeofday rather than time(): whole seconds alone made a program that
 # times a short loop always read zero.
 #
-# The basis is UTC, which both runtimes share; see the Win64 twin.
+# Midnight is local, the clock TIME$ reads. This used to count from midnight
+# UTC, so anywhere but Greenwich TIMER and TIME$ disagreed by hours. The whole
+# seconds and the fraction come from the one gettimeofday reading, so they
+# cannot straddle a second.
 #
 # Arguments: none
 #
 # Returns:
-#   xmm0 = seconds since midnight (double, 0 <= t < 86400)
+#   xmm0 = seconds since midnight (double, 0 <= t < 86401 across a leap second)
 .globl _rt_timer
 _rt_timer:
     push rbp
@@ -308,12 +366,15 @@ _rt_timer:
     xor esi, esi            # timezone = NULL
     call gettimeofday
 
-    # tv_sec mod 86400
-    mov rax, QWORD PTR [rsp]
-    xor edx, edx
-    mov rcx, 86400
-    div rcx                 # rdx = seconds since midnight
-    cvtsi2sd xmm0, rdx
+    mov rdi, rsp            # &tv.tv_sec is a time_t *
+    call localtime          # struct tm *: tm_sec, tm_min, tm_hour are ints
+    mov ecx, DWORD PTR [rax + 8]
+    imul ecx, ecx, 3600
+    mov edx, DWORD PTR [rax + 4]
+    imul edx, edx, 60
+    add ecx, edx
+    add ecx, DWORD PTR [rax]
+    cvtsi2sd xmm0, ecx
 
     # ... plus tv_usec / 1000000
     cvtsi2sd xmm1, QWORD PTR [rsp + 8]

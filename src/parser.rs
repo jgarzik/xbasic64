@@ -4,44 +4,38 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::{DataTypeWord, Token};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
 ///
 /// These are LANGREF's table read upside down -- it numbers 1 as tightest, this
-/// numbers 1 as loosest. `XOR` used to sit alone at 3, binding tighter than
-/// `AND`, which contradicted both LANGREF and GW-BASIC and made
-/// `-1 OR 0 XOR -1` give -1 instead of 0.
+/// numbers 1 as loosest -- and the table is GW-BASIC's and QuickBASIC's: each
+/// logical operator has a level of its own, in the order NOT, AND, OR, XOR,
+/// EQV, IMP, and `\` and MOD sit below `*` and `/`, each on its own. OR and
+/// XOR used to share a level, as did all four multiplicative operators, so
+/// `1 XOR 1 OR 1` gave 1 and `6 \ 2 * 3` gave 9.
 ///
 /// Returns (precedence, BinaryOp) or None if not a binary operator
 fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
     match token {
-        // Precedence 1: implication (lowest)
         Token::Imp => Some((1, BinaryOp::Imp)),
-        // Precedence 2: equivalence
         Token::Eqv => Some((2, BinaryOp::Eqv)),
-        // Precedence 3: logical OR and XOR, which share a level
-        Token::Or => Some((3, BinaryOp::Or)),
         Token::Xor => Some((3, BinaryOp::Xor)),
-        // Precedence 4: logical AND
-        Token::And => Some((4, BinaryOp::And)),
-        // Precedence 5 is NOT, a prefix operator; see `parse_prec_inner`.
-        // Precedence 6: comparison
+        Token::Or => Some((4, BinaryOp::Or)),
+        Token::And => Some((5, BinaryOp::And)),
+        // 6 is NOT, a prefix operator; see `parse_prec_inner`.
         Token::Eq => Some((CMP_PREC, BinaryOp::Eq)),
         Token::Ne => Some((CMP_PREC, BinaryOp::Ne)),
         Token::Lt => Some((CMP_PREC, BinaryOp::Lt)),
         Token::Gt => Some((CMP_PREC, BinaryOp::Gt)),
         Token::Le => Some((CMP_PREC, BinaryOp::Le)),
         Token::Ge => Some((CMP_PREC, BinaryOp::Ge)),
-        // Precedence 7: additive
-        Token::Plus => Some((7, BinaryOp::Add)),
-        Token::Minus => Some((7, BinaryOp::Sub)),
-        // Precedence 8: multiplicative
-        Token::Star => Some((8, BinaryOp::Mul)),
-        Token::Slash => Some((8, BinaryOp::Div)),
-        Token::Backslash => Some((8, BinaryOp::IntDiv)),
-        Token::Mod => Some((8, BinaryOp::Mod)),
-        // Precedence 9: power
+        Token::Plus => Some((8, BinaryOp::Add)),
+        Token::Minus => Some((8, BinaryOp::Sub)),
+        Token::Mod => Some((9, BinaryOp::Mod)),
+        Token::Backslash => Some((10, BinaryOp::IntDiv)),
+        Token::Star => Some((11, BinaryOp::Mul)),
+        Token::Slash => Some((11, BinaryOp::Div)),
         Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
@@ -52,10 +46,10 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
 /// Named because `NOT` sits directly below it: `NOT` takes an operand at this
 /// level, which is what makes `NOT A = B` group as `NOT (A = B)` while
 /// `NOT A AND B` groups as `(NOT A) AND B`.
-const CMP_PREC: u8 = 6;
+const CMP_PREC: u8 = 7;
 
 /// Precedence of `^`, the tightest-binding binary operator.
-const POWER_PREC: u8 = 9;
+const POWER_PREC: u8 = 12;
 
 /// How deeply expressions and blocks may nest before the parser gives up.
 ///
@@ -151,7 +145,9 @@ pub enum StmtKind {
     },
     Goto(GotoTarget),
     Gosub(GotoTarget),
-    Return,
+    /// `RETURN`, or GW-BASIC's `RETURN line`: leave the subroutine for that
+    /// line rather than for the statement after the GOSUB.
+    Return(Option<GotoTarget>),
     OnGoto {
         expr: Expr,
         targets: Vec<GotoTarget>,
@@ -167,7 +163,23 @@ pub enum StmtKind {
     },
     Dim {
         decls: Vec<Declarator>,
+        /// `DIM SHARED`: visible inside every SUB and FUNCTION.
+        shared: bool,
     },
+    /// `DECLARE SUB|FUNCTION name(params) [AS T]` -- checked against the
+    /// definition, and otherwise nothing.
+    Declare {
+        name: String,
+        is_function: bool,
+        params: Vec<Param>,
+        ret_ty: Option<TypeRef>,
+    },
+    /// `SHARED a, b(), c AS T` -- inside a procedure, use these module-level
+    /// names rather than locals of the same names.
+    Shared(Vec<ScopeItem>),
+    /// `STATIC a, b(), c AS T` -- inside a procedure, locals that keep their
+    /// values between calls.
+    Static(Vec<ScopeItem>),
     /// `REDIM [PRESERVE] A(bounds)` -- resize an existing array.
     Redim {
         decls: Vec<Declarator>,
@@ -178,6 +190,8 @@ pub enum StmtKind {
         name: String,
         params: Vec<Param>,
         body: Vec<Stmt>,
+        /// `SUB name STATIC`: every local keeps its value between calls.
+        is_static: bool,
     },
     Function {
         name: String,
@@ -186,6 +200,11 @@ pub enum StmtKind {
         /// type comes from the name's suffix.
         ret_ty: Option<TypeRef>,
         body: Vec<Stmt>,
+        /// `FUNCTION name STATIC`, as for a SUB.
+        is_static: bool,
+        /// Written as `DEF FN`, which is part of the module: it sees every
+        /// module-level name, where a FUNCTION sees only what is shared.
+        def_fn: bool,
     },
     Call {
         name: String,
@@ -223,7 +242,7 @@ pub enum StmtKind {
         target: LValue,
         value: Expr,
     },
-    Data(Vec<Literal>),
+    Data(Vec<DataItem>),
     Read(Vec<LValue>),
     /// `DEFINT A-Z` and friends -- the default type for unsuffixed names whose
     /// first letter falls in one of the ranges.
@@ -282,9 +301,13 @@ pub enum StmtKind {
         /// `None` takes GW-BASIC's default of 128.
         reclen: Option<Expr>,
     },
-    /// `CLOSE #n`, or bare `CLOSE` to close every open file.
-    Close {
+    /// `CLOSE #n [, #m]...`, or bare `CLOSE` (an empty list) to close every
+    /// open file.
+    Close(Vec<Expr>),
+    /// `WIDTH w` for the console, or `WIDTH #n, w` for a file.
+    Width {
         file_num: Option<Expr>,
+        width: Expr,
     },
     /// `FIELD #n, w AS v$, ...` -- name slices of a random file's record buffer.
     ///
@@ -348,7 +371,10 @@ pub enum TypeRef {
     Long,
     Single,
     Double,
-    /// `STRING * n` -- a fixed-length string field.
+    /// `STRING * n` -- a fixed-length string. Width 0 is a plain `AS STRING`:
+    /// a variable-length string, exactly what a `$` suffix makes, which is the
+    /// convention codegen's `type_ref_of` already used for a `$` name. No
+    /// declared width is ever 0, so the two cannot be confused.
     FixedString(usize),
     /// A user-defined TYPE, by name.
     Record(String),
@@ -373,9 +399,22 @@ pub enum CaseClause {
 #[derive(Debug, Clone)]
 pub struct Declarator {
     pub name: String,
-    /// Array bounds, when this declares an array.
+    /// Array bounds, when this declares an array: each dimension's upper bound.
     pub dimensions: Option<Vec<Expr>>,
+    /// Each dimension's lower bound, when written (`DIM A(1 TO 10)`); without
+    /// one it is the OPTION BASE. As long as `dimensions`, or empty.
+    pub lowers: Vec<Option<Expr>>,
     /// Declared type from an `AS` clause.
+    pub ty: Option<TypeRef>,
+}
+
+/// One name in a SHARED or STATIC statement.
+#[derive(Debug, Clone)]
+pub struct ScopeItem {
+    pub name: String,
+    /// Written `name()`: the array of that name, not the scalar.
+    pub array: bool,
+    /// An `AS` clause, when one was given.
     pub ty: Option<TypeRef>,
 }
 
@@ -383,6 +422,12 @@ pub struct Declarator {
 #[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
+    /// `BYVAL`: the procedure gets a copy, and the caller's variable is
+    /// never written. Without it a variable argument is passed by
+    /// reference, as in QuickBASIC.
+    pub byval: bool,
+    /// Written `name()`: an array, passed by reference.
+    pub array: bool,
     /// Declared type from an `AS` clause; `None` means the type comes from the
     /// name's suffix, as it always has.
     pub ty: Option<TypeRef>,
@@ -414,6 +459,8 @@ pub struct LValue {
 pub struct ArrayDecl {
     pub name: String,
     pub dimensions: Vec<Expr>,
+    /// Lower bounds, as in [`Declarator::lowers`].
+    pub lowers: Vec<Option<Expr>>,
 }
 
 /// Where a `RESUME` goes back to.
@@ -459,13 +506,48 @@ pub enum Expr {
         base: Box<Expr>,
         field: String,
     },
+    /// A variable, element, field or call in parentheses: `(A)`. The value
+    /// is the operand's, but it is an expression rather than a variable, so
+    /// a by-reference parameter is given a copy of it, as in QuickBASIC.
+    /// Sema removes every one not passed to a by-reference parameter, where
+    /// it is only grouping; parentheses around anything else leave none.
+    Paren(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
 pub enum Literal {
+    /// A whole number, typed by its size: INTEGER if it fits 16 bits, else
+    /// LONG. The lexer makes anything wider than LONG a `Float`.
     Integer(i64),
+    /// A whole number that is a LONG whatever its size (`5&`, `&HFFFF&`).
+    Long(i64),
+    /// A SINGLE (`1.5!`), its value already rounded to one.
+    Single(f64),
+    /// A DOUBLE.
     Float(f64),
     String(String),
+}
+
+impl Literal {
+    /// The type a numeric literal has, or None for a string.
+    pub fn numeric_type(&self) -> Option<DataType> {
+        match self {
+            Literal::Integer(n) if i16::try_from(*n).is_ok() => Some(DataType::Integer),
+            Literal::Integer(_) | Literal::Long(_) => Some(DataType::Long),
+            Literal::Single(_) => Some(DataType::Single),
+            Literal::Float(_) => Some(DataType::Double),
+            Literal::String(_) => None,
+        }
+    }
+
+    /// The value of a numeric literal as a double.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Literal::Integer(n) | Literal::Long(n) => Some(*n as f64),
+            Literal::Single(f) | Literal::Float(f) => Some(*f),
+            Literal::String(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -662,14 +744,26 @@ pub enum ParseError {
     /// that was never closed. Without this the diagnostic lands on end of file,
     /// which is where the parser noticed rather than where the mistake is.
     ErrorAt(u32, String),
+    /// A statement refused for a reason the parser can state, with that
+    /// reason as a follow-up note -- the shape sema's diagnostics take, so a
+    /// refusal reads the same whichever pass makes it.
+    Refused(String, String),
 }
 
 impl ParseError {
     /// The line this error belongs to, if it names one of its own.
     fn line(&self) -> Option<u32> {
         match self {
-            ParseError::Error(_) => None,
+            ParseError::Error(_) | ParseError::Refused(..) => None,
             ParseError::ErrorAt(line, _) => Some(*line),
+        }
+    }
+
+    /// The follow-up line to print after the error, when there is one.
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            ParseError::Refused(_, note) => Some(note),
+            ParseError::Error(_) | ParseError::ErrorAt(..) => None,
         }
     }
 }
@@ -677,7 +771,9 @@ impl ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) => write!(f, "{}", msg),
+            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) | ParseError::Refused(msg, _) => {
+                write!(f, "{}", msg)
+            }
         }
     }
 }
@@ -818,37 +914,17 @@ fn describe_token(tok: &Token) -> String {
 }
 
 /// One item of a `DATA` statement, as written.
-struct DataItem {
-    text: String,
+///
+/// Kept as text: GW-BASIC decides what an item is when it is READ, so `007`
+/// reads as the string "007" or the number 7, and `"12"` as a string only.
+/// Classifying here, as this used to, turned `DATA 007` into 7 before any
+/// READ asked, so READ A$ gave " 7".
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataItem {
+    pub text: String,
     /// Whether it was written in quotes, which decides both whether the
-    /// surrounding spaces were significant and whether it is a string.
-    quoted: bool,
-}
-
-impl DataItem {
-    /// The value this item denotes.
-    ///
-    /// A quoted item is always a string. An unquoted one is whatever it looks
-    /// like: GW-BASIC decides the type when the item is READ, but the table this
-    /// compiles to is tagged per item, and the runtime already converts a string
-    /// entry to a number with `strtod` -- so classifying here loses nothing and
-    /// keeps numeric DATA on the fast path.
-    ///
-    /// An omitted item is the empty string, which reads as 0 or as "".
-    fn literal(&self) -> Literal {
-        if self.quoted {
-            return Literal::String(self.text.clone());
-        }
-        if let Ok(n) = self.text.parse::<i32>() {
-            return Literal::Integer(n as i64);
-        }
-        if let Ok(f) = self.text.parse::<f64>() {
-            if f.is_finite() {
-                return Literal::Float(f);
-            }
-        }
-        Literal::String(self.text.clone())
-    }
+    /// surrounding spaces were significant and whether it can be a number.
+    pub quoted: bool,
 }
 
 /// Split a `DATA` operand into its items.
@@ -948,12 +1024,20 @@ pub struct Parser {
     /// the next one up before reading another token, so the terminator reaches
     /// every loop it names as the recursion unwinds outward.
     pending_next: VecDeque<String>,
+    /// Every CONST parsed so far, by upper-case name, with its value when that
+    /// is a whole-number literal -- what `STRING * W` may name as a width.
+    ///
+    /// The width has to be known while the type is parsed, and QuickBASIC
+    /// requires the CONST to come first, so the parser can track them itself
+    /// rather than wait for sema's folded values.
+    consts: HashMap<String, Option<i64>>,
 }
 
 impl Parser {
     /// Build a parser. `lines` gives each token's source line, and may be
     /// empty when position information is unavailable.
     pub fn new(tokens: Vec<Token>, lines: Vec<u32>) -> Self {
+        let (tokens, lines) = Self::split_field_names(tokens, lines);
         let declared_procs = Self::scan_proc_names(&tokens);
         Parser {
             tokens,
@@ -961,6 +1045,87 @@ impl Parser {
             declared_procs,
             ..Default::default()
         }
+    }
+
+    /// Split `P.X` into a field access where `P` is a record variable.
+    ///
+    /// The lexer keeps a dot inside a name, as GW-BASIC does, so `MY.VAR` is
+    /// one variable. A record's field is reached the same way, though, and
+    /// QuickBASIC's rule decides: a name whose part before the dot is a record
+    /// variable is that record's field. So the record variables -- names
+    /// declared `AS` a TYPE anywhere -- are found first, and their dotted
+    /// names split again. A name after a dot (`A(1).X.Y`) is always a field.
+    fn split_field_names(tokens: Vec<Token>, lines: Vec<u32>) -> (Vec<Token>, Vec<u32>) {
+        if !tokens
+            .iter()
+            .any(|t| matches!(t, Token::Ident(n) if n.contains('.')))
+        {
+            return (tokens, lines);
+        }
+        let mut types = HashSet::new();
+        for pair in tokens.windows(2) {
+            if let (Token::Type, Token::Ident(n)) = (&pair[0], &pair[1]) {
+                types.insert(n.clone());
+            }
+        }
+        let mut records = HashSet::new();
+        for (i, pair) in tokens.windows(2).enumerate() {
+            let (Token::As, Token::Ident(t)) = (&pair[0], &pair[1]) else {
+                continue;
+            };
+            if !types.contains(t) {
+                continue;
+            }
+            // Back over an array's bounds, `A(1 TO 5) AS T`, to its name.
+            let mut j = i;
+            if j > 0 && tokens[j - 1] == Token::RParen {
+                let mut depth = 0;
+                while j > 0 {
+                    j -= 1;
+                    match tokens[j] {
+                        Token::RParen => depth += 1,
+                        Token::LParen => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(Token::Ident(n)) = j.checked_sub(1).map(|k| &tokens[k]) {
+                records.insert(n.clone());
+            }
+        }
+
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for (i, tok) in tokens.into_iter().enumerate() {
+            let line = lines.get(i).copied();
+            let split = match &tok {
+                Token::Ident(n) if n.contains('.') => {
+                    out.last() == Some(&Token::Dot)
+                        || records.contains(n.split('.').next().unwrap_or(""))
+                }
+                _ => false,
+            };
+            if !split {
+                out.push(tok);
+                out_lines.extend(line);
+                continue;
+            }
+            let Token::Ident(n) = tok else { unreachable!() };
+            for (k, part) in n.split('.').enumerate() {
+                if k > 0 {
+                    out.push(Token::Dot);
+                    out_lines.extend(line);
+                }
+                out.push(Token::Ident(part.to_string()));
+                out_lines.extend(line);
+            }
+        }
+        (out, out_lines)
     }
 
     /// Collect the names following SUB and FUNCTION, before parsing.
@@ -971,10 +1136,10 @@ impl Parser {
     fn scan_proc_names(tokens: &[Token]) -> HashSet<String> {
         let mut names = HashSet::new();
         for pair in tokens.windows(2) {
-            if matches!(pair[0], Token::Sub | Token::Function) {
-                if let Token::Ident(n) = &pair[1] {
-                    names.insert(n.to_uppercase());
-                }
+            if matches!(pair[0], Token::Sub | Token::Function)
+                && let Token::Ident(n) = &pair[1]
+            {
+                names.insert(n.to_uppercase());
             }
         }
         names
@@ -989,12 +1154,104 @@ impl Parser {
         self.tokens.get(self.pos + n).unwrap_or(&Token::Eof)
     }
 
-    /// True if the token after the current one is `tok`.
+    /// True if the token after the current one ends the statement.
+    fn next_ends_statement(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Token::Newline | Token::Colon | Token::Eof | Token::Else
+        )
+    }
+
+    /// True if a file number follows the statement word `word`: `#n`, or,
+    /// as GW-BASIC also allows, a bare number or name -- unless the program
+    /// has a procedure of that name, for which it is an argument.
+    fn next_is_file_number(&self, word: &str) -> bool {
+        match self.peek_at(1) {
+            Token::Hash => true,
+            Token::Integer(_) | Token::Ident(_) => {
+                !self.declared_procs.contains(word)
+                    && !matches!(self.peek_at(2), Token::Eq | Token::LParen)
+            }
+            _ => false,
+        }
+    }
+
+    /// The reason to refuse a statement that begins with the name `name`, when
+    /// it is a GW-BASIC statement this compiler does not provide.
     ///
-    /// Used to tell the random-access statements apart from ordinary names:
-    /// `FIELD` is only the statement when a `#` follows it.
-    fn next_is(&self, tok: Token) -> bool {
-        *self.peek_at(1) == tok
+    /// Sema already refuses these names with a reason, but only once the
+    /// statement has parsed, and many of them have a shape no call has:
+    /// `NAME a AS b`, `CIRCLE (x, y), r`, `VIEW PRINT 1 TO 10`, `KEY(1) ON`.
+    /// Those failed on the AS, the comma or the ON, so the program was told
+    /// "unexpected AS" about a statement whose only problem is that it is not
+    /// implemented. The parser now gives the reason itself, and the caller's
+    /// usual recovery skips the rest of the statement.
+    ///
+    /// Two shapes keep the name, because sema already decides them: an
+    /// assignment (`KEY(1) = 5`, `KEY.X = 5` on a record called KEY), and a
+    /// call to the program's own SUB of that name. A label (`NAME:`) never
+    /// reaches here.
+    fn unsupported_statement(&self, name: &str) -> Option<&'static str> {
+        if self.declared_procs.contains(&name.to_uppercase()) || self.at_assignment() {
+            return None;
+        }
+        crate::sema::unsupported_reason(name)
+    }
+
+    /// True if the name at the current position is the target of an
+    /// assignment: `v =`, `v(...) =`, or a field path `v.f` / `v(...).f`.
+    ///
+    /// The same shapes `parse_assignment_or_call` takes as one, looked at
+    /// without consuming anything.
+    fn at_assignment(&self) -> bool {
+        let mut i = 1;
+        if matches!(self.peek_at(i), Token::LParen) {
+            let mut depth = 0;
+            loop {
+                match self.peek_at(i) {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Token::Newline | Token::Colon | Token::Eof => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        matches!(self.peek_at(i), Token::Eq | Token::Dot)
+    }
+
+    /// True if the parenthesis at the current position opens one argument of
+    /// a call statement, `D (A)` or `D (A) + 1, B`, rather than an argument
+    /// list or the subscripts of an assignment target: what it encloses is
+    /// not empty and has no comma of its own, and no `=` or `.` follows it.
+    fn at_parenthesized_argument(&self) -> bool {
+        if matches!(self.peek_at(1), Token::RParen) {
+            return false;
+        }
+        let mut depth = 0;
+        let mut i = 0;
+        loop {
+            match self.peek_at(i) {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Token::Comma if depth == 1 => return false,
+                Token::Newline | Token::Colon | Token::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        !matches!(self.peek_at(i + 1), Token::Eq | Token::Dot)
     }
 
     /// True if the token after the current one is any identifier.
@@ -1353,7 +1610,15 @@ impl Parser {
             Token::Gosub => self.parse_gosub(),
             Token::Return => {
                 self.advance();
-                Ok(StmtKind::Return)
+                let target = if matches!(
+                    self.peek(),
+                    Token::Integer(_) | Token::LineNumber(_) | Token::Ident(_)
+                ) {
+                    Some(self.parse_goto_target()?)
+                } else {
+                    None
+                };
+                Ok(StmtKind::Return(target))
             }
             Token::On => self.parse_on_goto(),
             Token::Dim => self.parse_dim(),
@@ -1405,17 +1670,47 @@ impl Parser {
                 // -- so programs may still use these names for their own
                 // variables and procedures.
                 match n.to_uppercase().as_str() {
-                    "FIELD" if self.next_is(Token::Hash) => self.parse_field(),
-                    "GET" if self.next_is(Token::Hash) => self.parse_get_put(false),
-                    "PUT" if self.next_is(Token::Hash) => self.parse_get_put(true),
-                    "LOCK" if self.next_is(Token::Hash) => self.parse_lock(false),
-                    "UNLOCK" if self.next_is(Token::Hash) => self.parse_lock(true),
+                    "FIELD" if self.next_is_file_number(n) => self.parse_field(),
+                    "GET" if self.next_is_file_number(n) => self.parse_get_put(false),
+                    "PUT" if self.next_is_file_number(n) => self.parse_get_put(true),
+                    "LOCK" if self.next_is_file_number(n) => self.parse_lock(false),
+                    "UNLOCK" if self.next_is_file_number(n) => self.parse_lock(true),
                     "CALL" if self.next_is_ident() => self.parse_call(),
                     "ERASE" if self.next_is_ident() => self.parse_erase(),
                     "ERROR" if self.next_is_an_operand() => self.parse_raise_error(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
-                    _ => self.parse_assignment_or_call(),
+                    "DECLARE" if matches!(self.peek_at(1), Token::Sub | Token::Function) => {
+                        self.parse_declare()
+                    }
+                    "WIDTH" if !matches!(self.peek_at(1), Token::Eq) => self.parse_width(),
+                    "SHARED" if self.next_is_ident() => {
+                        self.advance();
+                        Ok(StmtKind::Shared(self.parse_scope_items()?))
+                    }
+                    "STATIC" if self.next_is_ident() => {
+                        self.advance();
+                        Ok(StmtKind::Static(self.parse_scope_items()?))
+                    }
+                    // RESET closes every file, which is what a bare CLOSE does.
+                    "RESET" if self.next_ends_statement() => {
+                        self.advance();
+                        Ok(StmtKind::Close(Vec::new()))
+                    }
+                    // TIMER ON / OFF / STOP switch event trapping.
+                    "TIMER"
+                        if matches!(self.peek_at(1), Token::On | Token::Stop)
+                            || matches!(self.peek_at(1), Token::Ident(w) if w.eq_ignore_ascii_case("OFF")) =>
+                    {
+                        err("TIMER ON, OFF and STOP control event trapping, which is not supported")
+                    }
+                    _ => match self.unsupported_statement(n) {
+                        Some(why) => Err(ParseError::Refused(
+                            format!("'{}' is not supported", n.to_uppercase()),
+                            why.to_string(),
+                        )),
+                        None => self.parse_assignment_or_call(),
+                    },
                 }
             }
             // Newline and Colon are consumed by the skip loop above, so
@@ -1597,6 +1892,11 @@ impl Parser {
         };
         self.expect(Token::Eq)?;
         let value = self.parse_expression()?;
+        let whole = match &value {
+            Expr::Literal(Literal::Integer(n) | Literal::Long(n)) => Some(*n),
+            _ => None,
+        };
+        self.consts.insert(name.to_uppercase(), whole);
         Ok(StmtKind::Const { name, value })
     }
 
@@ -1626,6 +1926,11 @@ impl Parser {
         } else {
             return err("Expected a function name after DEF");
         };
+        if name.eq_ignore_ascii_case("SEG") {
+            return err(
+                "DEF SEG is not supported: it selects an 8086 segment, and segmented addressing does not exist on x86-64",
+            );
+        }
         if !name.to_uppercase().starts_with("FN") {
             return err(format!("DEF function name '{}' must begin with FN", name));
         }
@@ -1648,6 +1953,8 @@ impl Parser {
             name: name.clone(),
             params,
             ret_ty: None,
+            is_static: false,
+            def_fn: true,
             body: vec![Stmt {
                 line,
                 kind: StmtKind::Let {
@@ -1760,7 +2067,10 @@ impl Parser {
 
     fn parse_line_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LINE
-        self.expect(Token::Input)?;
+        if !matches!(self.peek(), Token::Input) {
+            return err("LINE draws graphics, which is not supported; LINE INPUT reads a line");
+        }
+        self.advance(); // consume INPUT
         self.skip_input_suppressor();
 
         // LINE INPUT #n, Var$ -- documented in LANGREF but never parsed.
@@ -1858,8 +2168,11 @@ impl Parser {
             });
         }
 
-        // Check for array subscript or function call
-        if matches!(self.peek(), Token::LParen) {
+        // Check for array subscript or function call. A call without CALL
+        // takes its arguments without parentheses, so `D (A)` -- however it
+        // is spaced -- passes the expression `(A)`, a copy, as QuickBASIC
+        // does; only a list, `D(A, B)`, is taken as the argument list.
+        if matches!(self.peek(), Token::LParen) && !self.at_parenthesized_argument() {
             self.advance();
 
             // Could be array assignment or subroutine call
@@ -1967,6 +2280,21 @@ impl Parser {
         let if_line = self.cur_line();
         self.advance(); // consume IF
         let condition = self.parse_expression()?;
+        // GW-BASIC's `IF c GOTO n` needs no THEN: the GOTO is the branch.
+        if matches!(self.peek(), Token::Goto) {
+            let then_branch = self.parse_single_line_branch()?;
+            let else_branch = if matches!(self.peek(), Token::Else) {
+                self.advance();
+                Some(self.parse_single_line_branch()?)
+            } else {
+                None
+            };
+            return Ok(StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            });
+        }
         self.expect(Token::Then)?;
 
         // A run of colons after THEN separates no statements, so the line ends
@@ -2389,6 +2717,23 @@ impl Parser {
             return Ok(StmtKind::OnError(Some(self.parse_goto_target()?)));
         }
 
+        // `ON TIMER(n) GOSUB` and its kin arm event trapping. They parse as a
+        // computed GOSUB on the value of TIMER(n), which compiled and then
+        // branched on the time of day.
+        if let Token::Ident(n) = self.peek() {
+            let upper = n.to_uppercase();
+            if matches!(
+                upper.as_str(),
+                "TIMER" | "KEY" | "COM" | "PEN" | "PLAY" | "STRIG"
+            ) && matches!(self.peek_at(1), Token::LParen)
+            {
+                return err(format!(
+                    "ON {}(...) is event trapping, which is not supported",
+                    upper
+                ));
+            }
+        }
+
         let expr = self.parse_expression()?;
         let is_gosub = match self.advance() {
             Token::Goto => false,
@@ -2420,9 +2765,53 @@ impl Parser {
 
     fn parse_dim(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume DIM
+        let shared = matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("SHARED"));
+        if shared {
+            self.advance();
+        }
         Ok(StmtKind::Dim {
             decls: self.parse_dim_list()?,
+            shared,
         })
+    }
+
+    /// `STATIC` after a procedure's header.
+    fn take_static(&mut self) -> bool {
+        let is_static = matches!(self.peek(), Token::Ident(n) if n.eq_ignore_ascii_case("STATIC"));
+        if is_static {
+            self.advance();
+        }
+        is_static
+    }
+
+    /// The names of a SHARED or STATIC statement: `a`, `b()` for an array,
+    /// `c AS T` with a type.
+    fn parse_scope_items(&mut self) -> PResult<Vec<ScopeItem>> {
+        let mut items = Vec::new();
+        loop {
+            let Token::Ident(name) = self.advance() else {
+                return err("Expected a variable or array name");
+            };
+            let mut array = false;
+            if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                self.expect(Token::RParen)?;
+                array = true;
+            }
+            let ty = if matches!(self.peek(), Token::As) {
+                self.advance();
+                Some(self.parse_type_ref()?)
+            } else {
+                None
+            };
+            items.push(ScopeItem { name, array, ty });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(items)
     }
 
     /// Parse the `name(bounds), name(bounds), ...` part shared by DIM and REDIM.
@@ -2440,9 +2829,28 @@ impl Parser {
                 return err("Expected a variable or array name");
             };
 
+            // Each bound is `upper`, or `lower TO upper` as in QuickBASIC.
+            let mut lowers = Vec::new();
             let dimensions = if matches!(self.peek(), Token::LParen) {
                 self.advance();
-                let dims = self.parse_expr_list()?;
+                let mut dims = Vec::new();
+                // `DIM A()` declares no dimensions; sema says so.
+                while !matches!(self.peek(), Token::RParen) {
+                    let first = self.parse_expression()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                        lowers.push(Some(first));
+                        dims.push(self.parse_expression()?);
+                    } else {
+                        lowers.push(None);
+                        dims.push(first);
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
                 self.expect(Token::RParen)?;
                 Some(dims)
             } else {
@@ -2456,16 +2864,10 @@ impl Parser {
                 None
             };
 
-            if dimensions.is_none() && ty.is_none() {
-                return err(format!(
-                    "'{}' needs either array bounds or an AS clause",
-                    name
-                ));
-            }
-
             decls.push(Declarator {
                 name,
                 dimensions,
+                lowers,
                 ty,
             });
 
@@ -2507,18 +2909,30 @@ impl Parser {
             "SINGLE" => Ok(TypeRef::Single),
             "DOUBLE" => Ok(TypeRef::Double),
             "STRING" => {
-                // STRING * n declares a fixed-length field.
+                // STRING * n declares a fixed-length string, whose width may
+                // be a CONST defined earlier.
                 if matches!(self.peek(), Token::Star) {
                     self.advance();
                     match self.advance() {
                         Token::Integer(n) if n > 0 => Ok(TypeRef::FixedString(n as usize)),
+                        Token::Ident(c) => match self.consts.get(&c.to_uppercase()) {
+                            Some(Some(n)) if *n > 0 => Ok(TypeRef::FixedString(*n as usize)),
+                            Some(_) => err(format!(
+                                "STRING * {c} needs a positive whole number, but CONST '{c}' is not written as one"
+                            )),
+                            None => err(format!(
+                                "STRING * {c} needs a length, and '{c}' is not a CONST defined before this line"
+                            )),
+                        },
                         tok => err(format!(
                             "Expected a positive length after STRING *, got {}",
                             describe_token(&tok)
                         )),
                     }
                 } else {
-                    err("A STRING field needs a fixed length, as in STRING * 20")
+                    // A plain STRING is variable-length. A TYPE field cannot
+                    // be, and `parse_type_def` says so.
+                    Ok(TypeRef::FixedString(0))
                 }
             }
             _ => Ok(TypeRef::Record(name)),
@@ -2557,8 +2971,24 @@ impl Parser {
                 return err("Expected a field name");
             };
             self.expect(Token::As)?;
-            let ty = self.parse_type_ref()?;
-            fields.push(FieldDecl { name: field, ty });
+            // A bad field costs only its own line, so the END TYPE is still
+            // found: returning the error left the rest of the TYPE to be read
+            // as statements, and each field became a complaint of its own.
+            let ty = match self.parse_type_ref() {
+                Ok(TypeRef::FixedString(0)) => Err(ParseError::Error(
+                    "A STRING field needs a fixed length, as in STRING * 20".to_string(),
+                )),
+                other => other,
+            };
+            match ty {
+                Ok(ty) => fields.push(FieldDecl { name: field, ty }),
+                Err(e) => {
+                    self.record(e);
+                    while !matches!(self.peek(), Token::Newline | Token::Eof) {
+                        self.advance();
+                    }
+                }
+            }
             self.skip_newlines();
         }
 
@@ -2590,12 +3020,18 @@ impl Parser {
                 name
             ));
         }
+        let is_static = self.take_static();
 
         self.skip_newlines();
 
         let body = self.parse_block(BlockEnd::EndSub, &format!("SUB '{}'", name), sub_line)?;
 
-        Ok(StmtKind::Sub { name, params, body })
+        Ok(StmtKind::Sub {
+            name,
+            params,
+            body,
+            is_static,
+        })
     }
 
     /// `FUNCTION name(params)` ... `END FUNCTION`
@@ -2632,6 +3068,7 @@ impl Parser {
             }
             ret_ty = Some(ty);
         }
+        let is_static = self.take_static();
 
         self.skip_newlines();
 
@@ -2646,6 +3083,39 @@ impl Parser {
             params,
             ret_ty,
             body,
+            is_static,
+            def_fn: false,
+        })
+    }
+
+    /// `DECLARE SUB name (params)` or `DECLARE FUNCTION name (params) [AS T]`:
+    /// a procedure's signature ahead of its definition, which sema checks the
+    /// definition against. QuickBASIC writes these at the top of every module.
+    fn parse_declare(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume DECLARE
+        let is_function = matches!(self.advance(), Token::Function);
+        let Token::Ident(name) = self.advance() else {
+            return err("Expected a procedure name after DECLARE");
+        };
+        let params = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let params = self.parse_param_list()?;
+            self.expect(Token::RParen)?;
+            params
+        } else {
+            Vec::new()
+        };
+        let ret_ty = if is_function && matches!(self.peek(), Token::As) {
+            self.advance();
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+        Ok(StmtKind::Declare {
+            name,
+            is_function,
+            params,
+            ret_ty,
         })
     }
 
@@ -2653,6 +3123,29 @@ impl Parser {
         let mut params = Vec::new();
         while let Token::Ident(name) = self.peek().clone() {
             self.advance();
+            // `BYVAL name` passes a copy.
+            let (byval, name) = if name.eq_ignore_ascii_case("BYVAL")
+                && let Token::Ident(real) = self.peek().clone()
+            {
+                self.advance();
+                (true, real)
+            } else {
+                (false, name)
+            };
+            // `name()` is an array.
+            let array = if matches!(self.peek(), Token::LParen) {
+                self.advance();
+                self.expect(Token::RParen)?;
+                true
+            } else {
+                false
+            };
+            if array && byval {
+                return err(format!(
+                    "array parameter '{}' cannot be BYVAL; an array is always passed by reference",
+                    name
+                ));
+            }
             // `name AS Type` declares a typed parameter, including a record.
             let ty = if matches!(self.peek(), Token::As) {
                 self.advance();
@@ -2660,7 +3153,12 @@ impl Parser {
             } else {
                 None
             };
-            params.push(Param { name, ty });
+            params.push(Param {
+                name,
+                byval,
+                array,
+                ty,
+            });
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
             } else {
@@ -2681,12 +3179,7 @@ impl Parser {
     /// fresh statement and produce an error about the word rather than the DATA.
     fn parse_data(&mut self, text: &str) -> PResult<StmtKind> {
         self.advance(); // consume the DATA token
-        Ok(StmtKind::Data(
-            split_data_items(text)
-                .iter()
-                .map(|it| it.literal())
-                .collect(),
-        ))
+        Ok(StmtKind::Data(split_data_items(text)))
     }
 
     fn parse_read(&mut self) -> PResult<StmtKind> {
@@ -2849,10 +3342,10 @@ impl Parser {
         let tok = self.advance();
         if let Token::Ident(name) = &tok {
             let mut chars = name.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if c.is_ascii_alphabetic() {
-                    return Ok(c);
-                }
+            if let (Some(c), None) = (chars.next(), chars.next())
+                && c.is_ascii_alphabetic()
+            {
+                return Ok(c);
             }
         }
         err(format!(
@@ -2894,11 +3387,63 @@ impl Parser {
         self.parse_expression()
     }
 
+    /// A file number where GW-BASIC makes the `#` optional: OPEN's `AS n`,
+    /// CLOSE, FIELD, GET, PUT, LOCK and UNLOCK. PRINT # and its kin need it,
+    /// since without it the number would be something to print.
+    fn parse_file_number_hash_optional(&mut self) -> PResult<Expr> {
+        if matches!(self.peek(), Token::Hash) {
+            self.advance();
+        }
+        self.parse_expression()
+    }
+
+    /// GW-BASIC's other OPEN: `OPEN mode, [#]n, file [, reclen]`, the mode
+    /// a string whose first letter is O, I, A or R. The mode string and the
+    /// comma after it are already consumed.
+    fn parse_open_short(&mut self, mode: Expr) -> PResult<StmtKind> {
+        let Expr::Literal(Literal::String(m)) = &mode else {
+            return err("OPEN's mode must be written as a string: \"O\", \"I\", \"A\" or \"R\"");
+        };
+        let mode = match m
+            .trim_start()
+            .chars()
+            .next()
+            .map(|c| c.to_ascii_uppercase())
+        {
+            Some('O') => FileMode::Output,
+            Some('I') => FileMode::Input,
+            Some('A') => FileMode::Append,
+            Some('R') => FileMode::Random,
+            _ => return err(format!("OPEN mode \"{}\" is not O, I, A or R", m)),
+        };
+        let file_num = self.parse_file_number_hash_optional()?;
+        self.expect(Token::Comma)?;
+        let filename = self.parse_expression()?;
+        // The record length. For a sequential file GW-BASIC took it as a
+        // buffer size, which means nothing here, so it is ignored there.
+        let reclen = if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+        Ok(StmtKind::Open {
+            filename,
+            reclen: reclen.filter(|_| mode == FileMode::Random),
+            mode,
+            file_num,
+        })
+    }
+
     fn parse_open(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume OPEN
 
         // Parse filename expression
         let filename = self.parse_expression()?;
+        if matches!(self.peek(), Token::Comma) {
+            self.advance();
+            return self.parse_open_short(filename);
+        }
 
         // Expect FOR
         self.expect(Token::For)?;
@@ -2935,7 +3480,7 @@ impl Parser {
         // Expect AS
         self.expect(Token::As)?;
 
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
 
         // `LEN = n` sets the record length. LEN is the string function's name
         // everywhere else, so it is matched here as an identifier rather than
@@ -2964,7 +3509,7 @@ impl Parser {
     /// `FIELD #n, width AS var$ [, width AS var$]...`
     fn parse_field(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume FIELD
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         self.expect(Token::Comma)?;
 
         let mut fields = Vec::new();
@@ -3023,7 +3568,7 @@ impl Parser {
     /// `GET #n[, record]` / `PUT #n[, record]`
     fn parse_get_put(&mut self, is_put: bool) -> PResult<StmtKind> {
         self.advance(); // consume GET or PUT
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         let record = if matches!(self.peek(), Token::Comma) {
             self.advance();
             // `GET #1,` with nothing after it means "the next record", the same
@@ -3046,7 +3591,7 @@ impl Parser {
     /// `LOCK #n[, start [TO end]]` / `UNLOCK #n[, start [TO end]]`
     fn parse_lock(&mut self, is_unlock: bool) -> PResult<StmtKind> {
         self.advance(); // consume LOCK or UNLOCK
-        let file_num = self.parse_file_number()?;
+        let file_num = self.parse_file_number_hash_optional()?;
         let range = if matches!(self.peek(), Token::Comma) {
             self.advance();
             let start = self.parse_expression()?;
@@ -3067,17 +3612,44 @@ impl Parser {
         })
     }
 
-    fn parse_close(&mut self) -> PResult<StmtKind> {
-        self.advance(); // consume CLOSE
-
-        // Bare CLOSE closes every open file.
+    /// `WIDTH w` or `WIDTH #n, w`. GW-BASIC's device forms (`WIDTH "LPT1:",
+    /// w`) name devices this compiler does not have.
+    fn parse_width(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume WIDTH
+        if matches!(self.peek(), Token::String(_)) {
+            return err("WIDTH for a device is not supported; WIDTH w or WIDTH #n, w");
+        }
         let file_num = if matches!(self.peek(), Token::Hash) {
-            Some(self.parse_file_number()?)
+            let n = self.parse_file_number()?;
+            self.expect(Token::Comma)?;
+            Some(n)
         } else {
             None
         };
+        let width = self.parse_expression()?;
+        Ok(StmtKind::Width { file_num, width })
+    }
 
-        Ok(StmtKind::Close { file_num })
+    fn parse_close(&mut self) -> PResult<StmtKind> {
+        self.advance(); // consume CLOSE
+
+        // Bare CLOSE closes every open file; otherwise a list, each `#`
+        // optional, as in GW-BASIC.
+        let mut file_nums = Vec::new();
+        if !matches!(
+            self.peek(),
+            Token::Newline | Token::Colon | Token::Eof | Token::Else
+        ) {
+            loop {
+                file_nums.push(self.parse_file_number_hash_optional()?);
+                if !matches!(self.peek(), Token::Comma) {
+                    break;
+                }
+                self.advance();
+            }
+        }
+
+        Ok(StmtKind::Close(file_nums))
     }
 
     // Expression parsing with precedence climbing
@@ -3220,6 +3792,14 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Literal(Literal::Float(f)))
             }
+            Token::Long(n) => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Long(n)))
+            }
+            Token::Single(f) => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Single(f)))
+            }
             Token::String(s) => {
                 self.advance();
                 Ok(Expr::Literal(Literal::String(s)))
@@ -3247,7 +3827,13 @@ impl Parser {
                 self.advance();
                 let expr = self.parse_expression()?;
                 self.expect(Token::RParen)?;
-                Ok(expr)
+                Ok(match expr {
+                    Expr::Variable(_)
+                    | Expr::ArrayAccess { .. }
+                    | Expr::FnCall { .. }
+                    | Expr::Field { .. } => Expr::Paren(Box::new(expr)),
+                    e => e,
+                })
             }
             tok => err(format!(
                 "unexpected {} in an expression",
@@ -3796,7 +4382,7 @@ mod tests {
     fn test_return() {
         let prog = parse("RETURN").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        assert!(matches!(&prog.statements[0].kind, StmtKind::Return));
+        assert!(matches!(&prog.statements[0].kind, StmtKind::Return(None)));
     }
 
     // OnGoto Tests
@@ -3819,7 +4405,7 @@ mod tests {
     fn test_dim_single() {
         let prog = parse("DIM A(10)").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 1);
@@ -3831,7 +4417,7 @@ mod tests {
     #[test]
     fn test_dim_multiple() {
         let prog = parse("DIM A(10), B$(100), C(50)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 3);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[1].name, "B$");
@@ -3844,7 +4430,7 @@ mod tests {
     #[test]
     fn test_dim_2d() {
         let prog = parse("DIM A(10, 20)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "A");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 2);
@@ -3856,7 +4442,7 @@ mod tests {
     #[test]
     fn test_dim_3d() {
         let prog = parse("DIM Matrix(5, 10, 15)").unwrap();
-        if let StmtKind::Dim { decls } = &prog.statements[0].kind {
+        if let StmtKind::Dim { decls, .. } = &prog.statements[0].kind {
             assert_eq!(decls.len(), 1);
             assert_eq!(decls[0].name, "MATRIX");
             assert_eq!(decls[0].dimensions.as_ref().unwrap().len(), 3);
@@ -3868,7 +4454,7 @@ mod tests {
     #[test]
     fn test_dim_mixed_declarators() {
         let prog = parse("DIM A(3), B AS INTEGER, C(2) AS LONG").unwrap();
-        let StmtKind::Dim { decls } = &prog.statements[0].kind else {
+        let StmtKind::Dim { decls, .. } = &prog.statements[0].kind else {
             panic!("Expected Dim");
         };
         assert_eq!(decls.len(), 3);
@@ -3926,7 +4512,10 @@ mod tests {
     fn test_sub_no_params() {
         let prog = parse("SUB MySub\nPRINT X\nEND SUB").unwrap();
         assert_eq!(prog.statements.len(), 1);
-        if let StmtKind::Sub { name, params, body } = &prog.statements[0].kind {
+        if let StmtKind::Sub {
+            name, params, body, ..
+        } = &prog.statements[0].kind
+        {
             assert_eq!(name, "MYSUB");
             assert!(params.is_empty());
             assert_eq!(body.len(), 1);
@@ -4017,7 +4606,8 @@ mod tests {
         assert_eq!(prog.statements.len(), 1);
         if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 5);
-            assert!(matches!(values[0], Literal::Integer(1)));
+            assert_eq!(values[0].text, "1");
+            assert!(!values[0].quoted);
         } else {
             panic!("Expected Data");
         }
@@ -4028,9 +4618,9 @@ mod tests {
         let prog = parse(r#"DATA 1, 3.14, "hello""#).unwrap();
         if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 3);
-            assert!(matches!(values[0], Literal::Integer(1)));
-            assert!(matches!(values[1], Literal::Float(_)));
-            assert!(matches!(values[2], Literal::String(_)));
+            assert_eq!(values[1].text, "3.14");
+            assert_eq!(values[2].text, "hello");
+            assert!(values[2].quoted);
         } else {
             panic!("Expected Data");
         }
@@ -4040,7 +4630,7 @@ mod tests {
     fn test_data_negative() {
         let prog = parse("DATA -5, -3.14").unwrap();
         if let StmtKind::Data(values) = &prog.statements[0].kind {
-            assert!(matches!(values[0], Literal::Integer(-5)));
+            assert_eq!(values[0].text, "-5");
         } else {
             panic!("Expected Data");
         }

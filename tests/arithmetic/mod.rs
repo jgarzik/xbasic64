@@ -116,8 +116,8 @@ PRINT NOT D%
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        vec!["-13", "-13", "-13", "-1", "0", "-2", "-256"],
-        "literal, Double, Integer, the boolean values, a truncated Double, and a bit mask"
+        vec!["-13", "-13", "-13", "-1", "0", "-3", "-256"],
+        "literal, Double, Integer, the boolean values, a rounded Double, and a bit mask"
     );
 }
 
@@ -275,14 +275,25 @@ PRINT &B1010
 PRINT &17
 PRINT &HFFFFFFFF
 PRINT &H10 + &H10
+PRINT &HFFFF
+PRINT &H8000
+PRINT &HFFFF&
+PRINT &H10000
+PRINT &O177777
+PRINT &B1111111111111111
+PRINT &H7FFF%
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        vec!["255", "15", "10", "15", "-1", "32"],
-        "hex, octal, binary, bare-& octal; &H values are 32-bit signed"
+        vec![
+            "255", "15", "10", "15", "-1", "32", "-1", "-32768", "65535", "65536", "-1", "-1",
+            "32767"
+        ],
+        "hex, octal, binary, bare-& octal; QuickBASIC's widths: up to 16 bits is an \
+         INTEGER, two's complement, unless written with &; up to 32 is a LONG"
     );
 }
 
@@ -334,7 +345,9 @@ PRINT 123456789.123456
             ".3333333333333333",
             ".6666666666666666",
             "3.141592653589793",
-            "1.4142135623730951",
+            // 16 significant digits, as GW-BASIC prints a DOUBLE: the 17th
+            // that read back exactly (1.4142135623730951) is not shown.
+            "1.414213562373095",
             // Values that are exact at fewer digits keep their short form.
             "3.14159",
             ".1",
@@ -360,7 +373,7 @@ PRINT CSNG(1 / 3)
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["3.14159", ".1", "3.14", ".33333334"]);
+    assert_eq!(lines, vec!["3.14159", ".1", "3.14", ".3333333"]);
 }
 
 /// The bitwise operators must work on Double operands, which is what an
@@ -450,22 +463,29 @@ fn test_logical_operator_precedence() {
 A% = 0 : B% = 0
 PRINT NOT A% AND B%
 PRINT (NOT A%) AND B%
-PRINT -1 OR 0 XOR -1
-PRINT (-1 OR 0) XOR -1
+PRINT 1 XOR 1 OR 1
+PRINT (1 XOR 1) OR 1
 PRINT 1 AND 0 OR 1
 PRINT 12 XOR 10 AND 6
+PRINT 0 EQV 1 XOR 1
+PRINT 1 IMP 0 EQV 0
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
     // NOT binds tighter than AND, so the first two agree.
     assert_eq!(&lines[0..2], &["0", "0"], "NOT binds tighter than AND");
-    // OR and XOR share a level and associate left to right, so these agree too.
-    assert_eq!(&lines[2..4], &["0", "0"], "OR and XOR share a level");
+    // OR binds tighter than XOR, as in GW-BASIC and QuickBASIC: 1 XOR (1 OR 1).
+    // They used to share a level and give 1.
+    assert_eq!(&lines[2..4], &["0", "1"], "OR binds tighter than XOR");
     // AND binds tighter than OR: (1 AND 0) OR 1 = 1.
     assert_eq!(lines[4], "1", "AND binds tighter than OR");
     // AND binds tighter than XOR: 12 XOR (10 AND 6) = 12 XOR 2 = 14.
     assert_eq!(lines[5], "14", "AND binds tighter than XOR");
+    // XOR binds tighter than EQV: 0 EQV (1 XOR 1) = 0 EQV 0 = -1.
+    assert_eq!(lines[6], "-1", "XOR binds tighter than EQV");
+    // EQV binds tighter than IMP: 1 IMP (0 EQV 0) = 1 IMP -1 = -1.
+    assert_eq!(lines[7], "-1", "EQV binds tighter than IMP");
 }
 
 /// `NOT` still binds looser than a comparison, which is the form that matters.
@@ -560,4 +580,381 @@ PRINT -1 IMP 0 EQV 0
     assert_eq!(lines[0], lines[2], "OR binds tighter than EQV");
     // -1 IMP (0 EQV 0) = -1 IMP -1 = -1
     assert_eq!(lines[3], "-1", "EQV binds tighter than IMP");
+}
+
+// ---------------------------------------------------------------------------
+// Conversion to an integer rounds, and every result that does not fit its type
+// is Overflow (error 6), as in GW-BASIC.
+// ---------------------------------------------------------------------------
+
+/// Run `source`, expecting it to stop with Overflow (or `msg`) and exit 1.
+fn assert_raises(source: &str, msg: &str) {
+    let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "{source:?}: stderr {}", run.stderr);
+    assert!(
+        run.stderr.contains(msg),
+        "{source:?}: stderr {}",
+        run.stderr
+    );
+}
+
+/// A fraction stored into an INTEGER or LONG rounds half to even -- what CINT
+/// does, and QuickBASIC's rule. It used to truncate: `A% = 7.9` gave 7.
+#[test]
+fn test_assignment_to_an_integer_rounds() {
+    let output = compile_and_run(
+        r#"
+A% = 7.9: PRINT A%
+A% = 2.5: PRINT A%
+A% = 3.5: PRINT A%
+A% = -2.5: PRINT A%
+A% = -7.9: PRINT A%
+B& = 1234567.5: PRINT B&
+S! = 6.5: C% = S!: PRINT C%
+DIM D AS INTEGER
+D = 9.99: PRINT D
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["8", "2", "4", "-2", "-8", "1234568", "6", "10"]
+    );
+}
+
+/// The operands of `\`, MOD and the bitwise operators round the same way,
+/// rather than truncating: `7.6 \ 2` is `8 \ 2`.
+#[test]
+fn test_integer_operator_operands_round() {
+    let output = compile_and_run(
+        r#"
+X = 7.6: Y = 2
+PRINT X \ Y
+PRINT 7.4 \ Y
+PRINT X MOD 3
+PRINT 2.5 AND 3
+PRINT X OR 0
+PRINT NOT X
+PRINT X XOR 1
+PRINT 5.5 EQV 6
+PRINT 0.4 IMP 0
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["4", "3", "2", "2", "8", "-9", "9", "-1", "-1"]
+    );
+}
+
+/// Subscripts, string positions and ON selectors round too.
+#[test]
+fn test_subscripts_and_arguments_round() {
+    let output = compile_and_run(
+        r#"
+DIM A(3)
+A(1) = 10: A(2) = 20
+I = 1.6: PRINT A(I)
+I = 1.4: PRINT A(I)
+N! = 2.6: PRINT LEFT$("abcdef", N!)
+PRINT MID$("abcdef", 1.5, 2.5)  ' 2 and 2: half to even
+PRINT RIGHT$("abcdef", 1.5)
+PRINT INSTR(1.6, "abcabc", "a")
+S = 1.6
+ON S GOTO 10, 20
+10 PRINT "one": END
+20 PRINT "two"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["20", "10", "abc", "bc", "ef", "4", "two"]
+    );
+}
+
+/// INPUT and READ into an integer round as assignment does.
+#[test]
+fn test_input_and_read_into_integers_round() {
+    let output = crate::common::compile_and_run_with_stdin(
+        "INPUT A%\nPRINT A%\nDATA 2.5, 3.5\nREAD B%, C&\nPRINT B%; C&\n",
+        "7.9\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output).last(), Some(&"2  4"));
+    assert!(output.contains("8"), "{output:?}");
+}
+
+/// INTEGER arithmetic overflows at 16 bits and LONG at 32, as in GW-BASIC.
+/// `X% * X%` with X% = 300 used to be 90000 when printed and 24464 when
+/// stored, and LONG wrapped silently.
+#[test]
+fn test_integer_arithmetic_overflow_is_an_error() {
+    for source in [
+        "X% = 300\nPRINT X% * X%\n",
+        "X% = 32767\nX% = X% + 1\n",
+        "X% = -32768\nX% = X% - 1\n",
+        "X% = -32768\nX% = -X%\n",
+        "X% = 200\nY% = X% * 200\n",
+        "X& = 2147483647\nX& = X& + 1\n",
+        "X& = -2147483647\nX& = X& - 2\n",
+        "X& = 65536\nX& = X& * X&\n",
+        "X& = 70000\nX% = X&\n",
+        "DIM Y AS INTEGER\nY = 40000\n",
+        "A% = 32767.5\n",
+        "A& = 1E10\n",
+        "A& = -2147483648.6\n",
+        "PRINT CINT(40000)\n",
+        "PRINT CLNG(3E9)\n",
+        "X = 3E9\nPRINT X \\ 2\n",
+        "X = 3E9\nPRINT X AND 1\n",
+        "DIM A(3)\nPRINT A(1E12)\n",
+    ] {
+        assert_raises(source, "Overflow");
+    }
+}
+
+/// The edges themselves are fine.
+#[test]
+fn test_integer_limits_are_not_overflow() {
+    let output = compile_and_run(
+        r#"
+X% = 32767: PRINT X%
+X% = -32768: PRINT X%
+X% = 32766: X% = X% + 1: PRINT X%
+Y& = 2147483647: PRINT Y&
+Y& = -2147483648: PRINT Y&
+Z% = 32767.4: PRINT Z%
+W& = -2147483648.5: PRINT W&
+PRINT CINT(-32768.5)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            "32767",
+            "-32768",
+            "32767",
+            "2147483647",
+            "-2147483648",
+            "32767",
+            "-2147483648",
+            "-32768"
+        ]
+    );
+}
+
+/// A SINGLE or DOUBLE result too large for its type is Overflow, not `inf`.
+#[test]
+fn test_float_overflow_is_an_error() {
+    for source in [
+        "X# = 1E308\nX# = X# * 10\nPRINT X#\n",
+        "X# = 1E308\nPRINT X# + X#\n",
+        "X# = -1E308\nPRINT X# - 1E308\n",
+        "X! = 1E38\nX! = X! * 10\n",
+        "X# = 1E300\nX! = X#\n",
+        "PRINT CSNG(1E300)\n",
+        "PRINT EXP(1000)\n",
+        "PRINT 10 ^ 400\n",
+        "X = 1E-310\nPRINT 1 / X\n",
+    ] {
+        assert_raises(source, "Overflow");
+    }
+}
+
+/// Zero to a negative power is Division by zero, as GW-BASIC says; pow()
+/// answered `inf`.
+#[test]
+fn test_zero_to_a_negative_power_is_division_by_zero() {
+    assert_raises("X = 0\nPRINT X ^ -1\n", "Division by zero");
+    assert_raises("X = 0\nY = -2\nPRINT X ^ Y\n", "Division by zero");
+    let output = compile_and_run("X = 0\nPRINT X ^ 0\nPRINT X ^ 2\n").unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["1", "0"]);
+}
+
+/// Overflow is an ordinary error: trappable, with ERR 6.
+#[test]
+fn test_overflow_is_trappable() {
+    let output = compile_and_run(
+        "ON ERROR GOTO 100\nX% = 32767\nX% = X% + 1\nPRINT \"after\"\nEND\n100 PRINT \"ERR\"; ERR\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["ERR 6", "after"]);
+}
+
+/// An ON selector outside 0-255 is Illegal function call; 0, and one past the
+/// list, still fall through.
+#[test]
+fn test_on_selector_range() {
+    assert_raises("X = -1\nON X GOTO 10\n10 END\n", "Illegal function call");
+    assert_raises(
+        "X = 256\nON X GOSUB 10\nEND\n10 RETURN\n",
+        "Illegal function call",
+    );
+    let output = compile_and_run(
+        "X = 0\nON X GOTO 10\nPRINT \"fell\"\nX = 255\nON X GOTO 10\nPRINT \"fell\"\nEND\n10 PRINT \"no\"\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["fell", "fell"]);
+}
+
+/// NaN compares as IEEE says: unequal to everything, itself included, and
+/// neither less nor greater. Only `--unsafe` can make one, by skipping the
+/// check that refuses SQR(-1); `=` `<` and `<=` used to answer true for it.
+#[test]
+fn test_nan_compares_as_ieee_says() {
+    let run = crate::common::compile_and_run_flags(
+        r#"
+X = SQR(-1)
+PRINT X = X; X <> X; X < 1; X <= 1; X > 1; X >= 1
+IF X = X THEN PRINT "eq" ELSE PRINT "not eq"
+IF X < 1 THEN PRINT "lt" ELSE PRINT "not lt"
+IF X <> 1 THEN PRINT "ne" ELSE PRINT "not ne"
+IF X THEN PRINT "true" ELSE PRINT "false"
+SELECT CASE X
+CASE 1: PRINT "case 1"
+CASE IS < 5: PRINT "case lt"
+CASE ELSE: PRINT "case else"
+END SELECT
+"#,
+        "",
+        &["--unsafe"],
+    )
+    .unwrap();
+    run.assert_ran_to_completion("NaN compares");
+    assert_eq!(
+        run.lines(),
+        vec![
+            "0 -1  0  0  0  0",
+            "not eq",
+            "not lt",
+            "ne",
+            "true",
+            "case else"
+        ]
+    );
+}
+
+/// `--unsafe` removes the overflow checks along with the others.
+#[test]
+fn test_unsafe_skips_overflow_checks() {
+    let run = crate::common::compile_and_run_flags(
+        "X% = 32767\nX% = X% + 1\nPRINT X%\n",
+        "",
+        &["--unsafe"],
+    )
+    .unwrap();
+    run.assert_ran_to_completion("unchecked overflow");
+    assert_eq!(run.lines(), vec!["-32768"]);
+}
+
+/// `\` binds looser than `*` and `/`, and MOD looser than `\`, as in GW-BASIC
+/// and QuickBASIC. All four used to share one level, left to right.
+#[test]
+fn test_integer_division_and_mod_have_their_own_levels() {
+    let output = compile_and_run(
+        r#"
+PRINT 6 \ 2 * 3
+PRINT 12 \ 2 / 2
+PRINT 7 MOD 4 \ 2
+PRINT 10 - 7 MOD 4
+PRINT 2 * 7 MOD 4
+PRINT 20 MOD 7 * 2
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["1", "12", "1", "7", "2", "6"]
+    );
+}
+
+/// An unsuffixed whole number is an INTEGER when it fits 16 bits, a LONG when
+/// it fits 32, and a DOUBLE beyond; a number with a point or an exponent is a
+/// DOUBLE. INTEGER arithmetic is checked at 16 bits, so -- as in QuickBASIC --
+/// `X% * 300` can overflow where `X% * 300&` cannot.
+#[test]
+fn test_literal_types_follow_their_size() {
+    let output = compile_and_run(
+        r#"
+X% = 300
+PRINT X% * 300&
+PRINT X% * 40000
+PRINT 32767 + 1&
+PRINT 100000 * 3
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["90000", "12000000", "32768", "300000"]
+    );
+    for source in [
+        "X% = 300\nPRINT X% * 300\n",
+        "PRINT 200 * 200\n",
+        "PRINT 32767 + 1\n",
+    ] {
+        assert_raises(source, "Overflow");
+    }
+}
+
+/// A literal may carry a type suffix, as in GW-BASIC: `%` INTEGER, `&` LONG,
+/// `!` SINGLE, `#` DOUBLE. They used to be refused.
+#[test]
+fn test_literal_suffixes() {
+    let output = compile_and_run(
+        r#"
+PRINT 1.5#
+PRINT 100!
+A# = .1!
+PRINT A# = .1#
+PRINT A# = CDBL(CSNG(.1))
+B& = 5&
+PRINT B&
+PRINT 32767% + 0&
+PRINT 1D3
+PRINT 2.5! * 2
+X% = 300
+PRINT X% * 300&
+PRINT 7#
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            "1.5", "100", "0", "-1", "5", "32767", "1000", "5", "90000", "7"
+        ]
+    );
+}
+
+/// A suffix the value does not fit is refused when the program is compiled.
+#[test]
+fn test_literal_suffix_out_of_range_is_refused() {
+    for (source, what) in [
+        ("PRINT 32768%\n", "INTEGER"),
+        ("PRINT 3000000000&\n", "LONG"),
+        ("PRINT 1.5%\n", "INTEGER"),
+        ("PRINT 1E39!\n", "SINGLE"),
+        ("PRINT &H10000%\n", "INTEGER"),
+        ("PRINT &H100000000&\n", "32 bits"),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.is_clean_rejection(), "{source:?}: {}", err.stderr);
+        assert!(err.contains(what), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// A constant expression is folded in its type, so one that overflows is an
+/// error when the program is compiled, as QuickBASIC reports it.
+#[test]
+fn test_constant_folding_respects_types() {
+    let output = compile_and_run(
+        "CONST A = 300 * 300&\nCONST B = 1 / 4\nCONST C = 100 * 100\nCONST D = 7 \\ 2\nPRINT A; B; C; D\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["90000  .25  10000  3"]);
+    let err = crate::common::compile_only("CONST A = 300 * 300\nPRINT A\n").unwrap_err();
+    assert!(err.contains("Overflow"), "{}", err.stderr);
 }

@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_raw};
 
 #[test]
 fn test_data_read_restore() {
@@ -246,19 +246,124 @@ PRINT D$
     );
 }
 
-/// And the mirror image, which already worked: a string item read as a number.
+/// An unquoted item is read as a number by the same rules as VAL, so the
+/// forms a literal may take work here too.
 #[test]
-fn test_string_data_read_as_a_number() {
+fn test_data_numbers_read_as_val_reads_them() {
     let output = compile_and_run(
         r#"
-DATA "12", "3.5", "notanumber"
-READ A, B, C
-PRINT A
-PRINT B
-PRINT C
+DATA 12, 3.5, &HFF, 1D3, -7, , 2 5
+READ A, B, C, D, E, F, G
+PRINT A; B; C; D; E; F; G
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["12", "3.5", "0"]);
+    assert_eq!(lines, vec!["12  3.5  255  1000 -7  0  25"]);
+}
+
+/// A quoted item, or text that is not a number, read into a numeric variable
+/// is GW-BASIC's "Syntax error" (2), reported for the READ. A quoted item used
+/// to go through strtod, so `DATA "abc"` read as 0 and nothing was said.
+#[test]
+fn test_reading_text_as_a_number_is_a_syntax_error() {
+    for source in [
+        "10 DATA \"12\"\n20 READ X\n",
+        "10 DATA abc\n20 READ X\n",
+        "10 DATA 12abc\n20 READ X\n",
+        "10 DATA 1.2.3\n20 READ X\n",
+    ] {
+        let run = compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Syntax error in 20"),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
+    let run = compile_and_run_raw("DATA 1E400\nREAD X\n", "").unwrap();
+    assert!(run.stderr.contains("Overflow"), "{}", run.stderr);
+    // ERR is 2, and it can be trapped.
+    let output = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 DATA x, 5\n30 READ A\n40 READ B\n50 PRINT B\n60 END\n100 PRINT ERR\n110 RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["2", "5"]);
+}
+
+/// A string READ gets the item as written: an unquoted number keeps its
+/// spelling, so `DATA 007` reads as "007". It used to be classified as a
+/// number when compiled and rendered back through STR$, giving " 7".
+#[test]
+fn test_numeric_data_read_into_a_string_keeps_its_spelling() {
+    let output = compile_and_run(
+        r#"
+DATA 007, 1.50, -0, &HFF, "007", 1E3
+READ A$, B$, C$, D$, E$, F$
+PRINT "["; A$; "]["; B$; "]["; C$; "]["; D$; "]["; E$; "]["; F$; "]"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["[007][1.50][-0][&HFF][007][1E3]"]
+    );
+}
+
+/// READ past the last item is GW-BASIC's error 4, `Out of DATA`.
+///
+/// It used to index past the end of the table: the entry after the last one is
+/// whatever the assembler put next, and the program died with SIGSEGV, taking
+/// the buffered output it had already printed with it.
+#[test]
+fn test_read_past_the_last_item_is_out_of_data() {
+    let run = compile_and_run_raw(
+        "10 DATA 1, 2\n20 READ X, Y\n30 PRINT X; Y\n40 READ Z\n50 PRINT Z\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        run.lines(),
+        vec!["1  2"],
+        "output before the error survives"
+    );
+    assert!(
+        run.stderr.contains("Out of DATA in 40"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// And it is an ordinary error: trappable, with ERR 4, for numbers and strings.
+#[test]
+fn test_out_of_data_is_trappable() {
+    let output = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 DATA 5
+30 READ A
+40 READ B
+50 READ C$
+60 PRINT A; B; "["; C$; "]"
+70 END
+100 PRINT "ERR"; ERR; "AT"; ERL
+110 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["ERR 4 AT 40", "ERR 4 AT 50", "5  0 []"]);
+}
+
+/// ERROR 4 raises the same error by number.
+#[test]
+fn test_error_4_is_out_of_data() {
+    let run = compile_and_run_raw("ERROR 4\n", "").unwrap();
+    assert!(
+        run.stderr.contains("Out of DATA"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
 }

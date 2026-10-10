@@ -1,237 +1,51 @@
-//! Assertions on the assembly the compiler emits, rather than on what a
-//! compiled program prints.
+//! Assertions on the Cranelift IR the compiler generates, plus behavioural
+//! tests of code paths that once had special cases in the old assembly
+//! backend.
 //!
-//! The optimizations these cover are invisible from the outside: a program
-//! that stops folding a constant, stops branching on flags, or starts
-//! rematerializing an address computes exactly the same answers, just with
-//! more instructions. Every other suite in this tree would stay green while
-//! the generated code silently got worse, which is what these are for.
+//! The IR assertions cover decisions the compiler makes itself, before
+//! Cranelift sees the function: a check it can settle at compile time, or a
+//! loop it can count in integers. A program whose divide-by-zero test stops
+//! being folded computes the same answers, so every other suite would stay
+//! green; these would not. They are pattern assertions, not golden files:
+//! naming the one symbol or instruction that must or must not appear says what
+//! the test is about, where a golden `.clif` would be regenerated rather than
+//! read.
 //!
-//! They are pattern assertions, not golden files. A golden `.s` would have to
-//! be regenerated after any change at all, so it would be rubber-stamped
-//! rather than read; naming the one instruction that must or must not appear
-//! says what the test is actually about.
+//! The behavioural tests run programs through constant operands, comparisons
+//! used as conditions and as values, array element widths, FOR-loop counters
+//! and accumulators, and array accesses inside loops. Register allocation and
+//! instruction selection are Cranelift's now, but each of those paths was once
+//! hand-optimized and got wrong in its own way, so the programs that pinned
+//! them down still earn their place.
 //!
-//! [`compile_to_asm`] returns only the generated portion, cut before the
-//! runtime's banner -- the runtime is thousands of hand-written instructions
-//! and contains an example of nearly everything asserted here.
+//! [`compile_to_clif`] returns only the generated functions -- the runtime is a
+//! prebuilt object linked beside them.
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_to_asm;
-
-/// The instructions of the one loop in a single-loop program.
-///
-/// Found by the label *definitions*, at the start of a line: searching for
-/// `.Lendfor_` anywhere finds the forward branch at the top of the loop
-/// instead, which sits before the body rather than after it. And by the
-/// numbered form only, since a loop whose step is not a constant also emits
-/// `.Lfor_neg_N` and `.Lfor_body_N`.
-///
-/// It asserts there is exactly one loop rather than guessing which to take.
-/// Every caller passes a program with one; a test that later grew a nested
-/// loop would otherwise quietly start asserting against the wrong body.
-#[track_caller]
-fn sole_loop_body(asm: &str) -> String {
-    let starts = label_positions(asm, ".Lfor_");
-    assert_eq!(
-        starts.len(),
-        1,
-        "this helper is for single-loop programs, but found {} loops",
-        starts.len()
-    );
-    let after = &asm[starts[0] + 1..];
-    let end = label_positions(after, ".Lendfor_")
-        .first()
-        .copied()
-        .expect("a loop exit label");
-    after[..end].to_string()
-}
-
-/// Byte offsets of the `\n<prefix><digits>:` label definitions in `asm`.
-fn label_positions(asm: &str, prefix: &str) -> Vec<usize> {
-    let needle = format!("\n{}", prefix);
-    asm.match_indices(&needle)
-        .filter(|(i, _)| {
-            let rest = &asm[i + needle.len()..];
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            !digits.is_empty() && rest[digits.len()..].starts_with(':')
-        })
-        .map(|(i, _)| i)
-        .collect()
-}
-
-/// Every one of `needles` must appear in the generated assembly.
-#[track_caller]
-fn asserts_emits(source: &str, needles: &[&str]) {
-    let asm = compile_to_asm(source).expect("the program must compile");
-    for needle in needles {
-        assert!(
-            asm.contains(needle),
-            "expected `{}` in the generated assembly for:\n{}\n--- got ---\n{}",
-            needle,
-            source,
-            asm
-        );
-    }
-}
-
-/// None of `needles` may appear in the generated assembly.
-#[track_caller]
-fn asserts_absent(source: &str, needles: &[&str]) {
-    let asm = compile_to_asm(source).expect("the program must compile");
-    for needle in needles {
-        assert!(
-            !asm.contains(needle),
-            "did not expect `{}` in the generated assembly for:\n{}\n--- got ---\n{}",
-            needle,
-            source,
-            asm
-        );
-    }
-}
-
-/// An argument register loaded with a small constant is written narrow.
-///
-/// `mov edi, 1` and `mov rdi, 1` put the same value in rdi, because writing a
-/// 32-bit register zeroes the upper half; the narrow encoding is two bytes
-/// shorter. PRINT's separator handling is the easiest site to reach from
-/// BASIC -- the comma is passed as an immediate character code.
-#[test]
-fn test_small_arguments_use_32_bit_registers() {
-    let src = "PRINT 1, 2\n";
-    let asm = compile_to_asm(src).expect("the program must compile");
-
-    assert!(
-        asm.lines().any(|l| l.trim_start().starts_with("mov e")
-            || l.trim_start().starts_with("mov r8d")
-            || l.trim_start().starts_with("mov r9d")),
-        "expected a narrow immediate load:\n{}",
-        asm
-    );
-
-    // No argument register should be loaded with a wide `mov` for a value
-    // that fits in 32 bits. Only the six System V / four Win64 argument
-    // registers are checked, since those are what emit_arg_imm writes.
-    for line in asm.lines().map(str::trim_start) {
-        for reg in ["rdi", "rsi", "rdx", "rcx", "r8", "r9"] {
-            let wide = format!("mov {}, ", reg);
-            if let Some(rest) = line.strip_prefix(&wide) {
-                if let Ok(v) = rest.parse::<i64>() {
-                    assert!(
-                        !(0..=u32::MAX as i64).contains(&v),
-                        "`{}` should have used the 32-bit register:\n{}",
-                        line,
-                        asm
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// A string literal's length is a small constant, so it too is written narrow.
-#[test]
-fn test_string_literal_length_uses_32_bit_register() {
-    asserts_emits("PRINT \"hello\"\n", &["mov edx, 5"]);
-    asserts_absent("PRINT \"hello\"\n", &["mov rdx, 5"]);
-}
-
-/// Reading an INTEGER already sign-extends it, so widening it is a no-op.
-///
-/// `movsx eax, WORD PTR [...]` leaves eax holding the sign-extended value; the
-/// `movsx eax, ax` that used to follow every INTEGER-to-LONG coercion could
-/// not change it.
-#[test]
-fn test_integer_load_is_not_sign_extended_twice() {
-    let src = "\
-DIM X AS INTEGER
-DIM Y AS LONG
-X = 7
-Y = X
-PRINT Y
-";
-    asserts_emits(src, &["movsx eax, WORD PTR"]);
-    asserts_absent(src, &["movsx eax, ax"]);
-}
-
-/// ...but a 16-bit truncation that carries meaning is still emitted.
-///
-/// INTEGER * INTEGER is INTEGER, computed with a 32-bit `imul`, so the result
-/// has to be brought back down to 16 bits before it is used as a LONG. This is
-/// the case the peephole must decline, and the reason it keys on the emitted
-/// instruction rather than on the static type.
-#[test]
-fn test_integer_arithmetic_is_still_truncated() {
-    let src = "\
-DIM X AS INTEGER
-DIM Y AS LONG
-X = 300
-Y = X * X
-PRINT Y
-";
-    asserts_emits(src, &["movsx eax, ax"]);
-}
-
-/// A Double constant is named in memory, not built as a 64-bit immediate.
-///
-/// `mov rax, <imm64>` plus `movq xmm0, rax` is fifteen bytes and costs a
-/// scratch register and a register round trip; a pool reference is eight.
-#[test]
-fn test_double_constants_come_from_the_pool() {
-    let src = "X# = 3.5\nPRINT X#\n";
-    asserts_emits(src, &["_f64_0: .quad 0x400C000000000000"]);
-    asserts_absent(src, &["mov rax, 0x400C000000000000", "movq xmm0, rax"]);
-}
-
-/// Equal constants share one pool entry.
-#[test]
-fn test_double_constant_pool_is_deduplicated() {
-    let asm = compile_to_asm("X# = 2.5 + 2.5\nPRINT X#\n").expect("the program must compile");
-    let entries = asm.lines().filter(|l| l.starts_with("_f64_")).count();
-    assert_eq!(entries, 1, "expected one pooled constant:\n{}", asm);
-}
-
-/// Zero is shorter still as an idiom, and breaks rather than makes a
-/// dependency on whatever xmm0 last held.
-#[test]
-fn test_double_zero_is_an_xor() {
-    let src = "X# = 0.0\nPRINT X#\n";
-    asserts_emits(src, &["xorpd xmm0, xmm0"]);
-}
-
-/// A constant right operand needs no spill: it cannot clobber the left one.
-///
-/// The general path parks the left operand on the stack while the right is
-/// evaluated, because evaluating the right can call a function. A literal
-/// cannot, so the whole `sub rsp` / store / reload / `add rsp` sequence -- and
-/// the `cvtsi2sd` that used to widen an integer literal -- goes away.
-#[test]
-fn test_double_operand_folds_into_the_instruction() {
-    let src = "Y# = 2\nX# = Y# * 3\nPRINT X#\n";
-    asserts_emits(src, &["mulsd xmm0, QWORD PTR [rip + _f64_"]);
-    asserts_absent(src, &["cvtsi2sd", "sub rsp, 16"]);
-}
-
-/// The same for integers, where the constant becomes an immediate.
-#[test]
-fn test_integer_operand_becomes_an_immediate() {
-    let src = "Y% = 2\nX% = Y% + 5\nPRINT X%\n";
-    asserts_emits(src, &["add eax, 5"]);
-    asserts_absent(src, &["sub rsp, 16"]);
-}
+use crate::common::{compile_to_clif, uses_symbol};
 
 /// Dividing by a constant zero is decided at compile time, not re-tested.
 ///
-/// The runtime test (`movq r11, xmm1` / `add r11, r11` / `jz`) exists to catch
-/// a divisor only known at run time. When the divisor is written into the
-/// program the branch is not a branch, and the trap is unconditional -- but it
-/// is still a trap.
+/// The runtime test (`fcmp eq` against 0.0) exists to catch a divisor only
+/// known at run time. When the divisor is written into the program the branch
+/// is not a branch, and the trap is unconditional -- but it is still a trap,
+/// and running the program must still stop with Division by zero.
 #[test]
 fn test_constant_zero_divisor_traps_without_testing() {
     let src = "Y# = 5\nX# = Y# / 0\nPRINT X#\n";
-    asserts_absent(src, &["movq r11, xmm1"]);
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(
+        uses_symbol(&clif, "_err_div0") && uses_symbol(&clif, "_rt_error"),
+        "a constant zero divisor must still raise:\n{}",
+        clif
+    );
+    assert!(
+        !clif.contains("fcmp eq"),
+        "a constant divisor needs no run-time zero test:\n{}",
+        clif
+    );
 
     let run = crate::common::compile_and_run_raw(src, "").expect("the program must compile");
     assert_eq!(run.exit_code, Some(1));
@@ -246,12 +60,33 @@ fn test_constant_zero_divisor_traps_without_testing() {
 /// ...and a nonzero constant divisor is not tested at all.
 #[test]
 fn test_constant_nonzero_divisor_is_not_tested() {
-    asserts_absent("Y# = 5\nX# = Y# / 2\nPRINT X#\n", &["movq r11, xmm1"]);
+    let clif = compile_to_clif("Y = 5\nX = Y / 4\nPRINT X\n").expect("the program must compile");
+    assert!(
+        !uses_symbol(&clif, "_err_div0"),
+        "a nonzero constant divisor cannot divide by zero:\n{}",
+        clif
+    );
+    assert!(
+        !clif.contains("fcmp eq"),
+        "no zero test expected:\n{}",
+        clif
+    );
 }
 
-/// Every operator that takes the constant path must still compute correctly.
-///
-/// The shape assertions above say the fast path fired; this says it was right.
+/// A divisor only known at run time is still tested, so the two tests above
+/// are not passing merely because no division is ever checked.
+#[test]
+fn test_variable_divisor_is_tested() {
+    let clif =
+        compile_to_clif("D = 3\nY = 5\nX = Y / D\nPRINT X\n").expect("the program must compile");
+    assert!(
+        uses_symbol(&clif, "_err_div0") && clif.contains("fcmp eq"),
+        "a variable divisor must be checked:\n{}",
+        clif
+    );
+}
+
+/// Every operator with a constant right operand must still compute correctly.
 #[test]
 fn test_constant_right_operand_arithmetic_is_correct() {
     let src = "\
@@ -281,63 +116,18 @@ PRINT (Z# >= 2.5)
     );
 }
 
-/// A CONST is a constant here too, not just a literal.
+/// A CONST operand computes the same as the literal it names.
 #[test]
 fn test_named_constants_take_the_constant_path() {
     let src = "CONST THREE = 3\nY# = 2\nX# = Y# * THREE\nPRINT X#\n";
-    asserts_emits(src, &["mulsd xmm0, QWORD PTR [rip + _f64_"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "6");
 }
 
-/// A comparison used as a condition branches on its own flags.
-///
-/// The `setcc` / `movzx` / `neg` / `test` sequence built a -1/0 word only to
-/// compare it against zero, when the comparison had already set exactly the
-/// flags the jump reads.
-#[test]
-fn test_if_branches_on_comparison_flags() {
-    let src = "A% = 5\nB% = 3\nIF A% > B% THEN PRINT \"y\"\n";
-    asserts_emits(src, &["cmp eax, ecx", "jle "]);
-    asserts_absent(src, &["setg", "neg eax", "test eax, eax"]);
-}
-
-/// The same for a Double comparison, which reads the flags unsigned because
-/// ucomisd reports through CF and ZF.
-#[test]
-fn test_double_comparison_branches_unsigned() {
-    let src = "X# = 1.5\nIF X# < 2 THEN PRINT \"y\"\n";
-    asserts_emits(src, &["ucomisd xmm0, QWORD PTR [rip + _f64_", "jae "]);
-    asserts_absent(src, &["setb", "neg eax"]);
-}
-
-/// ...and for strings, where _rt_strcmp's memcmp-style result reads signed.
-#[test]
-fn test_string_comparison_branches_on_strcmp() {
-    let src = "S$ = \"abc\"\nIF S$ < \"abd\" THEN PRINT \"y\"\n";
-    asserts_emits(src, &["call _rt_strcmp", "test eax, eax", "jge "]);
-    asserts_absent(src, &["setl", "neg eax"]);
-}
-
-/// Every loop form takes the same path, in both branch senses.
-#[test]
-fn test_every_loop_form_branches_on_flags() {
-    for src in [
-        "I% = 0\nWHILE I% < 3\nI% = I% + 1\nWEND\n",
-        "I% = 0\nDO WHILE I% < 3\nI% = I% + 1\nLOOP\n",
-        "I% = 0\nDO UNTIL I% >= 3\nI% = I% + 1\nLOOP\n",
-        "I% = 0\nDO\nI% = I% + 1\nLOOP WHILE I% < 3\n",
-        "I% = 0\nDO\nI% = I% + 1\nLOOP UNTIL I% >= 3\n",
-    ] {
-        asserts_emits(src, &["cmp eax, 3"]);
-        asserts_absent(src, &["setl", "setge", "neg eax"]);
-    }
-}
-
-/// Each of those loops must still run the right number of times.
+/// Each loop form runs the right number of times.
 ///
 /// The post-test forms branch backwards, so their senses are inverted against
-/// the pre-test ones -- the easiest thing in this change to get backwards.
+/// the pre-test ones -- the easiest thing about a loop to get backwards.
 #[test]
 fn test_every_loop_form_iterates_correctly() {
     for (src, expected) in [
@@ -372,13 +162,11 @@ fn test_every_loop_form_iterates_correctly() {
 
 /// A comparison that is *not* a condition still produces a -1/0 word.
 ///
-/// This is why the fast path is opt-in per site rather than a change to
-/// gen_binary_expr: BASIC's AND is bitwise, so `A > B AND C > D` needs both
-/// halves materialized, and assigning or printing a comparison needs a value.
+/// A comparison used as a condition can branch directly; one that is assigned
+/// or printed needs a value, and BASIC's true is -1.
 #[test]
 fn test_comparison_as_a_value_is_still_materialized() {
     let src = "A% = 5\nB% = 3\nN% = (A% > B%)\nPRINT N%\n";
-    asserts_emits(src, &["setg", "neg eax"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "-1");
 }
@@ -398,50 +186,15 @@ IF (A% < B%) AND (X# < 2) THEN PRINT \"wrong\" ELSE PRINT \"neither\"
     assert_eq!(got, vec!["both", "neither"]);
 }
 
-/// A scalar array element is read through a scaled index, not a computed
-/// address.
-///
-/// `imul rax, 8` / `add rax, <base>` / `movsd xmm0, [rax]` is three
-/// instructions for what x86-64 addressing does in one operand.
-///
-/// `add rax, QWORD PTR [rip + _arr_` is the discriminator, not the `imul`:
-/// DIM emits its own `imul rax, <size>` to work out how many bytes to
-/// allocate, and that one is not going anywhere.
-const FLAT_ADDRESS: &str = "add rax, QWORD PTR [rip + _arr_";
-
-#[test]
-fn test_array_element_is_read_through_a_scaled_index() {
-    let src = "DIM A#(10)\nI% = 3\nPRINT A#(I%)\n";
-    asserts_emits(src, &["movsd xmm0, QWORD PTR [r10 + rax*8]"]);
-    asserts_absent(src, &[FLAT_ADDRESS]);
-}
-
-/// Each scalar width gets its own scale.
-#[test]
-fn test_every_scalar_element_width_scales() {
-    for (decl, elem, scale) in [
-        ("DIM A%(10)", "A%", 2),
-        ("DIM A&(10)", "A&", 4),
-        ("DIM A!(10)", "A!", 4),
-        ("DIM A#(10)", "A#", 8),
-    ] {
-        let src = format!("{}\nI% = 3\nPRINT {}(I%)\n", decl, elem);
-        asserts_emits(&src, &[&format!("[r10 + rax*{}]", scale)]);
-        asserts_absent(&src, &[FLAT_ADDRESS]);
-    }
-}
-
-/// A string element is sixteen bytes, which is not a legal scale, so it keeps
-/// the multiply and the flat address.
+/// A string array element, sixteen bytes wide, is written and read back.
 #[test]
 fn test_string_array_keeps_the_multiply() {
     let src = "DIM A$(10)\nI% = 3\nA$(I%) = \"x\"\nPRINT A$(I%)\n";
-    asserts_emits(src, &["imul rax, 16", FLAT_ADDRESS]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "x");
 }
 
-/// Neither is a record element, whose size is eight times its word count.
+/// So is a record element, whose size is eight times its word count.
 #[test]
 fn test_record_array_keeps_the_multiply() {
     let src = "\
@@ -454,12 +207,11 @@ R(2).A = 1
 R(2).B = 2
 PRINT R(2).A + R(2).B
 ";
-    asserts_emits(src, &["imul rax, 16", FLAT_ADDRESS]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "3");
 }
 
-/// The addressing change must not disturb what the elements actually hold.
+/// Every scalar element width round-trips what it holds.
 #[test]
 fn test_array_elements_round_trip_through_every_type() {
     let src = "\
@@ -491,7 +243,7 @@ PRINT I%(0), L&(4), D#(1)
     assert_eq!(got[1], ["0", "4000", ".5"]);
 }
 
-/// Bounds checking still catches a subscript past the end.
+/// Bounds checking catches a subscript past the end.
 #[test]
 fn test_scaled_index_is_still_bounds_checked() {
     let src = "DIM A#(4)\nI% = 9\nPRINT A#(I%)\n";
@@ -505,8 +257,7 @@ fn test_scaled_index_is_still_bounds_checked() {
     );
 }
 
-/// A multi-dimensional array folds its scale the same way, after the
-/// row-major index has been accumulated.
+/// A multi-dimensional element is addressed by its row-major index.
 #[test]
 fn test_multidimensional_array_scales_too() {
     let src = "\
@@ -514,7 +265,6 @@ DIM A#(3, 3)
 A#(1, 2) = 7
 PRINT A#(1, 2)
 ";
-    asserts_emits(src, &["[r10 + rax*8]"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "7");
 }
@@ -523,22 +273,28 @@ PRINT A#(1, 2)
 ///
 /// The loop machinery used to work entirely in Double whatever the control
 /// variable's type was, which was both slower and wrong -- see
-/// `control::test_for_loop_control_variable_types`.
+/// `control::test_for_loop_control_variable_types`. The step is a sixteen-bit
+/// `sadd_overflow`, so that stepping past INTEGER's range is caught rather than
+/// silently wrapping, and no floating-point add or compare drives the loop.
 #[test]
 fn test_integer_for_loop_counts_in_integers() {
-    let src = "FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n";
-    asserts_emits(
-        src,
-        &[
-            "movsx eax, WORD PTR [rip + _var_I_I + 0]",
-            "cmp eax, 3",
-            // Sixteen-bit, so that stepping past INTEGER's range sets the
-            // overflow flag rather than silently wrapping.
-            "add ax, 1",
-            "mov WORD PTR [rip + _var_I_I + 0], ax",
-        ],
-    );
-    asserts_absent(src, &["ucomisd", "addsd", "cvttsd2si"]);
+    let clif = compile_to_clif("FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n").expect("must compile");
+    for needle in ["sadd_overflow", "ireduce.i16", "icmp sgt"] {
+        assert!(
+            clif.contains(needle),
+            "expected `{}` in the loop:\n{}",
+            needle,
+            clif
+        );
+    }
+    for needle in ["fadd", "fcmp"] {
+        assert!(
+            !clif.contains(needle),
+            "did not expect `{}` in an INTEGER loop:\n{}",
+            needle,
+            clif
+        );
+    }
 }
 
 /// Stepping an INTEGER counter past its range is reported, not wrapped.
@@ -548,8 +304,6 @@ fn test_integer_for_loop_counts_in_integers() {
 #[test]
 fn test_integer_counter_overflow_is_reported() {
     let src = "FOR I% = 32764 TO 32767\nPRINT I%\nNEXT I%\n";
-    asserts_emits(src, &["jo .Lerr_ovf"]);
-
     let run = crate::common::compile_and_run_raw(src, "").expect("the program must compile");
     assert_eq!(run.exit_code, Some(1));
     assert!(
@@ -565,42 +319,7 @@ fn test_integer_counter_overflow_is_reported() {
     );
 }
 
-/// A loop that calls nothing keeps its counter in a register.
-///
-/// A counter in memory makes the loop-carried dependency a store followed by
-/// the next iteration's load of the same address -- around ten cycles of
-/// store-to-load forwarding that nothing else in the loop can hide.
-#[test]
-fn test_call_free_loop_promotes_its_counter() {
-    let src = "T# = 0\nFOR I = 1 TO 10\nT# = T# + I\nNEXT I\nPRINT T#\n";
-    asserts_emits(src, &["addsd xmm4,", "movapd xmm4, xmm0"]);
-    // Nothing reads or writes the counter's storage inside the loop; it is
-    // written back once, after it.
-    let asm = compile_to_asm(src).expect("must compile");
-    assert_eq!(
-        asm.matches("_var_I + 0").count(),
-        1,
-        "the counter's storage should be touched once, at the writeback:\n{}",
-        asm
-    );
-}
-
-/// An INTEGER counter goes to a callee-saved GPR, which has to be saved.
-#[test]
-fn test_integer_counter_register_is_saved_and_restored() {
-    let src = "T% = 0\nFOR I% = 1 TO 10\nT% = T% + I%\nNEXT I%\nPRINT T%\n";
-    asserts_emits(
-        src,
-        &[
-            "mov QWORD PTR [rsp], r12",
-            "add r12w, 1",
-            "mov WORD PTR [rip + _var_I_I + 0], r12w",
-            "mov r12, QWORD PTR [rsp]",
-        ],
-    );
-}
-
-/// Nested promotable loops get different registers.
+/// Nested loops keep their counters apart.
 #[test]
 fn test_nested_promoted_loops_do_not_collide() {
     let src = "\
@@ -612,41 +331,18 @@ FOR I = 1 TO 3
 NEXT I
 PRINT T#
 ";
-    asserts_emits(src, &["xmm4", "xmm5"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     assert_eq!(out.trim(), "60", "(1+2+3) * (1+2+3+4)");
 }
 
-/// A loop that calls anything keeps its counter in memory.
-///
-/// System V has no callee-saved XMM register, so a Double counter would not
-/// survive the call; and a called procedure can reach a module-level counter
-/// by name. PRINT is a call, so this is most loops.
-#[test]
-fn test_calling_loop_keeps_its_counter_in_memory() {
-    for src in [
-        // A runtime call.
-        "FOR I = 1 TO 3\nPRINT I\nNEXT I\n",
-        // A libc math call.
-        "T# = 0\nFOR I = 1 TO 3\nT# = T# + SIN(I)\nNEXT I\nPRINT T#\n",
-        // Exponentiation, which calls pow.
-        "T# = 0\nFOR I = 1 TO 3\nT# = T# + I ^ 2\nNEXT I\nPRINT T#\n",
-        // A string operation, which goes through the runtime.
-        "S$ = \"\"\nFOR I = 1 TO 3\nS$ = S$ + \"x\"\nNEXT I\nPRINT S$\n",
-    ] {
-        asserts_absent(src, &["xmm4", "r12"]);
-    }
-}
-
-/// Neither does a loop whose body assigns to the counter, since the register
-/// would go stale and BASIC allows the assignment.
+/// A loop whose body assigns to its counter sees the assignment, as BASIC
+/// allows.
 #[test]
 fn test_loop_assigning_its_counter_keeps_it_in_memory() {
     // The body steps the counter itself, so it advances by three per
     // iteration: 1, 4, 7, 10, then 13, which is past the limit. Four
     // iterations and a final value of 13, both of which depend on the loop
-    // reading the counter back out of memory rather than out of a register it
-    // never saw the assignment through.
+    // reading back the counter the body wrote.
     let src = "\
 N# = 0
 FOR I = 1 TO 10
@@ -656,15 +352,13 @@ NEXT I
 PRINT N#
 PRINT I
 ";
-    asserts_absent(src, &["xmm4"]);
     let out = crate::common::compile_and_run(src).expect("the program must run");
     let lines = crate::common::lines(&out);
     assert_eq!(lines[0], "4", "the body ran four times");
     assert_eq!(lines[1], "13", "the body's own step took effect");
 }
 
-/// EXIT FOR leaves through the loop's own exit, where the register is written
-/// back, so the counter is correct afterwards.
+/// After EXIT FOR, the counter holds the value it left with.
 #[test]
 fn test_exit_for_writes_a_promoted_counter_back() {
     let out = crate::common::compile_and_run(
@@ -676,47 +370,11 @@ fn test_exit_for_writes_a_promoted_counter_back() {
     assert_eq!(lines[1], "4", "the counter survived EXIT FOR");
 }
 
-/// A constant step settles the loop's direction at compile time.
-///
-/// The step's sign decides whether the loop exits above or below its limit.
-/// It used to be re-tested on every iteration -- three loads, an xorpd, a
-/// ucomisd and two branches -- even when it was written into the program.
+/// INTEGER arithmetic is checked at 16 bits: 300 * 300 is 90000, which does
+/// not fit an INTEGER, and GW-BASIC stops with Overflow rather than wrap. This
+/// used to give 24464, and the same product printed directly gave 90000.
 #[test]
-fn test_constant_step_needs_no_direction_test() {
-    for src in [
-        "FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n",
-        "FOR I% = 3 TO 1 STEP -1\nPRINT I%\nNEXT I%\n",
-        "FOR X# = 0 TO 1 STEP 0.5\nPRINT X#\nNEXT X#\n",
-    ] {
-        asserts_absent(src, &[".Lfor_neg_"]);
-    }
-}
-
-/// ...and a step that is not constant still gets one.
-#[test]
-fn test_runtime_step_keeps_its_direction_test() {
-    let src = "S% = 2\nFOR I% = 0 TO 6 STEP S%\nPRINT I%\nNEXT I%\n";
-    asserts_emits(src, &[".Lfor_neg_"]);
-}
-
-/// A constant limit and step need no frame slots either: they are the
-/// compare's and the add's own operands.
-#[test]
-fn test_constant_bounds_need_no_frame_slots() {
-    let asm = compile_to_asm("FOR I% = 1 TO 3\nPRINT I%\nNEXT I%\n").expect("must compile");
-    assert!(
-        asm.contains("sub rsp, 0        # STACK_RESERVE"),
-        "expected an empty frame, since nothing needs a slot:\n{}",
-        asm
-    );
-}
-
-/// The truncation above is not decorative: the program must still wrap.
-///
-/// 300 * 300 is 90000, which does not fit in an INTEGER; GW-BASIC's INTEGER
-/// arithmetic wraps to 16 bits, giving 24464.
-#[test]
-fn test_integer_multiply_wraps_to_16_bits() {
+fn test_integer_multiply_overflows_at_16_bits() {
     let src = "\
 DIM X AS INTEGER
 DIM Y AS LONG
@@ -724,53 +382,9 @@ X = 300
 Y = X * X
 PRINT Y
 ";
-    let out = crate::common::compile_and_run(src).expect("the program must run");
-    assert_eq!(out.trim(), "24464");
-}
-
-/// Each runtime helper is emitted into a section of its own.
-///
-/// A linker discards an unreferenced *section*, never an unreferenced label,
-/// so this is what lets the linker drop the helpers a program does not call.
-/// Without it all 69 went into every binary.
-///
-/// Counted against the exported helpers, not against every label: a COMDAT
-/// section is identified by a symbol and that symbol has to be external, so
-/// the handful of helpers that are not `.globl` deliberately ride in the
-/// section of whichever helper precedes them.
-///
-/// The two object formats spell the directive differently -- ELF names the
-/// section after the helper, COFF repeats `.text` and names the helper as the
-/// COMDAT symbol -- so the match is on what they have in common.
-#[test]
-fn test_runtime_helpers_get_their_own_sections() {
-    let tmp = tempfile::TempDir::new().expect("temp dir");
-    let bas = tmp.path().join("t.bas");
-    std::fs::write(&bas, "PRINT \"hi\"\n").expect("write");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg("-S")
-        .arg(&bas)
-        .arg("-o")
-        .arg(tmp.path().join("t"))
-        .output()
-        .expect("run compiler");
-    assert!(out.status.success());
-    let asm = std::fs::read_to_string(tmp.path().join("t.s")).expect("read asm");
-
-    let exported = asm.lines().filter(|l| l.starts_with(".globl _rt_")).count();
-    let sections = asm
-        .lines()
-        .filter(|l| l.starts_with(".section .text") && l.contains("_rt_"))
-        .count();
-    assert!(
-        exported > 50,
-        "expected the whole runtime, saw {} exported helpers",
-        exported
-    );
-    assert_eq!(
-        sections, exported,
-        "every exported helper needs a section of its own"
-    );
+    let run = crate::common::compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stderr {}", run.stderr);
+    assert!(run.stderr.contains("Overflow"), "stderr {}", run.stderr);
 }
 
 /// No runtime helper may fall through into the next one.
@@ -795,21 +409,22 @@ fn test_no_runtime_helper_falls_through() {
             let mut previous: Option<String> = None;
             for line in text.lines() {
                 let t = line.trim();
-                if t.starts_with("_rt_") && t.ends_with(':') {
-                    if let Some(prev) = &previous {
-                        let op = prev.split_whitespace().next().unwrap_or("");
-                        // `_rt_error` never returns, so reaching a label after
-                        // a call to it is not a fall-through.
-                        let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
-                            || prev.starts_with("call _rt_error");
-                        assert!(
-                            terminal,
-                            "{} falls into {} from `{}`",
-                            path.display(),
-                            t,
-                            prev
-                        );
-                    }
+                if t.starts_with("_rt_")
+                    && t.ends_with(':')
+                    && let Some(prev) = &previous
+                {
+                    let op = prev.split_whitespace().next().unwrap_or("");
+                    // `_rt_error` never returns, so reaching a label after
+                    // a call to it is not a fall-through.
+                    let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
+                        || prev.starts_with("call _rt_error");
+                    assert!(
+                        terminal,
+                        "{} falls into {} from `{}`",
+                        path.display(),
+                        t,
+                        prev
+                    );
                 }
                 // Track the last thing that is an instruction: not a comment,
                 // not a directive, and not a label -- including the
@@ -828,28 +443,7 @@ fn test_no_runtime_helper_falls_through() {
     }
 }
 
-/// A loop's accumulator lives in a register, not in its storage.
-///
-/// `T = T + ...` has the same store-then-reload loop-carried dependency the
-/// control variable had, and usually a longer one, since the add sits on the
-/// critical path too. A hundred million iterations of `C# = C# + 1` went from
-/// 0.18s to 0.04s.
-#[test]
-fn test_loop_accumulator_is_promoted() {
-    let src = "C# = 0\nFOR I = 1 TO 10\nC# = C# + 1\nNEXT I\nPRINT C#\n";
-    let asm = compile_to_asm(src).expect("must compile");
-    let body = sole_loop_body(&asm);
-    assert!(
-        !body.contains("_var_C_D"),
-        "the accumulator's storage must not be touched inside the loop:\n{}",
-        body
-    );
-    // Loaded before the loop and written back after it.
-    asserts_emits(src, &["movsd xmm5, QWORD PTR [rip + _var_C_D + 0]"]);
-    asserts_emits(src, &["movsd QWORD PTR [rip + _var_C_D + 0], xmm5"]);
-}
-
-/// Only so many, and the rest keep working in memory.
+/// Several accumulators in one loop all accumulate.
 #[test]
 fn test_accumulator_promotion_has_a_limit() {
     let src = "\
@@ -868,26 +462,15 @@ PRINT B#
 PRINT C#
 PRINT D#
 ";
-    let asm = compile_to_asm(src).expect("must compile");
-    let body = sole_loop_body(&asm);
-    assert!(
-        body.contains("_var_D_D"),
-        "the fourth accumulator should have stayed in memory:\n{}",
-        body
-    );
-    for name in ["_var_A_D", "_var_B_D", "_var_C_D"] {
-        assert!(!body.contains(name), "{} should be in a register", name);
-    }
     let out = crate::common::compile_and_run(src).expect("must run");
     let got = crate::common::lines(&out);
     assert_eq!(got, vec!["4", "8", "12", "16"], "all four still accumulate");
 }
 
-/// An integer accumulator takes a callee-saved GPR, so it must be saved.
+/// An INTEGER accumulator in an INTEGER loop sums correctly.
 #[test]
 fn test_integer_accumulator_register_is_saved() {
     let src = "S% = 0\nFOR I% = 1 TO 5\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
-    asserts_emits(src, &["save an accumulator register"]);
     let out = crate::common::compile_and_run(src).expect("must run");
     assert_eq!(out.trim(), "15");
 }
@@ -924,20 +507,6 @@ fn test_accumulator_write_back_is_correct() {
     }
 }
 
-/// A loop that calls anything keeps its accumulator in memory, for the same
-/// reason it keeps its counter there.
-#[test]
-fn test_calling_loop_does_not_promote_accumulators() {
-    let src = "T# = 0\nFOR I = 1 TO 3\nT# = T# + I\nPRINT T#\nNEXT I\n";
-    let asm = compile_to_asm(src).expect("must compile");
-    let body = sole_loop_body(&asm);
-    assert!(
-        body.contains("_var_T_D"),
-        "PRINT is a call, so nothing may be promoted:\n{}",
-        body
-    );
-}
-
 /// The limit is captured before the loop, so assigning it inside does not
 /// extend the loop -- and the assignment still takes effect.
 #[test]
@@ -950,61 +519,22 @@ fn test_promoted_accumulator_does_not_change_the_limit() {
     assert_eq!(got, vec!["3", "100"]);
 }
 
-/// A loop hoists the array descriptors its body keeps re-reading.
+/// A loop that never runs creates no array.
 ///
-/// The element pointer and the bounds cannot change while the loop runs, yet
-/// every subscript fetched them again: two loads for the pointer, since the
-/// null check and the address each wanted it, and one per bound compare.
+/// A use of an array with no storage creates it, as GW-BASIC does; doing that
+/// before the loop rather than at the access would create an array that a
+/// loop running zero times never touched, and a later DIM of it would then be
+/// a Duplicate definition.
 #[test]
-fn test_loop_hoists_array_descriptors() {
-    let src = "\
-DIM A(5)
-T# = 0
-FOR I = 0 TO 5
-  T# = T# + A(I)
-NEXT I
-PRINT T#
-";
-    let asm = compile_to_asm(src).expect("must compile");
-    let body = sole_loop_body(&asm);
-    assert!(
-        !body.contains("_arr_A"),
-        "the descriptor should be in registers inside the loop:\n{}",
-        body
-    );
-    // Loaded once, before the loop.
-    asserts_emits(src, &["mov r12, QWORD PTR [rip + _arr_A + 0]"]);
+fn test_autodim_check_is_not_hoisted_out_of_the_loop() {
+    let out = crate::common::compile_and_run(
+        "FOR I = 1 TO 0\nB(I) = 1\nNEXT I\nDIM B(3)\nPRINT UBOUND(B)\n",
+    )
+    .expect("a loop that never runs creates nothing");
+    assert_eq!(out.trim(), "3");
 }
 
-/// The null check stays inside the loop even though the pointer is hoisted.
-///
-/// Hoisting the *check* as well would report an array that a loop running
-/// zero times never touched.
-#[test]
-fn test_undim_check_is_not_hoisted_out_of_the_loop() {
-    let src = "\
-DIM A(5)
-T# = 0
-FOR I = 0 TO 5
-  T# = T# + A(I)
-NEXT I
-PRINT T#
-";
-    let asm = compile_to_asm(src).expect("must compile");
-    let body = sole_loop_body(&asm);
-    assert!(
-        body.contains(".Lerr_undim"),
-        "the DIM check belongs with the access:\n{}",
-        body
-    );
-
-    // ...and it still fires when it should.
-    let run =
-        crate::common::compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
-    assert!(run.stderr.contains("Array used before DIM"));
-}
-
-/// Bounds checking survives the hoist, against the hoisted bound.
+/// Bounds checking inside a loop catches the first subscript past the end.
 #[test]
 fn test_bounds_check_uses_the_hoisted_bound() {
     let run =
@@ -1051,99 +581,249 @@ PRINT T#
     assert_eq!(got, vec!["9", "23", "90"]);
 }
 
-/// Every call in generated code must be made with the stack 16-byte aligned.
+/// A loop whose body cannot change the array's descriptor reads it once,
+/// before its head: no block of the loop but the cold one that creates the
+/// array loads a word of `_arr_A`.
 ///
-/// `tests/runtime` already checks this for the hand-written runtime; nothing
-/// checked the code the compiler emits. MID$ and INSTR each pushed three
-/// callee-saved registers and never padded, so every call in those sequences
-/// was 8 bytes out. The leaf helpers tolerated it, which is why it went
-/// unnoticed -- until an argument check jumped to an error trampoline, whose
-/// `_rt_error` calls into the C library. On Linux that survived; on Windows it
-/// was an access violation, and the Linux CI could not see it.
-///
-/// The model is a linear scan of `main`'s body, which is sound here because
-/// each program below is straight-line: no loops, no branches of its own. A
-/// conditional jump to an error trampoline is checked too, since the trampoline
-/// touches no stack before calling and so inherits the jump site's alignment.
+/// The loop is found as Cranelift sees it: the blocks that can reach
+/// themselves. A descriptor load is a load from a `symbol_value` of the
+/// array's data object.
 #[test]
-fn test_generated_calls_are_stack_aligned() {
-    let programs = [
-        ("MID$ three args", "PRINT MID$(\"abcdef\", 2, 3)\n"),
-        ("MID$ two args", "PRINT MID$(\"abcdef\", 2)\n"),
-        ("INSTR two args", "PRINT INSTR(\"abc\", \"b\")\n"),
-        ("INSTR three args", "PRINT INSTR(2, \"abc\", \"b\")\n"),
-        ("LEFT$", "PRINT LEFT$(\"abc\", 2)\n"),
-        ("RIGHT$", "PRINT RIGHT$(\"abc\", 2)\n"),
-        ("STRING$", "PRINT STRING$(3, \"x\")\n"),
-        ("SPACE$", "PRINT SPACE$(3)\n"),
-        ("CHR$", "PRINT CHR$(65)\n"),
-        ("ASC", "PRINT ASC(\"A\")\n"),
-        (
-            "nested",
-            "PRINT MID$(LEFT$(\"abcdef\", 5), INSTR(\"abc\", \"b\"), 2)\n",
-        ),
-        ("concat", "PRINT MID$(\"abc\", 1, 2) + RIGHT$(\"xyz\", 1)\n"),
-        (
-            "array subscript",
-            "DIM A(3)\nA(1) = 2\nPRINT MID$(\"abcdef\", A(1), 2)\n",
-        ),
-        ("REDIM PRESERVE", "DIM A(3)\nREDIM PRESERVE A(5)\n"),
-        ("REDIM plain", "DIM A(3)\nREDIM A(5)\n"),
-        ("string concat", "A$ = \"x\" + \"y\"\n"),
-        ("PRINT USING", "PRINT USING \"##.##\"; 1.5\n"),
-        ("SWAP", "A% = 1 : B% = 2\nSWAP A%, B%\n"),
-        ("fixed string", "DIM S AS STRING * 4\nS = \"xy\"\n"),
-    ];
+fn test_clean_loop_loads_no_descriptor_word() {
+    let src = "DIM A(99)\nFOR I = 0 TO 99: A(I) = A(I) + 1: NEXT\nPRINT A(5)\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    let main = clif
+        .split_once("function u0:0(")
+        .and_then(|(_, f)| f.split_once("\n}\n"))
+        .map(|(f, _)| f)
+        .expect("main is in the IR");
+    let words = |l: &str| -> Vec<String> {
+        l.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let data = clif
+        .lines()
+        .find_map(|l| l.strip_prefix("; ")?.strip_suffix(" = _arr_A"))
+        .expect("A has a descriptor");
+    let gv = main
+        .lines()
+        .find_map(|l| {
+            let (gv, sym) = l.trim().split_once(" = ")?;
+            (sym == format!("symbol colocated {data}")).then(|| gv.to_string())
+        })
+        .expect("main reaches the descriptor");
 
-    let mut problems = Vec::new();
-    for (what, source) in programs {
-        let asm = compile_to_asm(source).expect("must compile");
-        // `offset` is rsp modulo 16 measured from the ABI's state on entry.
-        // After `push rbp` it is 0, and every call must see it at 0.
-        let mut offset: i64 = 8;
-        let mut in_main = false;
+    // Blocks in order: name, whether cold, successors, and whether the block
+    // loads a descriptor word.
+    let mut blocks: Vec<(String, bool, Vec<String>, bool)> = Vec::new();
+    let mut desc_values: Vec<String> = Vec::new();
+    for line in main.lines() {
+        if line.starts_with("block") {
+            let name = words(line)[0].trim_end_matches(':').to_string();
+            blocks.push((name, line.contains(" cold"), Vec::new(), false));
+            continue;
+        }
+        let Some(block) = blocks.last_mut() else {
+            continue;
+        };
+        let w = words(line);
+        if line.contains("symbol_value") && w.contains(&gv) {
+            desc_values.push(w[0].clone());
+        } else if line.contains(" load") && w.iter().any(|x| desc_values.contains(x)) {
+            block.3 = true;
+        }
+        block
+            .2
+            .extend(w.into_iter().filter(|x| x.starts_with("block")));
+    }
+    assert!(
+        blocks.iter().any(|b| b.3),
+        "the descriptor is read somewhere:\n{main}"
+    );
 
-        for raw in asm.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
+    let index = |n: &str| blocks.iter().position(|b| b.0 == n).unwrap();
+    let in_loop = |start: usize| -> bool {
+        let mut seen = vec![false; blocks.len()];
+        let mut work: Vec<usize> = blocks[start].2.iter().map(|s| index(s)).collect();
+        while let Some(b) = work.pop() {
+            if b == start {
+                return true;
             }
-            if line == "main:" {
-                in_main = true;
-                offset = 8;
-                continue;
-            }
-            if !in_main {
-                continue;
-            }
-            // The body ends at the first `ret`; the trampolines past it are
-            // reached by jumps, so a linear scan cannot model them.
-            if line == "ret" {
-                break;
-            }
-
-            if line.starts_with("push ") || line.starts_with("pop ") {
-                offset = (offset + 8) % 16;
-            } else if let Some(n) = line.strip_prefix("sub rsp, ") {
-                offset = (offset - n.trim().parse::<i64>().expect("literal")).rem_euclid(16);
-            } else if let Some(n) = line.strip_prefix("add rsp, ") {
-                offset = (offset + n.trim().parse::<i64>().expect("literal")) % 16;
-            } else if line == "leave" {
-                offset = 8;
-            } else if let Some(target) = line.strip_prefix("call ") {
-                if offset != 0 {
-                    problems.push(format!("{what}: call {target} with rsp % 16 == {offset}"));
-                }
-            } else if line.starts_with('j') && line.contains(".Lerr_") && offset != 0 {
-                problems.push(format!("{what}: {line} with rsp % 16 == {offset}"));
+            if !std::mem::replace(&mut seen[b], true) {
+                work.extend(blocks[b].2.iter().map(|s| index(s)));
             }
         }
+        false
+    };
+    let looping: Vec<usize> = (0..blocks.len()).filter(|&b| in_loop(b)).collect();
+    assert!(!looping.is_empty(), "no loop found:\n{main}");
+    for b in looping {
+        assert!(
+            blocks[b].1 || !blocks[b].3,
+            "{} is in the loop and loads a descriptor word:\n{main}",
+            blocks[b].0
+        );
     }
+}
 
+/// A scalar nothing else can reach lives in an SSA value, not in memory: the
+/// program's IR never names its storage.
+#[test]
+fn test_private_scalars_live_in_registers() {
+    let src = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!uses_symbol(&clif, "_var_I_I"), "{clif}");
+    assert!(!uses_symbol(&clif, "_var_S_I"), "{clif}");
+}
+
+/// So does one declared `AS` a numeric type, in main and in a procedure;
+/// one shared with a procedure keeps its data object.
+#[test]
+fn test_typed_scalars_live_in_registers() {
+    let src = "DIM K AS LONG\nFOR K = 1 TO 10: S = S + K: NEXT\nPRINT S\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!uses_symbol(&clif, "_rec_K"), "{clif}");
+
+    let src = "CALL P\nSUB P\nDIM X AS INTEGER\nX = X + 1\nPRINT X\nEND SUB\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(!clif.contains("stack_store"), "{clif}");
+
+    let src = "DIM SHARED K AS LONG\nK = 1\nCALL P\nPRINT K\nSUB P\nK = 2\nEND SUB\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    assert!(uses_symbol(&clif, "_rec_K"), "{clif}");
+}
+
+/// ...and every scalar something else can reach stays in memory: read by an
+/// ON ERROR handler, a function of its own; passed by reference to a
+/// procedure; shared with one; or seen by a DEF FN.
+#[test]
+fn test_reachable_scalars_stay_in_memory() {
+    let cases = [
+        (
+            "10 ON ERROR GOTO 90\nS% = 1\nPRINT S%\nEND\n90 PRINT S%: RESUME NEXT\n",
+            "_var_S_I",
+        ),
+        (
+            "S% = 1\nCALL P(S%)\nPRINT S%\nSUB P(X%)\nX% = 2\nEND SUB\n",
+            "_var_S_I",
+        ),
+        (
+            "DIM SHARED S%\nS% = 1\nCALL P\nPRINT S%\nSUB P\nS% = 2\nEND SUB\n",
+            "_var_S_I",
+        ),
+        ("DEF FNA(X) = X + S%\nS% = 1\nPRINT FNA(1)\n", "_var_S_I"),
+    ];
+    for (src, sym) in cases {
+        let clif = compile_to_clif(src).expect("the program must compile");
+        assert!(
+            uses_symbol(&clif, sym),
+            "{sym} should be in memory for:\n{src}"
+        );
+        let out = crate::common::compile_and_run(src).expect("must run");
+        assert!(!out.trim().is_empty(), "{src}");
+    }
+}
+
+/// Under ON ERROR, only what the handler can reach stays in memory: main's
+/// loop counter and total, which the handler never mentions, are SSA values
+/// in main, and the count the handler keeps is in its data object. The
+/// handler, main compiled a second time, keeps them all in memory, so only
+/// main's function is looked at.
+#[test]
+fn test_scalars_the_handler_cannot_reach_live_in_registers() {
+    let src = "ON ERROR GOTO H\nFOR I% = 1 TO 10\nS% = S% + 100 \\ (I% MOD 3)\nNEXT I%\n\
+               PRINT S%; N%\nEND\nH:\nN% = N% + 1: RESUME NEXT\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    let main = clif
+        .split_once("function u0:0(")
+        .and_then(|(_, f)| f.split_once("\n}\n"))
+        .map(|(f, _)| f)
+        .expect("main is in the IR");
+    let main_uses = |sym: &str| -> bool {
+        let Some(ext) = clif.lines().find_map(|l| {
+            let (ext, name) = l.strip_prefix("; ")?.split_once(" = ")?;
+            (name == sym).then_some(ext.to_string())
+        }) else {
+            return false;
+        };
+        main.lines().any(|l| {
+            l.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+                .any(|w| w == ext)
+        })
+    };
+    assert!(!main_uses("_var_I_I"), "{main}");
+    assert!(!main_uses("_var_S_I"), "{main}");
+    assert!(main_uses("_var_N_I"), "{main}");
+    let out = crate::common::compile_and_run(src).expect("must run");
+    assert_eq!(out.trim(), "550  3");
+}
+
+/// Scalars in SSA values keep BASIC's behaviour where control flow is least
+/// structured: GOTO within a loop body and back to before the loop, GOSUB
+/// changing a caller's variable, recursion with locals of its own, and
+/// reading what was never assigned.
+#[test]
+fn test_registers_follow_unstructured_control_flow() {
+    let out = crate::common::compile_and_run(
+        r#"
+10 R = R + 1
+20 FOR J = 1 TO 3
+30 IF J = 2 THEN 50
+40 N = N + 1: GOSUB 200
+50 NEXT J
+60 IF R < 2 THEN 10
+80 PRINT N; J; K; R
+85 PRINT F(5); G
+86 END
+200 K = K + 100
+210 RETURN
+FUNCTION F(X)
+  IF X <= 1 THEN EXIT FUNCTION
+  L = X
+  F = F(X - 1) + L
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["4  4  400  2", "14  0"]);
+}
+
+/// A function too large for the optimizing register allocator is compiled
+/// with the cheap one, and still computes the same answers.
+#[test]
+fn test_huge_function_compiles_correctly() {
+    let mut src = String::new();
+    for i in 0..5000 {
+        src.push_str(&format!(
+            "A{} = A{} + {}: IF A{} > 1000 THEN A{} = A{} - 1000\n",
+            i % 7,
+            (i + 1) % 7,
+            i,
+            i % 7,
+            i % 7,
+            i % 7
+        ));
+    }
+    src.push_str("PRINT A0; A1; A2; A3; A4; A5; A6\n");
+    let clif = compile_to_clif(&src).expect("the program must compile");
+    let blocks = clif.lines().filter(|l| l.starts_with("block")).count();
     assert!(
-        problems.is_empty(),
-        "{} misaligned site(s):\n{}",
-        problems.len(),
-        problems.join("\n")
+        blocks > 20_000,
+        "only {blocks} blocks: not huge enough to test"
     );
+
+    // The same arithmetic in Rust.
+    let mut a = [0f64; 7];
+    for i in 0..5000usize {
+        a[i % 7] = a[(i + 1) % 7] + i as f64;
+        if a[i % 7] > 1000.0 {
+            a[i % 7] -= 1000.0;
+        }
+    }
+    let want: Vec<String> = a.iter().map(|v| format!("{}", v)).collect();
+    let out = crate::common::compile_and_run(&src).unwrap();
+    let got: Vec<&str> = out.split_whitespace().collect();
+    assert_eq!(got, want);
 }

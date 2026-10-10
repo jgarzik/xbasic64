@@ -235,22 +235,50 @@ fn test_unknown_names_are_diagnosed() {
     expect_rejected("PRIN \"hello\"\n", "unknown subroutine 'PRIN'");
     expect_rejected("PRIN \"hello\"\n", "did you mean 'PRINT'?");
     expect_rejected("NoSuchSub(1)\n", "unknown subroutine 'NOSUCHSUB'");
-    expect_rejected(
-        "PRINT NOSUCHFN(1)\n",
-        "unknown function or array 'NOSUCHFN'",
-    );
-    expect_rejected("PRINT SQRT(4)\n", "did you mean 'SQR'?");
 }
 
-/// Using an array without DIM used to abort the compiler with a Rust panic
-/// ("Array not declared"), as did a subscript-count mismatch.
+/// An array no DIM declares is created by its first use, as in GW-BASIC,
+/// with as many dimensions as that use has subscripts, each 0 to 10. It used
+/// to be refused. A later use with another number of subscripts is still an
+/// error, and so is a subscript past 10.
 #[test]
-fn test_undeclared_array_is_diagnosed() {
-    expect_rejected("A(0) = 1\n", "array 'A' is used but never declared");
+fn test_an_undeclared_array_is_created_by_its_use() {
+    let output = compile_and_run(
+        "A(0) = 1\nA(10) = 2\nB$(3, 4) = \"x\"\nPRINT A(0); A(10); A(5); B$(3, 4); UBOUND(A); UBOUND(B$, 2)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2  0 x 10  10");
     expect_rejected(
         "DIM M(3,3)\nPRINT M(1)\n",
         "array 'M' has 2 dimensions, but 1 subscript was given",
     );
+    expect_rejected(
+        "N(1) = 0\nPRINT N(1, 2)\n",
+        "'N' was created by its first use, on line 1",
+    );
+    expect_runtime_error("A(11) = 1\n", &[], "Subscript out of range");
+}
+
+/// A mistyped function is an array too, as in GW-BASIC -- but a name close to
+/// a function or a procedure is worth a warning, and the program compiles.
+#[test]
+fn test_an_array_named_like_a_function_is_warned_about() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bas = tmp.path().join("w.bas");
+    std::fs::write(&bas, "PRINT SQRT(4)\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas)
+        .arg("-o")
+        .arg(tmp.path().join("w"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: 'SQRT' is not a function"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did you mean 'SQR'?"), "{stderr}");
 }
 
 /// Argument counts are checked for both user procedures and builtins.
@@ -403,14 +431,20 @@ fn test_math_domain_is_checked() {
     expect_runtime_error("PRINT LOG(-1)\n", &[], "Illegal function call");
 }
 
-/// An array whose DIM has not executed yet has a null element pointer.
+/// An array used before its DIM runs is created by the use, 0 to 10, as in
+/// GW-BASIC -- and the DIM, finding it there, is "Duplicate definition" (10).
+/// The use used to be the error "Array used before DIM".
 #[test]
-fn test_use_before_dim_is_checked() {
-    expect_runtime_error(
-        "SUB T\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n",
-        &[],
-        "Array used before DIM",
+fn test_use_before_dim_creates_the_array() {
+    let run = compile_and_run_raw("SUB T\nSHARED A()\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n", "")
+        .expect("should compile");
+    assert_eq!(run.lines(), vec!["0"]);
+    assert!(
+        run.stderr.contains("Duplicate definition in 6"),
+        "{}",
+        run.stderr
     );
+    assert_eq!(run.exit_code, Some(1));
 }
 
 /// The diagnostic names the BASIC line the fault occurred on.
@@ -516,14 +550,14 @@ fn test_numeric_operands_are_checked_not_panicked_on() {
     for (source, expect) in [
         ("A$ = \"x\"\nERROR A$\n", "ERROR needs a number"),
         ("ERROR \"boom\"\n", "ERROR needs a number"),
-        ("ERROR NoSuchFn(1)\n", "unknown function or array"),
+        ("ERROR NoSuchFn$(1)\n", "ERROR needs a number"),
         // The same hole, and the same fix, for every statement that takes a
         // bare numeric operand. All four were added in the last two batches.
         ("A$ = \"x\"\nLOCATE A$, 1\n", "LOCATE needs a number"),
         ("A$ = \"x\"\nCOLOR 1, A$\n", "COLOR needs a number"),
         ("A$ = \"x\"\nRANDOMIZE A$\n", "RANDOMIZE needs a number"),
-        ("LOCATE NoSuchFn(1), 1\n", "unknown function or array"),
-        ("RANDOMIZE NoSuchFn(1)\n", "unknown function or array"),
+        ("LOCATE NoSuchFn$(1), 1\n", "LOCATE needs a number"),
+        ("RANDOMIZE NoSuchFn$(1)\n", "RANDOMIZE needs a number"),
     ] {
         let err =
             compile_only(source).expect_err(&format!("{} must be refused", source.escape_debug()));
@@ -635,6 +669,108 @@ fn test_error_before_the_first_line_number() {
     );
 }
 
+/// An error raised inside a runtime helper reports its line, as every other
+/// runtime error does: "?File not found in 20", not a bare "?File not found".
+///
+/// Most file helpers, PRINT USING and VAL are given no line, and passed 0 to
+/// `_rt_error`, which then printed the message alone. Generated code now
+/// stores the line in `_err_line` before each call that can fail, and the
+/// runtime falls back on it when it is given 0.
+#[test]
+fn test_errors_raised_in_helpers_report_their_line() {
+    let cases = [
+        (
+            "10 PRINT \"x\"\n20 OPEN \"missing.txt\" FOR INPUT AS #1\n",
+            "File not found",
+        ),
+        (
+            "10 PRINT \"x\"\n20 OPEN \"no-such-dir/x.txt\" FOR OUTPUT AS #1\n",
+            "Path not found",
+        ),
+        (
+            "10 OPEN \"a.txt\" FOR OUTPUT AS #1\n20 OPEN \"b.txt\" FOR OUTPUT AS #1\n",
+            "File already open",
+        ),
+        (
+            "10 PRINT \"x\"\n20 OPEN \"\" FOR RANDOM AS #1\n",
+            "Bad file name",
+        ),
+        (
+            "5 OPEN \"e.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"e.txt\" FOR INPUT AS #1\n20 INPUT #1, A\n",
+            "Input past end of file",
+        ),
+        (
+            "5 OPEN \"e.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"e.txt\" FOR INPUT AS #1\n20 LINE INPUT #1, A$\n",
+            "Input past end of file",
+        ),
+        (
+            "10 OPEN \"f.txt\" FOR OUTPUT AS #1\n20 INPUT #1, A$\n",
+            "Bad file mode",
+        ),
+        (
+            "5 OPEN \"f.txt\" FOR OUTPUT AS #1\n6 CLOSE #1\n10 OPEN \"f.txt\" FOR INPUT AS #1\n20 PRINT #1, \"x\"\n",
+            "Bad file mode",
+        ),
+        (
+            "10 OPEN \"f.txt\" FOR OUTPUT AS #1\n20 FIELD #1, 4 AS A$\n",
+            "Bad file mode",
+        ),
+        ("10 PRINT \"x\"\n20 PRINT #3, \"x\"\n", "Bad file number"),
+        (
+            "10 OPEN \"r.dat\" FOR RANDOM AS #1 LEN = 4\n20 FIELD #1, 8 AS A$\n",
+            "FIELD overflow",
+        ),
+        (
+            "10 PRINT \"x\"\n20 PRINT USING \"##\"; \"abc\"\n",
+            "Type mismatch",
+        ),
+        ("10 PRINT \"x\"\n20 X = VAL(\"1D400\")\n", "Overflow"),
+        (
+            "10 SUB S\n15 OPEN \"missing.txt\" FOR INPUT AS #1\n16 END SUB\n20 CALL S\n",
+            "File not found",
+        ),
+    ];
+    for (source, message) in cases {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        let line = if source.contains("SUB") { 15 } else { 20 };
+        assert_eq!(
+            run.stderr.trim(),
+            format!("?{message} in {line}"),
+            "{source:?}"
+        );
+    }
+}
+
+/// `_err_line` is stored once in a statement rather than before every
+/// helper, so a FUNCTION called between two helpers -- whose own statements
+/// store their lines -- must not leave its line for the second helper's
+/// error. Nor may an earlier statement on the same line leave its own.
+#[test]
+fn test_helper_error_line_after_a_function_call() {
+    let cases = [
+        "FUNCTION F(X)\n  PRINT \"f\";\n  F = X\nEND FUNCTION\nPRINT USING \"##\"; 1; F(1); \"x\"\n",
+        "SUB S\n  PRINT \"s\";\nEND SUB\nPRINT \"a\";\nS: PRINT \"b\";: PRINT USING \"##\"; \"x\"\n",
+    ];
+    for source in cases {
+        let run = compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert_eq!(run.stderr.trim(), "?Type mismatch in 5", "{source:?}");
+    }
+}
+
+/// A program without line numbers reports the source line of a helper's
+/// error, as it does for any other.
+#[test]
+fn test_errors_raised_in_helpers_report_the_source_line() {
+    let run = compile_and_run_raw(
+        "PRINT \"x\"\nPRINT \"y\"\nOPEN \"missing.txt\" FOR INPUT AS #1\n",
+        "",
+    )
+    .expect("should compile");
+    assert_eq!(run.stderr.trim(), "?File not found in 3");
+}
+
 /// Runtime diagnostics go to stderr, leaving the program's own output clean.
 #[test]
 fn test_runtime_errors_go_to_stderr() {
@@ -682,10 +818,7 @@ fn test_new_statement_misuse_is_diagnosed() {
         "SWAP requires both values to be the same type",
     );
     expect_rejected("X = 1\nCONST C = X\n", "must have a constant value");
-    expect_rejected(
-        "F$ = \"##\"\nPRINT USING F$; 1\n",
-        "PRINT USING requires a literal format string",
-    );
+    expect_rejected("PRINT USING 5; 1\n", "PRINT USING needs a string format");
 }
 
 /// OPTION BASE placement and value are checked, and subscript 0 becomes out of
@@ -702,16 +835,33 @@ fn test_option_base_rules() {
     assert_eq!(run.exit_code, Some(1));
 }
 
-/// REDIM must keep the array's rank, and PRESERVE may only change the last
-/// dimension -- QuickBASIC's own rule, since any other change would need the
-/// elements remapped rather than the block simply grown.
+/// REDIM must keep the array's rank, with or without PRESERVE.
 #[test]
 fn test_redim_rules() {
-    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimension(s)");
+    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimensions");
+    expect_rejected("DIM A(2)\nREDIM A(3, 3)\n", "must keep its 1 dimension");
     expect_rejected(
-        "DIM A(2,2)\nREDIM PRESERVE A(2,3)\n",
-        "may only change its last dimension",
+        "DIM A(2,2)\nREDIM PRESERVE A(3)\n",
+        "REDIM PRESERVE of 'A' must keep its 2 dimensions; only the last one's upper bound may change",
     );
+}
+
+/// PRESERVE on an array of several dimensions is QuickBASIC's, as long as
+/// the rank is unchanged: only the last dimension's upper bound may change,
+/// which is checked when the program runs. It was refused outright, with a
+/// message -- "may only change its last dimension" -- that said the opposite
+/// of what had gone wrong when that was all the program did.
+#[test]
+fn test_redim_preserve_of_several_dimensions_compiles() {
+    for source in [
+        "DIM A(2, 3)\nREDIM PRESERVE A(2, 5)\n",
+        "DIM A(1 TO 2, 3, 4)\nREDIM PRESERVE A(1 TO 2, 3, 9)\n",
+        "REDIM B$(2, 2)\nREDIM PRESERVE B$(2, 4)\n",
+    ] {
+        if let Err(e) = compile_only(source) {
+            panic!("{source:?} should compile, got:\n{}", e.stderr);
+        }
+    }
 }
 
 /// TYPE declarations and uses are checked.
@@ -722,7 +872,7 @@ fn test_type_rules() {
         "TYPE 'P' has no field 'Z'",
     );
     expect_rejected("DIM Q AS NoSuch\n", "undefined TYPE 'NOSUCH'");
-    expect_rejected("A = 1\nPRINT A.X\n", "is not a record variable");
+    expect_rejected("DIM A(3)\nPRINT A(1).X\n", "is not a record");
     expect_rejected(
         "TYPE P\nX AS INTEGER\nX AS LONG\nEND TYPE\n",
         "is declared twice",
@@ -856,18 +1006,29 @@ fn test_whole_record_is_not_a_value_to_a_file() {
     );
 }
 
-/// Using an array before its DIM has executed is a runtime error, not a
-/// compiler panic: the descriptor exists from the start, with a null element
-/// pointer until the DIM runs.
+/// A DIM that runs twice is "Duplicate definition" (10); it used to clear and
+/// reallocate the array silently. After ERASE the array may be DIMmed again,
+/// and REDIM may always resize it.
 #[test]
-fn test_use_before_dim_runs() {
-    let run = compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
+fn test_dim_twice_is_a_duplicate_definition() {
+    let run = compile_and_run_raw("FOR I = 1 TO 2\nDIM A(3)\nA(1) = I\nNEXT I\n", "")
+        .expect("should compile");
     assert!(
-        run.stderr.contains("Array used before DIM"),
-        "expected a runtime diagnostic, got {:?}",
+        run.stderr.contains("Duplicate definition in 2"),
+        "{}",
         run.stderr
     );
-    assert_eq!(run.exit_code, Some(1));
+    let run = compile_and_run_raw(
+        "DIM A(3)\nA(1) = 5\nERASE A\nDIM A(4)\nPRINT A(1); UBOUND(A)\nREDIM A(9)\nPRINT UBOUND(A)\nERROR 10\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(run.lines(), vec!["0  4", "9"]);
+    assert!(
+        run.stderr.contains("Duplicate definition"),
+        "{}",
+        run.stderr
+    );
 }
 
 /// Anything that is not a record lvalue must be rejected where a record
@@ -993,6 +1154,63 @@ fn test_gosub_stack_overflow() {
     );
 }
 
+/// A RETURN reached with nothing on the GOSUB stack is GW-BASIC's error 3.
+///
+/// Sema refuses a program with no GOSUB at all, but falling into a subroutine
+/// is the classic way to reach one at run time, and it used to pop past the
+/// top of the stack and jump to whatever was there.
+#[test]
+fn test_return_without_gosub_at_run_time() {
+    let src = "10 PRINT \"A\"\n20 GOSUB 100\n30 PRINT \"B\"\n100 PRINT \"SUB\"\n110 RETURN\n";
+    let run = compile_and_run_raw(src, "").unwrap();
+    assert_eq!(run.lines(), &["A", "SUB", "B", "SUB"]);
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// ...and it is trappable, as error number 3.
+#[test]
+fn test_return_without_gosub_is_trappable() {
+    let src = "10 ON ERROR GOTO 200\n20 GOSUB 100\n30 PRINT \"B\"\n\
+               100 PRINT \"SUB\"\n110 RETURN\n200 PRINT \"ERR\"; ERR\n210 END\n";
+    let out = compile_and_run(src).unwrap();
+    assert_eq!(crate::common::lines(&out), &["SUB", "B", "SUB", "ERR 3"]);
+}
+
+/// A procedure's RETURN may only go back to a GOSUB made in that procedure.
+///
+/// Popping a return site that main pushed would jump into main's code with the
+/// procedure's frame still live.
+#[test]
+fn test_return_cannot_cross_into_another_scope() {
+    let src = "10 GOSUB 100\n20 PRINT \"never\"\n30 END\n100 CALL S\n110 RETURN\n\
+               SUB S\n  IF 0 THEN GOSUB 500\n500 PRINT \"in S\"\n  RETURN\nEND SUB\n";
+    let run = compile_and_run_raw(src, "").unwrap();
+    assert_eq!(run.lines(), &["in S"]);
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// `ERROR 3` raises the same error by number.
+#[test]
+fn test_error_3_is_return_without_gosub() {
+    let run = compile_and_run_raw("ERROR 3\n", "").unwrap();
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
 /// `--unsafe` removes the runtime checks, and the program still works.
 ///
 /// The flag's entire effect is on emitted code, so without a test that runs
@@ -1076,13 +1294,24 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
         ("PLAY \"cde\"\n", "PLAY"),
         ("LPRINT \"x\"\n", "LPRINT"),
         ("CHAIN \"other\"\n", "CHAIN"),
+        ("X = ERDEV\n", "ERDEV"),
+        ("A$ = IOCTL$(1)\n", "IOCTL$"),
+        ("MOTOR 1\n", "MOTOR"),
+        ("PCOPY 0, 1\n", "PCOPY"),
+        ("ON TIMER(5) GOSUB 10\n10 RETURN\n", "ON TIMER"),
+        ("ON COM(1) GOSUB 10\n10 RETURN\n", "ON COM"),
+        ("ON PLAY(3) GOSUB 10\n10 RETURN\n", "ON PLAY"),
+        ("TIMER ON\n", "TIMER ON"),
+        ("TIMER OFF\n", "TIMER OFF"),
+        ("LINE (0, 0)-(10, 10)\n", "LINE"),
+        ("DEF SEG = 0\n", "DEF SEG"),
     ];
 
     for (source, name) in cases {
         let err = compile_only(source)
             .expect_err(&format!("{} must be refused, not silently accepted", name));
         assert!(
-            err.contains("not supported"),
+            err.contains("not supported") || err.contains("is not supported yet"),
             "{} was refused, but without saying why: {}",
             name,
             err.stderr
@@ -1208,6 +1437,67 @@ fn test_documented_unimplemented_names_are_all_in_the_table() {
             err.stderr
         );
     }
+}
+
+/// Every GW-BASIC name the compiler does not provide is refused with its
+/// reason, whatever shape the statement takes.
+///
+/// Two gaps. Some names were missing from the table: `EXTERR(0)` compiled as
+/// an array nobody declared and read 0, and ENVIRON, LCOPY and DELETE fell
+/// through to "unknown subroutine". Others were in it, but their statement
+/// form -- `NAME a AS b`, `CIRCLE (x,y), r`, `KEY(1) ON` -- is not the shape of
+/// a call, so the parser failed on the AS, the comma or the ON before sema
+/// could give the reason, and the program was told only "unexpected AS".
+#[test]
+fn test_unsupported_statements_are_refused_with_their_reason() {
+    let cases = [
+        ("X = EXTERR(0): PRINT X\n", "MS-DOS"),
+        ("ENVIRON \"A=B\"\n", "not implemented yet"),
+        ("LCOPY\n", "printer"),
+        ("LLIST\n", "interpreter command"),
+        ("DELETE 10\n", "interpreter command"),
+        ("DELETE 10-20\n", "interpreter command"),
+        ("NAME \"a\" AS \"b\"\n", "NAME is not implemented yet"),
+        ("CIRCLE (5,5), 3\n", "graphics is not supported"),
+        ("VIEW (0,0)-(10,10)\n", "console windowing"),
+        ("WINDOW (0,0)-(1,1)\n", "graphics is not supported"),
+        ("VIEW PRINT 1 TO 10\n", "console windowing"),
+        ("KEY(1) ON\n", "KEY is not implemented yet"),
+        ("COM(1) ON\n", "serial-port event trapping"),
+        ("PEN ON\n", "light-pen input"),
+        ("STRIG ON\n", "joystick input"),
+        ("PLAY ON\n", "PLAY is not implemented yet"),
+        // Inside a block and a single-line IF, the refusal costs only the
+        // statement: the END IF and the rest of the program still parse.
+        ("IF 1 THEN\nPEN ON\nEND IF\nPRINT 1\n", "light-pen input"),
+        ("IF 1 THEN KEY(1) ON\n", "KEY is not implemented yet"),
+    ];
+    for (source, reason) in cases {
+        let err = compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains("is not supported") && err.contains(reason),
+            "{source:?} should be refused with its reason ({reason:?}), got:\n{}",
+            err.stderr
+        );
+        assert!(
+            !err.contains("unexpected") && !err.contains("unknown subroutine"),
+            "{source:?} fell through to a generic message:\n{}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// Refusing an unsupported statement at its first word must not take the
+/// name away where a program may still use it: as a label, or as the name of
+/// its own SUB.
+#[test]
+fn test_unsupported_names_still_work_as_labels_and_procedures() {
+    let out = compile_and_run("GOTO NAME\nPRINT \"skipped\"\nNAME: PRINT \"label\"\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["label"]);
+
+    let out = compile_and_run("SUB PEN (X)\nPRINT X\nEND SUB\nPEN 5\nCALL PEN(6)\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["5", "6"]);
 }
 
 /// A name cannot be both an array and a procedure, or an array and a builtin.
@@ -1728,6 +2018,60 @@ fn test_swap_of_mismatched_record_fields_is_diagnosed() {
         .expect("two numeric fields are a legal SWAP");
 }
 
+/// SWAP's two operands must have the same type, not merely both be numbers
+/// or both strings: QuickBASIC's rule. Only "string against number" was
+/// checked, so an INTEGER swapped with a DOUBLE was converted both ways, and a
+/// record swapped with a number reached codegen.
+#[test]
+fn test_swap_operands_must_have_the_same_type() {
+    let ty = "TYPE R\n  N AS STRING * 4\n  V AS INTEGER\n  D AS DOUBLE\nEND TYPE\n\
+              TYPE Q\n  V AS INTEGER\nEND TYPE\nDIM P AS R, P2 AS R, O AS Q\nDIM A(3) AS R\n";
+    let refused = [
+        ("SWAP A%, B#\n", "'A%' is an INTEGER and 'B#' is a DOUBLE"),
+        ("SWAP C&, D!\n", "'C&' is a LONG and 'D!' is a SINGLE"),
+        (
+            "DIM X(3)\nSWAP X(1), N%\n",
+            "is a DOUBLE and 'N%' is an INTEGER",
+        ),
+        (
+            "SWAP P.V, P.D\n",
+            "'P.V' is an INTEGER and 'P.D' is a DOUBLE",
+        ),
+        ("SWAP P, Z\n", "'P' is a TYPE R record and 'Z' is a DOUBLE"),
+        ("SWAP Z, A(1)\n", "is a TYPE R record"),
+        (
+            "SWAP P, O\n",
+            "'P' is a TYPE R record and 'O' is a TYPE Q record",
+        ),
+        (
+            "DIM N AS INTEGER\nSWAP N, Z\n",
+            "'N' is an INTEGER and 'Z' is a DOUBLE",
+        ),
+    ];
+    for (source, expected) in refused {
+        expect_rejected(
+            &format!("{ty}{source}"),
+            "SWAP requires both values to be the same type",
+        );
+        expect_rejected(&format!("{ty}{source}"), expected);
+    }
+    // The same type is fine, however it was spelled: a fixed-length string
+    // with a variable-length one, two records of one TYPE, a declared type
+    // with the matching suffix.
+    for source in [
+        "SWAP P.N, S$\n",
+        "SWAP P, P2\n",
+        "SWAP P, A(2)\n",
+        "DIM N AS INTEGER\nSWAP N, M%\n",
+        "DIM S AS STRING\nSWAP S, P.N\n",
+        "SWAP X, Y\n",
+    ] {
+        if let Err(e) = compile_only(&format!("{ty}{source}")) {
+            panic!("{source:?} should pass sema, got:\n{}", e.stderr);
+        }
+    }
+}
+
 /// Out-of-range arguments to the string builtins are refused.
 ///
 /// Each of these returned something plausible instead. The negative-length
@@ -1745,6 +2089,9 @@ fn test_string_builtin_arguments_are_range_checked() {
         ("PRINT MID$(\"abc\", -1, 2)\n", "MID$ negative start"),
         ("PRINT MID$(\"abc\", 1, -1)\n", "MID$ negative count"),
         ("PRINT ASC(\"\")\n", "ASC of the empty string"),
+        ("PRINT STRING$(3, \"\")\n", "STRING$ of the empty string"),
+        ("PRINT STRING$(3, 256)\n", "STRING$ of a code past 255"),
+        ("PRINT STRING$(3, -1)\n", "STRING$ of a negative code"),
     ] {
         let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
         assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
@@ -1770,11 +2117,16 @@ PRINT MID$("abcdef", 3)
 PRINT MID$("abcdef", 3, 2)
 PRINT MID$("abc", 4)
 PRINT ASC("A")
+PRINT STRING$(3, "xy")
+PRINT STRING$(2, 65)
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
+    assert_eq!(
+        lines,
+        &["abc", "", "abc", "ef", "cdef", "cd", "", "65", "xxx", "AA"]
+    );
 }
 
 /// A negative base with a fractional exponent has no real result. It used to
@@ -1874,10 +2226,11 @@ fn test_dim_suffix_must_agree_with_its_as_clause() {
 // ---------------------------------------------------------------------------
 // Error trapping: ON ERROR GOTO, ERR, ERL
 //
-// The mechanism is a longjmp in all but name. `_rt_error` never returned, and
-// is reached from thirteen places inside each runtime tree with live frames --
-// some two deep, some holding a lock structure on the stack. Trapping abandons
-// all of them, so what the handler starts with has to be captured up front.
+// The mechanism is error-status propagation. A trapped `_rt_error` sets
+// `_err_pending` and returns; the runtime helper that raised it leaves through
+// its own epilogue, generated code tests the flag after every call that can
+// fail, a procedure leaves through its epilogue in turn, and main dispatches
+// to the handler. Nothing is abandoned, so nothing has to be captured.
 
 /// The handler runs, and ERR and ERL say what happened and where.
 #[test]
@@ -1928,6 +2281,37 @@ fn test_on_error_traps_the_error_statement() {
     assert_eq!(out.trim(), "62");
 }
 
+/// `ERROR n` sets ERR to n even for a number GW-BASIC has no message for,
+/// which is how a program raises errors of its own: `ERROR 200` and then
+/// `IF ERR = 200` in the handler.
+///
+/// ERR used to be found by looking the message up in the table, and every
+/// unlisted number shares the one "Unprintable error" message, which the table
+/// does not list -- so ERR was 0 and the idiom failed silently. Listed numbers
+/// were unaffected, apart from a number that shares its message with another:
+/// `ERROR 7` and the GOSUB overflow both say "Out of memory".
+#[test]
+fn test_on_error_traps_an_unlisted_error_number() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 ERROR 200\n30 ERROR 7\n40 ERROR 1\n50 ERROR 255\n60 END\n\
+         100 PRINT ERR; ERL\n110 RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["200  20", "7  30", "1  40", "255  50"]
+    );
+}
+
+/// Untrapped, an unlisted number still reports GW-BASIC's "Unprintable
+/// error", with its line.
+#[test]
+fn test_unlisted_error_number_untrapped_reports_its_line() {
+    let run = compile_and_run_raw("10 PRINT \"x\"\n20 ERROR 200\n", "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1));
+    assert_eq!(run.stderr.trim(), "?Unprintable error in 20");
+}
+
 /// `ON ERROR GOTO 0` puts the fatal path back.
 #[test]
 fn test_on_error_goto_zero_disarms() {
@@ -1960,7 +2344,7 @@ fn test_error_inside_the_handler_is_fatal() {
 /// The handler can carry on with the program, and the variables it reads are
 /// the ones the program actually wrote.
 ///
-/// The unwind abandons every intervening frame, so anything the compiler was
+/// The error leaves every intervening frame, so anything the compiler was
 /// holding in a register has to be back in memory by then.
 #[test]
 fn test_state_survives_the_unwind() {
@@ -2005,24 +2389,38 @@ END SUB
     assert_eq!(out.trim(), "trapped 11");
 }
 
-/// A program that never traps carries none of the machinery.
+/// A program that never traps carries none of the machinery: no trap state
+/// is read or written, and there is no handler function.
+///
+/// `_err_line` is not in the list. It is not trap state alone: a runtime
+/// helper given no line reports the one stored there, so every program
+/// stores it before each call that can fail -- `PRINT` here -- and a failed
+/// OPEN says "?File not found in 20" rather than a bare "?File not found".
 #[test]
 fn test_no_cost_without_on_error() {
-    let asm = crate::common::compile_to_asm("PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n").unwrap();
+    let src = "PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n";
+    let clif = crate::common::compile_to_clif(src).unwrap();
     for symbol in [
         "_err_handler",
-        "_err_ctx",
-        "_err_line",
-        "_rt_trap_capture",
-        "_err_stmt",
-        "_err_depth",
-        "_resume_at",
-        "_resume_next",
+        "_err_pending",
+        "_err_active",
+        "_err_resume_label",
+        "_err_handler_fn",
     ] {
         assert!(
-            !asm.contains(symbol),
+            !crate::common::uses_symbol(&clif, symbol),
             "{symbol} should not appear in a program with no ON ERROR"
         );
+    }
+
+    // The same program with ON ERROR does use them, so the check above is
+    // looking at the right names.
+    let clif = crate::common::compile_to_clif(&format!(
+        "10 ON ERROR GOTO 100\n{src}90 END\n100 RESUME NEXT\n"
+    ))
+    .unwrap();
+    for symbol in ["_err_pending", "_err_line", "_err_handler_fn"] {
+        assert!(crate::common::uses_symbol(&clif, symbol), "{symbol}");
     }
 }
 
@@ -2083,46 +2481,55 @@ fn test_gosub_survives_a_trap() {
     );
 }
 
-/// ...but a GOSUB inside a procedure cannot, so it is refused.
+/// A GOSUB inside a procedure works in a trapping program too.
 ///
-/// Its return address is a label in a frame the unwind discards, so a later
-/// RETURN would jump into dead code with main's frame pointer.
+/// The handler runs on top of the procedure's frame, so the GOSUB's return
+/// site is still there when it RESUMEs; and a RESUME <label> that leaves the
+/// procedure drops the GOSUBs it made, because each procedure puts the GOSUB
+/// stack back as it found it on the way out.
 #[test]
-fn test_gosub_inside_a_procedure_is_refused_when_trapping() {
-    let src = "10 ON ERROR GOTO 100\n20 CALL S\n30 END\n100 END\n\
-               SUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
-    let err = compile_only(src).expect_err("GOSUB in a procedure must be refused when trapping");
-    assert!(err.contains("GOSUB inside"), "got: {}", err.stderr);
-    assert!(err.is_clean_rejection());
-
-    // The same program without ON ERROR is fine: nothing unwinds.
-    let ok = "10 CALL S\n20 END\nSUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
-    compile_only(ok).expect("a GOSUB in a procedure is fine when nothing traps");
-}
-
-/// A trapping program keeps its loop variables in memory.
-///
-/// FOR-loop register promotion is switched off when a program traps, and that
-/// is load-bearing rather than a concession: a promoted counter's register is
-/// gone after the unwind and its memory copy is written back only at the
-/// loop's exit label, so a handler would read a stale value. The promotion's
-/// stack saves are also the one thing that moves `rsp` across a statement
-/// boundary, which is what lets the trap restore a single captured `rsp`.
-#[test]
-fn test_trapping_disables_register_promotion() {
-    let hot = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
-    let plain = crate::common::compile_to_asm(hot).unwrap();
-    assert!(
-        plain.contains("save a counter register"),
-        "the loop should promote when nothing traps"
-    );
-
-    let trapping =
-        crate::common::compile_to_asm(&format!("10 ON ERROR GOTO 100\n{hot}90 END\n100 END\n"))
-            .unwrap();
-    assert!(
-        !trapping.contains("save a counter register"),
-        "a trapping program must keep its counter in memory"
+fn test_gosub_inside_a_procedure_when_trapping() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 CALL S
+30 CALL T
+40 GOSUB 300
+50 PRINT "done"
+60 END
+100 PRINT "trapped"; ERR
+110 IF ERL = 600 THEN RESUME 40
+120 RESUME NEXT
+300 PRINT "main gosub"
+310 RETURN
+SUB S
+  GOSUB 500
+  PRINT "back in S"
+  EXIT SUB
+500 ERROR 5
+  PRINT "after error"
+  RETURN
+END SUB
+SUB T
+  GOSUB 600
+  PRINT "never"
+  EXIT SUB
+600 ERROR 7
+  RETURN
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &[
+            "trapped 5",
+            "after error",
+            "back in S",
+            "trapped 7",
+            "main gosub",
+            "done"
+        ]
     );
 }
 
@@ -2256,24 +2663,69 @@ fn test_resume_without_an_error_is_fatal() {
     );
 }
 
-/// A bare `RESUME` after an error raised inside a procedure fails cleanly.
-///
-/// The unwind discarded that frame, so there is nothing to go back to. The
-/// diagnosis is the point: guessing would resume at the CALL, which looks
-/// plausible and is wrong.
+/// RESUME goes back into the procedure that raised the error, as in
+/// QuickBASIC: the handler runs on top of the faulting frame, so the
+/// statement is still there to retry, or to continue after.
 #[test]
-fn test_resume_after_a_procedure_error_is_refused() {
-    let src = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"no\"\n40 END\n\
-               100 RESUME\nSUB B\nPRINT 1 / 0\nEND SUB\n";
-    let run = compile_and_run_raw(src, "").expect("should compile");
-    assert_eq!(run.exit_code, Some(1));
-    assert!(run.stderr.contains("RESUME"), "got: {:?}", run.stderr);
-    assert!(!run.stdout.contains("no"), "it must not resume anywhere");
+fn test_resume_into_a_procedure() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 CALL B
+40 PRINT F(3)
+50 PRINT "landed"
+60 END
+100 PRINT "trapped"; ERR
+110 IF ERR = 5 THEN RESUME NEXT
+120 D = 4
+130 RESUME
+SUB B
+  SHARED D
+  X = 8 / D
+  PRINT "B"; X
+END SUB
+FUNCTION F(N)
+  F = N
+900 ERROR 5
+  F = F * 10
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["trapped 11", "B 2", "trapped 5", "30", "landed"]
+    );
 
-    // `RESUME <line>` needs no failing statement, so it is allowed.
+    // `RESUME <line>` leaves the procedure for that line.
     let ok = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"skipped\"\n40 PRINT \"landed\"\n50 END\n\
-              100 RESUME 40\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+              100 RESUME 40\nSUB B\nPRINT 1 / 0\nPRINT \"no\"\nEND SUB\n";
     assert_eq!(compile_and_run(ok).unwrap().trim(), "landed");
+}
+
+/// A recursive procedure's error resumes in the frame that raised it, and a
+/// RESUME <label> from deep inside unwinds every one of them.
+#[test]
+fn test_resume_in_a_recursive_procedure() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 PRINT R(3)
+30 ON ERROR GOTO 200
+40 PRINT R(3)
+50 PRINT "unwound"
+60 END
+100 RESUME NEXT
+200 RESUME 50
+FUNCTION R(N)
+  IF N = 0 THEN ERROR 5: R = 100: EXIT FUNCTION
+  R = R(N - 1) + N
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["106", "unwound"]);
 }
 
 /// A statement that continues after a call returns is still resumable.
@@ -2358,4 +2810,420 @@ fn test_resume_next_off_the_end() {
     )
     .expect("should compile");
     run.assert_ran_to_completion("RESUME NEXT past the last statement");
+}
+
+/// An error two procedure frames deep reaches main's handler with the right
+/// ERR and ERL, and the program carries on from the handler. Inner has no
+/// line numbers, so ERL is the physical line of its ERROR, as the error
+/// message would say.
+#[test]
+fn test_error_two_procedures_deep_is_trapped() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 CALL Outer
+30 PRINT "not reached"
+40 END
+100 PRINT "trapped"; ERR; ERL
+110 PRINT "after"
+120 END
+SUB Outer
+  CALL Inner
+  PRINT "not reached either"
+END SUB
+SUB Inner
+  ERROR 6
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["trapped 6  14", "after"]);
+}
+
+/// An error raised mid-expression, trapped and resumed a million times, must
+/// leave the stack where it was each time.
+///
+/// Each expression has a temporary on the stack when its error is raised --
+/// one by an inline check, one inside a runtime helper. A trap that left the
+/// temporary there would leak 16 bytes per error and run out of stack long
+/// before the loop ends.
+#[test]
+fn test_trapping_mid_expression_does_not_leak_stack() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 100
+15 A$ = "abc"
+20 FOR I& = 1 TO 500000
+30 X# = I& + (Y# / Z#) * 2
+35 P& = I& + INSTR(Z%, A$, "b") * 2
+40 NEXT I&
+50 PRINT "done"; N&
+60 END
+100 N& = N& + 1
+110 RESUME NEXT
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("a million trapped errors");
+    assert_eq!(run.lines(), &["done 1000000"]);
+}
+
+/// Every runtime helper that can raise an error is trapped, resumed past,
+/// and leaves the program in a state that can carry on and exit cleanly.
+#[test]
+fn test_every_fallible_helper_traps_and_resumes() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 900
+20 OPEN "x.txt" FOR OUTPUT AS #1
+30 PRINT #1, "one line"
+40 OPEN "x.txt" FOR INPUT AS #1
+50 CLOSE #1
+60 OPEN "x.txt" FOR INPUT AS #1
+70 LINE INPUT #1, A$
+80 LINE INPUT #1, A$
+90 CLOSE #1
+100 OPEN "no-such-file.txt" FOR INPUT AS #2
+110 PRINT #3, "nowhere"
+120 PRINT #3, 1.5
+130 WRITE #3, 2
+140 LINE INPUT #3, B$
+150 GET #4, 1
+160 PUT #4, 1
+170 OPEN "r.dat" FOR RANDOM AS #5 LEN = 4
+180 FIELD #5, 8 AS F$
+190 OPEN "s.txt" FOR OUTPUT AS #6
+200 FIELD #6, 2 AS G$
+210 V% = CVI("x")
+220 P% = INSTR(0, "abc", "b")
+230 LOCK #7
+240 PRINT "codes"; C$
+250 PRINT "A$="; A$; " V%="; V%; " P%="; P%
+260 END
+900 C$ = C$ + STR$(ERR)
+910 RESUME NEXT
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("trapped helper errors");
+    assert_eq!(
+        run.lines(),
+        &[
+            "codes 55 62 53 52 52 52 52 52 52 50 54 5 5 52",
+            "A$=one line V%= 0  P%= 0"
+        ]
+    );
+}
+
+/// `ERROR n` inside a procedure is trapped by main's handler.
+#[test]
+fn test_error_statement_inside_a_procedure_is_trapped() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 CALL S\n30 END\n100 PRINT \"ERR\"; ERR\n110 END\n\
+         SUB S\n  ERROR 70\nEND SUB\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "ERR 70");
+}
+
+/// A procedure's error passed up through the middle of a call sequence that
+/// has saved registers on main's stack -- INSTR's arguments -- still lands
+/// in the handler with main's frame intact, half a million times over, and
+/// the program then exits cleanly to the C runtime.
+#[test]
+fn test_procedure_error_mid_call_sequence_resumes_by_line() {
+    let run = compile_and_run_raw(
+        r#"
+10 ON ERROR GOTO 100
+15 A$ = "abcdef"
+20 FOR I& = 1 TO 500000
+30 P& = INSTR(1, A$, MID$(A$, F%(0), 1))
+40 NEXT I&
+50 PRINT "done"; N&
+60 END
+100 N& = N& + 1
+110 RESUME 40
+FUNCTION F%(D%)
+  F% = 1 \ D%
+END FUNCTION
+"#,
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("procedure errors resumed by line");
+    assert_eq!(run.lines(), &["done 500000"]);
+}
+
+/// A DIM or REDIM that fails leaves the array as it was.
+///
+/// The new bounds used to be written into the descriptor one by one as they
+/// were evaluated, and checked afterwards. A trapped error -- a bound below
+/// its lower one, or a size too large to address -- then left the new bounds
+/// beside the old element block, and RESUME NEXT carried on with subscripts
+/// that passed the bounds check and indexed far past the block's end.
+#[test]
+fn test_failed_redim_leaves_the_array_unchanged() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 DIM A(10, 10)
+30 REDIM A(1000, -1)
+40 PRINT UBOUND(A, 1); UBOUND(A, 2)
+50 A(10, 10) = 5: PRINT A(10, 10)
+60 DIM B%(1, 1, 1, 1)
+70 REDIM B%(65535, 65535, 65535, 65535)
+80 PRINT UBOUND(B%, 1)
+90 B%(1000, 1, 1, 1) = 1
+95 END
+100 PRINT "error"; ERR
+110 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["error 9", "10  10", "5", "error 7", "1", "error 9"]
+    );
+}
+
+/// `ON ERROR GOTO 0` inside a handler stops the program with the error the
+/// handler was given, as GW-BASIC and QuickBASIC do: it is how a handler
+/// says "I cannot deal with this one". It used to disarm the handler and
+/// carry on, so the error was silently swallowed.
+#[test]
+fn test_on_error_goto_0_in_a_handler_reraises() {
+    let src = "10 ON ERROR GOTO 100\n20 PRINT 1 / 0\n30 PRINT \"nope\"\n40 END\n\
+               100 IF ERR = 53 THEN RESUME NEXT\n110 ON ERROR GOTO 0\n";
+    let run = compile_and_run_raw(src, "").expect("should compile");
+    assert_eq!(run.exit_code, Some(1), "stdout {:?}", run.stdout);
+    assert!(
+        run.stderr.contains("Division by zero in 20"),
+        "got: {:?}",
+        run.stderr
+    );
+    assert!(!run.stdout.contains("nope"));
+
+    // Outside a handler it only disarms trapping.
+    let src = "10 ON ERROR GOTO 100\n20 ON ERROR GOTO 0\n30 PRINT \"armed no more\"\n40 END\n100 RESUME NEXT\n";
+    assert_eq!(compile_and_run(src).unwrap().trim(), "armed no more");
+}
+
+/// A handler that leaves by GOTO -- re-arming with ON ERROR first -- carries
+/// on as the program, as in GW-BASIC. Into a FOR loop, the loop keeps its
+/// limit and step: the handler is main compiled a second time, and the
+/// loop it jumps into is that copy's, which used to have none, so the loop
+/// ended at the first NEXT.
+#[test]
+fn test_handler_leaving_by_goto_into_a_loop() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 FOR I = 1 TO 5\n30 X = 1 / 0\n40 NEXT I\n\
+         50 PRINT \"done\"; N; I\n60 END\n100 N = N + 1: ON ERROR GOTO 100: GOTO 40\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "done 5  6");
+}
+
+/// Trapping errors over and over while running the handler's code, which
+/// is what a handler that leaves by GOTO does, does not grow the stack.
+/// Each such error used to call the handler again from inside itself, and
+/// enough of them overflowed the stack.
+#[test]
+fn test_repeated_traps_after_goto_out_of_a_handler() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 X = 1 / 0\n30 N = N + 1\n40 IF N < 1000000 THEN X = 1 / 0\n\
+         50 PRINT N\n60 END\n100 ON ERROR GOTO 100: GOTO 30\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1000000");
+}
+
+/// An error raised in code the handler reached by GOTO is handled there,
+/// and RESUME NEXT goes on after the statement that raised it.
+#[test]
+fn test_resume_after_an_error_in_the_handlers_code() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 X = 1 / 0\n30 PRINT \"never\"\n40 END\n\
+         100 PRINT \"h1\"\n110 ON ERROR GOTO 200\n120 GOTO 300\n\
+         200 PRINT \"h2\"; ERL\n210 RESUME NEXT\n300 Y = 1 / 0\n310 PRINT \"after 300\"\n320 END\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["h1", "h2 300", "after 300"]
+    );
+}
+
+/// A statement that faults after making a string temporary -- or before,
+/// with one still to come -- compiles, and RESUME NEXT goes on past it.
+/// Its temporaries were freed in the statement's next block, where RESUME
+/// NEXT arrives from paths that never made them: the verifier refused
+/// these, in main for a check ahead of the temporary and in the handler's
+/// copy of main for any.
+#[test]
+fn test_resume_next_past_a_statement_with_string_temporaries() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nDIM A$(2)\nB$ = \"b\"\nI = 7\n\
+         X$ = A$(I) + B$ + \"x\"\nY$ = MID$(B$ + \"r\", 0)\n\
+         PRINT \"[\"; X$; \"][\"; Y$; \"]\"\nEND\nH:\nPRINT ERR;\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["9  5 [][]"]);
+}
+
+/// A CONST cannot be the target of anything that stores into it.
+///
+/// Every one of these compiled, and the store went nowhere: the name is
+/// replaced by its value wherever it is read, so `CONST MAX = 100: MAX = 5:
+/// PRINT MAX` printed 100. QuickBASIC refuses them all ("Duplicate
+/// definition").
+#[test]
+fn test_a_const_cannot_be_assigned() {
+    let cases = [
+        "CONST MAX = 100: MAX = 5: PRINT MAX\n",
+        "CONST MAX = 100\nLET MAX = 5\n",
+        "CONST MAX = 100\nFOR MAX = 1 TO 2: NEXT\n",
+        "CONST MAX = 100\nINPUT MAX\n",
+        "CONST MAX = 100\nINPUT \"n\"; A, MAX\n",
+        "CONST MAX = 100\nREAD MAX\nDATA 1\n",
+        "CONST M$ = \"x\"\nLINE INPUT M$\n",
+        "CONST MAX = 100\nX = 1\nSWAP MAX, X\n",
+        "CONST MAX = 100\nX = 1\nSWAP X, MAX\n",
+        "CONST M$ = \"abc\"\nMID$(M$, 1) = \"z\"\n",
+        "CONST M$ = \"abc\"\nLSET M$ = \"z\"\n",
+        // Inside a procedure too: a module-level CONST is visible there.
+        "CONST MAX = 100\nSUB S\nMAX = 1\nEND SUB\nS\n",
+    ];
+    for source in cases {
+        expect_rejected(source, "is a CONST");
+    }
+    // Reading one is of course still fine.
+    let out = compile_and_run("CONST MAX = 100\nX = MAX: PRINT X; MAX\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["100  100"]);
+}
+
+/// A parameter and a FUNCTION result must be variable-length strings, as
+/// QuickBASIC requires. A `STRING * 8` parameter was accepted and its width
+/// ignored, and a `STRING * 3` result failed later as a confusing "type
+/// mismatch" on the assignment to the FUNCTION's name.
+#[test]
+fn test_fixed_length_parameters_and_results_are_refused() {
+    let cases = [
+        (
+            "SUB S(T AS STRING * 8)\nPRINT T\nEND SUB\nS \"x\"\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+        (
+            "FUNCTION F(N, BYVAL T AS STRING * 2)\nF = N\nEND FUNCTION\nPRINT F(1, \"x\")\n",
+            "parameter 'T' of 'F' is declared AS STRING * 2",
+        ),
+        (
+            "FUNCTION F AS STRING * 3\nF = \"abc\"\nEND FUNCTION\nPRINT F\n",
+            "the result of 'F' is declared AS STRING * 3",
+        ),
+        (
+            "DECLARE SUB S (T AS STRING * 8)\nSUB S (T AS STRING)\nEND SUB\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+        expect_rejected(source, "must be a variable-length string");
+        let err = compile_only(source).unwrap_err();
+        assert!(
+            !err.contains("type mismatch"),
+            "{source:?} should be refused for the declaration alone:\n{}",
+            err.stderr
+        );
+    }
+}
+
+// ---- Main's scalars and the handler ----
+//
+// In a trapping program main's scalars live in SSA values unless the
+// handler can reach a statement that mentions them. These pin down what the
+// handler must still see and change, whichever way a variable lives.
+
+/// What the handler writes, main reads after RESUME and after RESUME NEXT;
+/// and a variable the handler never mentions keeps its value across both.
+#[test]
+fn test_handler_writes_are_seen_after_resume() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nK = 7\nD = 0\nX = 10 / D\nPRINT X; D; N; K\n\
+         M = 1\nY = 1 / 0\nPRINT Y; N; K\nEND\n\
+         H:\nN = N + 1\nIF M = 0 THEN D = 2: RESUME\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["5  2  1  7", "0  2  7"]);
+}
+
+/// The handler reads what main wrote just before the fault.
+#[test]
+fn test_handler_reads_what_main_just_wrote() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I = 1 TO 3\nV = I * 10\nZ = 1 / 0\nNEXT\nEND\n\
+         H:\nPRINT V;\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "10  20  30");
+}
+
+/// A handler that leaves by GOTO runs main's code, which reads variables
+/// main set and the handler did not.
+#[test]
+fn test_handler_goto_into_code_using_mains_variables() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nA = 1: B = 2\nFOR I = 1 TO 3: S = S + I: NEXT\n\
+         X = 1 / 0\nPRINT \"never\"\nTail:\nPRINT A; B; S; C; I\nEND\n\
+         H:\nC = 5\nGOTO Tail\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1  2  6  5  4");
+}
+
+/// A subroutine the handler GOSUBs to writes variables main reads.
+#[test]
+fn test_handler_gosub_writes_mains_variables() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nGOSUB Fix\nX = 1 / 0\nPRINT W; Q\nEND\n\
+         H:\nGOSUB Fix\nRESUME NEXT\nFix:\nW = 42: Q = Q + 1\nRETURN\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "42  2");
+}
+
+/// Two handlers, armed one after the other, each write what main reads.
+#[test]
+fn test_two_handlers_at_different_times() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H1\nX = 1 / 0\nON ERROR GOTO H2\nY = 1 / 0\nPRINT P; Q\nEND\n\
+         H1:\nP = 1: RESUME NEXT\nH2:\nQ = P + 1: RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1  2");
+}
+
+/// A loop whose counter and totals the handler never mentions, faulting
+/// every third iteration, keeps counting through RESUME NEXT.
+#[test]
+fn test_loop_the_handler_never_mentions_survives_faults() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I% = 1 TO 30\nT = T + 1\n\
+         IF I% MOD 3 = 0 THEN X = 1 / 0: S = S + 100\nS = S + I%\nNEXT I%\n\
+         PRINT T; S; E; I%\nEND\nH:\nE = E + 1: RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "30  1465  10  31");
+}
+
+/// RESUME to a label inside a loop carries on with the loop.
+#[test]
+fn test_resume_to_a_label_inside_a_loop() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I = 1 TO 5\nIF I = 3 THEN X = 1 / 0\nBack:\nS = S + I\nNEXT I\n\
+         PRINT S; E; I\nEND\nH:\nE = E + 1: RESUME Back\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "15  1  6");
 }

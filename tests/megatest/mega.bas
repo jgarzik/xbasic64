@@ -37,6 +37,8 @@ TYPE Person
     Home AS Point
 END TYPE
 
+' Check's tallies, shared with every procedure -- Check among them.
+DIM SHARED Passed, Failed, Shared%
 Passed = 0
 Failed = 0
 
@@ -110,14 +112,14 @@ Check "single", STR$(S!), "1.5"
 Check "double keeps its digits", STR$(D#), ".3333333333333333"
 Check "string", T$, "text"
 Check "unsuffixed is double", STR$(1 / 3), ".3333333333333333"
-Check "integer truncates on store", STR$(CINT(2.6)), "3"
+Check "CINT rounds", STR$(CINT(2.6)), "3"
 Check "widening in an expression", STR$(I% + S!), "301.5"
 Check "CLNG", STR$(CLNG(2.5)), "2"
 Check "CSNG", STR$(CSNG(1.5)), "1.5"
 Check "CDBL", STR$(CDBL(2)), "2"
 DIM DeclaredInt AS INTEGER
 DeclaredInt = 7.9
-Check "DIM AS INTEGER truncates", STR$(DeclaredInt), "7"
+Check "DIM AS INTEGER rounds", STR$(DeclaredInt), "8"
 
 ' ---------------------------------------------------------------------------
 ' CONST
@@ -158,7 +160,7 @@ Check "string array", Names$(3), "three"
 Check "string array untouched", Names$(1), ""
 
 Typed%(2) = 7.6
-Check "typed array truncates", STR$(Typed%(2)), "7"
+Check "typed array rounds", STR$(Typed%(2)), "8"
 
 DIM Growable(2)
 Growable(0) = 1
@@ -409,11 +411,14 @@ Check "FUNCTION", STR$(Square(7)), "49"
 Check "FUNCTION recursion", STR$(Fact(6)), "720"
 Check "FUNCTION two arguments", STR$(AddUp(3, 4)), "7"
 Check "FUNCTION returning a string", Shout$("hi"), "HI!"
-Check "FUNCTION AS INTEGER truncates", STR$(HalfInt(7)), "3"
+Check "FUNCTION AS INTEGER rounds half to even", STR$(HalfInt(7)), "4"
 
 Arg = 5
 Doubler Arg
-Check "parameters are by value", STR$(Arg), "5"
+Check "parameters are by reference", STR$(Arg), "10"
+Arg = 5
+Doubler Arg + 0
+Check "an expression argument is a copy", STR$(Arg), "5"
 
 CallCount = 0
 Bumper
@@ -458,7 +463,8 @@ Check "LCASE$", LCASE$("MiXeD"), "mixed"
 Check "HEX$", HEX$(255), "FF"
 Check "OCT$", OCT$(8), "10"
 Check "concatenation", "a" + "b" + "c", "abc"
-Check "embedded quote", "say ""hi""", "say " + CHR$(34) + "hi" + CHR$(34)
+Check "embedded quote", MID$("say " + CHR$(34) + "hi" + CHR$(34), 5, 1), CHR$(34)
+Check "dotted name", STR$(MY.COUNT + 1), " 1"
 Check "empty string", "[" + "" + "]", "[]"
 
 B$ = "hello"
@@ -672,14 +678,20 @@ Check "CVL round trip", STR$(CVL(MKL$(2147483647))), "2147483647"
 Check "CVS round trip", STR$(CVS(MKS$(3.5))), "3.5"
 
 ' ---------------------------------------------------------------------------
-' Scope: a module-level name is the same storage inside a procedure, a name
-' used only inside one is not.
+' Scope: a procedure sees a module-level name only when it is shared -- by DIM
+' SHARED or a SHARED statement -- and its other names are its own, fresh on
+' every call unless STATIC.
 ' ---------------------------------------------------------------------------
 Shared% = 1
 TouchShared
-Check "procedures see module storage", STR$(Shared%), "2"
+Check "DIM SHARED reaches a procedure", STR$(Shared%), "2"
 Check "locals start fresh", STR$(FreshLocal()), "1"
 Check "locals start fresh again", STR$(FreshLocal()), "1"
+Hidden = 5
+Check "an unshared name is local", STR$(SeesHidden()), "0"
+Check "and the module's is untouched", STR$(Hidden), "5"
+Check "STATIC keeps its value", STR$(Counted()), "1"
+Check "STATIC keeps its value again", STR$(Counted()), "2"
 
 ' ---------------------------------------------------------------------------
 ' Report
@@ -765,12 +777,14 @@ FUNCTION EarlyOut(N)
 END FUNCTION
 
 FUNCTION SetUnlessZero(N)
+    SHARED Marker
     Marker = 0
     Marked N
     SetUnlessZero = Marker
 END FUNCTION
 
 SUB Marked(N)
+    SHARED Marker
     IF N = 0 THEN EXIT SUB
     Marker = 1
 END SUB
@@ -780,6 +794,7 @@ SUB Doubler(X)
 END SUB
 
 SUB Bumper
+    SHARED CallCount
     CallCount = CallCount + 1
 END SUB
 
@@ -792,6 +807,17 @@ END SUB
 FUNCTION FreshLocal()
     OnlyHere = OnlyHere + 1
     FreshLocal = OnlyHere
+END FUNCTION
+
+FUNCTION SeesHidden()
+    SeesHidden = Hidden
+    Hidden = 99
+END FUNCTION
+
+FUNCTION Counted()
+    STATIC Calls
+    Calls = Calls + 1
+    Counted = Calls
 END FUNCTION
 
 FUNCTION ShowName$(P AS Person)

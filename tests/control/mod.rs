@@ -293,6 +293,33 @@ fn test_goto_gosub() {
     assert_eq!(lines[4], "second", "on goto");
 }
 
+/// GOSUB inside a procedure returns into that procedure's own frame, including
+/// when the procedure recurses between the GOSUB and its RETURN.
+#[test]
+fn test_gosub_inside_a_recursive_procedure() {
+    let output = compile_and_run(
+        r#"
+CALL S(3)
+PRINT "done"
+SUB S(N%)
+  GOSUB 500
+  PRINT "back"; N%
+  EXIT SUB
+500 PRINT "sub"; N%
+  IF N% > 1 THEN CALL S(N% - 1)
+  RETURN
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &[
+            "sub 3", "sub 2", "sub 1", "back 1", "back 2", "back 3", "done"
+        ]
+    );
+}
+
 #[test]
 fn test_select_case() {
     // Test SELECT CASE and CASE ELSE
@@ -697,7 +724,8 @@ RETURN
 }
 
 /// A selector outside the list runs nothing and continues, as in GW-BASIC --
-/// zero, past the end, and negative alike.
+/// zero and past the end alike. A negative one is Illegal function call;
+/// see test_on_selector_range.
 #[test]
 fn test_on_gosub_out_of_range_falls_through() {
     let output = compile_and_run(
@@ -707,7 +735,7 @@ ON 0 GOSUB Only
 PRINT Hit$
 ON 5 GOSUB Only
 PRINT Hit$
-ON -3 GOSUB Only
+ON 255 GOSUB Only
 PRINT Hit$
 ON 1 GOSUB Only
 PRINT Hit$
@@ -722,6 +750,62 @@ RETURN
         crate::common::lines(&output),
         vec!["none", "none", "none", "ran"]
     );
+}
+
+/// ON GOTO and ON GOSUB dispatch on a selector variable of every numeric type,
+/// over the whole range and both sides of it.
+///
+/// Variables rather than literals, which a constant-folding change could
+/// satisfy without the dispatch itself working.
+#[test]
+fn test_on_dispatch_with_every_selector_type() {
+    for suffix in ["%", "&", "!", "#", ""] {
+        let src = format!(
+            r#"
+FOR K{s} = 0 TO 4
+  ON K{s} GOTO G1, G2, G3
+  PRINT "goto none"
+  GOTO Gosubs
+G1: PRINT "goto 1"
+  GOTO Gosubs
+G2: PRINT "goto 2"
+  GOTO Gosubs
+G3: PRINT "goto 3"
+Gosubs:
+  ON K{s} GOSUB S1, S2, S3
+  PRINT "back"
+NEXT K{s}
+END
+S1: PRINT "gosub 1"
+RETURN
+S2: PRINT "gosub 2"
+RETURN
+S3: PRINT "gosub 3"
+RETURN
+"#,
+            s = suffix
+        );
+        let output = compile_and_run(&src).unwrap();
+        assert_eq!(
+            crate::common::lines(&output),
+            vec![
+                "goto none",
+                "back",
+                "goto 1",
+                "gosub 1",
+                "back",
+                "goto 2",
+                "gosub 2",
+                "back",
+                "goto 3",
+                "gosub 3",
+                "back",
+                "goto none",
+                "back"
+            ],
+            "selector suffix {suffix:?}"
+        );
+    }
 }
 
 /// The return stack is left balanced, so an ordinary GOSUB still works after
@@ -797,8 +881,8 @@ RETURN
     .unwrap();
     assert_eq!(
         crate::common::lines(&output),
-        vec!["two", "one"],
-        "4/2 selects the second; 1.9 truncates to 1"
+        vec!["two", "two"],
+        "4/2 selects the second; 1.9 rounds to 2"
     );
 }
 
@@ -1198,4 +1282,154 @@ CALL Wipe
     )
     .unwrap();
     assert_eq!(output.trim(), "ok");
+}
+
+/// A branch cannot cross between module code and a procedure, in either
+/// direction, or between two procedures: each has its own frame, and the code
+/// at the target would run with the wrong one. QuickBASIC refuses it too.
+///
+/// Nothing checked it. `GOTO 100` into a SUB compiled, printed the SUB's line
+/// and the program exited with whatever status was lying in a register.
+#[test]
+fn test_branches_cannot_cross_a_procedure_boundary() {
+    for (source, what) in [
+        (
+            "10 GOTO 100\n20 END\nSUB S\n100 PRINT 1\nEND SUB\n",
+            "GOTO into a SUB",
+        ),
+        (
+            "10 GOSUB 100\n20 END\nSUB S\n100 RETURN\nEND SUB\n",
+            "GOSUB into a SUB",
+        ),
+        (
+            "10 CALL S\n20 END\n30 PRINT 1\nSUB S\nGOTO 30\nEND SUB\n",
+            "GOTO out of a SUB",
+        ),
+        (
+            "X = 1\nON X GOTO Inside\nSUB S\nInside:\nEND SUB\n",
+            "ON GOTO into a SUB",
+        ),
+        (
+            "CALL A\nSUB A\nGOTO There\nEND SUB\nSUB B\nThere:\nEND SUB\n",
+            "GOTO between SUBs",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(what);
+        assert!(err.is_clean_rejection(), "{what}: {}", err.stderr);
+        assert!(err.contains("another"), "{what}: {}", err.stderr);
+    }
+}
+
+/// A line number names one line. GW-BASIC replaces a line typed twice; in a
+/// file the second is a mistake, and a branch to it was ambiguous.
+#[test]
+fn test_duplicate_line_numbers_are_diagnosed() {
+    let err = crate::common::compile_only("10 PRINT 1\n10 PRINT 2\n").unwrap_err();
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(err.contains("duplicate line number 10"), "{}", err.stderr);
+}
+
+/// STOP says where it stopped, as GW-BASIC's "Break in 20" does, on standard
+/// error so the program's own output is untouched, and the program ends
+/// normally. It used to be a silent END.
+#[test]
+fn test_stop_reports_where_it_stopped() {
+    let run = crate::common::compile_and_run_raw(
+        "10 PRINT \"before\"\n20 STOP\n30 PRINT \"after\"\n",
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("STOP");
+    assert_eq!(run.lines(), vec!["before"]);
+    assert_eq!(run.stderr.trim(), "Break in 20");
+
+    // Inside a procedure it ends the program too, and a program without line
+    // numbers quotes the source line, as its errors do.
+    let run = crate::common::compile_and_run_raw(
+        "CALL S\nPRINT \"after\"\nSUB S\nPRINT \"in\"\nSTOP\nEND SUB\n",
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("STOP in a SUB");
+    assert_eq!(run.lines(), vec!["in"]);
+    assert_eq!(run.stderr.trim(), "Break in 5");
+}
+
+/// GW-BASIC's `IF c GOTO n`: no THEN, and an ELSE may follow.
+#[test]
+fn test_if_goto_without_then() {
+    let out = compile_and_run(
+        r#"
+10 IF 1 GOTO 30
+20 PRINT "skipped"
+30 PRINT "jumped"
+40 IF 0 GOTO 20 ELSE PRINT "else"
+50 IF 1 => 1 AND 1 =< 2 AND 1 >< 2 THEN PRINT "either order"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["jumped", "else", "either order"]
+    );
+}
+
+/// `RETURN line` drops the GOSUB's return site and goes to that line.
+#[test]
+fn test_return_to_a_line() {
+    let out = compile_and_run(
+        r#"
+10 GOSUB 100
+20 PRINT "not here"
+30 GOSUB 200
+40 PRINT "back"; N
+50 END
+100 RETURN 30
+200 N = N + 1
+210 IF N < 3 THEN GOSUB 200
+220 RETURN
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["back 3"]);
+
+    // The stack really is popped: a second RETURN has nothing to go to.
+    let run =
+        crate::common::compile_and_run_raw("10 GOSUB 100\n20 END\n30 RETURN\n100 RETURN 30\n", "")
+            .unwrap();
+    assert!(
+        run.stderr.contains("RETURN without GOSUB"),
+        "{:?}",
+        run.stderr
+    );
+
+    // In a procedure, to one of its own lines.
+    let out = compile_and_run(
+        "CALL S\nSUB S\n  GOSUB 500\n  PRINT \"no\"\n600 PRINT \"in S\"\n  EXIT SUB\n500 RETURN 600\nEND SUB\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "in S");
+
+    let err = compile_only("10 GOSUB 100\n20 END\n100 RETURN 999\n").unwrap_err();
+    assert!(err.contains("999"), "got: {}", err.stderr);
+}
+
+/// A handler's `RETURN line` leaves the GOSUB the error interrupted for a
+/// line of the main program.
+#[test]
+fn test_return_to_a_line_from_a_handler() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 900
+20 GOSUB 100
+30 PRINT "not here"
+40 PRINT "landed"
+50 END
+100 ERROR 5
+110 RETURN
+900 RETURN 40
+"#,
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "landed");
 }

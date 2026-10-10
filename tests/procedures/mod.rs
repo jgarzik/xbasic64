@@ -103,15 +103,16 @@ PRINT AddThree(Mul(2, 3), Mul(4, 5), Mul(6, 7))
     assert_eq!(lines[1], "68", "nested three: 6+20+42");
 }
 
-/// LANGREF documents module-level variables as "global by default: accessible
-/// everywhere". They used to read as 0 inside a procedure, because procedures
-/// were compiled before main and so allocated their own local instead.
+/// A module-level variable a procedure SHAREs is the same storage inside it.
+/// (They once read as 0 inside a procedure, because procedures were compiled
+/// before main and so allocated their own local instead.)
 #[test]
-fn test_module_variables_visible_in_procedures() {
+fn test_shared_module_variables_in_procedures() {
     let output = compile_and_run(
         r#"
 G = 99
 SUB Bump
+SHARED G
 PRINT G
 G = G + 1
 END SUB
@@ -132,7 +133,7 @@ PRINT G
 fn test_module_array_accessible_in_procedure() {
     let output = compile_and_run(
         r#"
-DIM A(5)
+DIM SHARED A(5)
 A(0) = 7
 SUB Touch
 PRINT A(0)
@@ -319,23 +320,40 @@ IF Name$ = "bob" THEN PRINT "eq" ELSE PRINT "ne"
     assert_eq!(lines, vec!["bob", "42", "eq"]);
 }
 
-/// String parameters are by value, like numeric ones.
+/// A variable argument is passed by reference, as in QuickBASIC: the
+/// procedure's changes reach it, strings included. BYVAL passes a copy, and
+/// an expression is a copy whatever the parameter says. Every parameter used
+/// to be by value.
 #[test]
-fn test_string_parameters_are_by_value() {
+fn test_parameters_are_by_reference() {
     let output = compile_and_run(
         r#"
-SUB Change(S$)
+SUB Change(S$, N)
 S$ = "changed"
-PRINT S$
+N = N * 2
 END SUB
-T$ = "original"
-Change(T$)
-PRINT T$
+SUB Keep(BYVAL S$, BYVAL N)
+S$ = "kept?"
+N = 0
+END SUB
+T$ = "original": X = 21
+Change T$, X
+PRINT T$; X
+Keep T$, X
+PRINT T$; X
+Change T$ + "", X + 0
+PRINT T$; X
+DIM A%(3): A%(2) = 5
+SUB Bump(K%)
+K% = K% + 1
+END SUB
+Bump A%(2)
+PRINT A%(2)
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["changed", "original"]);
+    assert_eq!(lines, vec!["changed 42", "changed 42", "changed 42", "6"]);
 }
 
 /// DEF FN is desugared into an ordinary FUNCTION, so it reuses the whole
@@ -387,7 +405,7 @@ fn test_function_declared_return_type() {
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["3", "3000"]);
+    assert_eq!(lines, vec!["4", "3000"], "7 / 2 rounds half to even");
 }
 
 /// Without an AS clause the suffix still decides, as before.
@@ -429,4 +447,470 @@ Greet 8
 fn test_call_is_not_reserved() {
     let output = compile_and_run("CALL = 5\nPRINT CALL\n").unwrap();
     assert_eq!(output.trim(), "5");
+}
+
+/// A procedure's names are its own unless shared, as in QuickBASIC: a module
+/// variable of the same name is a different variable inside it. Every name the
+/// module used used to be visible in every procedure.
+#[test]
+fn test_procedure_variables_are_local_unless_shared() {
+    let output = compile_and_run(
+        r#"
+X = 1: Y = 2
+DIM A(2): A(1) = 7
+SUB Show
+PRINT X; A(1)
+X = 50
+END SUB
+SUB ShowShared
+SHARED Y, A()
+PRINT Y; A(1)
+Y = 60
+END SUB
+Show
+ShowShared
+PRINT X; Y
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["0  0", "2  7", "1  60"]);
+}
+
+/// DIM SHARED at module level shares a variable, array or record with every
+/// procedure.
+#[test]
+fn test_dim_shared_reaches_every_procedure() {
+    let output = compile_and_run(
+        r#"
+TYPE P
+N AS INTEGER
+END TYPE
+DIM SHARED Total, Names$(3), R AS P
+SUB AddUp(N)
+Total = Total + N
+Names$(N) = "n" + STR$(N)
+R.N = R.N + 1
+END SUB
+AddUp 1
+AddUp 2
+PRINT Total; Names$(2); R.N
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "3 n 2 2");
+}
+
+/// STATIC keeps a procedure's variable from one call to the next; `SUB name
+/// STATIC` does that for every local. Recursion still gets a fresh ordinary
+/// local per call.
+#[test]
+fn test_static_locals_keep_their_values() {
+    let output = compile_and_run(
+        r#"
+FUNCTION Tick
+STATIC N
+N = N + 1
+Tick = N
+END FUNCTION
+SUB Every STATIC
+C = C + 1
+DIM Hist(3)
+PRINT C;
+END SUB
+PRINT Tick; Tick; Tick
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2  3");
+    let output = compile_and_run(
+        "SUB Count STATIC\nC = C + 1\nS$ = S$ + \"x\"\nPRINT C; S$\nEND SUB\nCount\nCount\nCount\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["1 x", "2 xx", "3 xxx"]);
+}
+
+/// SHARED and STATIC belong inside a procedure, and DIM SHARED outside one.
+#[test]
+fn test_shared_and_static_placement_is_checked() {
+    for (source, msg) in [
+        ("SHARED X\n", "SHARED belongs inside a SUB or FUNCTION"),
+        ("STATIC X\n", "STATIC belongs inside a SUB or FUNCTION"),
+        (
+            "SUB S\nDIM SHARED X\nEND SUB\n",
+            "DIM SHARED belongs at module level",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// DEF FN is part of the module, as in GW-BASIC: its expression sees module
+/// variables without any SHARED.
+#[test]
+fn test_def_fn_sees_module_variables() {
+    let output =
+        compile_and_run("Rate = 3\nDEF FNScale(X) = X * Rate\nPRINT FNScale(5)\n").unwrap();
+    assert_eq!(output.trim(), "15");
+}
+
+/// An array parameter, `A()`, takes an array by reference: the procedure sees
+/// the caller's elements and bounds, and a REDIM or ERASE in it reaches the
+/// caller. Its dimensions are whatever the body subscripts it with.
+#[test]
+fn test_array_parameters() {
+    let output = compile_and_run(
+        r#"
+SUB Fill(V(), N)
+FOR I = LBOUND(V) TO UBOUND(V): V(I) = I * N: NEXT I
+END SUB
+FUNCTION Total(V())
+T = 0
+FOR I = LBOUND(V) TO UBOUND(V): T = T + V(I): NEXT I
+Total = T
+END FUNCTION
+SUB Grow(V())
+REDIM PRESERVE V(5)
+V(5) = 50
+END SUB
+SUB Corner(M$())
+M$(2, 3) = "x"
+END SUB
+DIM A(3), B(1 TO 2)
+Fill A(), 10
+Fill B(), 1
+PRINT A(3); Total(A()); Total(B())
+Grow A()
+PRINT UBOUND(A); A(5); A(3)
+DIM G$(2, 3)
+Corner G$()
+PRINT G$(2, 3)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["30  60  3", "5  50  30", "x"]
+    );
+}
+
+/// An array argument must be an array of the parameter's type, with the
+/// dimensions the procedure uses.
+#[test]
+fn test_array_arguments_are_checked() {
+    for (source, msg) in [
+        ("SUB S(V())\nV(1) = 1\nEND SUB\nS 5\n", "must be an array"),
+        (
+            "SUB S(V())\nV(1) = 1\nEND SUB\nDIM M(2, 2)\nS M()\n",
+            "has 2 dimensions, but V() is used with 1",
+        ),
+        (
+            "SUB S(V())\nV(1) = 1\nEND SUB\nDIM N$(2)\nS N$()\n",
+            "wrong type",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// A variable passed by reference must be the parameter's type, as
+/// QuickBASIC's "Parameter type mismatch" requires; an expression of another
+/// type is converted into a temporary.
+#[test]
+fn test_by_reference_type_must_match() {
+    let err =
+        crate::common::compile_only("SUB S(N%)\nN% = 1\nEND SUB\nX# = 2\nS X#\n").unwrap_err();
+    assert!(
+        err.contains("passed by reference, so it must be an INTEGER, not a DOUBLE"),
+        "{}",
+        err.stderr
+    );
+    let output = compile_and_run(
+        "SUB S(N%)\nN% = N% * 2\nPRINT N%\nEND SUB\nX# = 2.6\nS X# + 0\nS CINT(X#)\nPRINT X#\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["6", "6", "2.6"]);
+}
+
+/// DECLARE states a procedure's signature, as QuickBASIC modules begin with;
+/// it is checked against the definition.
+#[test]
+fn test_declare() {
+    let output = compile_and_run(
+        "DECLARE SUB Show (A$, BYVAL N%)\nDECLARE FUNCTION Twice# (X#)\nShow \"n\", 2\nPRINT Twice#(4)\nSUB Show (A$, BYVAL N%)\nPRINT A$; N%\nEND SUB\nFUNCTION Twice# (X#)\nTwice# = X# * 2\nEND FUNCTION\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["n 2", "8"]);
+    for (source, msg) in [
+        ("DECLARE SUB Nope ()\n", "declared but never defined"),
+        (
+            "DECLARE SUB S (A)\nSUB S (A, B)\nEND SUB\n",
+            "defined with 2 parameters",
+        ),
+        (
+            "DECLARE FUNCTION S (A)\nSUB S (A)\nEND SUB\n",
+            "defined as a SUB",
+        ),
+        (
+            "DECLARE SUB S (BYVAL A)\nSUB S (A)\nEND SUB\n",
+            "parameter 1 differs",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.contains(msg), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// By reference through recursion, and when an error leaves the procedure:
+/// what it had written still reaches the caller.
+#[test]
+fn test_by_reference_through_recursion_and_errors() {
+    let output = compile_and_run(
+        r#"
+SUB Down(N, Steps)
+IF N <= 0 THEN EXIT SUB
+Steps = Steps + 1
+Down N - 1, Steps
+END SUB
+S = 0
+Down 5, S
+PRINT S
+SUB Fails(V)
+V = 7
+ERROR 5
+END SUB
+ON ERROR GOTO 100
+X = 1
+Fails X
+200 PRINT "x"; X
+END
+100 PRINT "trapped"; X
+RESUME 200
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["5", "trapped 7", "x 7"]);
+}
+
+/// A by-reference parameter is the caller's variable, not a copy of it: a
+/// write is seen at once through every other name for the same storage --
+/// another parameter, a SHARED name, or an array element -- as in QuickBASIC.
+#[test]
+fn test_by_reference_parameters_alias() {
+    let output = compile_and_run(
+        r#"
+DIM SHARED G, ARR(3)
+SUB Both(A, B)
+  A = 1
+  PRINT "both"; B
+END SUB
+SUB Global(A)
+  A = 2
+  PRINT "shared"; G
+END SUB
+SUB Element(E)
+  E = 9
+  PRINT "element"; ARR(1)
+END SUB
+SUB Swap2(A$, B$)
+  A$ = A$ + B$
+  PRINT B$
+END SUB
+X = 5
+Both X, X
+G = 1
+Global G
+Element ARR(1)
+S$ = "ab"
+Swap2 S$, S$
+PRINT X; G; ARR(1); S$
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["both 1", "shared 2", "element 9", "abab", "1  2  9 abab"]
+    );
+}
+
+/// A BYVAL parameter, and an expression argument, are copies: the
+/// procedure's writes go nowhere the caller can see.
+#[test]
+fn test_byval_and_expression_arguments_are_copies() {
+    let output = compile_and_run(
+        r#"
+SUB Bump(BYVAL A, B)
+  A = A + 1
+  B = B + 1
+END SUB
+X = 1: Y = 1
+Bump X, Y
+Bump X, Y + 0
+Bump X, Y * 1
+PRINT X; Y
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2");
+}
+
+/// A BYVAL parameter declared with `AS` reads as its argument, in a FUNCTION
+/// declared with `AS` too -- recursive, so each call has its own.
+#[test]
+fn test_typed_byval_parameters() {
+    let output = compile_and_run(
+        r#"
+FUNCTION FIB(BYVAL N AS LONG) AS LONG
+IF N < 2 THEN FIB = N ELSE FIB = FIB(N - 1) + FIB(N - 2)
+END FUNCTION
+SUB SHOW(BYVAL X AS INTEGER, BYVAL D AS DOUBLE, BYVAL S$)
+PRINT X; D; S$
+END SUB
+PRINT FIB(20)
+SHOW 7, 2.5, "s"
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["6765", "7  2.5 s"]);
+}
+
+/// A fixed-length string passed to an ordinary string parameter is passed
+/// as a copy and copied back padded or cut to its width, as in QuickBASIC:
+/// the callee cannot change its length. A record field the same.
+#[test]
+fn test_fixed_length_string_argument_keeps_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 5
+  V AS INTEGER
+END TYPE
+SUB P(X$)
+  PRINT "in["; X$; "]"; LEN(X$)
+  X$ = "abcdefgh"
+END SUB
+SUB Q(X$)
+  X$ = "z"
+END SUB
+DIM T AS R
+T.N = "hello"
+T.V = 7
+P T.N
+PRINT "["; T.N; "]"; LEN(T.N); T.V
+DIM F AS STRING * 4
+F = "wxyz"
+P F
+PRINT "["; F; "]"; LEN(F)
+Q F
+PRINT "["; F; "]"; LEN(F)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "in[hello] 5",
+            "[abcde] 5  7",
+            "in[wxyz] 4",
+            "[abcd] 4",
+            "[z   ] 4",
+        ]
+    );
+}
+
+/// An argument in parentheses is an expression, so it is passed as a copy
+/// even to a by-reference parameter: QuickBASIC's way to protect a variable.
+#[test]
+fn test_parenthesized_argument_is_passed_by_value() {
+    let out = compile_and_run(
+        r#"
+SUB D(X)
+  X = X * 2
+END SUB
+FUNCTION F(X)
+  X = X + 1
+  F = X
+END FUNCTION
+A = 5
+CALL D((A))
+PRINT A
+D (A)
+PRINT A
+D A
+PRINT A
+B = 1
+PRINT F((B)); B
+PRINT F(B); B
+DIM Z(2)
+Z(1) = 3
+D (Z(1))
+PRINT Z(1)
+S$ = "a"
+CALL T((S$))
+PRINT S$
+SUB T(X$)
+  X$ = "changed"
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["5", "5", "10", "2  1", "2  2", "3", "a"]
+    );
+}
+
+/// An element of an array of fixed-length strings, and a fixed-length field
+/// of an array of records, are copied back at their width too -- found again
+/// by their subscripts, since the procedure may have REDIMmed the array.
+#[test]
+fn test_fixed_length_element_argument_keeps_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 5
+  V AS INTEGER
+END TYPE
+DIM SHARED A(3) AS STRING * 4
+DIM T(2) AS R
+SUB P(X$)
+  PRINT "in["; X$; "]"; LEN(X$)
+  X$ = "abcdefgh"
+END SUB
+SUB Q(X$)
+  X$ = "z"
+END SUB
+SUB SHRINK(X$)
+  REDIM A(1) AS STRING * 4
+  X$ = "qq"
+END SUB
+A(2) = "wxyz"
+P A(2)
+PRINT "["; A(2); "]"
+Q A(2)
+PRINT "["; A(2); "]"
+T(1).N = "hello"
+T(1).V = 9
+P T(1).N
+PRINT "["; T(1).N; "]"; T(1).V
+Q T(1).N
+PRINT "["; T(1).N; "]"; T(1).V
+SHRINK A(1)
+PRINT "["; A(1); "]"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "in[wxyz] 4",
+            "[abcd]",
+            "[z   ]",
+            "in[hello] 5",
+            "[abcde] 9",
+            "[z    ] 9",
+            "[qq  ]",
+        ]
+    );
 }
