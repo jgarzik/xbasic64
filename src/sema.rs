@@ -2732,6 +2732,16 @@ impl Analyzer {
     /// The type of `arg` when it is a variable, array element or field --
     /// something a by-reference parameter would share -- or None for any
     /// other expression.
+    /// The type a variable or an array's elements hold: the `AS` clause it
+    /// was declared with, or its name's suffix. None for a record.
+    fn declared_type(&self, name: &str, scope: &Scope) -> Option<DataType> {
+        match self.symbols.typed_var(scope, name) {
+            Some(TypeRef::Record(_)) => None,
+            Some(t) => Some(DataType::from_type_ref(t)),
+            None => Some(DataType::from_suffix(name)),
+        }
+    }
+
     fn lvalue_type(&self, arg: &Expr, scope: &Scope) -> Option<DataType> {
         match arg {
             Expr::Variable(n) => {
@@ -2744,7 +2754,7 @@ impl Analyzer {
                     None => DataType::from_suffix(n),
                 })
             }
-            Expr::ArrayAccess { name, .. } => Some(DataType::from_suffix(name)),
+            Expr::ArrayAccess { name, .. } => self.declared_type(name, scope),
             Expr::FnCall { name, args }
                 if !args.is_empty()
                     && self
@@ -2752,7 +2762,7 @@ impl Analyzer {
                         .lookup_array(scope, &name.to_uppercase())
                         .is_some() =>
             {
-                Some(DataType::from_suffix(name))
+                self.declared_type(name, scope)
             }
             _ => None,
         }
@@ -2902,7 +2912,7 @@ impl Analyzer {
     /// Reject assigning a string to a numeric variable or vice versa. These
     /// used to reach codegen and abort it with a panic.
     fn check_assign_types(&mut self, name: &str, value: &Expr, scope: &Scope, line: u32) {
-        let target_is_string = name.ends_with('$');
+        let target_is_string = self.declared_type(name, scope) == Some(DataType::String);
         if let Some(value_is_string) = self.expr_is_string(value, scope)
             && target_is_string != value_is_string
         {

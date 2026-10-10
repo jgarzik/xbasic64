@@ -285,7 +285,18 @@ impl FnGen<'_> {
     /// Type of an array's elements, when it was declared `DIM a(n) AS T`.
     pub(super) fn array_elem_type(&self, name: &str) -> Option<TypeRef> {
         let ty = self.typed_var(name)?;
-        self.record_elem_words_of(name).is_some().then_some(ty)
+        (matches!(ty, TypeRef::Record(_)) && self.record_elem_words_of(name).is_some())
+            .then_some(ty)
+    }
+
+    /// The type an element of the scalar array `name` holds: its `AS`
+    /// clause -- `DIM A(3) AS INTEGER` is an array of INTEGERs whatever the
+    /// name says -- or its name's suffix.
+    pub(super) fn array_value_type(&self, name: &str) -> TypeRef {
+        match self.typed_var(name) {
+            Some(TypeRef::Record(_)) | None => type_ref_of(DataType::from_suffix(name)),
+            Some(t) => t,
+        }
     }
 
     /// Resolve `base.field...` to a storage location and the field's type.
@@ -374,7 +385,7 @@ impl FnGen<'_> {
         if let Some(words) = self.record_elem_words_of(name) {
             return words * 8;
         }
-        elem_size(DataType::from_suffix(name))
+        elem_size(DataType::from_type_ref(&self.array_value_type(name)))
     }
 
     /// Create `name` with GW-BASIC's default bounds if it has no storage yet.
@@ -448,9 +459,9 @@ impl FnGen<'_> {
 
     /// Load an element of the array `name`.
     pub(super) fn array_load(&mut self, name: &str, indices: &[Expr]) -> Val {
-        let ty = DataType::from_suffix(name);
+        let ty = self.array_value_type(name);
         let a = self.array_addr(name, indices);
-        self.load_val(ty, Loc::Ptr(a, 0))
+        self.load_typed(Loc::Ptr(a, 0), &ty)
     }
 
     /// Allocate or reallocate an array's storage.
@@ -637,7 +648,9 @@ impl FnGen<'_> {
     pub(super) fn gen_declarator(&mut self, decl: &Declarator, redim: bool, preserve: bool) {
         match (&decl.dimensions, &decl.ty) {
             (Some(dims), ty) => {
-                if let Some(ty) = ty {
+                // An array of records has elements of the record's size; one
+                // declared AS a scalar type sizes them by that type.
+                if let Some(ty @ TypeRef::Record(_)) = ty {
                     let words = self.cg.symbols.type_words(ty);
                     let key = decl.name.to_uppercase();
                     if self.current_proc.is_some() {
@@ -747,10 +760,7 @@ impl FnGen<'_> {
         }
         if let Some(indices) = &target.indices {
             let a = self.array_addr(&target.name, indices);
-            return (
-                Loc::Ptr(a, 0),
-                type_ref_of(DataType::from_suffix(&target.name)),
-            );
+            return (Loc::Ptr(a, 0), self.array_value_type(&target.name));
         }
         if let Some((loc, ty)) = self.typed_storage(&target.name) {
             return (loc, ty);

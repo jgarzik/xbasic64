@@ -111,7 +111,7 @@ impl FnGen<'_> {
                     },
                 },
             },
-            Expr::ArrayAccess { name, .. } => DataType::from_suffix(name),
+            Expr::ArrayAccess { name, .. } => DataType::from_type_ref(&self.array_value_type(name)),
             Expr::FnCall { name, args } => self.call_return_type(name, args),
             Expr::Field { .. } => self.field_expr_type(expr),
             // NOT is bitwise and yields an integer, as AND, OR and XOR do.

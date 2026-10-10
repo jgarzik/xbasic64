@@ -446,8 +446,12 @@ impl FnGen<'_> {
             } if !indices.is_empty()
                 && self.lookup_array(&name.to_uppercase()).is_some()
                 && !self.cg.symbols.procs.contains_key(&name.to_uppercase())
+                && !matches!(
+                    self.array_value_type(name),
+                    TypeRef::Record(_) | TypeRef::FixedString(1..)
+                )
                 && self.array_elem_type(name).is_none()
-                && DataType::from_suffix(name) == ty =>
+                && DataType::from_type_ref(&self.array_value_type(name)) == ty =>
             {
                 let indices = indices.clone();
                 Some(self.array_addr(name, &indices))

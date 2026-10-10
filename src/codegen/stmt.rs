@@ -162,7 +162,7 @@ impl FnGen<'_> {
                     return;
                 }
                 let v = self.gen_expr(value);
-                let ty = storage::type_ref_of(DataType::from_suffix(name));
+                let ty = self.array_value_type(name);
                 self.store_typed(Loc::Ptr(a, 0), &ty, v);
             }
 

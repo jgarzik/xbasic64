@@ -127,7 +127,9 @@ impl FnGen<'_> {
         let es = i64::from(self.elem_size_for(name));
         let offsets = match self.array_elem_type(name) {
             Some(ty) => self.string_offsets(&ty),
-            None if DataType::from_suffix(name) == DataType::String => vec![0],
+            None if DataType::from_type_ref(&self.array_value_type(name)) == DataType::String => {
+                vec![0]
+            }
             None => Vec::new(),
         };
         (!offsets.is_empty()).then_some((es, offsets))

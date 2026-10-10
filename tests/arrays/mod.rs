@@ -316,3 +316,43 @@ fn test_array_size_overflow_is_out_of_memory() {
         assert!(!run.stdout.contains("allocated"), "{src}");
     }
 }
+
+/// An array declared `AS` a type holds that type, whatever its name's suffix
+/// says: an INTEGER array rounds what it is given, a LONG one holds past
+/// 16 bits, and a `STRING * n` one pads to its width -- including through a
+/// by-reference argument, INPUT-style stores and REDIM.
+#[test]
+fn test_arrays_declared_with_a_type() {
+    let out = compile_and_run(
+        r#"
+SUB Bump(N AS INTEGER)
+  N = N + 1
+END SUB
+DIM A(3) AS INTEGER
+A(1) = 2.6: PRINT A(1)
+Bump A(1): PRINT A(1)
+DIM L(2) AS LONG
+L(2) = 70000: PRINT L(2)
+DIM S(2) AS STRING * 4
+S(1) = "x": PRINT "["; S(1); "]"; LEN(S(1))
+S(2) = "toolong": PRINT S(2)
+READ S(0): PRINT "["; S(0); "]"
+DATA ab
+REDIM D(2) AS DOUBLE
+D(1) = 1 / 3: PRINT D(1)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "3",
+            "4",
+            "70000",
+            "[x   ] 4",
+            "tool",
+            "[ab  ]",
+            ".3333333333333333"
+        ]
+    );
+}
