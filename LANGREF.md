@@ -398,7 +398,9 @@ case-sensitive and a prefix sorts before the longer string (`"ab" < "abc"`).
 
 These operate bitwise on integers, allowing both logical tests and bit
 manipulation. Their operands are converted to LONG first -- rounded, and
-`Overflow` outside its range -- and the result is a LONG:
+`Overflow` outside its range -- and the result is a LONG. This is QuickBASIC's
+range; GW-BASIC converts to INTEGER, where `40000 AND 1` is `Overflow`. The
+operands of `\` and `MOD` follow the same rule:
 
 ```basic
 IF A > 0 AND B > 0 THEN PRINT "Both positive"
