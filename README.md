@@ -48,6 +48,9 @@ cargo build --release
 # Compile a BASIC program to executable
 xbasic64 program.bas
 
+# Or compile it into memory and run it at once, with no executable
+xbasic64 run program.bas
+
 # Specify output file
 xbasic64 program.bas -o myprogram
 
@@ -92,9 +95,12 @@ Source → Lexer → Parser → Semantic Analysis → Code Generator → Object 
 3. **Semantic analysis** - Resolves names, checks types and argument counts, and
    reports problems with a source line
 4. **Code Generator** - Lowers the AST to Cranelift IR; Cranelift does instruction
-   selection and register allocation and writes the object file
+   selection and register allocation and writes the object file -- or, for
+   `xbasic64 run`, puts the code in memory (a JIT) and runs it in the compiler's
+   own process. The whole program is compiled first either way, from the same
+   lowering; nothing is interpreted
 
-The runtime library (I/O, strings, number formatting, math) is a `no_std` Rust crate in `rt/` that calls the C library. It is built once, when the compiler is built, and linked beside each program.
+The runtime library (I/O, strings, number formatting, math) is a `no_std` Rust crate in `rt/` that calls the C library. It is built once, when the compiler is built, and linked beside each program; `xbasic64 run` uses the copy linked into the compiler.
 
 Key design choices:
 - No IR of its own: the AST is lowered directly to Cranelift's
