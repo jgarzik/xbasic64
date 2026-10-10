@@ -236,6 +236,51 @@ pub fn compile_and_run_env(
     })
 }
 
+/// Run `source` with `xbasic64 run` -- compiled into memory and run in the
+/// compiler's own process -- from a temp dir, with `stdin_input` and extra
+/// `flags`. Like [`compile_and_run_raw`], `Ok` whatever the program did; but
+/// here a compile error is the same process failing, so it is in the
+/// output too (exit 1, with the diagnostic on stderr).
+pub fn run_jit(source: &str, stdin_input: &str, flags: &[&str]) -> Result<RunOutput, String> {
+    let tmp = TempDir::new().map_err(|e| e.to_string())?;
+    run_jit_in(&tmp, source, stdin_input, flags)
+}
+
+/// [`run_jit`] in the directory `dir`, which files the program opens are in.
+pub fn run_jit_in(
+    dir: &TempDir,
+    source: &str,
+    stdin_input: &str,
+    flags: &[&str],
+) -> Result<RunOutput, String> {
+    let bas_file = dir.path().join("test.bas");
+    fs::write(&bas_file, source).map_err(|e| e.to_string())?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg("run")
+        .arg(&bas_file)
+        .args(flags)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run the compiler: {}", e))?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(stdin_input.as_bytes())
+        .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for the compiler: {}", e))?;
+    Ok(RunOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        exit_code: out.status.code(),
+    })
+}
+
 pub fn compile_and_run(source: &str) -> Result<String, String> {
     compile_and_run_with_stdin(source, "")
 }

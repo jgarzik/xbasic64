@@ -358,6 +358,7 @@ pub fn generate(
 /// defined, `main` among them.
 pub struct Lowered<M> {
     pub module: M,
+    pub main: FuncId,
     /// The CLIF, when asked for, with a header naming each `uN:M`.
     pub clif: String,
 }
@@ -403,8 +404,10 @@ pub fn lower<M: Module + 'static>(
         module,
     };
     let clif = (&mut cg as &mut CodeGen).lower(program)?;
+    let main = cg.funcs["main"];
     Ok(Lowered {
         module: cg.module,
+        main,
         clif,
     })
 }
@@ -479,7 +482,7 @@ const HUGE_FUNCTION_BLOCKS: usize = 20_000;
 /// The target: this host, as the compiler is built for the machine it runs on.
 /// `huge` selects the cheap settings for functions past
 /// `HUGE_FUNCTION_BLOCKS`.
-fn make_isa(huge: bool) -> Result<OwnedTargetIsa, String> {
+pub(crate) fn make_isa(huge: bool) -> Result<OwnedTargetIsa, String> {
     let mut flags = settings::builder();
     let set = |f: &mut settings::Builder, k: &str, v: &str| {
         f.set(k, v).map_err(|e| format!("{}={}: {}", k, v, e))
@@ -536,7 +539,14 @@ fn rt_type(t: rtsig::Ty) -> Type {
 }
 
 /// The C library functions generated code calls, with their signatures.
+/// The C library functions generated code calls, all of them.
+pub(crate) const LIBC_FUNCTIONS: [&str; 12] = [
+    "pow", "sin", "cos", "tan", "atan", "exp", "log", "calloc", "realloc", "free", "memset",
+    "memcpy",
+];
+
 fn libc_sig(name: &str) -> (&'static [Type], &'static [Type]) {
+    debug_assert!(LIBC_FUNCTIONS.contains(&name), "{name} is not listed");
     const F: &[Type] = &[types::F64];
     match name {
         "pow" => (&[types::F64, types::F64], F),

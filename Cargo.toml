@@ -27,9 +27,13 @@ clap = { version = "4", features = ["derive"] }
 # Pinned exactly: Cranelift's API changes between minor releases.
 cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "x86", "arm64", "unwind"] }
 cranelift-frontend = "=0.136.2"
+cranelift-jit = "=0.136.2"
 cranelift-module = "=0.136.2"
 cranelift-object = "=0.136.2"
 target-lexicon = "0.13"
+# The runtime, linked into the compiler too, for `xbasic64 run`; programs
+# compiled to executables link the copy build.rs builds.
+xbasic64-rt = { path = "rt", features = ["host"] }
 
 [dev-dependencies]
 tempfile = "3"

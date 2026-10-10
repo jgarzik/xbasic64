@@ -14,6 +14,7 @@ mod docs;
 mod errors;
 mod file_io;
 mod input;
+mod jit;
 mod math;
 mod megatest;
 mod print;

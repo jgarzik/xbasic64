@@ -320,7 +320,7 @@ pub enum Scope {
 }
 
 /// Everything the analysis learned about a program.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Symbols {
     pub procs: HashMap<String, ProcInfo>,
     pub arrays: HashMap<(Scope, String), ArrayInfo>,
