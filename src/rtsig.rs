@@ -159,7 +159,7 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_read_string", &[I64], STR)),
     h("_rt_restore", &[I64], &[]),
     // Strings
-    h("_rt_val", STR, &[F64]),
+    fallible(h("_rt_val", STR, &[F64])),
     h("_rt_str", &[F64], STR),
     h("_rt_str_single", &[F64], STR),
     h("_rt_chr", &[I64], STR),

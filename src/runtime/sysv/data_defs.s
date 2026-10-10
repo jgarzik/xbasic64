@@ -39,6 +39,7 @@ _redo_msg: .asciz "?Redo from start\n"
 _num_buf: .skip 64
 _fmt_scratch: .skip 64          # _rt_fmt_double's printf output, before reshaping
 _fmt_digits: .skip 32           # ... and its significant digits
+_scan_buf: .skip 128            # _rt_scan_number's copy of a number, for strtod
 # Current output column per file number, so TAB(n) knows how far to advance.
 # Updated by the print helpers and reset by a newline. Slot 0 is the console,
 # which is file handle 0. Indexed as quadwords, hence the alignment above.

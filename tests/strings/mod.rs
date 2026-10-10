@@ -495,3 +495,47 @@ PRINT VAL(MID$("12.25xyz", 1, 5))
     let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["1", "5", "9.5", "0", "12.25"]);
 }
+
+/// VAL reads a number the way GW-BASIC's does: blanks anywhere are ignored,
+/// `&H` and `&O` work, a D exponent is a DOUBLE's, and text stops the number
+/// where it stops being one. It used to hand the text to strtod, which knew no
+/// D or &H, skipped no inner blanks, and took "inf", "nan" and "0x1F".
+#[test]
+fn test_val_reads_numbers_as_gw_basic_does() {
+    let output = compile_and_run(
+        r#"
+PRINT VAL("1 2")
+PRINT VAL("  -3.5")
+PRINT VAL("1D3")
+PRINT VAL("2.5E-1")
+PRINT VAL("&HFF")
+PRINT VAL("&HFFFF")
+PRINT VAL("&O17")
+PRINT VAL("12abc")
+PRINT VAL("abc")
+PRINT VAL("")
+PRINT VAL("inf")
+PRINT VAL("nan")
+PRINT VAL("0x1F")
+PRINT VAL("- 5")
+PRINT VAL("1.2.3")
+PRINT VAL("+")
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            "12", "-3.5", "1000", ".25", "255", "-1", "15", "12", "0", "0", "0", "0", "0", "-5",
+            "1.2", "0"
+        ]
+    );
+}
+
+/// A number too large for a DOUBLE is Overflow, not infinity.
+#[test]
+fn test_val_overflow_is_an_error() {
+    let run = crate::common::compile_and_run_raw("PRINT VAL(\"1E400\")\n", "").unwrap();
+    assert_eq!(run.exit_code, Some(1), "{}", run.stderr);
+    assert!(run.stderr.contains("Overflow"), "{}", run.stderr);
+}

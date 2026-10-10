@@ -1160,6 +1160,13 @@ nobody to ask, so it takes the clock.
 
 **String indexing is 1-based** for `MID$` and `INSTR`.
 
+`VAL` reads the number a string begins with, as GW-BASIC does: blanks are
+ignored wherever they are (`VAL("1 2")` is 12), an exponent may be spelled `E`
+or `D`, `&H` and `&O` work as they do in a literal (`VAL("&HFFFF")` is -1), and
+the number ends where the text stops being one (`VAL("12abc")` is 12). Text
+that does not begin with a number is 0; one too large for a DOUBLE is
+`Overflow`.
+
 `HEX$` and `OCT$` show a negative number as two's complement in its own type's
 width, as QuickBASIC does: `HEX$(-1)` is `FFFF`, since -1 is an INTEGER, and
 `HEX$(-1&)` is `FFFFFFFF`. Any other type is converted to a LONG first.
