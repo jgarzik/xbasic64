@@ -1328,3 +1328,29 @@ fn test_duplicate_line_numbers_are_diagnosed() {
     assert!(err.is_clean_rejection(), "{}", err.stderr);
     assert!(err.contains("duplicate line number 10"), "{}", err.stderr);
 }
+
+/// STOP says where it stopped, as GW-BASIC's "Break in 20" does, on standard
+/// error so the program's own output is untouched, and the program ends
+/// normally. It used to be a silent END.
+#[test]
+fn test_stop_reports_where_it_stopped() {
+    let run = crate::common::compile_and_run_raw(
+        "10 PRINT \"before\"\n20 STOP\n30 PRINT \"after\"\n",
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("STOP");
+    assert_eq!(run.lines(), vec!["before"]);
+    assert_eq!(run.stderr.trim(), "Break in 20");
+
+    // Inside a procedure it ends the program too, and a program without line
+    // numbers quotes the source line, as its errors do.
+    let run = crate::common::compile_and_run_raw(
+        "CALL S\nPRINT \"after\"\nSUB S\nPRINT \"in\"\nSTOP\nEND SUB\n",
+        "",
+    )
+    .unwrap();
+    run.assert_ran_to_completion("STOP in a SUB");
+    assert_eq!(run.lines(), vec!["in"]);
+    assert_eq!(run.stderr.trim(), "Break in 5");
+}

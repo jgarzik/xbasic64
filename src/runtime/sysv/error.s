@@ -17,6 +17,8 @@
 .data
 _err_fmt_line: .asciz "?%s in %ld\n"
 _err_fmt_bare: .asciz "?%s\n"
+_stop_fmt_line: .asciz "Break in %ld\n"
+_stop_fmt_bare: .asciz "Break\n"
 
 _err_subscript: .asciz "Subscript out of range"
 _err_div0:      .asciz "Division by zero"
@@ -252,3 +254,40 @@ _rt_fatal:
 .Lerr_exit:
     mov edi, 1
     call exit
+    ud2                     # exit does not return
+
+# _rt_stop - STOP: say where, and end the program
+#
+# GW-BASIC prints "Break in 20" and returns to its prompt; a compiled program
+# has no prompt, so it ends -- normally, as END does. The message goes to
+# stderr, after stdout is flushed, so the program's own output is untouched.
+# STOP used to be a silent END.
+#
+# Arguments: rdi = BASIC line number, or 0 when unknown
+# Returns: never (exit code 0)
+.globl _rt_stop
+_rt_stop:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 8              # keeps rsp 16-byte aligned for the calls
+    mov rbx, rdi            # line number
+    xor edi, edi
+    call fflush
+    mov rdi, QWORD PTR [rip + stderr]
+    test rbx, rbx
+    jz .Lstop_bare
+    lea rsi, [rip + _stop_fmt_line]
+    mov rdx, rbx
+    xor eax, eax
+    call fprintf
+    jmp .Lstop_end
+.Lstop_bare:
+    lea rsi, [rip + _stop_fmt_bare]
+    xor eax, eax
+    call fprintf
+.Lstop_end:
+    add rsp, 8
+    pop rbx
+    leave
+    jmp _rt_end

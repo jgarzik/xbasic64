@@ -4065,7 +4065,12 @@ impl CodeGen {
                 self.emit_label(&end_label);
             }
 
-            StmtKind::End | StmtKind::Stop => {
+            // STOP reports where it stopped, then ends as END does.
+            StmtKind::Stop => {
+                self.emit_arg_imm(0, self.report_line() as i64);
+                self.call_rt("_rt_stop");
+            }
+            StmtKind::End => {
                 // Terminate the program, not just the current frame. A plain
                 // `leave; ret` only ends the program when END appears in main;
                 // inside a SUB or FUNCTION it just returns to the caller.

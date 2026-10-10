@@ -1065,8 +1065,13 @@ Terminate program:
 
 ```basic
 END     ' Normal termination
-STOP    ' Terminate (historically for debugging)
+STOP    ' Report where, then terminate
 ```
+
+`STOP` writes `Break in` and the line number to standard error, as GW-BASIC
+does -- the source line when the program has no line numbers -- and then ends
+the program normally, with exit status 0. GW-BASIC would return to its prompt
+and allow `CONT`; a compiled program has neither.
 
 ---
 

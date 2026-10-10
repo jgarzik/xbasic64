@@ -19,6 +19,8 @@
 .data
 _err_fmt_line: .asciz "?%s in %lld\r\n"
 _err_fmt_bare: .asciz "?%s\r\n"
+_stop_fmt_line: .asciz "Break in %lld\r\n"
+_stop_fmt_bare: .asciz "Break\r\n"
 
 _err_subscript: .asciz "Subscript out of range"
 _err_div0:      .asciz "Division by zero"
@@ -267,3 +269,39 @@ _rt_fatal:
 
     mov ecx, 1
     call ExitProcess
+    ud2                     # exit does not return
+
+# _rt_stop - STOP: say where, and end the program
+#
+# See the System V twin. Console output here is written straight through, so
+# there is nothing to flush first.
+#
+# Arguments: rcx = BASIC line number, or 0 when unknown
+# Returns: never (exit code 0)
+.globl _rt_stop
+_rt_stop:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    sub rsp, 40             # shadow space + the 5th WriteFile argument
+    lea rdx, [rip + _stop_fmt_bare]
+    test rcx, rcx
+    jz .Lstop_fmt
+    lea rdx, [rip + _stop_fmt_line]
+.Lstop_fmt:
+    mov r8, rcx             # the line, if the format wants it
+    lea rcx, [rip + _err_buf]
+    call sprintf
+    mov rbx, rax            # length
+    mov ecx, STD_ERROR_HANDLE
+    call GetStdHandle
+    mov rcx, rax
+    lea rdx, [rip + _err_buf]
+    mov r8, rbx
+    lea r9, [rip + _err_bytes_written]
+    mov QWORD PTR [rsp + 32], 0
+    call WriteFile
+    add rsp, 40
+    pop rbx
+    leave
+    jmp _rt_end

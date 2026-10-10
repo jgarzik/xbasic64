@@ -85,6 +85,7 @@ pub static HELPERS: &[RtHelper] = &[
     // Program lifetime and errors
     h("_rt_platform_init", &[], &[]),
     noreturn(h("_rt_end", &[], &[])),
+    noreturn(h("_rt_stop", &[I64], &[])),
     // (message, line). Returns only when a handler traps the error.
     h("_rt_error", &[I64, I64], &[]),
     noreturn(h("_rt_fatal", &[I64, I64], &[])),
