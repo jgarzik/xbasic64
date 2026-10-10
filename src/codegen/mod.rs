@@ -16,13 +16,15 @@
 //!
 //! # Storage
 //!
-//! Every BASIC variable lives in memory. Module-level names are zero-filled
-//! data objects (`_var_X`, `_arr_X`, ...), reachable from every procedure
-//! that shares them; a procedure's own names are stack slots, zeroed on
-//! entry so that each call starts at 0 and "". A value never lives in an SSA
-//! value across a statement: GOTO, GOSUB, and RESUME may enter any statement
-//! from anywhere, and an SSA value defined in one statement would not
-//! dominate the next.
+//! A numeric scalar that only its own function can reach lives in a
+//! Cranelift `Variable` (see `ssa.rs`). Everything else lives in memory:
+//! module-level names in zero-filled data objects (`_var_X`, `_arr_X`, ...),
+//! reachable from every procedure that shares them, and a procedure's own
+//! names in stack slots, zeroed on entry so that each call starts at 0 and
+//! "". No plain SSA value lives across a statement: GOTO, GOSUB and RESUME
+//! may enter any statement from anywhere, and a value defined in one
+//! statement would not dominate the next -- a `Variable` gets a block
+//! parameter there instead.
 //!
 //! A string is two words, pointer then length; an array descriptor is the
 //! element pointer, a count per dimension, then a lower bound per dimension.
@@ -71,7 +73,7 @@ pub use storage::mangle;
 /// Code generation options.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
-    /// Emit runtime safety checks (array bounds, division by zero, ...).
+    /// Emit runtime safety checks (array bounds, division by zero, overflow, ...).
     pub checks: bool,
 }
 

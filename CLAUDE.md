@@ -20,9 +20,9 @@ cargo test control::
 cargo test strings::
 
 # Compile a BASIC program
-cargo run -- program.bas           # Output: ./program
+cargo run -- program.bas           # Output: program, beside the source
 cargo run -- program.bas -o out    # Custom output name
-cargo run -- -S program.bas        # Write the program's Cranelift IR to program.clif (no linking)
+cargo run -- -S program.bas        # Cranelift IR to <output>.clif instead (no object, no link)
 ```
 
 ## Architecture
@@ -68,42 +68,56 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
 ### Test Structure (`tests/`)
 
 Integration tests organized by feature area:
+- `integration.rs` - The one test crate: every module directory below is
+  declared there, so a new one must be added
 - `common/mod.rs` - Test harness. `compile_and_run()` for the usual case;
-  `compile_only()` for "this must be rejected, with this message"; and
-  `compile_and_run_raw()` for "printed this, then aborted with this exit code"
+  `compile_only()` for "this must be rejected, with this message";
+  `compile_and_run_raw()` for "printed this, then aborted with this exit code";
+  and `compile_to_clif()` / `uses_symbol()` for the IR the compiler generates
 - `docs/mod.rs` - Compiles every ```basic example in LANGREF.md and README.md
 - `megatest/` - One large program (`mega.bas`) exercising most of the language
   at once, so that features are tested coexisting rather than in isolation. It
   is its own assertion harness: a regression names itself
-- `codegen/` - Assertions on the Cranelift IR the compiler generates
-  (`compile_to_clif()`, `uses_symbol()`), and behavioural tests of code paths
+- `codegen/` - Assertions on the Cranelift IR the compiler generates (through
+  `common::compile_to_clif()`), and behavioural tests of code paths
   with special cases: constant divisors, scalars in SSA values, huge functions
+- `runtime/` - Structural checks on the two assembly runtimes: the same
+  `.globl` names, no `.equ` length constants, and the like
 - Feature modules: `arithmetic/`, `arrays/`, `control/`, `data/`, `errors/`, `file_io/`, `input/`, `math/`, `print/`, `procedures/`, `strings/`, `types/`, `variables/`
 
 ### Key Design Decisions
 
 - **No IR of its own**: the AST is lowered straight to Cranelift IR. Cranelift
   0.136.2, pinned exactly: its API changes between releases
-- **Every variable lives in memory**: module names in data objects, a
-  procedure's own in zeroed stack slots. No SSA value lives across a statement,
-  because GOTO, GOSUB and RESUME may enter any statement from anywhere and a
-  value defined in one would not dominate the next; FOR's limit and step and
-  SELECT's selector are slots for the same reason
+- **Scalars only a function can reach live in SSA values** (`codegen/ssa.rs`):
+  a numeric scalar not passed to a procedure, not SHARED or STATIC, and -- in
+  main -- not in a program with ON ERROR is a Cranelift `Variable`, as are
+  FOR's limit and step. GOTO, GOSUB and RESUME entering a statement just give
+  it a block parameter. Everything else lives in memory: module names in data
+  objects, a procedure's own in stack slots zeroed on entry. No plain SSA
+  value lives across a statement, since one defined in a statement would not
+  dominate the statements GOTO can reach
+- **Huge functions are compiled cheaply**: past `HUGE_FUNCTION_BLOCKS` (20,000)
+  a function gets no optimizer and the single-pass register allocator, since
+  the backtracking one is superlinear with SSA values live across it; that
+  code runs about 2x slower
 - **Every reference is colocated**: functions and data, the runtime's and libc's
-  included, are reached with `call rel32` and RIP-relative addresses; the link is
-  `-no-pie`
+  included, are reached with `call rel32` and RIP-relative addresses; on Linux
+  the link is `-no-pie`
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility
 - **Scope is QuickBASIC's**: module-level storage is static (.bss, zeroed),
   but a procedure reaches a module name only when it is shared (`DIM SHARED`,
-  or `SHARED` in the procedure; a DEF FN sees all). Its other names are frame
-  slots zeroed on entry, unless STATIC, which gives them .bss storage of their
-  own. `Symbols::shares` and `Symbols::is_static` decide, in one place each
-- **Uniform word addressing**: every variable, string (pointer + length), array
-  descriptor and record field is a sequence of 8-byte words reached through `Loc`
-- **Runtime checks on by default**: `--unsafe` removes them
-- **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
+  or `SHARED` in the procedure; a DEF FN sees all). Its other names are its
+  own -- SSA values or zeroed frame slots -- unless STATIC, which gives them
+  .bss storage of their own. `Symbols::shares` and `Symbols::is_static` decide, in one place each
+- **Uniform word addressing**: every variable in memory, string (pointer +
+  length), array descriptor and record field is a sequence of 8-byte words
+  reached through `Loc`; a scalar in an SSA value is a `Place::Var`
+- **Runtime checks on by default**: subscripts, division by zero, overflow
+  and the rest; `--unsafe` removes them, and is refused with ON ERROR
+- **Two runtimes in lockstep**: `src/runtime/sysv/` and `src/runtime/win64-native/` export
   the same `.globl` names; a new helper must be added to both
 - **Two assemblers, not just two runtimes**: `build.rs` assembles the runtime
   with GNU `as` on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
@@ -142,8 +156,9 @@ Integration tests organized by feature area:
   ERROR target -- on top of the faulting frame, so RESUME and RESUME NEXT go
   back into a SUB as in QuickBASIC: the handler returns 1 or 2 and the fault
   block jumps to the statement's start or next block. A RESUME label returns 3
-  and sets `_err_pending` to 2, so each procedure leaves through its epilogue
-  and main dispatches on `_err_resume_label`. By-reference parameters are real
+  and sets `_err_pending` to 2 -- as does a handler RETURNing to main's GOSUB,
+  with 3 -- so each procedure leaves through its epilogue and main dispatches
+  on `_err_resume_label`. By-reference parameters are real
   references, so the handler sees what a procedure wrote. Only programs with
   ON ERROR pay for any of this
 - **Every helper follows its platform's standard ABI**: a double goes where the
@@ -157,5 +172,7 @@ See [LANGREF.md](LANGREF.md) for the supported BASIC dialect. Key points:
 - Types: INTEGER (`%`), LONG (`&`), SINGLE (`!`), DOUBLE (`#`), STRING (`$`)
 - Control flow: IF/THEN/ELSE, FOR/NEXT, WHILE/WEND, DO/LOOP, SELECT CASE, GOTO/GOSUB
 - Procedures: SUB and FUNCTION with recursion; arguments by reference unless BYVAL
-- File I/O: OPEN FOR INPUT/OUTPUT/APPEND, PRINT #, INPUT #, LINE INPUT #, CLOSE
-- String indexing is 1-based (MID$, INSTR); array indexing is 0-based
+- File I/O: OPEN FOR INPUT/OUTPUT/APPEND/RANDOM, PRINT #, INPUT #, LINE INPUT #,
+  FIELD/GET/PUT, CLOSE
+- String indexing is 1-based (MID$, INSTR); array subscripts start at 0 by
+  default, at `OPTION BASE`'s value if set, or at `lo` in `DIM A(lo TO hi)`

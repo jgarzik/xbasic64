@@ -48,31 +48,6 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// Both runtimes must assemble, including the one this host cannot run.
-    ///
-    /// Only one tree is ever reachable from a compiled program, so a mistake in
-    /// the other -- a duplicated `.L` label, a typo'd branch target, an operand
-    /// form the assembler rejects -- stays invisible until the other platform's
-    /// CI runs. That is exactly how a block of code duplicated into a second
-    /// function, defining its labels twice, reached Windows and failed every
-    /// single compile there.
-    ///
-    /// The files of a tree are concatenated into one assembly unit, so this
-    /// assembles the whole tree rather than each file alone: `.L` labels are
-    /// not file-local the way they look.
-    ///
-    /// This is a Unix-host check, which is where it is worth having: GNU `as`
-    /// assembles every variant, so the Linux job catches a Win64 mistake before
-    /// Windows CI ever sees it. The reverse is not needed -- a System V
-    /// mistake fails the Linux job outright -- and Windows builds its own tree
-    /// on every compile a test performs.
-    ///
-    /// What it does *not* cover, since GNU `as` targets ELF: the Win64 tree's
-    /// per-function section directives, whose flags and COMDAT selector are
-    /// COFF spellings that this assembler rejects outright. They are stripped
-    /// here so the hand-written code underneath still gets checked, which is
-    /// what this test was ever for. Only Windows CI can say whether the
-    /// directive itself is right.
     /// Every exported helper's `.globl` is immediately followed by its label.
     ///
     /// `split_helpers` puts the section directive ahead of the `.globl`, so a
@@ -139,6 +114,31 @@ mod tests {
         }
     }
 
+    /// Both runtimes must assemble, including the one this host cannot run.
+    ///
+    /// Only one tree is ever reachable from a compiled program, so a mistake in
+    /// the other -- a duplicated `.L` label, a typo'd branch target, an operand
+    /// form the assembler rejects -- stays invisible until the other platform's
+    /// CI runs. That is exactly how a block of code duplicated into a second
+    /// function, defining its labels twice, reached Windows and failed every
+    /// single compile there.
+    ///
+    /// The files of a tree are concatenated into one assembly unit, so this
+    /// assembles the whole tree rather than each file alone: `.L` labels are
+    /// not file-local the way they look.
+    ///
+    /// This is a Unix-host check, which is where it is worth having: GNU `as`
+    /// assembles every variant, so the Linux job catches a Win64 mistake before
+    /// Windows CI ever sees it. The reverse is not needed -- a System V
+    /// mistake fails the Linux job outright -- and Windows CI builds its own
+    /// tree in build.rs.
+    ///
+    /// What it does *not* cover, since GNU `as` targets ELF: the Win64 tree's
+    /// per-function section directives, whose flags and COMDAT selector are
+    /// COFF spellings that this assembler rejects outright. They are stripped
+    /// here so the hand-written code underneath still gets checked, which is
+    /// what this test was ever for. Only Windows CI can say whether the
+    /// directive itself is right.
     #[test]
     #[cfg_attr(windows, ignore = "GNU as assembles every tree; Windows uses clang")]
     fn test_both_runtimes_assemble() {

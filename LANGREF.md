@@ -13,7 +13,9 @@ This document describes the BASIC dialect supported by xbasic64, a native code c
 - [File I/O](#file-io)
 - [Random-Access Files](#random-access-files)
 - [Procedures](#procedures)
+- [Runtime Errors](#runtime-errors)
 - [Limitations](#limitations)
+- [Compatibility Notes](#compatibility-notes)
 
 ---
 
@@ -59,9 +61,11 @@ PRINT "done"
 
 A label definition must be the first thing on its line, though a statement may
 follow it there (`Finish: PRINT "done"`). Labels are case-insensitive, like
-every other name, and are accepted wherever a line number is: `GOTO`, `GOSUB`,
-`ON...GOTO` and `RESTORE`. A name already declared as a `SUB` is read as a call
-to it rather than as a label definition.
+every other name, and are accepted by `GOTO`, `GOSUB`, `ON...GOTO`,
+`ON...GOSUB`, `ON ERROR GOTO`, `RESUME`, `RETURN`, `RESTORE` and `IF ... GOTO`.
+After `THEN` or `ELSE` only a line number is an implied `GOTO`: a bare name
+there is a SUB call, so write `THEN GOTO label`. A name already declared as a
+`SUB` is read as a call to it rather than as a label definition.
 
 ### Statement Separators
 
@@ -103,21 +107,23 @@ Variable and procedure names:
 - Followed by letters, digits, underscore, or a dot followed by a letter or
   digit (`MY.VAR`, as GW-BASIC allows)
 - Case-insensitive (`MyVar` and `MYVAR` are the same)
-- May end with a type suffix (`%`, `&`, `!`, `#`, `$`)
+- May end with a type suffix (`%`, `&`, `!`, `#`, `$`); a keyword with a
+  suffix is a name, so `Line$` and `Print%` are variables
 
 A dotted name is a field of a record instead when the part before the first
 dot is a record variable: with `DIM P AS Point`, `P.X` is the field `X` of `P`.
 
 Keywords are words of their own. GW-BASIC's cruncher works the same way: a
 keyword immediately followed by a letter, digit or dot is part of a longer name,
-so `FORI=1TO9` is not a `FOR` loop.
+so `FORI=1TO9` is not a `FOR` loop -- it is an assignment to `FORI` followed by
+`TO9`, and refused.
 
 ### Literals
 
 **Integers:**
 ```basic
 A = 42          ' Decimal
-B = -17         ' Negative
+B = -17         ' Negative: unary minus applied to 17
 C = &HFF        ' Hexadecimal (255)
 D = &O377       ' Octal (255)
 E = &377        ' Octal too: a bare & introduces octal
@@ -132,7 +138,8 @@ bits: with `X% = 300`, `X% * 300` is `Overflow`, as in QuickBASIC, where
 A hexadecimal, octal or binary literal of up to 16 bits is an INTEGER, read as
 two's complement, so `&HFFFF` is -1 and `&H8000` is -32768; one of up to 32
 bits is a LONG, likewise, so `&HFFFFFFFF` is -1. Write `&` after it for a LONG
-whatever its size: `&HFFFF&` is 65535.
+whatever its size: `&HFFFF&` is 65535; `%` insists on an INTEGER. One wider
+than 32 bits is refused.
 
 **Floating-point:**
 ```basic
@@ -233,7 +240,10 @@ GW-BASIC:
 - a SINGLE or DOUBLE result too large for its type, such as `1E308 * 10` or
   `EXP(1000)`, rather than an infinity
 
-`--unsafe` removes these checks with the others, and the results then wrap.
+`--unsafe` removes these checks with the others. LONG arithmetic and a store
+into an INTEGER then wrap, a float converted to an integer saturates, an
+INTEGER intermediate result is kept at 32 bits until it is stored, and a float
+that overflows becomes an infinity.
 
 ### Division Semantics
 
@@ -241,7 +251,10 @@ Following GW-BASIC conventions:
 - `/` (division) always produces a **Double** result
 - `\` (integer division) produces a **Long** result; its operands are rounded
   to LONG first, so `7.6 \ 2` is `8 \ 2`
-- `0 ^` a negative number is `Division by zero`, as in GW-BASIC
+- `0 ^` a negative number is `Division by zero`, as in GW-BASIC, and a `^`
+  with no real result, such as `(-8) ^ (1 / 3)`, is `Illegal function call`
+- `MOD` produces a **Long** too, its operands rounded the same way, and its
+  result has the dividend's sign: `-7 MOD 2` is -1
 
 ```basic
 PRINT 7 / 2       ' Prints 3.5
@@ -293,7 +306,8 @@ with as many dimensions as that use has subscripts, each running from the
 `OPTION BASE` to 10. The same happens to a declared array used before its
 `DIM` has run, or after `ERASE`. A `DIM` of an array that already exists -- by
 an earlier `DIM`, or by a use -- is `Duplicate definition` (10); `REDIM` may
-always resize one. Since a mistyped function would quietly become such an
+always resize one. Two `DIM` statements naming one array are refused when
+compiling, even on paths that cannot both run. Since a mistyped function would quietly become such an
 array, a name close to a function or procedure draws a warning.
 
 Arrays can hold any type:
@@ -330,7 +344,7 @@ END SUB
 
 `SHARED` lists names, and `A()` for an array: `SHARED X, Names$(), R AS P`.
 `DIM SHARED` takes the same forms as `DIM`, and a plain name -- `DIM SHARED X`
--- shares a scalar. Every procedure used to see every name the module used.
+-- shares a scalar.
 
 Unassigned variables read as `0` or `""`; they are never left holding whatever
 was previously in memory.
@@ -348,7 +362,7 @@ was previously in memory.
 | `*`      | Multiplication        | `A * B`        |
 | `/`      | Division (→ Double)   | `A / B`        |
 | `\`      | Integer division (→ Long) | `A \ B`    |
-| `MOD`    | Modulo                | `A MOD B`      |
+| `MOD`    | Modulo (→ Long)       | `A MOD B`      |
 | `^`      | Exponentiation        | `A ^ B`        |
 | `-`      | Unary negation        | `-A`           |
 
@@ -486,14 +500,14 @@ SINGLE and `D` for a DOUBLE, with at least two digits:
 ```basic
 PRINT .1 + .2       ' .3
 PRINT 1 / 3         ' .3333333333333333
-X! = 1.1E-6         ' .0000011: seven digits after the point
-X! = 1.1E-7         ' 1.1E-07: eight would be needed
-X! = 12345678       ' 1.234568E+07
+PRINT 1.1E-6!       ' .0000011: seven digits after the point
+PRINT 1.1E-7!       ' 1.1E-07: eight would be needed
+PRINT 12345678!     ' 1.234568E+07
 PRINT 1E16          ' 1D+16
 ```
 
 Trailing zeros are dropped, and a value below one has no leading zero (`.5`,
-not `0.5`). `STR$` gives exactly what `PRINT` writes.
+not `0.5`). `STR$` gives what `PRINT` writes, less the blank after it.
 
 A comma moves to the start of the next 14-column zone, padding with blanks.
 
@@ -507,9 +521,12 @@ fit starts a new line -- as in GW-BASIC, whose screen started at 80.
 ```basic
 WIDTH 40
 PRINT STRING$(50, "*")    ' 40 stars, then 10 on the next line
-``` `WRITE` and
-`PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
-meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
+```
+
+`WRITE` and `PRINT USING` text wraps at the width like any other, but neither
+uses print zones or moves a number whole -- `WRITE` pads nothing, because its
+output is meant to be read back by `INPUT`, and `PRINT USING` lays out its
+own.
 
 Semicolon at end suppresses newline:
 ```basic
@@ -524,7 +541,7 @@ runs, and `PRINT #n, USING` writes to a file:
 ```basic
 PRINT USING "###.##"; 3.14159       '   3.14
 PRINT USING "Total: ###"; 42        ' Total:  42
-PRINT USING "## and ##"; 1; 2       '   1 and  2
+PRINT USING "## and ##"; 1; 2       '  1 and  2
 F$ = "$$#,###.##"
 PRINT USING F$; 1234.5              '  $1,234.50
 ```
@@ -627,8 +644,8 @@ A bare line number after `THEN` or `ELSE` is an implied `GOTO`, and GW-BASIC's
 
 ```basic
 10 IF X < 0 THEN 90
-20 IF X = 0 THEN 90 ELSE 80
-30 IF X > 100 GOTO 90
+20 IF X > 100 GOTO 90
+30 IF X = 0 THEN 90 ELSE 80
 80 PRINT "Positive"
 90 PRINT "Done"
 ```
@@ -664,8 +681,11 @@ END SELECT
 Case expressions can be:
 - Single values: `CASE 1`
 - Ranges: `CASE 1 TO 10`
-- Comparisons: `CASE IS > 100`
-- Lists: `CASE 1, 2, 3`
+- Comparisons: `CASE IS > 100` -- the `IS` is required
+- Lists of any of these: `CASE 0, 11 TO 12, IS < -5`
+
+A string selector takes string cases, compared as the relational operators
+compare strings: `CASE "a" TO "f"`, `CASE IS >= "m"`.
 
 ### FOR...NEXT
 
@@ -680,10 +700,16 @@ FOR J = 10 TO 1 STEP -1
     PRINT J
 NEXT J
 
-FOR K = 0 TO 1 STEP 0.1
+FOR K = 0 TO 1 STEP 0.25
     PRINT K
 NEXT K
 ```
+
+The counter counts in its own type, so a step past that type's range is
+`Overflow`, as in QuickBASIC: `FOR I% = 32765 TO 32767` prints its three
+values and then stops with Overflow rather than wrapping. A fractional step
+accumulates rounding error, as any repeated addition does: `STEP 0.1` from 0
+reaches .9999999999999999, not 1.
 
 The loop variable name after `NEXT` is optional, and a bare `NEXT` closes the
 innermost open loop:
@@ -770,7 +796,8 @@ END
 A `RETURN` goes back only to a `GOSUB` made in the same scope: main's
 `RETURN` to main's `GOSUB`, a procedure's to its own. Reaching one with no such
 `GOSUB` outstanding -- typically by falling into a subroutine -- is the
-runtime error `RETURN without GOSUB`.
+runtime error `RETURN without GOSUB`. A program with no `GOSUB` anywhere is
+refused at compile time instead.
 
 `RETURN line` ends the subroutine as `RETURN` does, but continues at `line`
 rather than after the `GOSUB`. The line must be in the same scope as the
@@ -820,9 +847,10 @@ byte: a negative one, or one above 255, is `Illegal function call`.
 
 ### ON ERROR GOTO
 
-`ON ERROR GOTO n` installs an error handler. From then on a runtime error
-jumps to line `n` instead of stopping the program, with `ERR` holding the
-error's number and `ERL` the line it happened on.
+`ON ERROR GOTO n` installs an error handler, at a line number or a label.
+From then on a runtime error jumps there instead of stopping the program, with
+`ERR` holding the error's number and `ERL` the line it happened on (see
+[Error Functions](#error-functions)).
 
 ```basic
 10 ON ERROR GOTO 900
@@ -1284,10 +1312,12 @@ MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 | Function | Returns                                                      |
 |----------|--------------------------------------------------------------|
 | `ERR`    | The number of the trapped error, 0 before any is trapped      |
-| `ERL`    | The line it happened on, 0 if the program has no line numbers |
+| `ERL`    | The line it happened on                                       |
 
-Both are only meaningful inside an `ON ERROR` handler. `ERL` reports the BASIC
-line number, as the error messages do.
+Both are only meaningful inside an `ON ERROR` handler. `ERL` reports a BASIC
+line number, as the error messages do: the last one at or before the failing
+statement, or -- in a program without line numbers, or before the first one --
+the source file's line.
 
 `STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
 is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop

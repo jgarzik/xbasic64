@@ -28,8 +28,8 @@ xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBA
   conversion family
 - `DATA`/`READ`/`RESTORE` for inline data
 - Formatted output with `PRINT USING`
-- Runtime checks for out-of-range subscripts and division by zero, with
-  `--unsafe` to remove them
+- Runtime checks for out-of-range subscripts, division by zero and arithmetic
+  overflow, with `--unsafe` to remove them
 - Diagnostics that name the file, line and problem rather than failing at link
   time, including a reason for every GW-BASIC keyword the compiler does not
   provide, so a program using one is refused rather than quietly misbehaving
@@ -103,7 +103,7 @@ Key design choices:
 
 ## Requirements
 
-- Rust toolchain
+- Rust 1.96 or later
 - Linux: the system assembler (`as`) to build the compiler, which assembles
   its runtime library; the C compiler/linker (`cc`) with libc to link programs
 - Windows: Clang to build the compiler (it assembles the runtime), and the MSVC

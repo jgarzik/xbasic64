@@ -38,7 +38,7 @@ struct Args {
     #[arg(short = 'S')]
     asm_only: bool,
 
-    /// Disable runtime safety checks (array bounds, division by zero)
+    /// Disable runtime safety checks (array bounds, division by zero, overflow)
     ///
     /// Named `no_checks` because `unsafe` is a Rust keyword.
     #[arg(long = "unsafe")]
