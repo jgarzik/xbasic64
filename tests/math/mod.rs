@@ -396,6 +396,17 @@ fn test_fre_returns_something_plausible() {
     assert_eq!(output.trim(), "plenty");
 }
 
+/// `FRE` takes a string as readily as a number: `FRE("")` is the common
+/// GW-BASIC spelling, and it was refused as "'FRE' takes a numeric argument".
+#[test]
+fn test_fre_takes_a_string_or_a_number() {
+    let output = compile_and_run(
+        "A$ = \"x\"\nIF FRE(\"\") > 1000 THEN PRINT \"plenty\"\nPRINT FRE(A$ + \"y\") = FRE(0)\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), &["plenty", "-1"]);
+}
+
 /// TIMER counts from local midnight, the same clock TIME$ reads.
 ///
 /// It used to count from midnight UTC, so a program east or west of Greenwich

@@ -1172,6 +1172,7 @@ impl Analyzer {
                 // REDIM may also introduce an array, so both are collected.
                 StmtKind::Dim { decls, .. } | StmtKind::Redim { decls, .. } => {
                     let is_redim = matches!(stmt.kind, StmtKind::Redim { .. });
+                    let preserve = matches!(stmt.kind, StmtKind::Redim { preserve: true, .. });
                     if let StmtKind::Dim { shared: true, .. } = &stmt.kind {
                         if scope == &Scope::Module {
                             for decl in decls {
@@ -1255,13 +1256,25 @@ impl Analyzer {
                                     format!("array '{}' is already declared", decl.name),
                                 );
                             } else if prev.rank != dims.len() {
-                                self.error(
-                                    stmt.line,
-                                    format!(
-                                        "REDIM of '{}' must keep its {} dimension(s)",
-                                        decl.name, prev.rank
-                                    ),
+                                let rank = format!(
+                                    "{} dimension{}",
+                                    prev.rank,
+                                    if prev.rank == 1 { "" } else { "s" }
                                 );
+                                // PRESERVE may change only the last dimension's
+                                // upper bound -- QuickBASIC's rule, since that is
+                                // the change that keeps every element where it
+                                // was -- and codegen checks that at run time.
+                                // The rank is the part sema can see.
+                                let message = if preserve {
+                                    format!(
+                                        "REDIM PRESERVE of '{}' must keep its {}; only the last one's upper bound may change",
+                                        decl.name, rank
+                                    )
+                                } else {
+                                    format!("REDIM of '{}' must keep its {}", decl.name, rank)
+                                };
+                                self.error(stmt.line, message);
                             }
                         }
                         let has_lower = decl.lowers.iter().any(Option::is_some)
@@ -1841,23 +1854,11 @@ impl Analyzer {
                     }
                 }
             }
-            StmtKind::Redim { decls, preserve } => {
+            StmtKind::Redim { decls, .. } => {
                 for decl in decls {
                     let dims = decl.dimensions.as_deref().unwrap_or(&[]);
                     for d in dims.iter().chain(decl.lowers.iter().flatten()) {
                         self.check_expr(d, scope, line);
-                    }
-                    // Only the last dimension may change under PRESERVE, which
-                    // is QuickBASIC's own rule: any other change would need the
-                    // elements remapped rather than the block simply grown.
-                    if *preserve && dims.len() > 1 {
-                        self.error(
-                            line,
-                            format!(
-                                "REDIM PRESERVE of '{}' may only change its last dimension",
-                                decl.name
-                            ),
-                        );
                     }
                 }
             }
@@ -2254,6 +2255,13 @@ impl Analyzer {
                     n
                 ));
             }
+            return None;
+        }
+
+        // FRE takes either: `FRE("")` is GW-BASIC's usual spelling, and the
+        // argument only chooses which figure to report. Codegen evaluates it
+        // and answers the same plausible number for both.
+        if name == "FRE" {
             return None;
         }
 

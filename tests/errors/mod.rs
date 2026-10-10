@@ -733,16 +733,33 @@ fn test_option_base_rules() {
     assert_eq!(run.exit_code, Some(1));
 }
 
-/// REDIM must keep the array's rank, and PRESERVE may only change the last
-/// dimension -- QuickBASIC's own rule, since any other change would need the
-/// elements remapped rather than the block simply grown.
+/// REDIM must keep the array's rank, with or without PRESERVE.
 #[test]
 fn test_redim_rules() {
-    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimension(s)");
+    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimensions");
+    expect_rejected("DIM A(2)\nREDIM A(3, 3)\n", "must keep its 1 dimension");
     expect_rejected(
-        "DIM A(2,2)\nREDIM PRESERVE A(2,3)\n",
-        "may only change its last dimension",
+        "DIM A(2,2)\nREDIM PRESERVE A(3)\n",
+        "REDIM PRESERVE of 'A' must keep its 2 dimensions; only the last one's upper bound may change",
     );
+}
+
+/// PRESERVE on an array of several dimensions is QuickBASIC's, as long as
+/// the rank is unchanged: only the last dimension's upper bound may change,
+/// which is checked when the program runs. It was refused outright, with a
+/// message -- "may only change its last dimension" -- that said the opposite
+/// of what had gone wrong when that was all the program did.
+#[test]
+fn test_redim_preserve_of_several_dimensions_compiles() {
+    for source in [
+        "DIM A(2, 3)\nREDIM PRESERVE A(2, 5)\n",
+        "DIM A(1 TO 2, 3, 4)\nREDIM PRESERVE A(1 TO 2, 3, 9)\n",
+        "REDIM B$(2, 2)\nREDIM PRESERVE B$(2, 4)\n",
+    ] {
+        if let Err(e) = compile_only(source) {
+            panic!("{source:?} should compile, got:\n{}", e.stderr);
+        }
+    }
 }
 
 /// TYPE declarations and uses are checked.
