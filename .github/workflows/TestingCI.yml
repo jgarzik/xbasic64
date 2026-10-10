@@ -18,6 +18,13 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      # The integration suite again, every program run by `xbasic64 run`
+      # (compiled into memory, in the compiler's process) instead of as an
+      # executable: the two must agree.
+      - name: Run tests through the JIT
+        run: cargo test --release --test integration
+        env:
+          XB_JIT: "1"
       - name: Run fmt check
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -33,6 +40,7 @@ jobs:
             echo "== $f"
             ./target/release/xbasic64 "$f" -o /tmp/example
             /tmp/example </dev/null >/dev/null
+            ./target/release/xbasic64 run "$f" </dev/null >/dev/null
           done
 
   linux-aarch64:
@@ -48,6 +56,13 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      # The integration suite again, every program run by `xbasic64 run`
+      # (compiled into memory, in the compiler's process) instead of as an
+      # executable: the two must agree.
+      - name: Run tests through the JIT
+        run: cargo test --release --test integration
+        env:
+          XB_JIT: "1"
       - name: Run fmt check
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -63,6 +78,7 @@ jobs:
             echo "== $f"
             ./target/release/xbasic64 "$f" -o /tmp/example
             /tmp/example </dev/null >/dev/null
+            ./target/release/xbasic64 run "$f" </dev/null >/dev/null
           done
 
   macos-arm64:
@@ -78,6 +94,13 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      # The integration suite again, every program run by `xbasic64 run`
+      # (compiled into memory, in the compiler's process) instead of as an
+      # executable: the two must agree.
+      - name: Run tests through the JIT
+        run: cargo test --release --test integration
+        env:
+          XB_JIT: "1"
       - name: Run fmt check
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -93,6 +116,7 @@ jobs:
             echo "== $f"
             ./target/release/xbasic64 "$f" -o /tmp/example
             /tmp/example </dev/null >/dev/null
+            ./target/release/xbasic64 run "$f" </dev/null >/dev/null
           done
 
   windows-native:
@@ -113,6 +137,13 @@ jobs:
         run: cargo build --release --verbose
       - name: Run tests
         run: cargo test --release --verbose
+      # The integration suite again, every program run by `xbasic64 run`
+      # (compiled into memory, in the compiler's process) instead of as an
+      # executable: the two must agree.
+      - name: Run tests through the JIT
+        run: cargo test --release --test integration
+        env:
+          XB_JIT: "1"
       - name: Run fmt check
         run: cargo fmt --all -- --check
       - name: Run clippy
@@ -145,6 +176,11 @@ jobs:
               # PowerShell 0xFFFFFFFF is Int32 -1, so the -band was a no-op and
               # [uint32] then threw on the very value it was there to show.
               throw ("run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $LASTEXITCODE)
+            }
+            # The same program through the JIT: `xbasic64 run`.
+            & ./target/release/xbasic64.exe run $_.FullName | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw ("xbasic64 run failed: {0} (exit {1}, 0x{2:X8})" -f $_.Name, $LASTEXITCODE, $LASTEXITCODE)
             }
           }
 
