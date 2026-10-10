@@ -631,3 +631,7 @@ dependencies = [
  "target-lexicon",
  "tempfile",
 ]
+
+[[package]]
+name = "xbasic64-rt"
+version = "1.0.2"

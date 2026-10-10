@@ -13,6 +13,12 @@ keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
 categories = ["compilers", "command-line-utilities", "development-tools"]
 rust-version = "1.96"
 
+# The runtime library is a member, so that clippy and its unit tests cover
+# it; build.rs builds the copy programs link against.
+[workspace]
+members = ["rt"]
+default-members = [".", "rt"]
+
 [features]
 default = []
 
