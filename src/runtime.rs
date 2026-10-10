@@ -11,7 +11,8 @@
 /// The runtime for the target this compiler was built for.
 pub const OBJECT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rt.o"));
 
-#[cfg(test)]
+// nm is how the object is inspected, and Linux is where it is sure to be.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::process::Command;
@@ -20,7 +21,6 @@ mod tests {
     /// table. In particular no part of `core` is left undefined -- a panic
     /// path the build did not merge in -- since a program could not link.
     #[test]
-    #[cfg(target_os = "linux")]
     fn test_runtime_needs_only_libc_and_the_program() {
         let dir = std::env::temp_dir().join(format!("xbasic64-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

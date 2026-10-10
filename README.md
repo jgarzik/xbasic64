@@ -1,10 +1,10 @@
 # xbasic64
 
-A BASIC-to-x86_64 native code compiler.
+A BASIC native code compiler for x86-64 and aarch64.
 
 ## Overview
 
-xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC) directly to native x86-64 executables. No interpreter, no bytecode—just fast native binaries.
+xbasic64 compiles 1980s-era BASIC dialects (Tandy Color BASIC, GW-BASIC, QuickBASIC) directly to native x86-64 and aarch64 executables. No interpreter, no bytecode—just fast native binaries.
 
 **Why xbasic64?**
 
@@ -104,13 +104,15 @@ Key design choices:
 ## Requirements
 
 - Rust 1.96 or later
-- Linux: the C compiler/linker (`cc`) with libc, to link programs
+- Linux and macOS: the C compiler/linker (`cc`) with the C library, to link
+  programs
 - Windows: the MSVC linker (`link.exe`) and its C runtime, to link programs
 
 ## Platforms
 
-- Linux (x86-64)
+- Linux (x86-64, aarch64)
 - Windows (x86-64)
+- macOS (arm64)
 
 ## License
 

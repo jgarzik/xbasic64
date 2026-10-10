@@ -439,7 +439,11 @@ fn make_isa(huge: bool) -> Result<OwnedTargetIsa, String> {
     }
     let mut isa = cranelift_codegen::isa::lookup(target_lexicon::Triple::host())
         .map_err(|e| e.to_string())?;
-    isa.set("has_sse41", "true").map_err(|e| e.to_string())?;
+    // x86-64's baseline has no SSE4.1, whose roundsd `nearest`, `floor` and
+    // `trunc` use instead of a libcall. aarch64 has its equivalents always.
+    if cfg!(target_arch = "x86_64") {
+        isa.set("has_sse41", "true").map_err(|e| e.to_string())?;
+    }
     isa.finish(settings::Flags::new(flags))
         .map_err(|e| e.to_string())
 }

@@ -27,7 +27,8 @@ cargo run -- -S program.bas        # Cranelift IR to <output>.clif instead (no o
 
 ## Architecture
 
-xbasic64 is a BASIC-to-x86_64 native code compiler. The AST is lowered straight
+xbasic64 is a BASIC native code compiler for x86-64 (Linux, Windows) and
+aarch64 (Linux, macOS). The AST is lowered straight
 to Cranelift IR, and Cranelift writes the object file:
 
 ```
@@ -124,8 +125,14 @@ Integration tests organized by feature area:
   the backtracking one is superlinear with SSA values live across it; that
   code runs about 2x slower
 - **Every reference is colocated**: functions and data, the runtime's and libc's
-  included, are reached with `call rel32` and RIP-relative addresses; on Linux
-  the link is `-no-pie`
+  included, are reached PC-relative (`call rel32` and RIP-relative on x86-64,
+  `bl` and adrp+add on aarch64); on Linux the link is `-no-pie`, and macOS,
+  where executables are always PIE, needs nothing more
+- **Native only, two ISAs**: Cranelift's `x86` and `arm64` backends are built
+  in, and the compiler targets the host it was built for. aarch64 Linux can be
+  checked on an x86-64 host under qemu-user: cross-build with
+  `aarch64-linux-gnu-gcc` as the linker, and put a `cc` that is that compiler
+  first in PATH for the compiler's own link step
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility

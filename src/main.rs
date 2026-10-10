@@ -1,6 +1,6 @@
-//! BASIC-to-x86_64 Compiler
+//! BASIC native-code compiler
 //!
-//! Compiles 1980s-era BASIC programs to x86-64 executables.
+//! Compiles 1980s-era BASIC programs to native executables (x86-64, aarch64).
 //! Code generation is Cranelift, which writes the object file; the program is
 //! linked with `cc` on Linux and MSVC `link.exe` on Windows.
 
@@ -19,10 +19,10 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// BASIC-to-x86_64 compiler
+/// BASIC native-code compiler
 #[derive(Parser)]
 #[command(name = "xbasic64")]
-#[command(about = "Compiles 1980s-era BASIC programs to x86-64 executables")]
+#[command(about = "Compiles 1980s-era BASIC programs to native executables")]
 struct Args {
     /// Input BASIC source file
     input: String,
@@ -229,7 +229,7 @@ fn main() {
     // rustc emits each function into a section of its own, which is what the
     // flag works with, since a linker discards unreferenced sections, never
     // unreferenced labels. `PRINT "hi"` calls three of the 85 helpers.
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     let cc_output = Command::new("cc")
         .args([
             "-o",
@@ -240,6 +240,16 @@ fn main() {
             "-no-pie",
             "-Wl,--gc-sections",
         ])
+        .output();
+
+    // macOS: executables are always position independent there, so no
+    // -no-pie; the code is still fine, since a colocated reference is
+    // PC-relative (adrp+add, bl, which ld64 routes through a stub to reach
+    // libSystem). Apple's linker spells --gc-sections -dead_strip, and the
+    // math library is part of libSystem.
+    #[cfg(target_os = "macos")]
+    let cc_output = Command::new("cc")
+        .args(["-o", &exe_file, &obj_file, &rt_file, "-Wl,-dead_strip"])
         .output();
 
     match cc_output {

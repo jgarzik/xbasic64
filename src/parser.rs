@@ -1928,7 +1928,7 @@ impl Parser {
         };
         if name.eq_ignore_ascii_case("SEG") {
             return err(
-                "DEF SEG is not supported: it selects an 8086 segment, and segmented addressing does not exist on x86-64",
+                "DEF SEG is not supported: it selects an 8086 segment, and a flat 64-bit address space has no segments",
             );
         }
         if !name.to_uppercase().starts_with("FN") {

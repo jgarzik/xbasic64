@@ -162,7 +162,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
         "VARPTR$",
         "direct memory access has no meaning in a 64-bit hosted program",
     ),
-    ("VARSEG", "segmented addressing does not exist on x86-64"),
+    ("VARSEG", "a flat 64-bit address space has no segments"),
     ("USR", "USR calls 8086 machine code; use a SUB instead"),
     ("INP", "port I/O is not available to a user-mode program"),
     ("OUT", "port I/O is not available to a user-mode program"),

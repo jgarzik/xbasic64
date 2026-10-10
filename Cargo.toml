@@ -3,13 +3,13 @@ name = "xbasic64"
 version = "1.0.2"
 edition = "2024"
 authors = ["Jeff Garzik <jgarzik@pobox.com>"]
-description = "A BASIC-to-x86_64 native code compiler targeting 1980s-era BASIC dialects"
+description = "A BASIC native code compiler (x86-64, aarch64) targeting 1980s-era BASIC dialects"
 license = "MIT"
 repository = "https://github.com/jgarzik/xbasic64"
 homepage = "https://github.com/jgarzik/xbasic64"
 documentation = "https://docs.rs/xbasic64"
 readme = "README.md"
-keywords = ["basic", "compiler", "x86-64", "retro", "programming-language"]
+keywords = ["basic", "compiler", "x86-64", "aarch64", "retro"]
 categories = ["compilers", "command-line-utilities", "development-tools"]
 rust-version = "1.96"
 
@@ -25,7 +25,7 @@ default = []
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 # Pinned exactly: Cranelift's API changes between minor releases.
-cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "x86", "unwind"] }
+cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "x86", "arm64", "unwind"] }
 cranelift-frontend = "=0.136.2"
 cranelift-module = "=0.136.2"
 cranelift-object = "=0.136.2"
