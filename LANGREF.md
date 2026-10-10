@@ -877,7 +877,10 @@ The rules, which are GW-BASIC's:
   program. Without that, a handler that faults would call itself forever.
 - Trapping stays suspended while the handler runs. Executing an `ON ERROR`
   statement again re-arms it, so a handler that ends in `GOTO` rather than
-  returning must re-arm to keep trapping.
+  returning must re-arm to keep trapping. A handler that does carries on as
+  the program, loops and all.
+- `ON ERROR GOTO 0` inside a handler stops the program with the error being
+  handled, as in GW-BASIC: it is how a handler gives up on one.
 - The handler must be **module-level** code, and `ON ERROR` itself may not
   appear inside a `SUB` or `FUNCTION`. An error raised inside a procedure is
   still trapped: the handler runs with the procedure still active, as in
@@ -888,8 +891,7 @@ The rules, which are GW-BASIC's:
   that raise most trappable errors, so the handler would look right and never
   run.
 
-A program that never uses `ON ERROR` is compiled exactly as before, and pays
-nothing for the feature.
+A program that never uses `ON ERROR` pays nothing for the feature.
 
 ### RESUME
 
@@ -937,9 +939,10 @@ SUB Halve(N)
 END SUB
 ```
 
-`RESUME` outside a handler stops the program with `RESUME without error`.
-Neither of these two is trappable -- a handler that caught its own failing
-`RESUME` would be re-entered by it forever.
+`RESUME` outside a handler is `RESUME without error`: a compile error in a
+program with no `ON ERROR`, and otherwise a run-time stop. It is never
+trappable -- a handler that caught its own failing `RESUME` would be
+re-entered by it forever.
 
 ### DIM
 
@@ -954,7 +957,9 @@ DIM D(1 TO 12)       ' indices 1-12
 ```
 
 `LBOUND(A, n)` and `UBOUND(A, n)` give dimension `n`'s bounds; `n` defaults
-to 1.
+to 1. An array used without a `DIM`, and what a `DIM` executed twice does,
+are described under [Arrays](#arrays). A `DIM` or `REDIM` that fails --
+`Subscript out of range`, `Out of memory` -- leaves the array as it was.
 
 ### DATA / READ / RESTORE
 
@@ -1008,8 +1013,9 @@ SYSTEM                ' End the program, as END does
 ```
 
 `ERASE` is recognised only before a name, so `Erase` remains usable as a label
-or a variable elsewhere. Its argument must be an array that is DIMed somewhere
--- a name that is not one is a mistake, not a statement that does nothing.
+or a variable elsewhere. It takes a list, `ERASE A, B$`, and each name must be
+an array -- DIMed somewhere, or created by a use -- since a name that is not one
+is a mistake, not a statement that does nothing.
 
 ### LOCATE and COLOR
 
@@ -1043,7 +1049,8 @@ PRINT POS(0)          ' 4
 
 ### SWAP
 
-Exchange two values of the same type, including array elements:
+Exchange two values of the same type, including array elements and whole
+records:
 
 ```basic
 DIM Items(10)
@@ -1051,10 +1058,16 @@ SWAP A, B
 SWAP Items(I), Items(J)
 ```
 
+The two must be the same type -- `SWAP A%, B#` is refused, as in QuickBASIC --
+except that a fixed-length string may swap with an ordinary one, and keeps its
+width.
+
 ### CONST
 
-A named constant, folded at compile time. It may be used anywhere a literal
-can, including as an array bound:
+A named constant, folded at compile time. It may be used anywhere an expression
+can, including as an array bound, and as the length in `STRING * n`. It cannot
+be assigned to. `DATA` items and `OPTION BASE` take literals only, as in
+GW-BASIC:
 
 ```basic
 CONST MAX = 100
@@ -1096,8 +1109,8 @@ END SUB
 
 ### REDIM
 
-Resize an existing array. `REDIM` alone clears it; `REDIM PRESERVE` keeps the
-existing elements and zeroes the new ones:
+Resize an array, or create it if it does not exist yet. `REDIM` alone clears
+it; `REDIM PRESERVE` keeps the existing elements and zeroes the new ones:
 
 ```basic
 DIM Items(10)
@@ -1105,7 +1118,8 @@ REDIM Items(20)             ' cleared
 REDIM PRESERVE Items(30)    ' contents kept
 ```
 
-Only the last dimension may change under `PRESERVE`.
+Only the last dimension's upper bound may change under `PRESERVE`; changing
+another dimension is `Subscript out of range`.
 
 ### OPTION BASE
 
@@ -1116,7 +1130,8 @@ OPTION BASE 1
 DIM Items(10)     ' subscripts 1 to 10
 ```
 
-It is the lower bound of every dimension that does not name its own.
+It is the lower bound of every dimension that does not name its own. The
+value is 0 or 1, written as a number.
 
 ### DEF FN
 
@@ -1129,7 +1144,8 @@ PRINT FNArea(3, 4)
 
 ### TYPE
 
-A user-defined record. Fields may be any built-in type or another record:
+A user-defined record. Fields may be any numeric type, a fixed-length string
+(`STRING * n`, where `n` may be a `CONST`), or another record:
 
 ```basic
 TYPE Point
@@ -1163,13 +1179,15 @@ SUB Show(P AS Person)
 END SUB
 ```
 
-`AS` also gives an ordinary variable, parameter or `FUNCTION` result a
-declared type:
+`AS` also gives an ordinary variable, an array, a parameter or a `FUNCTION`
+result a declared type. A plain `AS STRING` is a variable-length string, as a
+`$` suffix is; a variable or array may also be `STRING * n`, but a parameter or
+result may not, as in QuickBASIC:
 
 ```basic
 DIM Count AS INTEGER
 
-SUB Log(Level AS INTEGER, Text AS STRING * 80)
+SUB Log(Level AS INTEGER, Text AS STRING)
     PRINT Level; Text
 END SUB
 
@@ -1178,7 +1196,7 @@ FUNCTION Total AS DOUBLE
 END FUNCTION
 
 FUNCTION Half(X) AS INTEGER
-    Half = X / 2        ' Half(7) is 3, not 3.5
+    Half = X / 2        ' Half(7) is 4, not 3.5: rounded, halves to even
 END FUNCTION
 ```
 
@@ -1232,7 +1250,7 @@ and allow `CONT`; a compiled program has neither.
 | `EXP(x)`   | e raised to power x                      |
 | `LOG(x)`   | Natural logarithm                        |
 | `RND`      | Random number 0 ≤ r < 1                  |
-| `FRE(x)`   | Free memory; a large constant here       |
+| `FRE(x)`   | Free memory; a constant here (x may be a number or a string) |
 
 **Numeric output:** `PRINT` shows 16 significant digits of a `DOUBLE`
 (`PRINT 1 / 3` gives `.3333333333333333`) and 7 of a `SINGLE`; see
@@ -1307,6 +1325,10 @@ A$ = "hello"
 MID$(A$, 1, 1) = "J"      ' A$ is now "Jello"
 ```
 
+`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
+is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
+it.
+
 ### Error Functions
 
 | Function | Returns                                                      |
@@ -1318,10 +1340,6 @@ Both are only meaningful inside an `ON ERROR` handler. `ERL` reports a BASIC
 line number, as the error messages do: the last one at or before the failing
 statement, or -- in a program without line numbers, or before the first one --
 the source file's line.
-
-`STR$` keeps the blank PRINT puts where a minus sign would go, so `STR$(5)`
-is `" 5"` and `STR$(-5)` is `"-5"`. `MID$(STR$(N), 2)` is the usual way to drop
-it.
 
 ### Type Conversion Functions
 
@@ -1400,7 +1418,8 @@ GW-BASIC. `PRINT #` and the other reading and writing statements need it.
 
 `FOR RANDOM` opens for reading *and* writing, and creates the file when it
 does not exist. `LEN =` gives the record length in bytes; without it the record
-is 128 bytes, as in GW-BASIC. The largest record is 32767 bytes.
+is 128 bytes, as in GW-BASIC. A length outside 1 to 32767 is `Illegal function
+call`.
 
 File numbers range from `#1` to `#15`; the runtime has a handle slot for each.
 One outside that range is refused at compile time, or reported as
@@ -1445,9 +1464,11 @@ LINE INPUT #1, Text$  ' Read entire line
 
 `INPUT #` reads one comma-delimited field per variable, skipping leading
 blanks and line breaks, so several fields may come from one line and one
-field may span several. A field wrapped in quotes may contain commas. A numeric
-field is read as `VAL` reads a string. `LINE INPUT #` takes a whole line,
-commas and all.
+field may span several. A field wrapped in quotes may contain commas, and two
+commas with nothing between them are an empty field, 0 or `""`. A number ends
+at a blank as well, as in GW-BASIC, so the ` 1  2  3 ` that `PRINT #1, 1; 2; 3`
+writes reads back as three numbers; it is read as `VAL` reads a string.
+`LINE INPUT #` takes a whole line, commas and all.
 
 Reading past the end of a file is an error (`Input past end of file`), as is
 opening a file that is not there (`File not found`) or re-using a file number
@@ -1761,15 +1782,21 @@ The message names the fault, and each carries GW-BASIC's number for it:
 
 `ERROR n` raises the error numbered `n`, exactly as if the runtime had raised
 it. The number must be 1 to 255; one the table above does not list is raised as
-`Unprintable error`, which is GW-BASIC's own wording.
+`Unprintable error`, which is GW-BASIC's own wording, and a handler sees it as
+`ERR`, so a program may number errors of its own: `ERROR 200`, then
+`IF ERR = 200` in the handler.
 
 ```basic
 10 IF Total < 0 THEN ERROR 5
 20 PRINT "fine"
 ```
 
-Two numbers appear twice above. `ERROR 7` and `ERROR 9` raise the first message
-listed for each -- `Out of memory` and `Subscript out of range`.
+One number appears twice above: `ERROR 7` raises the first message listed for
+it, `Out of memory`.
+
+`RESUME without error` -- a `RESUME` with no error to return from -- has no
+number, and is never trapped: a handler that caught its own failing `RESUME`
+would be re-entered by it forever.
 
 Checks are on by default. Compiling with `--unsafe` removes them, which is
 worth doing only for code already known to be correct:
@@ -1796,8 +1823,8 @@ Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
 - **Console control** -- `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
-- **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`
+- **Operating system** -- `SHELL`, `ENVIRON`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
+- **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`, `LCOPY`
 - **Odds and ends** -- `INPUT$`
 
 ### Out of scope
@@ -1813,12 +1840,12 @@ randomised, and the pages are protected. A `POKE` that appeared to work would be
 the worst outcome available, so these are refused rather than emulated.
 
 **Commands to the interpreter** -- `RUN`, `LIST`, `LOAD`, `SAVE`, `MERGE`,
-`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `TRON`, `TROFF`, `CLEAR`.
+`NEW`, `EDIT`, `RENUM`, `AUTO`, `CONT`, `DELETE`, `LLIST`, `TRON`, `TROFF`, `CLEAR`.
 These operate on program text that a compiled program no longer has.
 
 **Program chaining** -- `CHAIN` and `COMMON` need separate compilation.
 
-**MS-DOS devices** -- `ERDEV`, `ERDEV$`, `IOCTL`, `IOCTL$`, `MOTOR`, the
+**MS-DOS devices** -- `ERDEV`, `ERDEV$`, `EXTERR`, `IOCTL`, `IOCTL$`, `MOTOR`, the
 light pen (`PEN`) and joysticks (`STICK`, `STRIG`).
 
 **Event trapping** -- `ON TIMER`, `ON KEY`, `ON COM`, `ON PEN`, `ON PLAY`,
@@ -1842,7 +1869,8 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 1. **Default type is Double** - Unsuffixed variables are `#` (Double), not Single
 2. **Division always returns Double** - Use `\` for integer division
 3. **Boolean true is -1** - Comparisons return -1 (true) or 0 (false)
-4. **Array indices start at 0** - `DIM A(10)` creates 11 elements (0-10)
+4. **Array indices start at 0** by default - `DIM A(10)` creates 11 elements
+   (0-10); `OPTION BASE 1` and `DIM A(1 TO 10)` change that
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
 6. **Parameters are by reference**, as in QuickBASIC; `BYVAL` passes a copy
 
@@ -1851,6 +1879,13 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 These are places where a GW-BASIC program will behave differently here. They
 are choices, not oversights.
 
-7. **`LOC` on a sequential file counts 128-byte blocks**, which is what
-    GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
-    because the number is useful.
+1. **Bare `RANDOMIZE` seeds from the clock.** GW-BASIC asks the operator for a
+   seed; a compiled program has nobody to ask.
+2. **`FRE` returns a constant.** A compiled program has no BASIC string heap to
+   report on; listings use `FRE` to test for room, which there always is.
+3. **`DEF FN` is compiled, not interpreted.** A `DEF FN` may be used before the
+   line that defines it, and defining it twice is refused.
+
+`LOC` on a sequential file counts 128-byte blocks, which is what GW-BASIC
+reported on MS-DOS; it is kept for compatibility rather than because the
+number is useful.
