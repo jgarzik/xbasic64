@@ -22,15 +22,13 @@ mod tests {
     /// path the build did not merge in -- since a program could not link.
     #[test]
     fn test_runtime_needs_only_libc_and_the_program() {
-        let dir = std::env::temp_dir().join(format!("xbasic64-rt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let obj = dir.join("rt.o");
+        let dir = tempfile::tempdir().unwrap();
+        let obj = dir.path().join("rt.o");
         std::fs::write(&obj, OBJECT).unwrap();
         let out = match Command::new("nm").arg("-u").arg(&obj).output() {
             Ok(out) => out,
             Err(_) => return, // no nm here: nothing to check with
         };
-        let _ = std::fs::remove_dir_all(&dir);
         let text = String::from_utf8_lossy(&out.stdout);
         let foreign: Vec<&str> = text
             .lines()
