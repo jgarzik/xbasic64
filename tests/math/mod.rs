@@ -224,20 +224,28 @@ A! = 3.5: B# = CDBL(A!): PRINT B#
     assert_eq!(lines[8], "3.5", "cdbl single");
 }
 
-/// TIMER returns the host's seconds since midnight, UTC.
+/// TIMER returns the host's seconds since local midnight.
 ///
 /// Asserting only `TIMER >= 0` could not fail: a bare `TIMER` used to read an
 /// uninitialized variable of that name, which is 0, and 0 passes that test.
 /// Comparing against the clock this test can read itself is what makes the
 /// assertion mean something -- and it is what caught the Win64 runtime
-/// returning seconds since *boot* rather than since midnight.
+/// returning seconds since *boot* rather than since midnight. The program runs
+/// on UTC, the one zone the standard library can tell this test the time in.
 #[test]
 fn test_timer_matches_the_host_clock() {
     let before = seconds_since_midnight_utc();
-    let output = compile_and_run("PRINT TIMER\nPRINT TIMER(0)\n").unwrap();
+    let run = crate::common::compile_and_run_env(
+        "PRINT TIMER\nPRINT TIMER(0)\n",
+        "",
+        &[],
+        &[("TZ", "UTC0")],
+    )
+    .unwrap();
+    run.assert_ran_to_completion("TIMER");
     let after = seconds_since_midnight_utc();
 
-    for (i, line) in crate::common::lines(&output).iter().enumerate() {
+    for (i, line) in run.lines().iter().enumerate() {
         // TIMER counts fractional seconds, as GW-BASIC's does. The line is
         // trimmed first: a number carries a blank on each side.
         let t: f64 = line
@@ -270,7 +278,7 @@ fn test_timer_does_not_go_backwards() {
     assert_eq!(lines, vec!["-1", "-1"]);
 }
 
-/// Seconds since midnight UTC, the same quantity TIMER reports.
+/// Seconds since midnight UTC, what TIMER reports when TZ says UTC.
 fn seconds_since_midnight_utc() -> f64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -386,4 +394,33 @@ fn test_fre_returns_something_plausible() {
     let output =
         compile_and_run("IF FRE(0) > 1000 THEN PRINT \"plenty\" ELSE PRINT \"tight\"\n").unwrap();
     assert_eq!(output.trim(), "plenty");
+}
+
+/// TIMER counts from local midnight, the same clock TIME$ reads.
+///
+/// It used to count from midnight UTC, so a program east or west of Greenwich
+/// saw TIMER and TIME$ disagree by hours. Run under a zone five hours each way
+/// from UTC, so the test means something on a host that is itself on UTC.
+#[test]
+fn test_timer_agrees_with_time_dollar() {
+    for tz in ["XST-5", "YST5"] {
+        let run = crate::common::compile_and_run_env(
+            "T = TIMER\nPRINT T\nPRINT TIME$\n",
+            "",
+            &[],
+            &[("TZ", tz)],
+        )
+        .unwrap();
+        run.assert_ran_to_completion("TIMER and TIME$");
+        let lines = run.lines();
+        let t: f64 = lines[0].parse().unwrap();
+        let hms: Vec<f64> = lines[1].split(':').map(|f| f.parse().unwrap()).collect();
+        let clock = hms[0] * 3600.0 + hms[1] * 60.0 + hms[2];
+        let skew = (t - clock).rem_euclid(86_400.0);
+        assert!(
+            skew < 2.0 || skew > 86_398.0,
+            "TZ={tz}: TIMER said {t}, TIME$ said {}",
+            lines[1]
+        );
+    }
 }

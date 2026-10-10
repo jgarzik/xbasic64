@@ -31,9 +31,15 @@ _rng_state: .quad 0x12345678DEADBEEF
 _rng_last:  .quad 0            # last value RND returned, for RND(0)
 _cls_seq: .asciz "\033[2J\033[H"
 _locate_fmt: .asciz "\033[%d;%dH"
+_locate_row_fmt: .asciz "\033[%dd"
+_locate_col_fmt: .asciz "\033[%dG"
 _date_fmt: .asciz "%m-%d-%Y"
 _time_fmt: .asciz "%H:%M:%S"
-_color_fmt: .asciz "\033[%d;%dm"
+_color_fmt: .asciz "\033[%d;%d;%dm"
+_color_fg_fmt: .asciz "\033[%d;%dm"
+_color_bg_fmt: .asciz "\033[%dm"
+# GW-BASIC colour 0-7 -> ANSI colour: black blue green cyan red magenta brown white
+_gw_to_ansi: .byte 0, 4, 2, 6, 1, 5, 3, 7
 _redo_msg: .asciz "?Redo from start\n"
 
 # Scratch buffers. These start as zeros, so they belong in .bss: in .data

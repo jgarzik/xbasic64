@@ -27,15 +27,21 @@
 # _rt_read_number - Read next DATA value as a number
 # Reads the next value from the DATA table and returns it as a double.
 #
-# Arguments: none
+# Arguments:
+#   rcx = BASIC line number, for the diagnostic
 #
 # Returns:
-#   xmm0 = value as double
+#   xmm0 = value as double; 0 when there is nothing left to read
+#
+# Reading past the last item raises Out of DATA (error 4).
 .globl _rt_read_number
 _rt_read_number:
     push rbp
     mov rbp, rsp
     sub rsp, 32                         # Shadow space
+    mov rax, QWORD PTR [rip + _data_ptr]
+    cmp rax, QWORD PTR [rip + _data_count]
+    jae .Lread_num_none
 
     # Calculate address: &_data_table[_data_ptr]
     mov rax, QWORD PTR [rip + _data_ptr]
@@ -70,6 +76,13 @@ _rt_read_number:
     inc QWORD PTR [rip + _data_ptr]     # advance to next entry
     leave
     ret
+.Lread_num_none:
+    mov rdx, rcx                        # line
+    lea rcx, [rip + _err_outofdata]
+    call _rt_error                      # returns only when trapped
+    xorpd xmm0, xmm0
+    leave
+    ret
 
 # _rt_read_string - Read next DATA value as a string
 # Reads the next value from the DATA table and returns it as a string.
@@ -83,17 +96,21 @@ _rt_read_number:
 # in the other direction, so the table's tag need not match the variable the
 # program reads it into.
 #
-# Arguments: none
+# Arguments:
+#   rcx = BASIC line number, for the diagnostic
 #
 # Returns:
 #   rax = pointer to string data
-#   rdx = string length
+#   rdx = string length; an empty string when there is nothing left to read
 .globl _rt_read_string
 _rt_read_string:
     push rbp
     mov rbp, rsp
     push rdi                            # rdi is callee-saved
     sub rsp, 40                         # Shadow space + alignment
+    mov rax, QWORD PTR [rip + _data_ptr]
+    cmp rax, QWORD PTR [rip + _data_count]
+    jae .Lread_str_none
 
     # Calculate entry address
     mov rax, QWORD PTR [rip + _data_ptr]
@@ -137,6 +154,16 @@ _rt_read_string:
     pop rdi
     leave
     jmp _rt_str                         # returns (rax, rdx) already
+.Lread_str_none:
+    mov rdx, rcx                        # line
+    lea rcx, [rip + _err_outofdata]
+    call _rt_error                      # returns only when trapped
+    xor eax, eax
+    xor edx, edx
+    add rsp, 40
+    pop rdi
+    leave
+    ret
 
 # _rt_restore - Reset DATA pointer (RESTORE statement)
 # Resets the DATA read position.

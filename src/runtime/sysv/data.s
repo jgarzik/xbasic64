@@ -35,19 +35,23 @@
 #   - Float (type 1): Return as-is
 #   - String (type 2): Parse with strtod (like VAL function)
 #
-# Arguments: none
+# Arguments:
+#   rdi = BASIC line number, for the diagnostic
 #
 # Returns:
-#   xmm0 = value as double
+#   xmm0 = value as double; 0 when there is nothing left to read
 #
 # Side effect: Advances _data_ptr to next entry
 #
-# Error handling: No bounds checking - reading past end is undefined behavior.
-# BASIC programs are expected to READ only as many values as they DATA'd.
+# Reading past the last item raises Out of DATA (error 4). It used to read
+# whatever followed the table, and die with SIGSEGV.
 .globl _rt_read_number
 _rt_read_number:
     push rbp
     mov rbp, rsp
+    mov rax, QWORD PTR [rip + _data_ptr]
+    cmp rax, QWORD PTR [rip + _data_count]
+    jae .Lread_num_none
     # Calculate address: &_data_table[_data_ptr]
     # Each entry is 16 bytes, so offset = _data_ptr * 16 = _data_ptr << 4
     mov rax, QWORD PTR [rip + _data_ptr]
@@ -77,6 +81,13 @@ _rt_read_number:
     inc QWORD PTR [rip + _data_ptr]     # advance to next entry
     leave
     ret
+.Lread_num_none:
+    mov rsi, rdi                        # line
+    lea rdi, [rip + _err_outofdata]
+    call _rt_error                      # returns only when trapped
+    xorpd xmm0, xmm0
+    leave
+    ret
 
 # _rt_read_string - Read next DATA value as a string
 # Reads the next value from the DATA table and returns it as a string.
@@ -90,17 +101,21 @@ _rt_read_number:
 # _rt_read_number in the other direction (it strtod's a string entry), so the
 # table's tag never has to match the variable the program reads it into.
 #
-# Arguments: none
+# Arguments:
+#   rdi = BASIC line number, for the diagnostic
 #
 # Returns:
 #   rax = pointer to string data
-#   rdx = string length
+#   rdx = string length; an empty string when there is nothing left to read
 #
 # Side effect: Advances _data_ptr to next entry
 .globl _rt_read_string
 _rt_read_string:
     push rbp
     mov rbp, rsp
+    mov rax, QWORD PTR [rip + _data_ptr]
+    cmp rax, QWORD PTR [rip + _data_count]
+    jae .Lread_str_none
     # Calculate entry address
     mov rax, QWORD PTR [rip + _data_ptr]
     shl rax, 4                          # offset = index * 16
@@ -137,6 +152,14 @@ _rt_read_string:
     inc QWORD PTR [rip + _data_ptr]     # advance before the tail call
     leave
     jmp _rt_str                         # returns (rax, rdx) already
+.Lread_str_none:
+    mov rsi, rdi                        # line
+    lea rdi, [rip + _err_outofdata]
+    call _rt_error                      # returns only when trapped
+    xor eax, eax
+    xor edx, edx
+    leave
+    ret
 
 # _rt_restore - Reset DATA pointer (RESTORE statement)
 # Resets the DATA read position, allowing DATA to be re-read from the beginning

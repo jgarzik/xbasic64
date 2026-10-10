@@ -34,20 +34,50 @@
 #
 # Arguments:
 #   rdi = pointer to string
-#   rsi = length (currently ignored - strtod reads until non-numeric)
+#   rsi = length
 #
 # Returns:
 #   xmm0 = parsed double value
 #
-# Note: We pass NULL as endptr to strtod since we don't need to know where
-# parsing stopped. The string should be null-terminated for strtod.
+# The text is copied and terminated before strtod sees it. A string is a
+# (pointer, length) pair, and LEFT$/MID$ return a view into their source, so the
+# byte after the view is the rest of the source: VAL(LEFT$("123", 1)) was 123.
 .globl _rt_val
 _rt_val:
     push rbp
     mov rbp, rsp
-    xor rsi, rsi            # endptr = NULL (2nd arg)
-    # rdi already has string ptr (1st arg)
-    call strtod       # returns double in xmm0
+    push rbx
+    push r12
+    sub rsp, 16                     # a slot for the result across free
+    xorpd xmm0, xmm0
+    test rsi, rsi
+    jz .Lval_done                   # "" is 0
+    mov rbx, rdi                    # source
+    mov r12, rsi                    # length
+    lea rdi, [rsi + 1]
+    call malloc
+    test rax, rax
+    jz .Lval_zero
+    mov rdi, rax
+    mov rsi, rbx
+    mov rdx, r12
+    call memcpy                     # returns the copy
+    mov BYTE PTR [rax + r12], 0
+    mov rbx, rax
+    mov rdi, rax
+    xor esi, esi                    # endptr = NULL
+    call strtod
+    movsd QWORD PTR [rsp], xmm0
+    mov rdi, rbx
+    call free
+    movsd xmm0, QWORD PTR [rsp]
+    jmp .Lval_done
+.Lval_zero:
+    xorpd xmm0, xmm0
+.Lval_done:
+    add rsp, 16
+    pop r12
+    pop rbx
     leave
     ret
 

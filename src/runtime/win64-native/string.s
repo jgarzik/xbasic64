@@ -42,17 +42,49 @@ _chr_buf: .skip 2           # Scratch for CHR$(); never returned
 # _rt_val - Convert string to number (VAL function)
 # Arguments:
 #   rcx = pointer to string
-#   rdx = length (ignored - strtod reads until non-numeric)
+#   rdx = length
 #
 # Returns:
 #   xmm0 = parsed double value
+#
+# The text is copied and terminated before strtod sees it; see the System V
+# tree for why a view from LEFT$ or MID$ is not terminated where it ends.
 .globl _rt_val
 _rt_val:
     push rbp
     mov rbp, rsp
-    sub rsp, 32             # Shadow space
-    xor rdx, rdx            # endptr = NULL
-    call strtod             # returns double in xmm0
+    push rbx
+    push r12
+    sub rsp, 48                     # shadow space + a slot for the result
+    xorpd xmm0, xmm0
+    test rdx, rdx
+    jz .Lval_done                   # "" is 0
+    mov rbx, rcx                    # source
+    mov r12, rdx                    # length
+    lea rcx, [rdx + 1]
+    call malloc
+    test rax, rax
+    jz .Lval_zero
+    mov rcx, rax
+    mov rdx, rbx
+    mov r8, r12
+    call memcpy                     # returns the copy
+    mov BYTE PTR [rax + r12], 0
+    mov rbx, rax
+    mov rcx, rax
+    xor edx, edx                    # endptr = NULL
+    call strtod
+    movsd QWORD PTR [rsp + 32], xmm0
+    mov rcx, rbx
+    call free
+    movsd xmm0, QWORD PTR [rsp + 32]
+    jmp .Lval_done
+.Lval_zero:
+    xorpd xmm0, xmm0
+.Lval_done:
+    add rsp, 48
+    pop r12
+    pop rbx
     leave
     ret
 

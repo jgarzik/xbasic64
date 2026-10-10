@@ -452,3 +452,25 @@ fn test_instr_start_below_one_is_refused() {
         );
     }
 }
+
+/// VAL reads only the characters of the string it is given.
+///
+/// LEFT$, RIGHT$ and MID$ return a view into their source rather than a copy,
+/// so the byte after the view is the rest of the source, not a terminator. VAL
+/// handed the pointer to strtod, which read on: `VAL(LEFT$("123", 1))` was 123.
+#[test]
+fn test_val_reads_only_its_own_characters() {
+    let output = compile_and_run(
+        r#"
+PRINT VAL(LEFT$("123", 1))
+A$ = "45" + "6"
+PRINT VAL(MID$(A$, 2, 1))
+PRINT VAL(LEFT$("9.5E3", 3))
+PRINT VAL(LEFT$("77", 0))
+PRINT VAL(MID$("12.25xyz", 1, 5))
+"#,
+    )
+    .unwrap();
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["1", "5", "9.5", "0", "12.25"]);
+}

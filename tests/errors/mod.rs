@@ -1802,6 +1802,9 @@ fn test_string_builtin_arguments_are_range_checked() {
         ("PRINT MID$(\"abc\", -1, 2)\n", "MID$ negative start"),
         ("PRINT MID$(\"abc\", 1, -1)\n", "MID$ negative count"),
         ("PRINT ASC(\"\")\n", "ASC of the empty string"),
+        ("PRINT STRING$(3, \"\")\n", "STRING$ of the empty string"),
+        ("PRINT STRING$(3, 256)\n", "STRING$ of a code past 255"),
+        ("PRINT STRING$(3, -1)\n", "STRING$ of a negative code"),
     ] {
         let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
         assert_eq!(run.exit_code, Some(1), "{what}: stderr={}", run.stderr);
@@ -1827,11 +1830,16 @@ PRINT MID$("abcdef", 3)
 PRINT MID$("abcdef", 3, 2)
 PRINT MID$("abc", 4)
 PRINT ASC("A")
+PRINT STRING$(3, "xy")
+PRINT STRING$(2, 65)
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, &["abc", "", "abc", "ef", "cdef", "cd", "", "65"]);
+    assert_eq!(
+        lines,
+        &["abc", "", "abc", "ef", "cdef", "cd", "", "65", "xxx", "AA"]
+    );
 }
 
 /// A negative base with a fractional exponent has no real result. It used to

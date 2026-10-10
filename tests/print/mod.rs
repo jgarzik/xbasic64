@@ -169,16 +169,73 @@ fn test_locate_and_color_emit_escapes() {
     );
 }
 
-/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does.
+/// `LOCATE` with only a row leaves the column alone, as GW-BASIC does: VPA
+/// moves the row and nothing else.
 #[test]
 fn test_locate_row_only() {
     let out = crate::common::compile_and_run_raw("LOCATE 7\n", "").expect("should compile");
     out.assert_ran_to_completion("LOCATE with a row only");
+    assert_eq!(out.stdout, "\u{1b}[7d", "row given, column preserved");
+}
+
+/// And with only a column, the row stays: CHA moves the column alone. It used
+/// to go to row 1.
+#[test]
+fn test_locate_column_only() {
+    let out = crate::common::compile_and_run_raw("LOCATE , 10\nPRINT POS(0)\n", "")
+        .expect("should compile");
+    out.assert_ran_to_completion("LOCATE with a column only");
     assert!(
-        out.stdout.contains("\u{1b}[7;"),
-        "row given, column preserved: {:?}",
+        out.stdout.starts_with("\u{1b}[10G"),
+        "column given, row preserved: {:?}",
         out.stdout
     );
+    assert!(
+        out.stdout.trim_end().ends_with("10"),
+        "POS follows the cursor: {:?}",
+        out.stdout
+    );
+}
+
+/// COLOR sets only what it is given. A foreground also states blink, which
+/// 16-31 turn on; an omitted background is left alone instead of turning black.
+/// And the hues are GW-BASIC's: 1 is blue and 4 red, where ANSI has them the
+/// other way round -- COLOR 1 used to print red.
+#[test]
+fn test_color_sets_only_what_it_is_given() {
+    for (source, expected) in [
+        ("COLOR 14\n", "\u{1b}[25;93m"),
+        ("COLOR , 1\n", "\u{1b}[44m"),
+        ("COLOR 14, 1\n", "\u{1b}[25;93;44m"),
+        ("COLOR 7, 9\n", "\u{1b}[25;37;104m"),
+        ("COLOR 4, 6\n", "\u{1b}[25;31;43m"),
+        ("COLOR 30\n", "\u{1b}[5;93m"),
+        ("COLOR 16, 0\n", "\u{1b}[5;30;40m"),
+    ] {
+        let out = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        out.assert_ran_to_completion(source);
+        assert_eq!(out.stdout, expected, "{source:?}");
+    }
+}
+
+/// Values a screen cannot show are Illegal function call, as in GW-BASIC.
+#[test]
+fn test_locate_and_color_arguments_are_range_checked() {
+    for source in [
+        "COLOR 32\n",
+        "COLOR -1\n",
+        "COLOR , 16\n",
+        "LOCATE 0\n",
+        "LOCATE , 0\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").expect("should compile");
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Illegal function call"),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
 }
 
 /// `POS(0)` reports the column the next character will go to, counting from 1.

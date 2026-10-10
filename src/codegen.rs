@@ -1746,6 +1746,19 @@ impl CodeGen {
         self.emit_arg_range_check(reg, min, None);
     }
 
+    /// An optional LOCATE/COLOR argument as a 64-bit value in rax, range
+    /// checked, or -1 when it was omitted.
+    fn gen_optional_arg(&mut self, arg: Option<&Expr>, min: i64, max: Option<i64>) {
+        match arg {
+            Some(e) => {
+                self.gen_expr_to_long(e);
+                self.emit("    movsxd rax, eax");
+                self.emit_arg_range_check("rax", min, max);
+            }
+            None => self.emit("    mov rax, -1"),
+        }
+    }
+
     /// The same, with an upper bound as well.
     fn emit_arg_range_check(&mut self, reg: &str, min: i64, max: Option<i64>) {
         if !self.opts.checks {
@@ -3633,6 +3646,8 @@ impl CodeGen {
 
             StmtKind::Read(vars) => {
                 for var in vars {
+                    // The line goes along for Out of DATA.
+                    self.emit_arg_imm(0, self.report_line() as i64);
                     if is_string_var(&var.name) {
                         // _rt_read_string returns (ptr, len); the length used to
                         // be discarded, leaving whatever was in the length word.
@@ -3729,33 +3744,31 @@ impl CodeGen {
             // The column tracker knows the column; the row is not tracked, so
             // an omitted row asks the terminal for line 1, which is the one
             // divergence here and is documented.
+            // An omitted argument is passed as -1 and the runtime leaves that
+            // setting as it was, as GW-BASIC does. Defaults used to stand in:
+            // `LOCATE , 10` went to row 1, and `COLOR 14` turned the background
+            // black.
             StmtKind::Locate { row, col } => {
-                match row {
-                    Some(e) => self.gen_expr_to_long(e),
-                    None => self.emit("    mov eax, 1"),
-                }
-                self.emit("    movsxd r10, eax");
-                match col {
-                    Some(e) => self.gen_expr_to_long(e),
-                    None => self.call_rt("_rt_pos"),
-                }
-                self.emit("    movsxd r11, eax");
+                self.gen_optional_arg(row.as_ref(), 1, None);
+                self.emit("    push rax");
+                self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+                self.gen_optional_arg(col.as_ref(), 1, None);
+                self.emit("    mov r11, rax");
+                self.emit("    add rsp, 8");
+                self.emit("    pop r10");
                 self.emit_arg_reg(0, "r10");
                 self.emit_arg_reg(1, "r11");
                 self.call_rt("_rt_locate");
             }
 
             StmtKind::Color { fg, bg } => {
-                match fg {
-                    Some(e) => self.gen_expr_to_long(e),
-                    None => self.emit("    mov eax, 7"), // the usual default
-                }
-                self.emit("    movsxd r10, eax");
-                match bg {
-                    Some(e) => self.gen_expr_to_long(e),
-                    None => self.emit("    xor eax, eax"),
-                }
-                self.emit("    movsxd r11, eax");
+                self.gen_optional_arg(fg.as_ref(), 0, Some(31));
+                self.emit("    push rax");
+                self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
+                self.gen_optional_arg(bg.as_ref(), 0, Some(15));
+                self.emit("    mov r11, rax");
+                self.emit("    add rsp, 8");
+                self.emit("    pop r10");
                 self.emit_arg_reg(0, "r10");
                 self.emit_arg_reg(1, "r11");
                 self.call_rt("_rt_color");
@@ -6299,10 +6312,15 @@ impl CodeGen {
                 self.emit("    push rax");
                 self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
                 let ct = self.gen_expr(&args[1]);
+                // Either way there must be a character: the empty string has
+                // no first byte (this read one anyway), and a code is a byte
+                // (STRING$(3, 321) repeated "A").
                 if ct == DataType::String {
+                    self.emit_arg_min_check("rdx", 1);
                     self.emit("    movzx eax, BYTE PTR [rax]");
                 } else {
                     self.gen_coercion(ct, DataType::Long);
+                    self.emit_arg_range_check("eax", 0, Some(255));
                 }
                 self.emit("    mov r10d, eax");
                 self.emit("    add rsp, 8");

@@ -168,6 +168,18 @@ pub fn compile_and_run_flags(
     stdin_input: &str,
     flags: &[&str],
 ) -> Result<RunOutput, String> {
+    compile_and_run_env(source, stdin_input, flags, &[])
+}
+
+/// The same, with environment variables set for the program (not the
+/// compiler). `TZ` is the reason: the host running the tests may well be on
+/// UTC, where local time and UTC cannot be told apart.
+pub fn compile_and_run_env(
+    source: &str,
+    stdin_input: &str,
+    flags: &[&str],
+    env: &[(&str, &str)],
+) -> Result<RunOutput, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let bas_file = tmp.path().join("test.bas");
     let exe_file = tmp.path().join("test");
@@ -197,6 +209,7 @@ pub fn compile_and_run_flags(
         // -- and `OPEN "a.txt" FOR OUTPUT` left a stray file behind on every
         // run, two of which were committed by accident.
         .current_dir(tmp.path())
+        .envs(env.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_raw};
 
 #[test]
 fn test_data_read_restore() {
@@ -261,4 +261,62 @@ PRINT C
     .unwrap();
     let lines = crate::common::lines(&output);
     assert_eq!(lines, vec!["12", "3.5", "0"]);
+}
+
+/// READ past the last item is GW-BASIC's error 4, `Out of DATA`.
+///
+/// It used to index past the end of the table: the entry after the last one is
+/// whatever the assembler put next, and the program died with SIGSEGV, taking
+/// the buffered output it had already printed with it.
+#[test]
+fn test_read_past_the_last_item_is_out_of_data() {
+    let run = compile_and_run_raw(
+        "10 DATA 1, 2\n20 READ X, Y\n30 PRINT X; Y\n40 READ Z\n50 PRINT Z\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        run.lines(),
+        vec!["1  2"],
+        "output before the error survives"
+    );
+    assert!(
+        run.stderr.contains("Out of DATA in 40"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
+}
+
+/// And it is an ordinary error: trappable, with ERR 4, for numbers and strings.
+#[test]
+fn test_out_of_data_is_trappable() {
+    let output = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 DATA 5
+30 READ A
+40 READ B
+50 READ C$
+60 PRINT A; B; "["; C$; "]"
+70 END
+100 PRINT "ERR"; ERR; "AT"; ERL
+110 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    let lines = crate::common::lines(&output);
+    assert_eq!(lines, vec!["ERR 4 AT 40", "ERR 4 AT 50", "5  0 []"]);
+}
+
+/// ERROR 4 raises the same error by number.
+#[test]
+fn test_error_4_is_out_of_data() {
+    let run = compile_and_run_raw("ERROR 4\n", "").unwrap();
+    assert!(
+        run.stderr.contains("Out of DATA"),
+        "stderr was {:?}",
+        run.stderr
+    );
+    assert_eq!(run.exit_code, Some(1));
 }
