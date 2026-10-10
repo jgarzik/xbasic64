@@ -253,12 +253,14 @@ pub fn compile_and_run_with_stdin(source: &str, stdin_input: &str) -> Result<Str
     Ok(run.stdout)
 }
 
-/// Compile to assembly and return it: only what the compiler generated, since
-/// the runtime is a prebuilt object linked beside it.
+/// Compile to Cranelift IR and return its text: every function the
+/// program defines, after a header naming each `u0:N` function and `u1:N`
+/// data object. Only what the compiler generated -- the runtime is a
+/// prebuilt object linked beside it.
 ///
-/// `-S` writes the assembly beside the output path and stops before the
-/// assembler, so nothing here depends on `as` or `cc` being able to run.
-pub fn compile_to_asm(source: &str) -> Result<String, String> {
+/// `-S` writes the IR beside the output path and stops before linking, so
+/// nothing here depends on `cc` being able to run.
+pub fn compile_to_clif(source: &str) -> Result<String, String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let bas_file = tmp.path().join("test.bas");
     let out_file = tmp.path().join("test");
@@ -281,7 +283,24 @@ pub fn compile_to_asm(source: &str) -> Result<String, String> {
         ));
     }
 
-    fs::read_to_string(tmp.path().join("test.s")).map_err(|e| e.to_string())
+    fs::read_to_string(tmp.path().join("test.clif")).map_err(|e| e.to_string())
+}
+
+/// Whether the functions in `clif` refer to the symbol `sym` -- a runtime
+/// helper, a C function, or a data object -- by the header's mapping.
+pub fn uses_symbol(clif: &str, sym: &str) -> bool {
+    let Some(ext) = clif.lines().find_map(|l| {
+        let (ext, name) = l.strip_prefix("; ")?.split_once(" = ")?;
+        (name == sym).then_some(ext.to_string())
+    }) else {
+        return false;
+    };
+    let body = clif.split_once("\n\n").map_or("", |(_, b)| b);
+    body.lines().any(|l| {
+        !l.starts_with(';')
+            && l.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+                .any(|w| w == ext)
+    })
 }
 
 /// Helper to compile and run with access to temp directory for file I/O tests

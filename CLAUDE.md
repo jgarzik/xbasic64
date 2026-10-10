@@ -22,16 +22,17 @@ cargo test strings::
 # Compile a BASIC program
 cargo run -- program.bas           # Output: ./program
 cargo run -- program.bas -o out    # Custom output name
-cargo run -- -S program.bas        # Emit the program's assembly only (no runtime, no linking)
+cargo run -- -S program.bas        # Write the program's Cranelift IR to program.clif (no linking)
 ```
 
 ## Architecture
 
-xbasic64 is a BASIC-to-x86_64 native code compiler with a direct AST-to-assembly pipeline (no IR):
+xbasic64 is a BASIC-to-x86_64 native code compiler. The AST is lowered straight
+to Cranelift IR, and Cranelift writes the object file:
 
 ```
-Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
-              (tokens)   (AST)  (symbols) (x86-64)
+Source → Lexer → Parser → Sema → CodeGen → Object → Executable
+              (tokens)   (AST)  (symbols) (Cranelift)
 ```
 
 ### Source Files (`src/`)
@@ -41,7 +42,10 @@ Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
 - **sema.rs** - Semantic analysis: builds the symbol table (procedures, arrays,
   records, constants, labels) and reports errors with a source line, so codegen
   never has to guess what a name means
-- **codegen.rs** - Direct AST-to-x86-64 assembly translation using System V AMD64 ABI
+- **codegen/** - Lowers the AST to Cranelift IR with a `FunctionBuilder`, one
+  function at a time (`FnGen`), into an `ObjectModule` (`CodeGen`): `storage.rs`
+  (where names live), `expr.rs`, `builtins.rs`, `stmt.rs`, `calls.rs` (procedures
+  and by-reference calls), `io.rs`, `trap.rs` (ON ERROR)
 - **rtbuild.rs** - The hand-written x86-64 runtime library's trees
   (`runtime/sysv`, `runtime/win64-native`: I/O, strings, math, using libc) and
   how they become one assembly unit. Shared by `build.rs`, which assembles the
@@ -53,7 +57,8 @@ Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
 - **rtsig.rs** - Signature of every runtime helper generated code calls, and
   whether it can raise an error. Every call goes through `CodeGen::call_rt`,
   which looks it up; a test derives `fallible` from the assembly's control flow
-- **main.rs** - CLI driver: reads source, runs pipeline, shells out to `as` and `cc` for linking
+- **main.rs** - CLI driver: reads source, runs the pipeline, writes the object
+  and the runtime's, and links them with `cc` (or `link.exe`)
 - **build.rs** - Assembles the runtime when the compiler is built, so building
   needs the target's assembler too
 
@@ -71,8 +76,16 @@ Integration tests organized by feature area:
 
 ### Key Design Decisions
 
-- **No IR**: AST compiles directly to assembly for simplicity
-- **System V AMD64 ABI**: Enables libc interoperability for I/O and math
+- **No IR of its own**: the AST is lowered straight to Cranelift IR. Cranelift
+  0.136.2, pinned exactly: its API changes between releases
+- **Every variable lives in memory**: module names in data objects, a
+  procedure's own in zeroed stack slots. No SSA value lives across a statement,
+  because GOTO, GOSUB and RESUME may enter any statement from anywhere and a
+  value defined in one would not dominate the next; FOR's limit and step and
+  SELECT's selector are slots for the same reason
+- **Every reference is colocated**: functions and data, the runtime's and libc's
+  included, are reached with `call rel32` and RIP-relative addresses; the link is
+  `-no-pie`
 - **GW-BASIC semantics**: Division (`/`) always returns Double; integer division uses `\`
 - **Default type is Double**: Unsuffixed numeric variables are `#` (Double), not Single
 - **Boolean -1/0**: Comparisons return -1 (true) or 0 (false) for bitwise compatibility
@@ -86,17 +99,18 @@ Integration tests organized by feature area:
 - **Runtime checks on by default**: `--unsafe` removes them
 - **Two runtimes in lockstep**: `runtime/sysv/` and `runtime/win64-native/` export
   the same `.globl` names; a new helper must be added to both
-- **Two assemblers, not just two runtimes**: `build.rs` and `main.rs` assemble
+- **Two assemblers, not just two runtimes**: `build.rs` assembles the runtime
   with GNU `as` on Linux and `clang -c` on Windows, so the Win64 tree is the one built by the
   assembler no test here runs. They disagree about `.equ len, . - label`: GNU
   `as` folds it to an immediate, and an assembler that cannot prove the symbol
   absolute assembles `mov reg, len` as a *load from that address* instead.
   `CLS` did that on every Windows run. Bracket data with an `_end` label and
   subtract at run time
-- **A runtime helper takes at most four arguments**: Win64 passes only four in
-  registers, so `arg_reg(4)` panics there while System V accepts six. A helper
-  that needs a fifth is invisible on Linux and breaks every Windows compile;
-  fold an argument away instead (see `_rt_file_open_random`)
+- **A runtime helper should take at most four arguments**: Win64 passes only
+  four in registers, so a fifth is on the stack, where the hand-written Win64
+  helper must find it above the shadow space. Cranelift places it correctly,
+  but `_rt_instr` and `_rt_mid_assign` show what the runtime side costs; fold an
+  argument away where possible (see `_rt_file_open_random`)
 - **Unsupported GW-BASIC names are refused, not ignored**: an unrecognised name
   is otherwise just a new variable, so `UNSUPPORTED` in `sema.rs` names the
   keywords this compiler does not provide and why
@@ -104,9 +118,9 @@ Integration tests organized by feature area:
   expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
   `_rt_oct` and `_rt_mk` end in `_rt_strdup`
 - **No jumps to code addresses**: GOSUB pushes a return site *number* and
-  RETURN dispatches through `_gosub_sites`; ON GOTO/GOSUB and the ON ERROR
-  handler (`_err_handler` holds a number) go through tables too. Every indirect
-  transfer is a bounded table jump, the shape Cranelift's `br_table` has
+  RETURN dispatches on it with a `br_table` over its scope's sites; ON
+  GOTO/GOSUB, the ON ERROR handler's entry (`_err_handler` holds a number) and
+  main's unwind to a RESUME label are `br_table`s too
 - **ON ERROR is error-status propagation**: a trapped `_rt_error` sets
   `_err_pending` and returns. A helper that raised leaves through its own
   epilogue; generated code tests the flag after each fallible call and each
@@ -114,24 +128,21 @@ Integration tests organized by feature area:
   `_err_handler_fn` -- main's code compiled a second time, entered at the ON
   ERROR target -- on top of the faulting frame, so RESUME and RESUME NEXT go
   back into a SUB as in QuickBASIC: the handler returns 1 or 2 and the fault
-  block jumps to the statement's start or end. A RESUME label returns 3 and sets
-  `_err_pending` to 2, so each procedure leaves through its epilogue and main
-  dispatches through `_err_resume_targets`. Every trapping function saves the
-  callee-saved registers, and a fault block resets rsp to its frame, so no
-  value lives in one across a statement (FOR promotion is off). By-reference
-  parameters, copied in and out, are synced around the handler call. Only
-  programs with ON ERROR pay for any of this
+  block jumps to the statement's start or next block. A RESUME label returns 3
+  and sets `_err_pending` to 2, so each procedure leaves through its epilogue
+  and main dispatches on `_err_resume_label`. By-reference parameters are real
+  references, so the handler sees what a procedure wrote. Only programs with
+  ON ERROR pay for any of this
 - **Every helper follows its platform's standard ABI**: a double goes where the
   ABI puts it -- by position on Win64, so `(file, value)` passes the value in
-  xmm1 there; `Abi::float_arg_reg` knows the rule. `rtsig.rs` lists one
-  signature that serves both ABIs, so a compiler that follows the ABI can call
-  any helper
+  xmm1 there. `rtsig.rs` lists one signature that serves both ABIs, and codegen
+  builds each call's Cranelift signature from it
 
 ## Language Reference
 
 See [LANGREF.md](LANGREF.md) for the supported BASIC dialect. Key points:
 - Types: INTEGER (`%`), LONG (`&`), SINGLE (`!`), DOUBLE (`#`), STRING (`$`)
 - Control flow: IF/THEN/ELSE, FOR/NEXT, WHILE/WEND, DO/LOOP, SELECT CASE, GOTO/GOSUB
-- Procedures: SUB and FUNCTION with recursion (parameters are by-value only)
+- Procedures: SUB and FUNCTION with recursion; arguments by reference unless BYVAL
 - File I/O: OPEN FOR INPUT/OUTPUT/APPEND, PRINT #, INPUT #, LINE INPUT #, CLOSE
 - String indexing is 1-based (MID$, INSTR); array indexing is 0-based

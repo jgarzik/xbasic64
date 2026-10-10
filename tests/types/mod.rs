@@ -239,7 +239,9 @@ fn test_whole_record_assignment() {
     assert_eq!(lines, vec!["3  4", "3"], "A kept its own copy");
 }
 
-/// Arrays of records, including a nested field and a string field.
+/// Arrays of records, including a nested field and a string field. The
+/// fixed-length field holds its full width, padded with spaces, as it does in
+/// a record that is not an array element.
 #[test]
 fn test_arrays_of_records() {
     let output = compile_and_run(
@@ -247,7 +249,13 @@ fn test_arrays_of_records() {
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["Alice 30", "Bob 25"]);
+    assert_eq!(
+        lines,
+        vec![
+            format!("{:<20} 30", "Alice").as_str(),
+            format!("{:<20} 25", "Bob").as_str()
+        ]
+    );
 }
 
 /// A record array indexed by a loop variable.

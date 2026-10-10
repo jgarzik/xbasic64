@@ -2124,23 +2124,34 @@ END SUB
     assert_eq!(out.trim(), "trapped 11");
 }
 
-/// A program that never traps carries none of the machinery.
+/// A program that never traps carries none of the machinery: no trap state
+/// is read or written, and there is no handler function.
 #[test]
 fn test_no_cost_without_on_error() {
-    let asm = crate::common::compile_to_asm("PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n").unwrap();
+    let src = "PRINT 1\nFOR I = 1 TO 3\nPRINT I\nNEXT I\n";
+    let clif = crate::common::compile_to_clif(src).unwrap();
     for symbol in [
         "_err_handler",
         "_err_pending",
+        "_err_active",
         "_err_line",
-        "_err_resume_targets",
-        ".Lfault_",
-        ".Lst_",
-        ".Lunwind",
+        "_err_resume_label",
+        "_err_handler_fn",
     ] {
         assert!(
-            !asm.contains(symbol),
+            !crate::common::uses_symbol(&clif, symbol),
             "{symbol} should not appear in a program with no ON ERROR"
         );
+    }
+
+    // The same program with ON ERROR does use them, so the check above is
+    // looking at the right names.
+    let clif = crate::common::compile_to_clif(&format!(
+        "10 ON ERROR GOTO 100\n{src}90 END\n100 RESUME NEXT\n"
+    ))
+    .unwrap();
+    for symbol in ["_err_pending", "_err_line", "_err_handler_fn"] {
+        assert!(crate::common::uses_symbol(&clif, symbol), "{symbol}");
     }
 }
 
@@ -2250,31 +2261,6 @@ END SUB
             "main gosub",
             "done"
         ]
-    );
-}
-
-/// A trapping program keeps its loop variables in memory.
-///
-/// FOR-loop register promotion is switched off when a program traps, and that
-/// is load-bearing rather than a concession: a fault block resets `rsp` to
-/// the frame, discarding the promotion's save slots, and the handler reads the
-/// counter's memory copy, written back only at the loop's exit label, so it
-/// would see a stale value.
-#[test]
-fn test_trapping_disables_register_promotion() {
-    let hot = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
-    let plain = crate::common::compile_to_asm(hot).unwrap();
-    assert!(
-        plain.contains("save a counter register"),
-        "the loop should promote when nothing traps"
-    );
-
-    let trapping =
-        crate::common::compile_to_asm(&format!("10 ON ERROR GOTO 100\n{hot}90 END\n100 END\n"))
-            .unwrap();
-    assert!(
-        !trapping.contains("save a counter register"),
-        "a trapping program must keep its counter in memory"
     );
 }
 

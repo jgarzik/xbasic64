@@ -18,6 +18,12 @@ default = []
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+# Pinned exactly: Cranelift's API changes between minor releases.
+cranelift-codegen = { version = "=0.136.2", default-features = false, features = ["std", "x86", "unwind"] }
+cranelift-frontend = "=0.136.2"
+cranelift-module = "=0.136.2"
+cranelift-object = "=0.136.2"
+target-lexicon = "0.13"
 
 [dev-dependencies]
 tempfile = "3"

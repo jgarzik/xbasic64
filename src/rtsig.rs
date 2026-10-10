@@ -36,15 +36,7 @@ use Ty::{F64, I32, I64};
 #[derive(Debug)]
 pub struct RtHelper {
     pub name: &'static str,
-    #[expect(
-        dead_code,
-        reason = "read by a backend that builds calls from signatures"
-    )]
     pub params: &'static [Ty],
-    #[expect(
-        dead_code,
-        reason = "read by a backend that builds calls from signatures"
-    )]
     pub rets: &'static [Ty],
     /// Whether the helper can raise a trappable runtime error.
     ///
@@ -337,17 +329,27 @@ mod tests {
     /// compiled; this catches one that no test happens to compile.
     #[test]
     fn test_every_helper_codegen_names_is_listed() {
-        let source = include_str!("codegen.rs");
-        let mut rest = source;
-        while let Some(at) = rest.find("\"_rt_") {
-            let name: String = rest[at + 1..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            rest = &rest[at + 1 + name.len()..];
-            // `"_rt_"` itself is a prefix test, not a helper.
-            if !name.ends_with('_') {
-                lookup(&name);
+        for source in [
+            include_str!("codegen/mod.rs"),
+            include_str!("codegen/builtins.rs"),
+            include_str!("codegen/calls.rs"),
+            include_str!("codegen/expr.rs"),
+            include_str!("codegen/io.rs"),
+            include_str!("codegen/stmt.rs"),
+            include_str!("codegen/storage.rs"),
+            include_str!("codegen/trap.rs"),
+        ] {
+            let mut rest = source;
+            while let Some(at) = rest.find("\"_rt_") {
+                let name: String = rest[at + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                rest = &rest[at + 1 + name.len()..];
+                // `"_rt_"` itself is a prefix test, not a helper.
+                if !name.ends_with('_') {
+                    lookup(&name);
+                }
             }
         }
     }

@@ -1630,6 +1630,11 @@ Show A              ' A is still 10
 Double A + 0        ' an expression: A is still 10
 ```
 
+The parameter *is* the caller's storage, not a copy that goes back at the
+end: a write through it is seen at once through every other name for the same
+storage -- the same variable passed twice, a SHARED name, an error handler that
+runs while the procedure is active.
+
 A variable passed by reference must be the parameter's type -- an INTEGER
 variable for an INTEGER parameter -- as QuickBASIC requires; to pass another
 type, pass an expression, which is converted.

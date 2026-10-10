@@ -692,3 +692,65 @@ RESUME 200
     .unwrap();
     assert_eq!(crate::common::lines(&output), vec!["5", "trapped 7", "x 7"]);
 }
+
+/// A by-reference parameter is the caller's variable, not a copy of it: a
+/// write is seen at once through every other name for the same storage --
+/// another parameter, a SHARED name, or an array element -- as in QuickBASIC.
+#[test]
+fn test_by_reference_parameters_alias() {
+    let output = compile_and_run(
+        r#"
+DIM SHARED G, ARR(3)
+SUB Both(A, B)
+  A = 1
+  PRINT "both"; B
+END SUB
+SUB Global(A)
+  A = 2
+  PRINT "shared"; G
+END SUB
+SUB Element(E)
+  E = 9
+  PRINT "element"; ARR(1)
+END SUB
+SUB Swap2(A$, B$)
+  A$ = A$ + B$
+  PRINT B$
+END SUB
+X = 5
+Both X, X
+G = 1
+Global G
+Element ARR(1)
+S$ = "ab"
+Swap2 S$, S$
+PRINT X; G; ARR(1); S$
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["both 1", "shared 2", "element 9", "abab", "1  2  9 abab"]
+    );
+}
+
+/// A BYVAL parameter, and an expression argument, are copies: the
+/// procedure's writes go nowhere the caller can see.
+#[test]
+fn test_byval_and_expression_arguments_are_copies() {
+    let output = compile_and_run(
+        r#"
+SUB Bump(BYVAL A, B)
+  A = A + 1
+  B = B + 1
+END SUB
+X = 1: Y = 1
+Bump X, Y
+Bump X, Y + 0
+Bump X, Y * 1
+PRINT X; Y
+"#,
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2");
+}

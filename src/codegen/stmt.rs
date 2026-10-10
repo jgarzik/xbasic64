@@ -1,0 +1,878 @@
+//! Statements: main, control flow, assignment, DATA
+
+// Copyright (c) 2025-2026 Jeff Garzik
+// SPDX-License-Identifier: MIT
+
+use super::*;
+use crate::lexer::normalized;
+
+impl FnGen<'_> {
+    /// Lower `main`: the module-level statements.
+    pub(super) fn gen_main(&mut self, program: &Program) {
+        self.reserve_array_descriptors();
+        if self.cg.gosub_used {
+            // The GOSUB stack grows down from its end.
+            let top = self.global_addr("_gosub_stack", GOSUB_STACK_SIZE as u32);
+            let top = self.b.ins().iadd_imm_s(top, GOSUB_STACK_SIZE);
+            let sp = self.global_addr("_gosub_sp", 8);
+            self.b.ins().store(MemFlagsData::trusted(), top, sp, 0);
+        }
+        // The console is file handle 0, and each platform's runtime seeds
+        // that slot its own way.
+        self.call_rt("_rt_platform_init", &[]);
+
+        self.begin_gosub_scope(&program.statements);
+        self.cg.main_gosub_scope = (self.gosub_first, self.gosub_blocks.len());
+        for stmt in &program.statements {
+            if !matches!(stmt.kind, StmtKind::Sub { .. } | StmtKind::Function { .. }) {
+                self.gen_stmt(stmt);
+            }
+        }
+        let zero = self.iconst(types::I32, 0);
+        self.b.ins().return_(&[zero]);
+        self.after_terminator();
+    }
+
+    /// The block of label `name` in this function, made on first mention.
+    pub(super) fn label_block(&mut self, name: &str) -> Block {
+        if let Some(b) = self.labels.get(name) {
+            return *b;
+        }
+        let b = self.b.create_block();
+        self.labels.insert(name.to_string(), b);
+        b
+    }
+
+    /// The block a GOTO or GOSUB to `target` goes to.
+    pub(super) fn target_block(&mut self, target: &GotoTarget) -> Block {
+        let name = storage::main_label(target);
+        self.label_block(&name)
+    }
+
+    /// Compile one statement, bracketed by its resume points when trapping.
+    ///
+    /// In a trapping program every statement, at every level and in every
+    /// function, has a start block -- where RESUME goes back to -- and a next
+    /// block, where RESUME NEXT goes on from; an error raised while it runs
+    /// goes to its fault block. A nested statement is its own: an error in a
+    /// FOR body's statement resumes there, one in the FOR's limit at the FOR.
+    pub(super) fn gen_stmt(&mut self, stmt: &Stmt) {
+        if !self.cg.traps {
+            self.gen_stmt_inner(stmt);
+            return;
+        }
+        let id = self.cg.stmt_count;
+        self.cg.stmt_count += 1;
+        let st = self.b.create_block();
+        let sn = self.b.create_block();
+        self.begin_block(st);
+        let outer = self.cur_stmt.replace((id, st, sn));
+        self.gen_stmt_inner(stmt);
+        self.cur_stmt = outer;
+        self.begin_block(sn);
+    }
+
+    fn gen_body(&mut self, body: &[Stmt]) {
+        for s in body {
+            self.gen_stmt(s);
+        }
+    }
+
+    fn gen_stmt_inner(&mut self, stmt: &Stmt) {
+        if stmt.line != 0 {
+            self.current_line = stmt.line;
+        }
+        // ERL, recorded per statement: many file helpers have no line to
+        // pass, and those are the errors ON ERROR is used to catch.
+        if self.cg.traps && !matches!(stmt.kind, StmtKind::Label(_) | StmtKind::LabelName(_)) {
+            let line = i64::from(self.report_line());
+            self.store_rt_word("_err_line", line);
+        }
+        match &stmt.kind {
+            StmtKind::Label(n) => {
+                self.basic_line = *n;
+                let b = self.target_block(&GotoTarget::Line(*n));
+                self.begin_block(b);
+            }
+            StmtKind::LabelName(name) => {
+                let b = self.target_block(&GotoTarget::Label(name.clone()));
+                self.begin_block(b);
+            }
+
+            StmtKind::Let {
+                name,
+                indices: None,
+                value,
+            } if self.typed_var(name).is_some() && !self.has_plain_slot(name) => {
+                let (loc, ty) = self.typed_storage(name).expect("guarded above");
+                if let TypeRef::Record(_) = &ty {
+                    // Assigning one whole record to another copies its words.
+                    let words = self.cg.symbols.type_words(&ty);
+                    let src = match value {
+                        Expr::Variable(_) | Expr::ArrayAccess { .. } | Expr::FnCall { .. } => {
+                            self.record_addr(value)
+                        }
+                        _ => None,
+                    };
+                    if let Some(src) = src {
+                        for w in 0..words {
+                            let v =
+                                self.b
+                                    .ins()
+                                    .load(types::I64, MemFlagsData::trusted(), src, 8 * w);
+                            self.store(v, loc.offset(8 * w));
+                        }
+                    }
+                    return;
+                }
+                let v = self.gen_expr(value);
+                let v = self.own_string(v, value);
+                self.store_typed(loc, &ty, v);
+            }
+
+            StmtKind::Let {
+                name,
+                indices: Some(indices),
+                value,
+            } => {
+                // The element's address first, then the value, as GW-BASIC
+                // evaluates them.
+                let a = self.array_addr(name, indices);
+                let v = self.gen_expr(value);
+                let v = self.own_string(v, value);
+                let ty = storage::type_ref_of(DataType::from_suffix(name));
+                self.store_typed(Loc::Ptr(a, 0), &ty, v);
+            }
+
+            StmtKind::Let {
+                name,
+                indices: None,
+                value,
+            } => {
+                let v = self.gen_expr(value);
+                let v = self.own_string(v, value);
+                let info = self.get_var_info(name);
+                let ty = storage::type_ref_of(info.data_type);
+                self.store_typed(info.loc, &ty, v);
+            }
+
+            StmtKind::FieldAssign { target, value } => {
+                let v = self.gen_expr(value);
+                let v = self.own_string(v, value);
+                let (loc, ty) = self.lvalue_loc(target);
+                self.store_typed(loc, &ty, v);
+            }
+
+            StmtKind::Print { .. }
+            | StmtKind::Input { .. }
+            | StmtKind::LineInput { .. }
+            | StmtKind::Open { .. }
+            | StmtKind::Close(_)
+            | StmtKind::Width { .. }
+            | StmtKind::Field { .. }
+            | StmtKind::SetField { .. }
+            | StmtKind::GetPut { .. }
+            | StmtKind::Lock { .. }
+            | StmtKind::Locate { .. }
+            | StmtKind::Color { .. }
+            | StmtKind::Cls
+            | StmtKind::Beep => self.gen_io_stmt(stmt),
+
+            StmtKind::Resume(_) | StmtKind::OnError(_) | StmtKind::RaiseError(_) => {
+                self.gen_trap_stmt(stmt)
+            }
+
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                let then_b = self.b.create_block();
+                let else_b = self.b.create_block();
+                let end = self.b.create_block();
+                let c = self.gen_condition(condition);
+                self.brif(c, then_b, else_b);
+                self.b.switch_to_block(then_b);
+                self.gen_body(then_branch);
+                self.b.ins().jump(end, &[]);
+                self.b.switch_to_block(else_b);
+                if let Some(eb) = else_branch {
+                    self.gen_body(eb);
+                }
+                self.begin_block(end);
+            }
+
+            StmtKind::For {
+                var,
+                start,
+                end,
+                step,
+                body,
+            } => self.gen_for(var, start, end, step.as_ref(), body),
+
+            StmtKind::While { condition, body } => {
+                let head = self.b.create_block();
+                let body_b = self.b.create_block();
+                let exit = self.b.create_block();
+                self.begin_block(head);
+                let c = self.gen_condition(condition);
+                self.brif(c, body_b, exit);
+                self.b.switch_to_block(body_b);
+                // WHILE is a DO-family loop for EXIT DO purposes.
+                self.loop_stack.push((false, exit));
+                self.gen_body(body);
+                self.loop_stack.pop();
+                self.b.ins().jump(head, &[]);
+                self.b.switch_to_block(exit);
+            }
+
+            StmtKind::DoLoop {
+                condition,
+                cond_at_start,
+                is_until,
+                body,
+            } => {
+                let head = self.b.create_block();
+                let exit = self.b.create_block();
+                self.begin_block(head);
+                if *cond_at_start && let Some(cond) = condition {
+                    // DO WHILE leaves when false; DO UNTIL when true.
+                    let c = self.gen_condition(cond);
+                    let body_b = self.b.create_block();
+                    if *is_until {
+                        self.brif(c, exit, body_b);
+                    } else {
+                        self.brif(c, body_b, exit);
+                    }
+                    self.b.switch_to_block(body_b);
+                }
+                self.loop_stack.push((false, exit));
+                self.gen_body(body);
+                self.loop_stack.pop();
+                match condition {
+                    Some(cond) if !*cond_at_start => {
+                        // LOOP WHILE repeats while true; LOOP UNTIL while false.
+                        let c = self.gen_condition(cond);
+                        if *is_until {
+                            self.brif(c, exit, head);
+                        } else {
+                            self.brif(c, head, exit);
+                        }
+                    }
+                    _ => {
+                        self.b.ins().jump(head, &[]);
+                    }
+                }
+                self.b.switch_to_block(exit);
+            }
+
+            StmtKind::Goto(target) => {
+                let b = self.target_block(target);
+                self.jump(b);
+            }
+
+            StmtKind::Gosub(target) => {
+                let b = self.target_block(target);
+                let ret = self.gosub_push();
+                self.jump(b);
+                self.b.switch_to_block(ret);
+            }
+
+            StmtKind::Return(target) => self.gen_return(target.as_ref()),
+
+            StmtKind::OnGoto { expr, targets } => {
+                // A selector outside 1..=n matches nothing and falls through.
+                let sel = self.on_selector(expr);
+                let after = self.b.create_block();
+                let blocks: Vec<Block> = targets.iter().map(|t| self.target_block(t)).collect();
+                let idx = self.b.ins().iadd_imm_s(sel, -1);
+                self.br_table(idx, &blocks, after);
+                self.b.switch_to_block(after);
+            }
+
+            StmtKind::OnGosub { expr, targets } => {
+                // One return site serves the whole statement, and is pushed
+                // only when the selector picks a subroutine: a GOSUB that
+                // never happened must not leave a frame behind.
+                let sel = self.on_selector(expr);
+                let push = self.b.create_block();
+                let none = self.b.create_block();
+                let lo = self.b.ins().icmp_imm_s(IntCC::SignedLessThan, sel, 1);
+                let hi =
+                    self.b
+                        .ins()
+                        .icmp_imm_s(IntCC::SignedGreaterThan, sel, targets.len() as i64);
+                let out = self.b.ins().bor(lo, hi);
+                self.brif(out, none, push);
+                self.b.switch_to_block(push);
+                let ret = self.gosub_push();
+                let blocks: Vec<Block> = targets.iter().map(|t| self.target_block(t)).collect();
+                let idx = self.b.ins().iadd_imm_s(sel, -1);
+                self.br_table(idx, &blocks, ret);
+                self.b.switch_to_block(none);
+                self.begin_block(ret);
+            }
+
+            StmtKind::Dim { decls, .. } => {
+                for decl in decls {
+                    self.gen_declarator(decl, false, false);
+                }
+            }
+            StmtKind::Redim { decls, preserve } => {
+                for decl in decls {
+                    self.gen_declarator(decl, true, *preserve);
+                }
+            }
+
+            StmtKind::Call { name, args } => {
+                self.gen_call(name, args);
+            }
+
+            StmtKind::Read(vars) => {
+                for var in vars {
+                    // The line goes along for Out of DATA.
+                    let line = self.iconst(types::I64, i64::from(self.report_line()));
+                    let v = if self.expr_type(&Self::lvalue_expr(var)) == DataType::String {
+                        let r = self.call_rt("_rt_read_string", &[line]);
+                        Val::Str(r[0], r[1])
+                    } else {
+                        let r = self.call_rt("_rt_read_number", &[line]);
+                        Val::Num(DataType::Double, r[0])
+                    };
+                    self.store_lvalue(var, v, false);
+                }
+            }
+
+            StmtKind::Restore(target) => {
+                // RESTORE <line> resumes at the first DATA item at or after
+                // that line.
+                let idx = match target {
+                    Some(GotoTarget::Line(n)) => {
+                        self.cg.data_line_index.get(n).copied().unwrap_or(0)
+                    }
+                    Some(GotoTarget::Label(name)) => self
+                        .cg
+                        .data_label_index
+                        .get(normalized(name))
+                        .copied()
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let i = self.iconst(types::I64, idx as i64);
+                self.call_rt("_rt_restore", &[i]);
+            }
+
+            StmtKind::MidAssign {
+                target,
+                start,
+                len,
+                value,
+            } => {
+                let cur = self.gen_expr(&Self::lvalue_expr(target));
+                let (tp, tl) = cur.str();
+                let s = self.gen_i64(start);
+                let n = match len {
+                    Some(e) => self.gen_i64(e),
+                    // No length given: replace as much as the value provides.
+                    None => self.iconst(types::I64, 0x7FFF_FFFF),
+                };
+                let (vp, vl) = self.gen_expr(value).str();
+                self.call_rt("_rt_mid_assign", &[tp, tl, s, n, vp, vl]);
+            }
+
+            StmtKind::Swap(a, b) => {
+                // Both are read before either is written, so `SWAP A(I),
+                // A(J)` is right even when the subscripts alias. Each value
+                // is parked in a slot while the other target is addressed.
+                let va = self.gen_expr(&Self::lvalue_expr(a));
+                let vb = self.gen_expr(&Self::lvalue_expr(b));
+                let (sa, sb) = (self.park(va), self.park(vb));
+                let vb = self.unpark(sb);
+                self.store_lvalue_raw(a, vb);
+                let va = self.unpark(sa);
+                self.store_lvalue_raw(b, va);
+            }
+
+            StmtKind::ExitLoop { is_for } => {
+                let target = self
+                    .loop_stack
+                    .iter()
+                    .rev()
+                    .find(|(f, _)| f == is_for)
+                    .map(|(_, b)| *b);
+                if let Some(b) = target {
+                    self.jump(b);
+                }
+            }
+
+            StmtKind::ExitProc => {
+                if let Some(b) = self.exit_block {
+                    self.jump(b);
+                }
+            }
+
+            StmtKind::Erase(names) => {
+                for name in names {
+                    let Some(info) = self.lookup_array(name) else {
+                        continue; // sema has already complained
+                    };
+                    // ERASE releases the storage and nulls the descriptor, so
+                    // the array reads as undimensioned again.
+                    let p = self.load(types::I64, info.loc);
+                    self.call("free", &[p]);
+                    let z = self.iconst(types::I64, 0);
+                    self.store(z, info.loc);
+                }
+            }
+
+            StmtKind::Randomize(seed) => {
+                // With no seed, take the clock: there is nobody to ask.
+                let s = match seed {
+                    Some(e) => self.gen_double(e),
+                    None => self.call_rt("_rt_timer", &[])[0],
+                };
+                self.call_rt("_rt_randomize", &[s]);
+            }
+
+            StmtKind::SelectCase { expr, cases } => self.gen_select(expr, cases),
+
+            // STOP reports where it stopped, then ends as END does.
+            StmtKind::Stop => {
+                let line = self.iconst(types::I64, i64::from(self.report_line()));
+                self.call_rt("_rt_stop", &[line]);
+            }
+            // END ends the program, from any frame.
+            StmtKind::End => {
+                self.call_rt("_rt_end", &[]);
+            }
+
+            // Decided before code generation, or consulted on lookup.
+            StmtKind::Sub { .. }
+            | StmtKind::Function { .. }
+            | StmtKind::Data(_)
+            | StmtKind::Shared(_)
+            | StmtKind::Static(_)
+            | StmtKind::Declare { .. }
+            | StmtKind::TypeDef { .. }
+            | StmtKind::Const { .. }
+            | StmtKind::OptionBase(_)
+            | StmtKind::DefType { .. } => {}
+        }
+    }
+
+    /// A string about to be stored, copied unless the expression already
+    /// produced one nothing else holds.
+    pub(super) fn own_string(&mut self, v: Val, expr: &Expr) -> Val {
+        match v {
+            Val::Str(p, l) if !self.expr_owns_its_string(expr) => {
+                let r = self.call_rt("_rt_strdup", &[p, l]);
+                Val::Str(r[0], r[1])
+            }
+            v => v,
+        }
+    }
+
+    /// Whether evaluating `expr` leaves a string in memory nothing else
+    /// holds: these helpers allocate, so a copy would be a second malloc of
+    /// bytes no one else can reach.
+    fn expr_owns_its_string(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::Add, ..
+            } => self.expr_type(expr) == DataType::String,
+            Expr::FnCall { name, .. } => {
+                let upper = name.to_uppercase();
+                !self.cg.symbols.procs.contains_key(&upper)
+                    && matches!(
+                        upper.as_str(),
+                        "STR$"
+                            | "CHR$"
+                            | "HEX$"
+                            | "OCT$"
+                            | "SPACE$"
+                            | "STRING$"
+                            | "UCASE$"
+                            | "LCASE$"
+                            | "MKI$"
+                            | "MKL$"
+                            | "MKS$"
+                            | "MKD$"
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    /// Keep a value in a fresh slot while other code runs.
+    fn park(&mut self, v: Val) -> (StackSlot, DataType) {
+        let slot = self.stack_slot(16);
+        match v {
+            Val::Str(p, l) => self.store_str((p, l), Loc::Stack(slot, 0)),
+            Val::Num(t, n) => {
+                self.b.ins().stack_store(types::I64, n, slot, 0);
+                return (slot, t);
+            }
+        }
+        (slot, DataType::String)
+    }
+
+    fn unpark(&mut self, (slot, t): (StackSlot, DataType)) -> Val {
+        if t == DataType::String {
+            let (p, l) = self.load_str(Loc::Stack(slot, 0));
+            Val::Str(p, l)
+        } else {
+            Val::Num(t, self.b.ins().stack_load(types::I64, num_type(t), slot, 0))
+        }
+    }
+
+    /// Store into a target without copying a string: SWAP moves values
+    /// between targets that each own theirs.
+    fn store_lvalue_raw(&mut self, target: &LValue, v: Val) {
+        let (loc, ty) = self.lvalue_loc(target);
+        self.store_typed(loc, &ty, v);
+    }
+
+    // ---- GOSUB ----
+
+    /// Push the number of this GOSUB's return site; its block, which the
+    /// caller continues in after the jump.
+    fn gosub_push(&mut self) -> Block {
+        let i = self.gosub_next;
+        self.gosub_next += 1;
+        let site = (self.gosub_first + i) as i64;
+        let block = self.gosub_blocks[i];
+        let spa = self.global_addr("_gosub_sp", 8);
+        let sp = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), spa, 0);
+        let sp = self.b.ins().iadd_imm_s(sp, -8);
+        let base = self.global_addr("_gosub_stack", GOSUB_STACK_SIZE as u32);
+        let full = self.b.ins().icmp(IntCC::UnsignedLessThan, sp, base);
+        self.check(full, RtError::GosubOverflow);
+        let n = self.iconst(types::I64, site);
+        self.b.ins().store(MemFlagsData::trusted(), n, sp, 0);
+        let spa = self.global_addr("_gosub_sp", 8);
+        self.b.ins().store(MemFlagsData::trusted(), sp, spa, 0);
+        block
+    }
+
+    /// RETURN: pop a return site number and dispatch on it -- or, for
+    /// `RETURN line`, drop it and go to the line.
+    ///
+    /// The number must be one of this scope's: an empty stack is a RETURN
+    /// nobody GOSUBed to, and another scope's site would jump into code whose
+    /// frame is not the live one. Both are "RETURN without GOSUB", and the
+    /// stack is left alone so that a handler sees it as it was.
+    fn gen_return(&mut self, target: Option<&GotoTarget>) {
+        let spa = self.global_addr("_gosub_sp", 8);
+        let sp = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), spa, 0);
+        let base = self.global_addr("_gosub_stack", GOSUB_STACK_SIZE as u32);
+        let top = self.b.ins().iadd_imm_s(base, GOSUB_STACK_SIZE);
+        let empty = self
+            .b
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, sp, top);
+        self.check(empty, RtError::ReturnWithoutGosub);
+        let site = self
+            .b
+            .ins()
+            .load(types::I64, MemFlagsData::trusted(), sp, 0);
+        let rel = self.b.ins().iadd_imm_s(site, -(self.gosub_first as i64));
+        let count = self.gosub_blocks.len() as i64;
+        let foreign = self
+            .b
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, rel, count);
+
+        if self.kind == FnKind::Handler {
+            // A handler that RETURNs from the GOSUB the error interrupted
+            // leaves the handler for main: the site is main's, so main goes
+            // there.
+            let main_site = self.b.create_block();
+            let own = self.b.create_block();
+            self.brif(foreign, main_site, own);
+            self.b.switch_to_block(main_site);
+            let (mfirst, mcount) = self.cg.main_gosub_scope;
+            let mrel = self.b.ins().iadd_imm_s(site, -(mfirst as i64));
+            let bad =
+                self.b
+                    .ins()
+                    .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, mrel, mcount as i64);
+            self.check(bad, RtError::ReturnWithoutGosub);
+            let next = self.b.ins().iadd_imm_s(sp, 8);
+            let spa = self.global_addr("_gosub_sp", 8);
+            self.b.ins().store(MemFlagsData::trusted(), next, spa, 0);
+            let rl = self.rt_label_addr();
+            match target {
+                None => {
+                    self.b.ins().store(MemFlagsData::trusted(), site, rl, 0);
+                    self.store_rt_word("_err_pending", 3);
+                }
+                Some(t) => {
+                    let idx = self.resume_index(t);
+                    let i = self.iconst(types::I64, idx as i64);
+                    self.b.ins().store(MemFlagsData::trusted(), i, rl, 0);
+                    self.store_rt_word("_err_pending", 2);
+                }
+            }
+            self.store_rt_word("_err_active", 0);
+            self.handler_return(3);
+            self.b.switch_to_block(own);
+        } else {
+            self.check(foreign, RtError::ReturnWithoutGosub);
+        }
+        let next = self.b.ins().iadd_imm_s(sp, 8);
+        let spa = self.global_addr("_gosub_sp", 8);
+        self.b.ins().store(MemFlagsData::trusted(), next, spa, 0);
+        match target {
+            None => {
+                let blocks = self.gosub_blocks.clone();
+                let trap = self.b.create_block();
+                self.br_table(rel, &blocks, trap);
+                // Unreachable once the range is checked; with checks off a
+                // foreign site lands here.
+                let cur = self.b.current_block().expect("a block");
+                self.b.switch_to_block(trap);
+                self.b.ins().trap(TrapCode::unwrap_user(1));
+                self.b.switch_to_block(cur);
+            }
+            Some(t) => {
+                let b = self.target_block(t);
+                self.jump(b);
+            }
+        }
+    }
+
+    /// An ON selector as an i64: a byte, as in GW-BASIC. 0 and past the list
+    /// fall through; a value no byte holds is Illegal function call.
+    fn on_selector(&mut self, expr: &Expr) -> Value {
+        let n = self.gen_i64(expr);
+        self.check_range(n, 0, Some(255), RtError::Domain);
+        n
+    }
+
+    // ---- FOR ----
+
+    /// Where a FOR control variable lives, and the type it counts in:
+    /// resolved as a read of the name is, so the loop writes where every
+    /// other reference looks.
+    fn for_control_var(&mut self, name: &str) -> (Loc, DataType) {
+        if let Some((loc, ty)) = self.typed_storage(name) {
+            return (loc, DataType::from_type_ref(&ty));
+        }
+        let info = self.get_var_info(name);
+        (info.loc, info.data_type)
+    }
+
+    /// FOR: the control variable counts in its own type. The start is
+    /// stored, then the limit and the step are each evaluated once, into
+    /// slots -- GOTO and RESUME may enter the body from anywhere, so nothing
+    /// is held in a register across it.
+    fn gen_for(&mut self, var: &str, start: &Expr, end: &Expr, step: Option<&Expr>, body: &[Stmt]) {
+        let (loc, ct) = self.for_control_var(var);
+        let s = self.gen_expr(start);
+        let s = self.coerce(s, ct).num();
+        self.store_num(ct, s, loc);
+
+        let e = self.gen_expr(end);
+        let e = self.coerce(e, ct).num();
+        let end_slot = self.stack_slot(8);
+        self.b.ins().stack_store(types::I64, e, end_slot, 0);
+
+        let st = match step {
+            Some(x) => {
+                let v = self.gen_expr(x);
+                self.coerce(v, ct).num()
+            }
+            None => {
+                let one = Val::Num(DataType::Integer, self.iconst(types::I32, 1));
+                self.coerce(one, ct).num()
+            }
+        };
+        let step_slot = self.stack_slot(8);
+        self.b.ins().stack_store(types::I64, st, step_slot, 0);
+
+        // Which way the loop runs is the step's sign, almost always written
+        // into the program and so decided here.
+        let direction = match step {
+            None => Some(true),
+            Some(s) => self.const_f64(s).map(|v| v >= 0.0),
+        };
+
+        let head = self.b.create_block();
+        let body_b = self.b.create_block();
+        let exit = self.b.create_block();
+        self.begin_block(head);
+        let ty = num_type(ct);
+        let counter = self.load_num(ct, loc);
+        let limit = self.b.ins().stack_load(types::I64, ty, end_slot, 0);
+        let past = |f: &mut Self, ascending: bool| -> Value {
+            if ct.is_integer() {
+                let cc = if ascending {
+                    IntCC::SignedGreaterThan
+                } else {
+                    IntCC::SignedLessThan
+                };
+                f.b.ins().icmp(cc, counter, limit)
+            } else {
+                // Ascending, past means above; descending, below -- or
+                // unordered, as the old jb/ja tests read it.
+                let cc = if ascending {
+                    FloatCC::GreaterThan
+                } else {
+                    FloatCC::UnorderedOrLessThan
+                };
+                f.b.ins().fcmp(cc, counter, limit)
+            }
+        };
+        match direction {
+            Some(asc) => {
+                let p = past(self, asc);
+                self.brif(p, exit, body_b);
+            }
+            None => {
+                let stepv = self.b.ins().stack_load(types::I64, ty, step_slot, 0);
+                let neg = if ct.is_integer() {
+                    self.b.ins().icmp_imm_s(IntCC::SignedLessThan, stepv, 0)
+                } else {
+                    let z = if ct == DataType::Single {
+                        self.b.ins().f32const(0.0)
+                    } else {
+                        self.f64const(0.0)
+                    };
+                    self.b.ins().fcmp(FloatCC::UnorderedOrLessThan, stepv, z)
+                };
+                let up = past(self, true);
+                let down = past(self, false);
+                let p = self.b.ins().select(neg, down, up);
+                self.brif(p, exit, body_b);
+            }
+        }
+        self.b.switch_to_block(body_b);
+        self.loop_stack.push((true, exit));
+        self.gen_body(body);
+        self.loop_stack.pop();
+
+        // The increment reloads the counter, which the body may assign. It
+        // is done at the counter's own width, so a step past the type's
+        // range is Overflow rather than a loop that never ends.
+        let c = self.load_num(ct, loc);
+        let stepv = self.b.ins().stack_load(types::I64, ty, step_slot, 0);
+        let next = match ct {
+            DataType::Integer => {
+                let a = self.b.ins().ireduce(types::I16, c);
+                let b = self.b.ins().ireduce(types::I16, stepv);
+                let (r, of) = self.b.ins().sadd_overflow(a, b);
+                self.check(of, RtError::Overflow);
+                self.b.ins().sextend(types::I32, r)
+            }
+            DataType::Long => {
+                let (r, of) = self.b.ins().sadd_overflow(c, stepv);
+                self.check(of, RtError::Overflow);
+                r
+            }
+            _ => self.b.ins().fadd(c, stepv),
+        };
+        self.store_num(ct, next, loc);
+        self.b.ins().jump(head, &[]);
+        self.b.switch_to_block(exit);
+    }
+
+    /// A numeric constant known at compile time: a literal, a CONST, or a
+    /// negated one.
+    pub(super) fn const_f64(&self, expr: &Expr) -> Option<f64> {
+        let lit = match expr {
+            Expr::Literal(lit) => lit,
+            Expr::Variable(name) => self.cg.symbols.consts.get(normalized(name))?,
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => return self.const_f64(operand).map(|v| -v),
+            _ => return None,
+        };
+        lit.as_f64()
+    }
+
+    // ---- SELECT CASE ----
+
+    fn gen_select(&mut self, expr: &Expr, cases: &[(Option<Vec<CaseClause>>, Vec<Stmt>)]) {
+        let end = self.b.create_block();
+        // The selector is evaluated once, into a slot: a string as its pair,
+        // a number as a Double.
+        let is_string = self.expr_type(expr) == DataType::String;
+        let v = self.gen_expr(expr);
+        let slot = self.stack_slot(16);
+        if is_string {
+            self.store_str(v.str(), Loc::Stack(slot, 0));
+        } else {
+            let d = self.double_of(v);
+            self.b.ins().stack_store(types::I64, d, slot, 0);
+        }
+
+        for (clauses, body) in cases {
+            let next = self.b.create_block();
+            if let Some(clauses) = clauses {
+                // Any alternative matching enters the body; all failing
+                // moves on to the next CASE.
+                let body_b = self.b.create_block();
+                for clause in clauses {
+                    self.gen_case_clause(clause, slot, is_string, body_b);
+                }
+                self.b.ins().jump(next, &[]);
+                self.b.switch_to_block(body_b);
+            }
+            self.gen_body(body);
+            self.b.ins().jump(end, &[]);
+            self.b.switch_to_block(next);
+        }
+        self.begin_block(end);
+    }
+
+    /// One CASE alternative: go to `body` when it matches.
+    fn gen_case_clause(
+        &mut self,
+        clause: &CaseClause,
+        slot: StackSlot,
+        is_string: bool,
+        body: Block,
+    ) {
+        // The selector compared with `e`: an i8 for `op`.
+        let cmp = |f: &mut Self, op: BinaryOp, e: &Expr| -> Value {
+            if is_string {
+                let (rp, rl) = f.gen_expr(e).str();
+                let (lp, ll) = f.load_str(Loc::Stack(slot, 0));
+                let c = f.call_rt("_rt_strcmp", &[lp, ll, rp, rl])[0];
+                f.b.ins().icmp_imm_s(expr::int_cc(op), c, 0)
+            } else {
+                let x = f.gen_double(e);
+                let sel = f.b.ins().stack_load(types::I64, types::F64, slot, 0);
+                f.b.ins().fcmp(expr::float_cc(op), sel, x)
+            }
+        };
+        let next = self.b.create_block();
+        match clause {
+            CaseClause::Value(e) => {
+                let c = cmp(self, BinaryOp::Eq, e);
+                self.brif(c, body, next);
+            }
+            CaseClause::Range(lo, hi) => {
+                // Inclusive at both ends; the low bound first.
+                let c = cmp(self, BinaryOp::Ge, lo);
+                let test_hi = self.b.create_block();
+                self.brif(c, test_hi, next);
+                self.b.switch_to_block(test_hi);
+                let c = cmp(self, BinaryOp::Le, hi);
+                self.brif(c, body, next);
+            }
+            CaseClause::Compare(op, e) => {
+                let c = cmp(self, *op, e);
+                self.brif(c, body, next);
+            }
+        }
+        self.b.switch_to_block(next);
+    }
+}
