@@ -1132,3 +1132,25 @@ CLOSE #1
     .unwrap();
     assert_eq!(crate::common::lines(&out), vec!["[abc     ]"]);
 }
+
+/// FIELD on a number that was opened FOR RANDOM and then closed is Bad file
+/// number (error 52): the record buffer outlives the file, the file does not.
+#[test]
+fn test_field_on_a_closed_random_file() {
+    let (out, _tmp) = compile_and_run_with_files(
+        r#"
+ON ERROR GOTO H
+OPEN "r.dat" FOR RANDOM AS #1 LEN = 8
+CLOSE #1
+FIELD #1, 4 AS F$
+PRINT "no"
+END
+H:
+PRINT ERR
+END
+"#,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["52"]);
+}

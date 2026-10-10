@@ -166,12 +166,7 @@ fn strftime_now(fmt: &[u8]) -> Str {
         )
     };
     // Fresh: the caller may hold another such result.
-    let p = crate::alloc_str(n);
-    if p.is_null() {
-        return Str::EMPTY;
-    }
-    unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), p, n) };
-    Str { ptr: p, len: n }
+    crate::string::strdup(buf.get(..n).unwrap_or(&[]))
 }
 
 export! {

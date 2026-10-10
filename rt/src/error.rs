@@ -108,11 +108,16 @@ static ERR_ERL: Word = Word::new(0);
 /// Raise the error `msg` on `line` (0: the line in `_err_line`). Returns only
 /// when a handler traps it.
 pub fn raise(msg: &'static [u8], line: i64) {
-    let code = ERR_CODES
+    raise_with_code(msg.as_ptr(), code_of(msg.as_ptr()), line);
+}
+
+/// The number of the `_err_*` message at `msg`, found by its address; 0
+/// for any other.
+fn code_of(msg: *const u8) -> u64 {
+    ERR_CODES
         .iter()
-        .find(|(m, _)| core::ptr::eq(m.as_ptr(), msg.as_ptr()))
-        .map_or(0, |&(_, n)| n);
-    raise_with_code(msg.as_ptr(), code, line);
+        .find(|(m, _)| core::ptr::eq(m.as_ptr(), msg))
+        .map_or(0, |&(_, n)| n)
 }
 
 /// The common path, with the number ERR is to report.
@@ -207,11 +212,7 @@ export! {
     /// Raise the error `msg` (one of the `_err_*` messages) on `line`, 0
     /// for the line in `_err_line`. Returns only when a handler traps it.
     fn _rt_error(msg: *const u8, line: i64) {
-        let code = ERR_CODES
-            .iter()
-            .find(|(m, _)| core::ptr::eq(m.as_ptr(), msg))
-            .map_or(0, |&(_, n)| n);
-        raise_with_code(msg, code, line);
+        raise_with_code(msg, code_of(msg), line);
     }
 
     /// Report `msg` and exit, without consulting the handler: for the errors

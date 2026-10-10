@@ -155,11 +155,12 @@ fn set_col(n: i64, c: i64) {
     }
 }
 
-/// The record buffer of file number `n`, if it was last opened FOR RANDOM
-/// (and the buffer could be allocated); null when it was not.
+/// The record buffer of file number `n`, if it is open FOR RANDOM; null when
+/// it is not. CLOSE leaves `mode` and the buffer as they were, so the stream
+/// is what says the number is still open.
 fn random_buf(n: i64) -> *mut u8 {
     match slot(n) {
-        Some(i) if files().mode[i] == RANDOM => files().recbuf[i],
+        Some(i) if files().mode[i] == RANDOM && !files().stream[i].is_null() => files().recbuf[i],
         _ => ptr::null_mut(),
     }
 }
@@ -682,6 +683,19 @@ export! {
         let Some(cname) = open_name(Str { ptr: name, len: len as usize }, n) else {
             return;
         };
+        let i = n as usize % FILES; // what `slot` checked
+        // The number's buffer from an earlier OPEN, or its first one,
+        // allocated before the file is opened: binding the file first left
+        // it open, and unusable, when there was no memory for one.
+        let mut buf = files().recbuf[i];
+        if buf.is_null() {
+            buf = unsafe { sys::malloc(MAX_RECLEN as usize) }.cast::<u8>();
+            if buf.is_null() {
+                raise(&error::_err_memory[..], 0);
+                return;
+            }
+            files().recbuf[i] = buf;
+        }
         // A random file is read *and* written, so it is opened for update.
         // "r+b" fails when the file does not exist yet, in which case it is
         // created.
@@ -693,19 +707,8 @@ export! {
             raise(open_error(unsafe { sys::open_failure(cname) }, RANDOM), 0);
             return;
         }
-        let i = n as usize % FILES; // what `slot` checked
         bind(i, f, RANDOM);
         files().reclen[i] = reclen;
-        // The number's buffer from an earlier OPEN, or its first one.
-        let mut buf = files().recbuf[i];
-        if buf.is_null() {
-            buf = unsafe { sys::malloc(MAX_RECLEN as usize) }.cast::<u8>();
-            if buf.is_null() {
-                raise(&error::_err_memory[..], 0);
-                return;
-            }
-            files().recbuf[i] = buf;
-        }
         // A new record reads as blanks, so a field never written holds
         // spaces rather than whatever the allocator or the last file left.
         unsafe { ptr::write_bytes(buf, b' ', reclen as usize) };
@@ -881,8 +884,13 @@ export! {
     fn _rt_field_next(n: i64, w: i64) -> Str {
         let buf = random_buf(n);
         if buf.is_null() {
-            // FIELD on a file not opened FOR RANDOM has no buffer to carve.
-            raise(&error::_err_badmode[..], 0);
+            // FIELD on a number not open is Bad file number; on a file not
+            // opened FOR RANDOM, which has no buffer to carve, Bad file mode.
+            if stream(n).is_null() {
+                raise(&error::_err_badfile[..], 0);
+            } else {
+                raise(&error::_err_badmode[..], 0);
+            }
             return Str::EMPTY;
         }
         let i = n as usize % FILES; // what `random_buf` checked
@@ -1297,6 +1305,44 @@ mod tests {
         expect_fatal(
             "file::tests::a_huge_field_width_is_field_overflow",
             "?FIELD overflow\n",
+        );
+    }
+
+    /// A number opened FOR RANDOM and then closed keeps its mode and buffer,
+    /// but is no random file: FIELD, GET and PUT are Bad file number (52),
+    /// and LOC and LOF are 0, as for any number not open. FIELD used to
+    /// carve the old buffer, and LOC report the old record.
+    #[test]
+    fn a_closed_random_file_is_not_open() {
+        use crate::error::_rt_err;
+        use crate::num::testing::*;
+        if in_child() {
+            let (_dir, path) = temp("closed.dat");
+            unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 8, 8) };
+            unsafe { _rt_file_put(8, 3, 0) };
+            assert_eq!(unsafe { _rt_file_loc(8) }, 3.0);
+            unsafe { _rt_file_close(8) };
+            assert!(random_buf(8).is_null());
+            let bad_file = |raised: bool| raised && unsafe { _rt_err() } == 52;
+            unsafe { _rt_field_reset(8) };
+            let (s, raised) = trapped(|| unsafe { _rt_field_next(8, 4) });
+            assert!(bad_file(raised));
+            assert_eq!(s, Str::EMPTY);
+            assert!(bad_file(trapped(|| unsafe { _rt_file_get(8, 1, 0) }).1));
+            assert!(bad_file(trapped(|| unsafe { _rt_file_put(8, 1, 0) }).1));
+            assert_eq!(trapped(|| unsafe { _rt_file_loc(8) }), (0.0, false));
+            assert_eq!(trapped(|| unsafe { _rt_file_lof(8) }), (0.0, false));
+            // Open, but not FOR RANDOM: Bad file mode.
+            open(&path, INPUT, 8);
+            let (_, raised) = trapped(|| unsafe { _rt_field_next(8, 4) });
+            assert!(raised && unsafe { _rt_err() } == 54);
+            unsafe { _rt_file_close(8) };
+            unsafe { _rt_field_next(8, 4) };
+            return;
+        }
+        expect_fatal(
+            "file::tests::a_closed_random_file_is_not_open",
+            "?Bad file number\n",
         );
     }
 

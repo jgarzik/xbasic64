@@ -258,10 +258,11 @@ fn render_num(width: usize, decimals: usize, flags: u32, value: f64, out: &mut [
     let decimals = decimals.min(MAX_DECIMALS);
     let width = width.min(MAX_WIDTH);
     let mut value = value;
-    // A trailing sign, or a forced sign placed here, means the number is
+    // A trailing sign, a forced sign placed here, or a minus that goes before
+    // the dollar sign ("-$12.50", as GW-BASIC writes it) means the number is
     // formatted without one.
     let mut sign = 0u8;
-    if flags & (TRAIL_SIGN | FORCE_SIGN) != 0 {
+    if flags & (TRAIL_SIGN | FORCE_SIGN | DOLLAR) != 0 {
         // NaN is unordered, so it takes the minus sign, as ucomisd did.
         if value >= 0.0 {
             if flags & FORCE_SIGN != 0 {
@@ -464,6 +465,13 @@ mod tests {
         assert_eq!(num(12, 0, COMMA, -1234567.0), "  -1,234,567");
         assert_eq!(num(6, 2, STAR, 1.5), "**1.50");
         assert_eq!(num(7, 2, DOLLAR, 1.5), "  $1.50");
+        // The sign goes before the dollar sign, and counts in the width.
+        assert_eq!(num(8, 2, DOLLAR, -12.5), " -$12.50");
+        assert_eq!(num(9, 2, STAR | DOLLAR, -12.5), "**-$12.50");
+        assert_eq!(num(5, 2, DOLLAR, -12.5), "%-$12.50");
+        assert_eq!(num(10, 2, DOLLAR | COMMA, -1234.5), "-$1,234.50");
+        assert_eq!(num(8, 2, DOLLAR | FORCE_SIGN, 12.5), " +$12.50");
+        assert_eq!(num(8, 2, DOLLAR | TRAIL_SIGN, -12.5), " $12.50-");
         assert_eq!(num(4, 0, TRAIL_SIGN, 5.0), "  5 ");
         assert_eq!(num(4, 0, TRAIL_SIGN, -5.0), "  5-");
         assert_eq!(num(4, 0, TRAIL_SIGN | FORCE_SIGN, 5.0), "  5+");

@@ -748,3 +748,14 @@ PRINT REC$(3)
         ]
     );
 }
+
+/// A number longer than any buffer keeps its magnitude: the digits past
+/// what can matter still count as places.
+#[test]
+fn test_val_of_a_very_long_number() {
+    let out = compile_and_run(
+        "A$ = \"1\" + STRING$(129, \"0\")\nPRINT VAL(A$)\nPRINT VAL(\"0.\" + STRING$(200, \"0\") + \"5\")\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["1D+129", "5D-201"]);
+}

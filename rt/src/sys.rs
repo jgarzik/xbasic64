@@ -322,6 +322,10 @@ mod unix {
     #[cfg(target_vendor = "apple")]
     unsafe extern "C" {
         fn __error() -> *mut c_int;
+        // The 64-bit-inode `struct stat`, which `is_directory` reads. It is
+        // arm64's only one, but x86-64's plain `fstat` fills the legacy
+        // layout, with a 32-bit st_ino before st_mode.
+        #[cfg_attr(target_arch = "x86_64", link_name = "fstat$INODE64")]
         fn fstat(fd: c_int, buf: *mut core::ffi::c_void) -> c_int;
     }
 

@@ -52,65 +52,178 @@ pub fn scan_number(text: &[u8]) -> Scanned {
         return scan_radix(text, i + 1);
     }
 
-    // The number, without its blanks, NUL-terminated for strtod.
-    let mut copy = [0u8; 128];
-    let mut n = 0;
+    // The mantissa's significant digits, for strtod.
+    let mut digits = Decimal::EMPTY;
+    let mut negative = false;
     // Just past the last digit or point used.
     let mut consumed = 0;
     // 0 sign, 1 mantissa, 2 exponent sign, 3 exponent.
     let mut stage = 0;
     let mut point = false;
-    // 120 is the copy's room; a longer number has no more precision.
-    while i < text.len() && n < 120 {
+    // A digit of the mantissa was read, zero or not.
+    let mut mantissa = false;
+    // Places to move the kept digits' point by: plus the integer digits past
+    // the room, less the fraction digits kept or skipped as leading zeros.
+    let mut places: i64 = 0;
+    // The exponent as written, saturated far past any DOUBLE's.
+    let mut exponent: i64 = 0;
+    let mut exponent_negative = false;
+    while i < text.len() {
         let c = text[i];
         match c {
             b' ' | b'\t' => {}
-            b'0'..=b'9' | b'.' => {
-                if c == b'.' {
-                    // No point in an exponent, nor a second one.
-                    if stage > 1 || point {
-                        break;
-                    }
-                    point = true;
-                    stage = 1;
-                } else {
-                    stage = if stage < 2 { 1 } else { 3 };
+            b'.' => {
+                // No point in an exponent, nor a second one.
+                if stage > 1 || point {
+                    break;
                 }
-                copy[n] = c;
-                n += 1;
+                point = true;
+                stage = 1;
+                consumed = i + 1;
+            }
+            b'0'..=b'9' if stage < 2 => {
+                stage = 1;
+                mantissa = true;
+                match (digits.push(c), point) {
+                    (true, true) => places -= 1,
+                    (false, false) => places += 1, // only a place now
+                    _ => {}
+                }
+                consumed = i + 1;
+            }
+            b'0'..=b'9' => {
+                stage = 3;
+                exponent = (exponent * 10 + i64::from(c - b'0')).min(EXPONENT_MAX);
                 consumed = i + 1;
             }
             // A sign begins the number or its exponent, and nothing else.
             b'+' | b'-' if stage == 0 || stage == 2 => {
+                if stage == 0 {
+                    negative = c == b'-';
+                } else {
+                    exponent_negative = c == b'-';
+                }
                 stage += 1;
-                copy[n] = c;
-                n += 1;
             }
             // An exponent only after some of the mantissa.
-            b'e' | b'E' | b'd' | b'D' if stage == 1 => {
-                stage = 2;
-                copy[n] = b'e'; // strtod's spelling
-                n += 1;
-            }
+            b'e' | b'E' | b'd' | b'D' if stage == 1 => stage = 2,
             _ => break,
         }
         i += 1;
     }
-    if consumed == 0 {
-        return NONE;
-    }
-    let start = copy.as_ptr().cast::<c_char>();
-    let mut end = start.cast_mut();
-    let value = unsafe { sys::strtod(start, &mut end) };
-    if core::ptr::eq(end, start) {
+    if !mantissa {
         return NONE; // "+", "." and the like are no number
     }
+    let exponent = if exponent_negative {
+        -exponent
+    } else {
+        exponent
+    };
+    let value = digits.value(negative, exponent + places);
     // Infinity is the only way past DOUBLE's range.
     let overflow = !value.is_finite();
     Scanned {
         consumed,
         value: if overflow { 0.0 } else { value },
         overflow,
+    }
+}
+
+/// An exponent far past any DOUBLE's, with room to add a number's length.
+const EXPONENT_MAX: i64 = 1 << 40;
+
+/// A number's significant digits, given to strtod as an integer and an
+/// exponent, so that a number of any length keeps its magnitude.
+///
+/// 800 digits are enough for strtod to round exactly as it would with all of
+/// them: no DOUBLE, nor any point halfway between two, has more than 767
+/// significant digits, and the digits past the 800th, when any is not 0, are
+/// stood for by one sticky 1. So the value is what strtod gives the whole
+/// number.
+struct Decimal {
+    /// Sign, digits, sticky digit, 'e', exponent, NUL.
+    buf: [u8; Decimal::CAP],
+    /// Digits kept, from `buf[1]` on.
+    len: usize,
+    /// A digit past the room was not 0.
+    sticky: bool,
+}
+
+impl Decimal {
+    const DIGITS: usize = 800;
+    const CAP: usize = Decimal::DIGITS + 32;
+
+    const EMPTY: Decimal = Decimal {
+        buf: [0; Decimal::CAP],
+        len: 0,
+        sticky: false,
+    };
+
+    /// Keep digit `c`: false once there is no room for it. Leading zeros
+    /// are not kept, and take none.
+    fn push(&mut self, c: u8) -> bool {
+        if self.len == 0 && c == b'0' {
+            return true;
+        }
+        if self.len < Decimal::DIGITS
+            && let Some(b) = self.buf.get_mut(1 + self.len)
+        {
+            *b = c;
+            self.len += 1;
+            return true;
+        }
+        self.sticky |= c != b'0';
+        false
+    }
+
+    fn put(&mut self, at: &mut usize, c: u8) {
+        if let Some(b) = self.buf.get_mut(*at) {
+            *b = c;
+            *at += 1;
+        }
+    }
+
+    /// The digits kept, read as an integer, times ten to `exponent`.
+    fn value(mut self, negative: bool, exponent: i64) -> f64 {
+        if let Some(b) = self.buf.get_mut(0) {
+            *b = if negative { b'-' } else { b'+' };
+        }
+        let mut at = 1 + self.len;
+        if self.len == 0 {
+            self.put(&mut at, b'0'); // "-0" is -0, as strtod read it before
+        } else {
+            // Past 100000 either way, 800 digits are infinity or 0 alike.
+            let exponent = exponent.clamp(-100_000, 100_000) - i64::from(self.sticky);
+            if self.sticky {
+                self.put(&mut at, b'1');
+            }
+            self.put(&mut at, b'e');
+            if exponent < 0 {
+                self.put(&mut at, b'-');
+            }
+            // The exponent's digits, least significant first.
+            let mut e = exponent.unsigned_abs();
+            let mut text = [0u8; 20];
+            let mut n = 0;
+            loop {
+                if let Some(t) = text.get_mut(n) {
+                    *t = b'0' + (e % 10) as u8;
+                    n += 1;
+                }
+                e /= 10;
+                if e == 0 {
+                    break;
+                }
+            }
+            while n > 0 {
+                n -= 1;
+                let c = text.get(n).copied().unwrap_or(b'0');
+                self.put(&mut at, c);
+            }
+        }
+        self.put(&mut at, 0);
+        let start = self.buf.as_ptr().cast::<c_char>();
+        unsafe { sys::strtod(start, core::ptr::null_mut()) }
     }
 }
 
@@ -597,11 +710,36 @@ mod tests {
     }
 
     #[test]
-    fn scan_keeps_120_characters() {
+    fn scan_reads_a_number_of_any_length() {
+        let s = |t: &str| scan_number(t.as_bytes());
         let long = "1".repeat(200);
-        let s = scan_number(long.as_bytes());
-        assert_eq!(s.consumed, 120);
-        assert_eq!(s.value, long[..120].parse::<f64>().unwrap());
+        assert_eq!(s(&long).consumed, 200);
+        assert_eq!(s(&long).value, long.parse::<f64>().unwrap());
+        // Digits past the room still count as places.
+        let big = format!("1{}", "0".repeat(129));
+        assert_eq!(s(&big).value, 1e129);
+        assert_eq!(s(&format!("{big}.5x")).consumed, 132);
+        let huge = format!("0.{}9", "1".repeat(2000));
+        assert_eq!(s(&huge).value, huge.parse::<f64>().unwrap());
+        assert!(s(&"9".repeat(400)).overflow);
+        // Leading zeros take no room, before the point or after it.
+        let small = format!("0.{}5", "0".repeat(200));
+        assert_eq!(s(&small).value, 5e-201);
+        assert_eq!(s(&small).consumed, small.len());
+        assert_eq!(s(&format!("{}1.5", "0".repeat(1000))).value, 1.5);
+        assert_eq!(s(&format!("-.{}1e990", "0".repeat(1000))).value, -1e-11);
+        // The fraction past the room still rounds: exactly halfway
+        // between two DOUBLEs rounds to even, a hair above it rounds up.
+        let half = "9007199254740993"; // 2^53 + 1
+        assert_eq!(s(half).value, 9007199254740992.0);
+        let above = format!("{half}.{}1", "0".repeat(1000));
+        assert_eq!(s(&above).value, 9007199254740994.0);
+        // Exponents and signs as before.
+        assert_eq!(s(&format!("{}e-129", big)).value, 1.0);
+        assert_eq!(s(&format!("0.{}1e201", "0".repeat(199))).value, 10.0);
+        assert_eq!(s("-0").value.to_bits(), (-0.0f64).to_bits());
+        assert!(s("1e99999999999999999999").overflow);
+        assert_eq!(s("1e-99999999999999999999").value, 0.0);
     }
 
     #[test]
