@@ -2686,3 +2686,35 @@ END FUNCTION
     run.assert_ran_to_completion("procedure errors resumed by line");
     assert_eq!(run.lines(), &["done 500000"]);
 }
+
+/// A DIM or REDIM that fails leaves the array as it was.
+///
+/// The new bounds used to be written into the descriptor one by one as they
+/// were evaluated, and checked afterwards. A trapped error -- a bound below
+/// its lower one, or a size too large to address -- then left the new bounds
+/// beside the old element block, and RESUME NEXT carried on with subscripts
+/// that passed the bounds check and indexed far past the block's end.
+#[test]
+fn test_failed_redim_leaves_the_array_unchanged() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 DIM A(10, 10)
+30 REDIM A(1000, -1)
+40 PRINT UBOUND(A, 1); UBOUND(A, 2)
+50 A(10, 10) = 5: PRINT A(10, 10)
+60 DIM B%(1, 1, 1, 1)
+70 REDIM B%(65535, 65535, 65535, 65535)
+80 PRINT UBOUND(B%, 1)
+90 B%(1000, 1, 1, 1) = 1
+95 END
+100 PRINT "error"; ERR
+110 RESUME NEXT
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["error 9", "10  10", "5", "error 7", "1", "error 9"]
+    );
+}

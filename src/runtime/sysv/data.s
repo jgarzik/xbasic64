@@ -193,6 +193,7 @@ _rt_array_autodim:
     lea r9, [rsi + r8]
     mov QWORD PTR [rbx + 8 + r9*8], rcx
     imul r12, rax
+    jo .Lautodim_nomem          # too large to address at all
     inc r8
     jmp .Lautodim_dim
 .Lautodim_alloc:

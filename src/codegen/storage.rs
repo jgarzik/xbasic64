@@ -480,37 +480,25 @@ impl FnGen<'_> {
             self.raise_if(exists, RtError::DuplicateDefinition);
         }
 
-        // With PRESERVE, the old size is needed to zero the new tail. It is
-        // kept in a slot, since a bound below may call anything.
-        let old_size = if preserve {
-            let size = self.descriptor_bytes(loc, ndims, elem_size);
-            let slot = self.stack_slot(8);
-            self.b.ins().stack_store(types::I64, size, slot, 0);
-            Some(slot)
-        } else {
-            None
-        };
-
         // Each dimension: the lower bound as written, or the OPTION BASE, and
         // the element count from it to the upper one. A bound below its
         // lower one leaves no elements, which is Subscript out of range.
-        let n = ndims as i32;
+        //
+        // Nothing reaches the descriptor until the new block exists. A
+        // trapped error on the way -- a bad bound, a size too large, no
+        // memory -- must leave the array as it was: new bounds beside the
+        // old block would pass every bounds check and index past its end.
+        let mut bounds = Vec::with_capacity(ndims);
         for (i, dim) in arr.dimensions.iter().enumerate() {
-            let lower_loc = loc.offset(8 * (1 + n + i as i32));
-            match arr.lowers.get(i).cloned().flatten() {
+            let lo = match arr.lowers.get(i).cloned().flatten() {
                 Some(lo) => {
                     let v = self.gen_expr(&lo);
-                    let lo = self.i64_of(v);
-                    self.store(lo, lower_loc);
+                    self.i64_of(v)
                 }
-                None => {
-                    let base = self.iconst(types::I64, self.cg.symbols.option_base);
-                    self.store(base, lower_loc);
-                }
-            }
+                None => self.iconst(types::I64, self.cg.symbols.option_base),
+            };
             let v = self.gen_expr(dim);
             let hi = self.i64_of(v);
-            let lo = self.load(types::I64, lower_loc);
             let d = self.b.ins().isub(hi, lo);
             let count = self.b.ins().iadd_imm_s(d, 1);
             if self.cg.opts.checks {
@@ -520,33 +508,40 @@ impl FnGen<'_> {
                     .icmp_imm_s(IntCC::SignedLessThanOrEqual, count, 0);
                 self.raise_if(bad, RtError::Subscript);
             }
-            self.store(count, loc.offset(8 * (1 + i as i32)));
+            bounds.push((lo, count));
         }
 
-        let size = self.descriptor_bytes(loc, ndims, elem_size);
-        let mem = if preserve {
+        let counts: Vec<Value> = bounds.iter().map(|(_, c)| *c).collect();
+        let size = self.checked_size(&counts, elem_size);
+        let (mem, old_size) = if preserve {
+            let n = ndims as i32;
+            let old_counts: Vec<Value> = (0..n)
+                .map(|i| self.load(types::I64, loc.offset(8 * (1 + i))))
+                .collect();
+            let old_size = self.checked_size(&old_counts, elem_size);
             let old = self.load(types::I64, loc);
-            self.call("realloc", &[old, size])[0]
+            (self.call("realloc", &[old, size])[0], Some(old_size))
         } else {
             // calloc: a fresh array reads as 0 / "".
             let one = self.iconst(types::I64, 1);
-            self.call("calloc", &[one, size])[0]
+            (self.call("calloc", &[one, size])[0], None)
         };
-
         if self.cg.opts.checks {
-            // A caught Out of memory must not leave the new bounds beside the
-            // old pointer, or a later subscript would pass the check and run
-            // past the old block. A null pointer is recreated on next use.
-            let zero = self.iconst(types::I64, 0);
-            self.store(zero, loc);
+            // On failure realloc leaves the old block as it was, and calloc
+            // made none, so the descriptor still describes what it points at.
             let null = self.b.ins().icmp_imm_s(IntCC::Equal, mem, 0);
             self.raise_if(null, RtError::OutOfMemory);
         }
-        self.store(mem, loc);
 
-        if let Some(slot) = old_size {
+        self.store(mem, loc);
+        let n = ndims as i32;
+        for (i, (lo, count)) in bounds.into_iter().enumerate() {
+            self.store(count, loc.offset(8 * (1 + i as i32)));
+            self.store(lo, loc.offset(8 * (1 + n + i as i32)));
+        }
+
+        if let Some(old) = old_size {
             // Zero the newly added tail, from the old size up to the new one.
-            let old = self.b.ins().stack_load(types::I64, types::I64, slot, 0);
             let grown = self.b.ins().icmp(IntCC::UnsignedLessThan, old, size);
             let zero_it = self.b.create_block();
             let done = self.b.create_block();
@@ -567,27 +562,21 @@ impl FnGen<'_> {
         }
     }
 
-    /// Total bytes an array's descriptor describes.
+    /// The bytes `counts` elements of `elem_size` take.
     ///
     /// A size that does not fit 64 bits is Out of memory. Wrapping instead
     /// -- 65536^4 two-byte elements is 2^65 bytes, which wraps to 0 -- would
     /// allocate a small block that every subscript's bounds check still
     /// admits, and writes would land outside it.
-    fn descriptor_bytes(&mut self, loc: Loc, ndims: usize, elem_size: i64) -> Value {
-        let mut n = self.load(types::I64, loc.offset(8));
-        let size = self.iconst(types::I64, elem_size);
-        for i in 1..=ndims {
-            let factor = if i < ndims {
-                self.load(types::I64, loc.offset(8 * (1 + i as i32)))
-            } else {
-                size
-            };
+    fn checked_size(&mut self, counts: &[Value], elem_size: i64) -> Value {
+        let mut n = self.iconst(types::I64, elem_size);
+        for c in counts {
             n = if self.cg.opts.checks {
-                let (p, of) = self.b.ins().umul_overflow(n, factor);
+                let (p, of) = self.b.ins().umul_overflow(n, *c);
                 self.raise_if(of, RtError::OutOfMemory);
                 p
             } else {
-                self.b.ins().imul(n, factor)
+                self.b.ins().imul(n, *c)
             };
         }
         n
