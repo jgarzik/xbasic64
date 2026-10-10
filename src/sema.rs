@@ -339,10 +339,10 @@ impl Symbols {
     /// Look up a variable's declared type, preferring the current scope.
     pub fn typed_var(&self, scope: &Scope, name: &str) -> Option<&TypeRef> {
         let upper = name.to_uppercase();
-        if let Scope::Proc(_) = scope {
-            if let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone())) {
-                return Some(t);
-            }
+        if let Scope::Proc(_) = scope
+            && let Some(t) = self.typed_vars.get(&(scope.clone(), upper.clone()))
+        {
+            return Some(t);
         }
         self.typed_vars.get(&(Scope::Module, upper))
     }
@@ -358,10 +358,10 @@ impl Symbols {
     /// Look up an array visible from `scope`: a procedure-local declaration
     /// shadows a module-level one of the same name.
     pub fn lookup_array(&self, scope: &Scope, name: &str) -> Option<&ArrayInfo> {
-        if let Scope::Proc(_) = scope {
-            if let Some(info) = self.arrays.get(&(scope.clone(), name.to_string())) {
-                return Some(info);
-            }
+        if let Scope::Proc(_) = scope
+            && let Some(info) = self.arrays.get(&(scope.clone(), name.to_string()))
+        {
+            return Some(info);
         }
         self.arrays.get(&(Scope::Module, name.to_string()))
     }
@@ -559,19 +559,19 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             StmtKind::Dim { decls } | StmtKind::Redim { decls, .. } => {
                 for d in decls.iter_mut() {
                     // A declarator with an `AS` clause states its own type.
-                    if d.ty.is_none() {
-                        if let Some(renamed) = defaulted(&d.name, table, procs) {
-                            d.name = renamed;
-                        }
+                    if d.ty.is_none()
+                        && let Some(renamed) = defaulted(&d.name, table, procs)
+                    {
+                        d.name = renamed;
                     }
                 }
             }
             StmtKind::Sub { params, .. } | StmtKind::Function { params, .. } => {
                 for p in params.iter_mut() {
-                    if p.ty.is_none() {
-                        if let Some(renamed) = defaulted(&p.name, table, procs) {
-                            p.name = renamed;
-                        }
+                    if p.ty.is_none()
+                        && let Some(renamed) = defaulted(&p.name, table, procs)
+                    {
+                        p.name = renamed;
                     }
                 }
             }
@@ -1011,10 +1011,10 @@ impl Analyzer {
                                     ),
                                 );
                             }
-                            if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(normalized(r)) {
-                                    self.error(stmt.line, format!("undefined TYPE '{}'", r));
-                                }
+                            if let TypeRef::Record(r) = ty
+                                && !self.symbols.records.contains_key(normalized(r))
+                            {
+                                self.error(stmt.line, format!("undefined TYPE '{}'", r));
                             }
                             if self.symbols.typed_vars.contains_key(&key) && !is_redim {
                                 self.error(
@@ -1113,16 +1113,13 @@ impl Analyzer {
                     // the body, so field access on it resolves.
                     for p in params {
                         if let Some(ty) = &p.ty {
-                            if let TypeRef::Record(r) = ty {
-                                if !self.symbols.records.contains_key(normalized(r)) {
-                                    self.error(
-                                        stmt.line,
-                                        format!(
-                                            "parameter '{}' uses undefined TYPE '{}'",
-                                            p.name, r
-                                        ),
-                                    );
-                                }
+                            if let TypeRef::Record(r) = ty
+                                && !self.symbols.records.contains_key(normalized(r))
+                            {
+                                self.error(
+                                    stmt.line,
+                                    format!("parameter '{}' uses undefined TYPE '{}'", p.name, r),
+                                );
                             }
                             self.symbols.typed_vars.insert(
                                 (Scope::Proc(name.clone()), p.name.to_uppercase()),
@@ -1458,10 +1455,10 @@ impl Analyzer {
                         field: f.clone(),
                     };
                 }
-                if let Some(ty) = self.check_field_path(&e, scope, line) {
-                    if matches!(ty, TypeRef::Record(_)) {
-                        self.error(line, "cannot assign to a whole record; assign its fields");
-                    }
+                if let Some(ty) = self.check_field_path(&e, scope, line)
+                    && matches!(ty, TypeRef::Record(_))
+                {
+                    self.error(line, "cannot assign to a whole record; assign its fields");
                 }
             }
             StmtKind::Call { name, args } => {
@@ -1913,16 +1910,16 @@ impl Analyzer {
             // A constant dimension is checked here; a computed one is checked
             // at run time, where reading past the descriptor used to return
             // whatever happened to follow it.
-            if let Some(Literal::Integer(n)) = self.const_eval(dim) {
-                if n < 1 || n as usize > rank {
-                    return Some(format!(
-                        "'{}' has {} dimension{}, so dimension {} does not exist",
-                        arr,
-                        rank,
-                        if rank == 1 { "" } else { "s" },
-                        n
-                    ));
-                }
+            if let Some(Literal::Integer(n)) = self.const_eval(dim)
+                && (n < 1 || n as usize > rank)
+            {
+                return Some(format!(
+                    "'{}' has {} dimension{}, so dimension {} does not exist",
+                    arr,
+                    rank,
+                    if rank == 1 { "" } else { "s" },
+                    n
+                ));
             }
             return None;
         }
@@ -2184,24 +2181,24 @@ impl Analyzer {
                 let Some(want_string) = param_strings.get(i).copied() else {
                     break;
                 };
-                if let Some(is_string) = self.expr_is_string(arg, scope) {
-                    if is_string != want_string {
-                        let (got, wanted) = if is_string {
-                            ("string", "numeric")
-                        } else {
-                            ("numeric", "string")
-                        };
-                        self.error(
-                            line,
-                            format!(
-                                "argument {} of '{}' is {}, but a {} value was given",
-                                i + 1,
-                                name,
-                                wanted,
-                                got
-                            ),
-                        );
-                    }
+                if let Some(is_string) = self.expr_is_string(arg, scope)
+                    && is_string != want_string
+                {
+                    let (got, wanted) = if is_string {
+                        ("string", "numeric")
+                    } else {
+                        ("numeric", "string")
+                    };
+                    self.error(
+                        line,
+                        format!(
+                            "argument {} of '{}' is {}, but a {} value was given",
+                            i + 1,
+                            name,
+                            wanted,
+                            got
+                        ),
+                    );
                 }
             }
 
@@ -2339,21 +2336,21 @@ impl Analyzer {
     /// used to reach codegen and abort it with a panic.
     fn check_assign_types(&mut self, name: &str, value: &Expr, scope: &Scope, line: u32) {
         let target_is_string = name.ends_with('$');
-        if let Some(value_is_string) = self.expr_is_string(value, scope) {
-            if target_is_string != value_is_string {
-                let (from, to) = if value_is_string {
-                    ("string", "numeric")
-                } else {
-                    ("numeric", "string")
-                };
-                self.error(
-                    line,
-                    format!(
-                        "type mismatch: cannot assign {} value to {} variable '{}'",
-                        from, to, name
-                    ),
-                );
-            }
+        if let Some(value_is_string) = self.expr_is_string(value, scope)
+            && target_is_string != value_is_string
+        {
+            let (from, to) = if value_is_string {
+                ("string", "numeric")
+            } else {
+                ("numeric", "string")
+            };
+            self.error(
+                line,
+                format!(
+                    "type mismatch: cannot assign {} value to {} variable '{}'",
+                    from, to, name
+                ),
+            );
         }
     }
 

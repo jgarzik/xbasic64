@@ -1012,10 +1012,10 @@ impl CodeGen {
     /// Find an array, preferring one DIM'd in the current procedure over a
     /// module-level array of the same name.
     fn lookup_array(&self, name: &str) -> Option<&ArrayInfo> {
-        if self.current_proc.is_some() {
-            if let Some(info) = self.proc_arrays.get(name) {
-                return Some(info);
-            }
+        if self.current_proc.is_some()
+            && let Some(info) = self.proc_arrays.get(name)
+        {
+            return Some(info);
         }
         self.arrays.get(name)
     }
@@ -1220,10 +1220,10 @@ impl CodeGen {
 
         // A user-defined FUNCTION's declared type wins over any name-based
         // guess, including the built-in table below.
-        if let Some(proc) = self.symbols.procs.get(&upper) {
-            if let Some(ty) = &proc.ret_ty {
-                return DataType::from_type_ref(ty);
-            }
+        if let Some(proc) = self.symbols.procs.get(&upper)
+            && let Some(ty) = &proc.ret_ty
+        {
+            return DataType::from_type_ref(ty);
         }
 
         if upper.ends_with('$') {
@@ -3058,11 +3058,11 @@ impl CodeGen {
                 // across the loop. Sixteen bytes rather than eight because a
                 // bounds check inside the loop can still reach a trampoline
                 // that calls the runtime, and it must find rsp aligned.
-                if let Some(reg) = &counter_reg {
-                    if ct.is_integer() {
-                        self.emit("    sub rsp, 16        # save a counter register");
-                        emit!(self, "    mov QWORD PTR [rsp], {}", reg);
-                    }
+                if let Some(reg) = &counter_reg
+                    && ct.is_integer()
+                {
+                    self.emit("    sub rsp, 16        # save a counter register");
+                    emit!(self, "    mov QWORD PTR [rsp], {}", reg);
                 }
 
                 // Initialize the control variable.
@@ -3307,12 +3307,10 @@ impl CodeGen {
 
                 self.emit_label(&start_label);
 
-                if *cond_at_start {
-                    if let Some(cond) = condition {
-                        // DO WHILE leaves when the condition is false;
-                        // DO UNTIL leaves when it is true.
-                        self.gen_condition(cond, &end_label, *is_until);
-                    }
+                if *cond_at_start && let Some(cond) = condition {
+                    // DO WHILE leaves when the condition is false;
+                    // DO UNTIL leaves when it is true.
+                    self.gen_condition(cond, &end_label, *is_until);
                 }
 
                 self.loop_stack.push((false, end_label.clone()));
@@ -4373,50 +4371,50 @@ impl CodeGen {
             }
         };
 
-        if let Expr::Binary { op, left, right } = cond {
-            if Self::is_comparison(*op) {
-                let left_type = self.expr_type(left);
-                let right_type = self.expr_type(right);
+        if let Expr::Binary { op, left, right } = cond
+            && Self::is_comparison(*op)
+        {
+            let left_type = self.expr_type(left);
+            let right_type = self.expr_type(right);
 
-                if left_type == DataType::String && right_type == DataType::String {
-                    self.gen_string_compare(left, right);
-                    emit!(self, "    {} {}", jcc(effective(*op), true), target);
-                    return;
-                }
+            if left_type == DataType::String && right_type == DataType::String {
+                self.gen_string_compare(left, right);
+                emit!(self, "    {} {}", jcc(effective(*op), true), target);
+                return;
+            }
 
-                if left_type != DataType::String && right_type != DataType::String {
-                    let work_type = self.promote_types(left_type, right_type, BinaryOp::Add);
-                    let signed = work_type.is_integer();
+            if left_type != DataType::String && right_type != DataType::String {
+                let work_type = self.promote_types(left_type, right_type, BinaryOp::Add);
+                let signed = work_type.is_integer();
 
-                    // Same constant-operand shortcut the value form takes.
-                    if signed {
-                        if let Some(n) = self.const_i32(right) {
-                            let ty = self.gen_expr(left);
-                            self.gen_coercion(ty, work_type);
-                            emit!(self, "    cmp eax, {}", n);
-                            emit!(self, "    {} {}", jcc(effective(*op), true), target);
-                            return;
-                        }
-                    } else if work_type == DataType::Double {
-                        if let Some(value) = self.const_double(right) {
-                            self.gen_expr_to_double(left);
-                            let operand = self.f64_operand(value);
-                            emit!(self, "    ucomisd xmm0, {}", operand);
-                            emit!(self, "    {} {}", jcc(effective(*op), false), target);
-                            return;
-                        }
+                // Same constant-operand shortcut the value form takes.
+                if signed {
+                    if let Some(n) = self.const_i32(right) {
+                        let ty = self.gen_expr(left);
+                        self.gen_coercion(ty, work_type);
+                        emit!(self, "    cmp eax, {}", n);
+                        emit!(self, "    {} {}", jcc(effective(*op), true), target);
+                        return;
                     }
-
-                    self.gen_binary_operands(left, right, work_type);
-                    self.emit_typed(
-                        work_type,
-                        "    cmp eax, ecx",
-                        "    ucomiss xmm0, xmm1",
-                        "    ucomisd xmm0, xmm1",
-                    );
-                    emit!(self, "    {} {}", jcc(effective(*op), signed), target);
+                } else if work_type == DataType::Double
+                    && let Some(value) = self.const_double(right)
+                {
+                    self.gen_expr_to_double(left);
+                    let operand = self.f64_operand(value);
+                    emit!(self, "    ucomisd xmm0, {}", operand);
+                    emit!(self, "    {} {}", jcc(effective(*op), false), target);
                     return;
                 }
+
+                self.gen_binary_operands(left, right, work_type);
+                self.emit_typed(
+                    work_type,
+                    "    cmp eax, ecx",
+                    "    ucomiss xmm0, xmm1",
+                    "    ucomisd xmm0, xmm1",
+                );
+                emit!(self, "    {} {}", jcc(effective(*op), signed), target);
+                return;
             }
         }
 
@@ -5249,10 +5247,10 @@ impl CodeGen {
 
     /// Find an already-allocated variable slot, without creating one.
     fn lookup_var(&self, name: &str) -> Option<&VarInfo> {
-        if self.current_proc.is_some() {
-            if let Some(info) = self.proc_vars.get(name) {
-                return Some(info);
-            }
+        if self.current_proc.is_some()
+            && let Some(info) = self.proc_vars.get(name)
+        {
+            return Some(info);
         }
         self.vars.get(name)
     }
@@ -5338,10 +5336,10 @@ impl CodeGen {
     /// Where a typed variable already lives, preferring the current
     /// procedure's own declarations over module-level ones.
     fn record_loc_of(&self, name: &str) -> Option<Loc> {
-        if self.current_proc.is_some() {
-            if let Some(loc) = self.proc_record_vars.get(name) {
-                return Some(loc.clone());
-            }
+        if self.current_proc.is_some()
+            && let Some(loc) = self.proc_record_vars.get(name)
+        {
+            return Some(loc.clone());
         }
         self.record_vars.get(name).cloned()
     }
@@ -5349,10 +5347,10 @@ impl CodeGen {
     /// Element size in words of an array of records, with the same preference.
     fn record_elem_words_of(&self, name: &str) -> Option<i32> {
         let upper = name.to_uppercase();
-        if self.current_proc.is_some() {
-            if let Some(w) = self.proc_record_elem_words.get(&upper) {
-                return Some(*w);
-            }
+        if self.current_proc.is_some()
+            && let Some(w) = self.proc_record_elem_words.get(&upper)
+        {
+            return Some(*w);
         }
         self.record_elem_words.get(&upper).copied()
     }
@@ -5447,23 +5445,22 @@ impl CodeGen {
         if !target.fields.is_empty() {
             // `arr(i).f`: the address is only known at run time, so the value
             // is parked across the address calculation that clobbers it.
-            if let Some(indices) = target.indices.clone() {
-                if let Some(base) = self.array_elem_type(&target.name) {
-                    if let Some((offset, ty)) = self.field_byte_offset(&base, &target.fields) {
-                        emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
-                        if DataType::from_type_ref(&ty) == DataType::String {
-                            self.emit("    mov QWORD PTR [rsp], rax");
-                            self.emit("    mov QWORD PTR [rsp + 8], rdx");
-                        } else {
-                            self.emit("    movsd QWORD PTR [rsp], xmm0");
-                        }
-                        self.gen_array_addr(&target.name, &indices);
-                        emit!(self, "    add rax, {}", offset);
-                        self.emit("    mov rcx, rax");
-                        self.emit_store_parked(&ty);
-                        return;
-                    }
+            if let Some(indices) = target.indices.clone()
+                && let Some(base) = self.array_elem_type(&target.name)
+                && let Some((offset, ty)) = self.field_byte_offset(&base, &target.fields)
+            {
+                emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
+                if DataType::from_type_ref(&ty) == DataType::String {
+                    self.emit("    mov QWORD PTR [rsp], rax");
+                    self.emit("    mov QWORD PTR [rsp + 8], rdx");
+                } else {
+                    self.emit("    movsd QWORD PTR [rsp], xmm0");
                 }
+                self.gen_array_addr(&target.name, &indices);
+                emit!(self, "    add rax, {}", offset);
+                self.emit("    mov rcx, rax");
+                self.emit_store_parked(&ty);
+                return;
             }
             if let Some((loc, ty)) = self.resolve_field_path(&target.name, &target.fields) {
                 self.gen_store_typed(&loc, &ty, DataType::Double);
@@ -6141,10 +6138,10 @@ impl CodeGen {
                 // The lower bound does not depend on which dimension is asked
                 // for, but an out-of-range dimension is still an error.
                 if upper_name == "LBOUND" {
-                    if let Some(dim) = args.get(1) {
-                        if self.const_dim(dim).is_none() {
-                            self.gen_dim_index(dim, rank);
-                        }
+                    if let Some(dim) = args.get(1)
+                        && self.const_dim(dim).is_none()
+                    {
+                        self.gen_dim_index(dim, rank);
                     }
                     emit!(self, "    mov eax, {}", self.symbols.option_base);
                     return;
@@ -6320,13 +6317,12 @@ impl CodeGen {
                 ty: Some(TypeRef::Record(_)),
                 ..
             }) = param_decls.get(i)
+                && self.gen_record_addr(arg)
             {
-                if self.gen_record_addr(arg) {
-                    emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
-                    temp_of.push(w * 8);
-                    w += 1;
-                    continue;
-                }
+                emit!(self, "    mov QWORD PTR [rsp + {}], rax", w * 8);
+                temp_of.push(w * 8);
+                w += 1;
+                continue;
             }
             if *ty == DataType::String {
                 self.gen_expr(arg);

@@ -243,17 +243,18 @@ fn test_runtime_calls_are_stack_aligned() {
                         (offset - n.trim().parse::<i64>().expect("literal reserve")).rem_euclid(16);
                 } else if let Some(n) = line.strip_prefix("add rsp, ") {
                     offset = (offset + n.trim().parse::<i64>().expect("literal release")) % 16;
-                } else if let Some(target) = line.strip_prefix("call ") {
-                    if !unknown && offset != 0 {
-                        problems.push(format!(
-                            "{}:{}: in {}: call {} with rsp % 16 == {} (want 0)",
-                            path,
-                            i + 1,
-                            func,
-                            target.trim(),
-                            offset
-                        ));
-                    }
+                } else if let Some(target) = line.strip_prefix("call ")
+                    && !unknown
+                    && offset != 0
+                {
+                    problems.push(format!(
+                        "{}:{}: in {}: call {} with rsp % 16 == {} (want 0)",
+                        path,
+                        i + 1,
+                        func,
+                        target.trim(),
+                        offset
+                    ));
                 }
             }
         }

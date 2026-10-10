@@ -361,10 +361,10 @@ impl<'a> Lexer<'a> {
                 is_float = true;
                 s.push(self.advance().unwrap());
                 // Handle optional sign after exponent
-                if let Some(sign) = self.peek() {
-                    if sign == '+' || sign == '-' {
-                        s.push(self.advance().unwrap());
-                    }
+                if let Some(sign) = self.peek()
+                    && (sign == '+' || sign == '-')
+                {
+                    s.push(self.advance().unwrap());
                 }
             } else {
                 break;
@@ -452,10 +452,10 @@ impl<'a> Lexer<'a> {
         }
 
         // Check for type suffix
-        if let Some(c) = self.peek() {
-            if c == '%' || c == '&' || c == '!' || c == '#' || c == '$' {
-                s.push(self.advance().unwrap());
-            }
+        if let Some(c) = self.peek()
+            && (c == '%' || c == '&' || c == '!' || c == '#' || c == '$')
+        {
+            s.push(self.advance().unwrap());
         }
 
         s
@@ -494,30 +494,29 @@ impl<'a> Lexer<'a> {
         }
 
         // Check for line number at start of line
-        if self.at_line_start {
-            if let Some(c) = self.peek() {
+        if self.at_line_start
+            && let Some(c) = self.peek()
+            && c.is_ascii_digit()
+        {
+            let mut num = String::new();
+            while let Some(c) = self.peek() {
                 if c.is_ascii_digit() {
-                    let mut num = String::new();
-                    while let Some(c) = self.peek() {
-                        if c.is_ascii_digit() {
-                            num.push(self.advance().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    self.at_line_start = false;
-                    self.skip_whitespace();
-                    // A number too large to represent used to become label 0,
-                    // so the program silently defined a label nobody wrote and
-                    // every GOTO to it failed separately -- past LONG range the
-                    // same digits lex as a Double. Every other numeric form in
-                    // this lexer refuses to guess; so does this one.
-                    return match num.parse::<u32>() {
-                        Ok(n) => Ok(Token::LineNumber(n)),
-                        Err(_) => Err(format!("line number '{}' is too large", num)),
-                    };
+                    num.push(self.advance().unwrap());
+                } else {
+                    break;
                 }
             }
+            self.at_line_start = false;
+            self.skip_whitespace();
+            // A number too large to represent used to become label 0,
+            // so the program silently defined a label nobody wrote and
+            // every GOTO to it failed separately -- past LONG range the
+            // same digits lex as a Double. Every other numeric form in
+            // this lexer refuses to guess; so does this one.
+            return match num.parse::<u32>() {
+                Ok(n) => Ok(Token::LineNumber(n)),
+                Err(_) => Err(format!("line number '{}' is too large", num)),
+            };
         }
         self.at_line_start = false;
 

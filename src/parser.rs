@@ -842,10 +842,10 @@ impl DataItem {
         if let Ok(n) = self.text.parse::<i32>() {
             return Literal::Integer(n as i64);
         }
-        if let Ok(f) = self.text.parse::<f64>() {
-            if f.is_finite() {
-                return Literal::Float(f);
-            }
+        if let Ok(f) = self.text.parse::<f64>()
+            && f.is_finite()
+        {
+            return Literal::Float(f);
         }
         Literal::String(self.text.clone())
     }
@@ -971,10 +971,10 @@ impl Parser {
     fn scan_proc_names(tokens: &[Token]) -> HashSet<String> {
         let mut names = HashSet::new();
         for pair in tokens.windows(2) {
-            if matches!(pair[0], Token::Sub | Token::Function) {
-                if let Token::Ident(n) = &pair[1] {
-                    names.insert(n.to_uppercase());
-                }
+            if matches!(pair[0], Token::Sub | Token::Function)
+                && let Token::Ident(n) = &pair[1]
+            {
+                names.insert(n.to_uppercase());
             }
         }
         names
@@ -2849,10 +2849,10 @@ impl Parser {
         let tok = self.advance();
         if let Token::Ident(name) = &tok {
             let mut chars = name.chars();
-            if let (Some(c), None) = (chars.next(), chars.next()) {
-                if c.is_ascii_alphabetic() {
-                    return Ok(c);
-                }
+            if let (Some(c), None) = (chars.next(), chars.next())
+                && c.is_ascii_alphabetic()
+            {
+                return Ok(c);
             }
         }
         err(format!(

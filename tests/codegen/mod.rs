@@ -117,15 +117,15 @@ fn test_small_arguments_use_32_bit_registers() {
     for line in asm.lines().map(str::trim_start) {
         for reg in ["rdi", "rsi", "rdx", "rcx", "r8", "r9"] {
             let wide = format!("mov {}, ", reg);
-            if let Some(rest) = line.strip_prefix(&wide) {
-                if let Ok(v) = rest.parse::<i64>() {
-                    assert!(
-                        !(0..=u32::MAX as i64).contains(&v),
-                        "`{}` should have used the 32-bit register:\n{}",
-                        line,
-                        asm
-                    );
-                }
+            if let Some(rest) = line.strip_prefix(&wide)
+                && let Ok(v) = rest.parse::<i64>()
+            {
+                assert!(
+                    !(0..=u32::MAX as i64).contains(&v),
+                    "`{}` should have used the 32-bit register:\n{}",
+                    line,
+                    asm
+                );
             }
         }
     }
@@ -795,21 +795,22 @@ fn test_no_runtime_helper_falls_through() {
             let mut previous: Option<String> = None;
             for line in text.lines() {
                 let t = line.trim();
-                if t.starts_with("_rt_") && t.ends_with(':') {
-                    if let Some(prev) = &previous {
-                        let op = prev.split_whitespace().next().unwrap_or("");
-                        // `_rt_error` never returns, so reaching a label after
-                        // a call to it is not a fall-through.
-                        let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
-                            || prev.starts_with("call _rt_error");
-                        assert!(
-                            terminal,
-                            "{} falls into {} from `{}`",
-                            path.display(),
-                            t,
-                            prev
-                        );
-                    }
+                if t.starts_with("_rt_")
+                    && t.ends_with(':')
+                    && let Some(prev) = &previous
+                {
+                    let op = prev.split_whitespace().next().unwrap_or("");
+                    // `_rt_error` never returns, so reaching a label after
+                    // a call to it is not a fall-through.
+                    let terminal = matches!(op, "ret" | "jmp" | "ud2" | "hlt")
+                        || prev.starts_with("call _rt_error");
+                    assert!(
+                        terminal,
+                        "{} falls into {} from `{}`",
+                        path.display(),
+                        t,
+                        prev
+                    );
                 }
                 // Track the last thing that is an instruction: not a comment,
                 // not a directive, and not a label -- including the

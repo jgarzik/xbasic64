@@ -114,10 +114,11 @@ fn split_helpers(part: &str, template: &str) -> String {
     // trees is immediately followed by `_rt_x:`, which a test enforces.
     let mut output = String::with_capacity(part.len() + part.len() / 8);
     for line in part.lines() {
-        if let Some(name) = line.strip_prefix(".globl ").map(str::trim) {
-            if exported.contains(&name) && name.starts_with("_rt_") {
-                output.push_str(&template.replace("{}", name));
-            }
+        if let Some(name) = line.strip_prefix(".globl ").map(str::trim)
+            && exported.contains(&name)
+            && name.starts_with("_rt_")
+        {
+            output.push_str(&template.replace("{}", name));
         }
         output.push_str(line);
         output.push('\n');
