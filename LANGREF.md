@@ -384,8 +384,8 @@ the leading blank's place. A string is written exactly as it is.
 A value below one drops its leading zero (`.5`, not `0.5`), and an exponent is
 spelled with `D` for a DOUBLE and `E` for a SINGLE: `1D+20`, `1.5E-10`.
 
-A comma moves to the start of the next 14-column zone, padding with blanks; if
-the line is already past the last zone it moves to the next line. `WRITE` and
+A comma moves to the start of the next 14-column zone, padding with blanks.
+There is no line width, so the zones go on as far as the line does. `WRITE` and
 `PRINT USING` are unaffected -- `WRITE` pads nothing, because its output is
 meant to be read back by `INPUT`, and `PRINT USING` lays out its own.
 
@@ -1577,24 +1577,20 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 ### Deliberate Differences from GW-BASIC
 
 These are places where a GW-BASIC program will behave differently here. They
-are choices, not oversights, and each is checked by a test.
+are choices, not oversights.
 
-7. **Numbers print bare** - GW-BASIC pads a number with a leading space for the
-   sign and a trailing one; `PRINT 42` here writes `42` and nothing else.
-   `STR$` matches `PRINT` exactly, so it also omits GW-BASIC's leading space
-   and round-trips through `VAL`.
-
-8. **Assignment to an integer truncates** - `A% = 7.9` gives 7, where GW-BASIC
+7. **Assignment to an integer truncates** - `A% = 7.9` gives 7, where GW-BASIC
    rounds to 8. `CINT` does round, half to even, as QuickBASIC does, so use
    `A% = CINT(X)` when rounding is what is wanted.
 
-9. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
-   elements on first use. Here that is `Array used before DIM`, because the
-   implicit version silently hides a typo.
+8. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
+   elements on first use. Here an array with no `DIM` anywhere is a compile
+   error, because the implicit version silently hides a typo; one whose `DIM`
+   has not run yet is `Array used before DIM` at run time.
 
-10. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
-    `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
+9. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
+   `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
 
-11. **`LOC` on a sequential file counts 128-byte blocks**, which is what
+10. **`LOC` on a sequential file counts 128-byte blocks**, which is what
     GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
     because the number is useful.

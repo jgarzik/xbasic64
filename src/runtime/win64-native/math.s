@@ -46,7 +46,8 @@ _cls_bytes_written: .skip 8
 # Returns a pseudo-random number in the range [0, 1).
 #
 # Arguments:
-#   xmm0 = seed parameter (currently ignored)
+#   xmm0 = the argument, as GW-BASIC reads it: RND(0) repeats the last
+#          number, RND(<0) reseeds from the value first, RND(>0) is the next
 #
 # Returns:
 #   xmm0 = random double in [0, 1)
