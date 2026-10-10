@@ -596,32 +596,9 @@ FOR I& = 1 TO 50000
 NEXT I&
 PRINT LEN(A$); LEN(B$); LEN(C$); LEN(S$(3))
 "#;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bas = tmp.path().join("churn.bas");
-    let exe = tmp.path().join("churn");
-    std::fs::write(&bas, src).unwrap();
-    let c = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg(&bas)
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .unwrap();
-    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
-    let run = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("ulimit -v 262144 && exec {}", exe.display()))
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "stdout {} stderr {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&run.stdout).trim(),
-        "1006  10  1000  100"
-    );
+    let run = crate::common::run_with_address_space_limit(src, 262144);
+    run.assert_ran_to_completion("under a 256 MB address-space limit");
+    assert_eq!(run.stdout.trim(), "1006  10  1000  100");
 }
 
 /// A statement left by a trapped error frees its temporaries too: the
@@ -661,29 +638,9 @@ RESUME TOP
 DONE:
 PRINT LEN(F); I&
 "#;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let bas = tmp.path().join("leak.bas");
-    let exe = tmp.path().join("leak");
-    std::fs::write(&bas, src).unwrap();
-    let c = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg(&bas)
-        .arg("-o")
-        .arg(&exe)
-        .output()
-        .unwrap();
-    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
-    let run = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("ulimit -v 262144 && exec {}", exe.display()))
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "stdout {} stderr {}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "20000  20001");
+    let run = crate::common::run_with_address_space_limit(src, 262144);
+    run.assert_ran_to_completion("under a 256 MB address-space limit");
+    assert_eq!(run.stdout.trim(), "20000  20001");
 }
 
 /// The places a string changes hands, each with a later reassignment that

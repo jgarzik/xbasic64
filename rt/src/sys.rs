@@ -550,11 +550,29 @@ mod windows {
     /// assembly runtime's CreateFileA did with FILE_SHARE_READ: a second
     /// writer is refused, which is "Permission denied".
     ///
+    /// And not inherited (`N`): the C library's handles are inheritable by
+    /// default, so a child process started while the file was open -- by a
+    /// test, or by the compiler around a program it runs -- kept a write
+    /// handle of its own, and the program's next OPEN of the file, refusing
+    /// other writers, was "Permission denied" while the child lived.
+    ///
     /// # Safety
     /// Both must be NUL-terminated.
     pub unsafe fn open(name: *const c_char, mode: *const c_char) -> *mut FILE {
         const _SH_DENYWR: c_int = 0x20;
-        unsafe { _fsopen(name, mode, _SH_DENYWR) }
+        // The mode, then N. Modes are a few letters ("r+b" at most).
+        let mut with_n = [0u8; 8];
+        let mut n = 0;
+        while n < with_n.len() - 2 {
+            let c = unsafe { *mode.add(n) } as u8;
+            if c == 0 {
+                break;
+            }
+            with_n[n] = c;
+            n += 1;
+        }
+        with_n[n] = b'N';
+        unsafe { _fsopen(name, with_n.as_ptr().cast(), _SH_DENYWR) }
     }
 
     /// Why the open just made failed. errno alone cannot say: the CRT maps

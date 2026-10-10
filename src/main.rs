@@ -2,19 +2,21 @@
 //!
 //! Compiles 1980s-era BASIC programs to native executables (x86-64, aarch64).
 //! Code generation is Cranelift, which writes the object file; the program is
-//! linked with `cc` on Linux and MSVC `link.exe` on Windows.
+//! linked with `cc` on Linux and macOS and MSVC `link.exe` on Windows. Or
+//! `xbasic64 run` compiles a program into memory and runs it at once (`jit`).
 
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
 mod codegen;
+mod jit;
 mod lexer;
 mod parser;
 mod rtsig;
 mod runtime;
 mod sema;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -23,9 +25,14 @@ use std::process::Command;
 #[derive(Parser)]
 #[command(name = "xbasic64")]
 #[command(about = "Compiles 1980s-era BASIC programs to native executables")]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct Args {
+    #[command(subcommand)]
+    mode: Option<Mode>,
+
     /// Input BASIC source file
-    input: String,
+    #[arg(required = true)]
+    input: Option<String>,
 
     /// Output file name
     #[arg(short, long)]
@@ -41,6 +48,19 @@ struct Args {
     /// Named `no_checks` because `unsafe` is a Rust keyword.
     #[arg(long = "unsafe")]
     no_checks: bool,
+}
+
+#[derive(Subcommand)]
+enum Mode {
+    /// Compile a program into memory and run it, without an executable
+    Run {
+        /// Input BASIC source file
+        input: String,
+
+        /// Disable runtime safety checks (array bounds, division by zero, overflow)
+        #[arg(long = "unsafe")]
+        no_checks: bool,
+    },
 }
 
 /// Format a diagnostic position as `file:line`, or just `file` when the line is
@@ -82,9 +102,16 @@ fn looks_like_coreutils_link(stderr: &str) -> bool {
 }
 
 fn main() {
-    let args = Args::parse();
-
-    let input_file = &args.input;
+    let mut args = Args::parse();
+    let run = match args.mode.take() {
+        Some(Mode::Run { input, no_checks }) => {
+            args.input = Some(input);
+            args.no_checks = no_checks;
+            true
+        }
+        None => false,
+    };
+    let input_file = &args.input.clone().expect("clap requires an input file");
 
     // Read source file
     let source = match fs::read_to_string(input_file) {
@@ -141,6 +168,12 @@ fn main() {
     let opts = codegen::Options {
         checks: !args.no_checks,
     };
+    if run {
+        // Runs the program, which ends the process; back only on failure.
+        let e = jit::run(&program, &symbols, opts);
+        eprintln!("{}: error: {}", input_file, e);
+        std::process::exit(1);
+    }
     let output = match codegen::generate(&program, symbols, opts, args.asm_only) {
         Ok(o) => o,
         Err(e) => {

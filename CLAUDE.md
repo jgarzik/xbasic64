@@ -23,6 +23,10 @@ cargo test strings::
 cargo run -- program.bas           # Output: program, beside the source
 cargo run -- program.bas -o out    # Custom output name
 cargo run -- -S program.bas        # Cranelift IR to <output>.clif instead (no object, no link)
+cargo run -- run program.bas       # Compile into memory and run it at once (the JIT)
+
+# The integration suite with every program run by `xbasic64 run`
+XB_JIT=1 cargo test --test integration
 ```
 
 ## Architecture
@@ -58,8 +62,14 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
   Every call goes through `FnGen::call`, which builds the call from it; tests
   read a call graph from `rt/src` and check that `fallible` is exactly "can
   reach `raise_with_code`" and `fresh` exactly "can reach `alloc_str`"
+- **jit.rs** - `xbasic64 run`: the same lowering (`codegen::lower`) into a
+  cranelift-jit `JITModule`, then main is called in-process. The runtime is
+  the `rt` crate linked into the compiler (feature `host`); `symbols()` gives
+  the JIT the address of every helper, runtime word and message, and C
+  function generated code names, since an executable exports none by name
 - **main.rs** - CLI driver: reads source, runs the pipeline, writes the object
-  and the runtime's, and links them with `cc` (or `link.exe`)
+  and the runtime's, and links them with `cc` (or `link.exe`); or, for the
+  `run` subcommand, hands the program to `jit.rs`
 - **build.rs** - Builds the runtime (`rt/`) with rustc for the target when the
   compiler is built: a `no_std` staticlib with fat LTO, of which only the
   crate's one merged object is kept (`$OUT_DIR/rt.o`; the rest of the
@@ -87,7 +97,9 @@ covers the workspace). In the runtime:
 Integration tests organized by feature area:
 - `integration.rs` - The one test crate: every module directory below is
   declared there, so a new one must be added
-- `common/mod.rs` - Test harness. `compile_and_run()` for the usual case;
+- `common/mod.rs` - Test harness. `XB_JIT=1` runs every program through
+  `xbasic64 run` instead of as an executable (CI runs the suite both ways).
+  `compile_and_run()` for the usual case;
   `compile_only()` for "this must be rejected, with this message";
   `compile_and_run_raw()` for "printed this, then aborted with this exit code";
   and `compile_to_clif()` / `uses_symbol()` for the IR the compiler generates
@@ -95,6 +107,8 @@ Integration tests organized by feature area:
 - `megatest/` - One large program (`mega.bas`) exercising most of the language
   at once, so that features are tested coexisting rather than in isolation. It
   is its own assertion harness: a regression names itself
+- `jit/` - What is particular to `xbasic64 run`: how the process ends, what
+  reaches stdout and stderr, and that it agrees with an executable
 - `codegen/` - Assertions on the Cranelift IR the compiler generates (through
   `common::compile_to_clif()`), and behavioural tests of code paths
   with special cases: constant divisors, scalars in SSA values, huge functions
@@ -124,10 +138,18 @@ Integration tests organized by feature area:
   a function gets no optimizer and the single-pass register allocator, since
   the backtracking one is superlinear with SSA values live across it; that
   code runs about 2x slower
-- **Every reference is colocated**: functions and data, the runtime's and libc's
-  included, are reached PC-relative (`call rel32` and RIP-relative on x86-64,
-  `bl` and adrp+add on aarch64); on Linux the link is `-no-pie`, and macOS,
-  where executables are always PIE, needs nothing more
+- **Every reference is colocated in an executable**: functions and data, the
+  runtime's and libc's included, are reached PC-relative (`call rel32` and
+  RIP-relative on x86-64, `bl` and adrp+add on aarch64); on Linux the link is
+  `-no-pie`, and macOS, where executables are always PIE, needs nothing more.
+  `CodeGen::colocate` says so; the JIT clears it
+- **The JIT's code model** (`jit.rs`): the runtime and libc are the
+  compiler's own, anywhere in its address space, so a reference to them is
+  an absolute address (Cranelift's default for an import). The program's
+  own code and data stay PC-relative, which needs them within 2 GB: they
+  come from one arena, 64 MB, doubled -- and the program lowered again --
+  when it runs out. A new runtime helper or C function needs an entry in
+  `jit::symbols()`, which a test holds to rtsig
 - **Native only, two ISAs**: Cranelift's `x86` and `arm64` backends are built
   in, and the compiler targets the host it was built for. aarch64 Linux can be
   checked on an x86-64 host under qemu-user: cross-build with

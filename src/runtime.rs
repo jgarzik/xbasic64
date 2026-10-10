@@ -17,11 +17,12 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    /// The runtime needs nothing but the C library and the program's DATA
-    /// table. In particular no part of `core` is left undefined -- a panic
-    /// path the build did not merge in -- since a program could not link.
+    /// The runtime needs nothing but the C library: no part of `core` -- a
+    /// panic path the build did not merge in -- since a program could not
+    /// link, and nothing of a program, so that it can run one compiled into
+    /// the compiler's own process.
     #[test]
-    fn test_runtime_needs_only_libc_and_the_program() {
+    fn test_runtime_needs_only_the_c_library() {
         let dir = tempfile::tempdir().unwrap();
         let obj = dir.path().join("rt.o");
         std::fs::write(&obj, OBJECT).unwrap();
@@ -36,6 +37,7 @@ mod tests {
             .filter(|s| s.starts_with("_R") || s.starts_with("_ZN") || s.contains("core"))
             .collect();
         assert!(foreign.is_empty(), "rt.o needs Rust symbols: {foreign:?}");
-        assert!(text.contains("_data_table"), "{text}");
+        // Nothing of a program: DATA is handed over by `_rt_data_init`.
+        assert!(!text.contains("_data_"), "{text}");
     }
 }

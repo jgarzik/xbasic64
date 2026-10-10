@@ -151,6 +151,55 @@ pub fn compile_only_flags(source: &str, flags: &[&str]) -> Result<(), CompileErr
     }
 }
 
+/// Whether the suite runs programs with `xbasic64 run` (in the compiler's
+/// own process, through the JIT) rather than as executables: `XB_JIT=1`.
+/// The whole suite runs both ways in CI; the two must agree.
+pub fn jit_mode() -> bool {
+    std::env::var("XB_JIT").is_ok_and(|v| v == "1")
+}
+
+/// Compile `bas_file` with `flags`, `Err` with the compiler's output if it
+/// does not compile: to the executable `exe_file`, or -- in JIT mode -- only
+/// as far as `-S`, so that a compile error stays apart from the run.
+fn compile_step(
+    bas_file: &std::path::Path,
+    exe_file: &std::path::Path,
+    flags: &[&str],
+) -> Result<(), String> {
+    let compile_output = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(bas_file)
+        .args(flags)
+        .args(if jit_mode() { &["-S"][..] } else { &[] })
+        .arg("-o")
+        .arg(exe_file)
+        .output()
+        .map_err(|e| format!("Failed to run compiler: {}", e))?;
+    if !compile_output.status.success() {
+        return Err(format!(
+            "Compilation failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&compile_output.stdout),
+            String::from_utf8_lossy(&compile_output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// The command that runs the program: the executable, or in JIT mode
+/// `xbasic64 run` on its source, with `flags`.
+fn program_command(
+    bas_file: &std::path::Path,
+    exe_file: &std::path::Path,
+    flags: &[&str],
+) -> Command {
+    if jit_mode() {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_xbasic64"));
+        c.arg("run").arg(bas_file).args(flags);
+        c
+    } else {
+        Command::new(exe_file)
+    }
+}
+
 /// Compile and run, returning `Ok` **regardless of the program's exit status**.
 ///
 /// `Err` is reserved for compilation failure. This is the primitive the other
@@ -185,24 +234,9 @@ pub fn compile_and_run_env(
     let exe_file = tmp.path().join("test");
 
     fs::write(&bas_file, source).map_err(|e| e.to_string())?;
+    compile_step(&bas_file, &exe_file, flags)?;
 
-    let compile_output = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg(&bas_file)
-        .args(flags)
-        .arg("-o")
-        .arg(&exe_file)
-        .output()
-        .map_err(|e| format!("Failed to run compiler: {}", e))?;
-
-    if !compile_output.status.success() {
-        return Err(format!(
-            "Compilation failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&compile_output.stdout),
-            String::from_utf8_lossy(&compile_output.stderr)
-        ));
-    }
-
-    let mut child = Command::new(&exe_file)
+    let mut child = program_command(&bas_file, &exe_file, flags)
         // Run inside the temp dir, so a program that opens a file by a bare
         // name writes it there and it dies with the TempDir. Without this the
         // program inherited the test runner's directory -- the repository root
@@ -233,6 +267,81 @@ pub fn compile_and_run_env(
         stdout: String::from_utf8_lossy(&run_output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&run_output.stderr).to_string(),
         exit_code: run_output.status.code(),
+    })
+}
+
+/// Compile `source` and run it under an address-space limit of `kb` KB
+/// (`ulimit -v`, which only Linux enforces), as an executable or -- in JIT
+/// mode -- with the compiler, the JIT's arena and the program all within it.
+#[cfg(target_os = "linux")]
+pub fn run_with_address_space_limit(source: &str, kb: u32) -> RunOutput {
+    let tmp = TempDir::new().unwrap();
+    let bas_file = tmp.path().join("test.bas");
+    let exe_file = tmp.path().join("test");
+    fs::write(&bas_file, source).unwrap();
+    compile_step(&bas_file, &exe_file, &[]).unwrap();
+    let program = program_command(&bas_file, &exe_file, &[]);
+    let line: Vec<String> = std::iter::once(program.get_program())
+        .chain(program.get_args())
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v {kb} && exec \"$@\"",))
+        .arg("sh")
+        .args(&line)
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    RunOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        exit_code: out.status.code(),
+    }
+}
+
+/// Run `source` with `xbasic64 run` -- compiled into memory and run in the
+/// compiler's own process -- from a temp dir, with `stdin_input` and extra
+/// `flags`. Like [`compile_and_run_raw`], `Ok` whatever the program did; but
+/// here a compile error is the same process failing, so it is in the
+/// output too (exit 1, with the diagnostic on stderr).
+pub fn run_jit(source: &str, stdin_input: &str, flags: &[&str]) -> Result<RunOutput, String> {
+    let tmp = TempDir::new().map_err(|e| e.to_string())?;
+    run_jit_in(&tmp, source, stdin_input, flags)
+}
+
+/// [`run_jit`] in the directory `dir`, which files the program opens are in.
+pub fn run_jit_in(
+    dir: &TempDir,
+    source: &str,
+    stdin_input: &str,
+    flags: &[&str],
+) -> Result<RunOutput, String> {
+    let bas_file = dir.path().join("test.bas");
+    fs::write(&bas_file, source).map_err(|e| e.to_string())?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg("run")
+        .arg(&bas_file)
+        .args(flags)
+        .current_dir(dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run the compiler: {}", e))?;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(stdin_input.as_bytes())
+        .map_err(|e| format!("Failed to write to stdin: {}", e))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for the compiler: {}", e))?;
+    Ok(RunOutput {
+        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+        exit_code: out.status.code(),
     })
 }
 
@@ -316,25 +425,10 @@ where
     setup(tmp.path())?;
 
     fs::write(&bas_file, source).map_err(|e| e.to_string())?;
-
-    // Compile
-    let compile_output = Command::new(env!("CARGO_BIN_EXE_xbasic64"))
-        .arg(&bas_file)
-        .arg("-o")
-        .arg(&exe_file)
-        .output()
-        .map_err(|e| format!("Failed to run compiler: {}", e))?;
-
-    if !compile_output.status.success() {
-        return Err(format!(
-            "Compilation failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&compile_output.stdout),
-            String::from_utf8_lossy(&compile_output.stderr)
-        ));
-    }
+    compile_step(&bas_file, &exe_file, &[])?;
 
     // Run from the temp directory so relative file paths work
-    let run_output = Command::new(&exe_file)
+    let run_output = program_command(&bas_file, &exe_file, &[])
         .current_dir(tmp.path())
         .output()
         .map_err(|e| format!("Failed to run executable: {}", e))?;
