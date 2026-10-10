@@ -135,6 +135,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("SLEEP", "SLEEP is not implemented yet"),
     ("SHELL", "SHELL is not implemented yet"),
     ("ENVIRON$", "ENVIRON$ is not implemented yet"),
+    ("ENVIRON", "ENVIRON is not implemented yet"),
     ("KILL", "KILL is not implemented yet"),
     ("NAME", "NAME is not implemented yet"),
     ("FILES", "FILES is not implemented yet"),
@@ -186,6 +187,10 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("KEY", "KEY is not implemented yet"),
     ("ERDEV", "device error codes are specific to MS-DOS drivers"),
     (
+        "EXTERR",
+        "extended error codes are specific to MS-DOS; use ERR and ERL",
+    ),
+    (
         "ERDEV$",
         "device error codes are specific to MS-DOS drivers",
     ),
@@ -203,6 +208,10 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("LPRINT", "LPRINT is not implemented yet"),
     ("LPOS", "LPOS is not implemented yet"),
     (
+        "LCOPY",
+        "LCOPY copies the screen to a printer, which is not supported",
+    ),
+    (
         "CHAIN",
         "a compiled program cannot load another program's code",
     ),
@@ -213,6 +222,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("MERGE", "MERGE is an interpreter command"),
     ("LIST", "LIST is an interpreter command"),
     ("LLIST", "LLIST is an interpreter command"),
+    ("DELETE", "DELETE is an interpreter command"),
     ("NEW", "NEW is an interpreter command"),
     ("EDIT", "EDIT is an interpreter command"),
     ("RENUM", "RENUM is an interpreter command"),

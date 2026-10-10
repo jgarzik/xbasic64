@@ -1320,6 +1320,67 @@ fn test_documented_unimplemented_names_are_all_in_the_table() {
     }
 }
 
+/// Every GW-BASIC name the compiler does not provide is refused with its
+/// reason, whatever shape the statement takes.
+///
+/// Two gaps. Some names were missing from the table: `EXTERR(0)` compiled as
+/// an array nobody declared and read 0, and ENVIRON, LCOPY and DELETE fell
+/// through to "unknown subroutine". Others were in it, but their statement
+/// form -- `NAME a AS b`, `CIRCLE (x,y), r`, `KEY(1) ON` -- is not the shape of
+/// a call, so the parser failed on the AS, the comma or the ON before sema
+/// could give the reason, and the program was told only "unexpected AS".
+#[test]
+fn test_unsupported_statements_are_refused_with_their_reason() {
+    let cases = [
+        ("X = EXTERR(0): PRINT X\n", "MS-DOS"),
+        ("ENVIRON \"A=B\"\n", "not implemented yet"),
+        ("LCOPY\n", "printer"),
+        ("LLIST\n", "interpreter command"),
+        ("DELETE 10\n", "interpreter command"),
+        ("DELETE 10-20\n", "interpreter command"),
+        ("NAME \"a\" AS \"b\"\n", "NAME is not implemented yet"),
+        ("CIRCLE (5,5), 3\n", "graphics is not supported"),
+        ("VIEW (0,0)-(10,10)\n", "console windowing"),
+        ("WINDOW (0,0)-(1,1)\n", "graphics is not supported"),
+        ("VIEW PRINT 1 TO 10\n", "console windowing"),
+        ("KEY(1) ON\n", "KEY is not implemented yet"),
+        ("COM(1) ON\n", "serial-port event trapping"),
+        ("PEN ON\n", "light-pen input"),
+        ("STRIG ON\n", "joystick input"),
+        ("PLAY ON\n", "PLAY is not implemented yet"),
+        // Inside a block and a single-line IF, the refusal costs only the
+        // statement: the END IF and the rest of the program still parse.
+        ("IF 1 THEN\nPEN ON\nEND IF\nPRINT 1\n", "light-pen input"),
+        ("IF 1 THEN KEY(1) ON\n", "KEY is not implemented yet"),
+    ];
+    for (source, reason) in cases {
+        let err = compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains("is not supported") && err.contains(reason),
+            "{source:?} should be refused with its reason ({reason:?}), got:\n{}",
+            err.stderr
+        );
+        assert!(
+            !err.contains("unexpected") && !err.contains("unknown subroutine"),
+            "{source:?} fell through to a generic message:\n{}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// Refusing an unsupported statement at its first word must not take the
+/// name away where a program may still use it: as a label, or as the name of
+/// its own SUB.
+#[test]
+fn test_unsupported_names_still_work_as_labels_and_procedures() {
+    let out = compile_and_run("GOTO NAME\nPRINT \"skipped\"\nNAME: PRINT \"label\"\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["label"]);
+
+    let out = compile_and_run("SUB PEN (X)\nPRINT X\nEND SUB\nPEN 5\nCALL PEN(6)\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["5", "6"]);
+}
+
 /// A name cannot be both an array and a procedure, or an array and a builtin.
 ///
 /// `A(1)` has to resolve to one thing. Sema resolved such a clash in favour of

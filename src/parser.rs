@@ -735,14 +735,26 @@ pub enum ParseError {
     /// that was never closed. Without this the diagnostic lands on end of file,
     /// which is where the parser noticed rather than where the mistake is.
     ErrorAt(u32, String),
+    /// A statement refused for a reason the parser can state, with that
+    /// reason as a follow-up note -- the shape sema's diagnostics take, so a
+    /// refusal reads the same whichever pass makes it.
+    Refused(String, String),
 }
 
 impl ParseError {
     /// The line this error belongs to, if it names one of its own.
     fn line(&self) -> Option<u32> {
         match self {
-            ParseError::Error(_) => None,
+            ParseError::Error(_) | ParseError::Refused(..) => None,
             ParseError::ErrorAt(line, _) => Some(*line),
+        }
+    }
+
+    /// The follow-up line to print after the error, when there is one.
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            ParseError::Refused(_, note) => Some(note),
+            ParseError::Error(_) | ParseError::ErrorAt(..) => None,
         }
     }
 }
@@ -750,7 +762,9 @@ impl ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) => write!(f, "{}", msg),
+            ParseError::Error(msg) | ParseError::ErrorAt(_, msg) | ParseError::Refused(msg, _) => {
+                write!(f, "{}", msg)
+            }
         }
     }
 }
@@ -1144,6 +1158,56 @@ impl Parser {
             }
             _ => false,
         }
+    }
+
+    /// The reason to refuse a statement that begins with the name `name`, when
+    /// it is a GW-BASIC statement this compiler does not provide.
+    ///
+    /// Sema already refuses these names with a reason, but only once the
+    /// statement has parsed, and many of them have a shape no call has:
+    /// `NAME a AS b`, `CIRCLE (x, y), r`, `VIEW PRINT 1 TO 10`, `KEY(1) ON`.
+    /// Those failed on the AS, the comma or the ON, so the program was told
+    /// "unexpected AS" about a statement whose only problem is that it is not
+    /// implemented. The parser now gives the reason itself, and the caller's
+    /// usual recovery skips the rest of the statement.
+    ///
+    /// Two shapes keep the name, because sema already decides them: an
+    /// assignment (`KEY(1) = 5`, `KEY.X = 5` on a record called KEY), and a
+    /// call to the program's own SUB of that name. A label (`NAME:`) never
+    /// reaches here.
+    fn unsupported_statement(&self, name: &str) -> Option<&'static str> {
+        if self.declared_procs.contains(&name.to_uppercase()) || self.at_assignment() {
+            return None;
+        }
+        crate::sema::unsupported_reason(name)
+    }
+
+    /// True if the name at the current position is the target of an
+    /// assignment: `v =`, `v(...) =`, or a field path `v.f` / `v(...).f`.
+    ///
+    /// The same shapes `parse_assignment_or_call` takes as one, looked at
+    /// without consuming anything.
+    fn at_assignment(&self) -> bool {
+        let mut i = 1;
+        if matches!(self.peek_at(i), Token::LParen) {
+            let mut depth = 0;
+            loop {
+                match self.peek_at(i) {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Token::Newline | Token::Colon | Token::Eof => return false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        matches!(self.peek_at(i), Token::Eq | Token::Dot)
     }
 
     /// True if the token after the current one is any identifier.
@@ -1596,7 +1660,13 @@ impl Parser {
                     {
                         err("TIMER ON, OFF and STOP control event trapping, which is not supported")
                     }
-                    _ => self.parse_assignment_or_call(),
+                    _ => match self.unsupported_statement(n) {
+                        Some(why) => Err(ParseError::Refused(
+                            format!("'{}' is not supported", n.to_uppercase()),
+                            why.to_string(),
+                        )),
+                        None => self.parse_assignment_or_call(),
+                    },
                 }
             }
             // Newline and Colon are consumed by the skip loop above, so

@@ -116,7 +116,7 @@ fn main() {
             input_file,
             &errors
                 .iter()
-                .map(|e| (e.line, e.to_string(), None))
+                .map(|e| (e.line, e.to_string(), e.error.note().map(str::to_string)))
                 .collect::<Vec<_>>(),
         ),
     };
