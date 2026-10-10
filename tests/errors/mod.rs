@@ -2740,3 +2740,48 @@ fn test_on_error_goto_0_in_a_handler_reraises() {
     let src = "10 ON ERROR GOTO 100\n20 ON ERROR GOTO 0\n30 PRINT \"armed no more\"\n40 END\n100 RESUME NEXT\n";
     assert_eq!(compile_and_run(src).unwrap().trim(), "armed no more");
 }
+
+/// A handler that leaves by GOTO -- re-arming with ON ERROR first -- carries
+/// on as the program, as in GW-BASIC. Into a FOR loop, the loop keeps its
+/// limit and step: the handler is main compiled a second time, and the
+/// loop it jumps into is that copy's, which used to have none, so the loop
+/// ended at the first NEXT.
+#[test]
+fn test_handler_leaving_by_goto_into_a_loop() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 FOR I = 1 TO 5\n30 X = 1 / 0\n40 NEXT I\n\
+         50 PRINT \"done\"; N; I\n60 END\n100 N = N + 1: ON ERROR GOTO 100: GOTO 40\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "done 5  6");
+}
+
+/// Trapping errors over and over while running the handler's code, which
+/// is what a handler that leaves by GOTO does, does not grow the stack.
+/// Each such error used to call the handler again from inside itself, and
+/// enough of them overflowed the stack.
+#[test]
+fn test_repeated_traps_after_goto_out_of_a_handler() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 X = 1 / 0\n30 N = N + 1\n40 IF N < 1000000 THEN X = 1 / 0\n\
+         50 PRINT N\n60 END\n100 ON ERROR GOTO 100: GOTO 30\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1000000");
+}
+
+/// An error raised in code the handler reached by GOTO is handled there,
+/// and RESUME NEXT goes on after the statement that raised it.
+#[test]
+fn test_resume_after_an_error_in_the_handlers_code() {
+    let out = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 X = 1 / 0\n30 PRINT \"never\"\n40 END\n\
+         100 PRINT \"h1\"\n110 ON ERROR GOTO 200\n120 GOTO 300\n\
+         200 PRINT \"h2\"; ERL\n210 RESUME NEXT\n300 Y = 1 / 0\n310 PRINT \"after 300\"\n320 END\n",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["h1", "h2 300", "after 300"]
+    );
+}

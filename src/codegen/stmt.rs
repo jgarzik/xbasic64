@@ -699,8 +699,27 @@ impl FnGen<'_> {
         let ty = num_type(ct);
         let e = self.gen_expr(end);
         let e = self.coerce(e, ct).num();
+        // Main's handler is main compiled a second time, and may GOTO into
+        // a loop main started: in a trapping program both copies keep the
+        // loop's limit and step in the same place, so a NEXT in either
+        // sees them. Anywhere else they are SSA values.
+        let shared = (self.cg.traps && self.kind != FnKind::Proc).then(|| {
+            let key = end as *const Expr as usize;
+            let n = self.cg.for_slots.len();
+            match self.cg.for_slots.get(&key) {
+                Some(id) => *id,
+                None => {
+                    let id = self.cg.global(&format!("_for_{}", n), 16);
+                    self.cg.for_slots.insert(key, id);
+                    id
+                }
+            }
+        });
         let limit_var = self.b.declare_var(ty);
         self.b.def_var(limit_var, e);
+        if let Some(id) = shared {
+            self.store_num(ct, e, Loc::Data(id, 0));
+        }
 
         let st = match step {
             Some(x) => {
@@ -714,6 +733,9 @@ impl FnGen<'_> {
         };
         let step_var = self.b.declare_var(ty);
         self.b.def_var(step_var, st);
+        if let Some(id) = shared {
+            self.store_num(ct, st, Loc::Data(id, 8));
+        }
         self.free_temps();
 
         // Which way the loop runs is the step's sign, almost always written
@@ -728,7 +750,10 @@ impl FnGen<'_> {
         let exit = self.b.create_block();
         self.begin_block(head);
         let counter = self.load_place(&place).num();
-        let limit = self.b.use_var(limit_var);
+        let limit = match shared {
+            Some(id) => self.load_num(ct, Loc::Data(id, 0)),
+            None => self.b.use_var(limit_var),
+        };
         let past = |f: &mut Self, ascending: bool| -> Value {
             if ct.is_integer() {
                 let cc = if ascending {
@@ -754,7 +779,10 @@ impl FnGen<'_> {
                 self.brif(p, exit, body_b);
             }
             None => {
-                let stepv = self.b.use_var(step_var);
+                let stepv = match shared {
+                    Some(id) => self.load_num(ct, Loc::Data(id, 8)),
+                    None => self.b.use_var(step_var),
+                };
                 let neg = if ct.is_integer() {
                     self.b.ins().icmp_imm_s(IntCC::SignedLessThan, stepv, 0)
                 } else {
@@ -780,7 +808,10 @@ impl FnGen<'_> {
         // is done at the counter's own width, so a step past the type's
         // range is Overflow rather than a loop that never ends.
         let c = self.load_place(&place).num();
-        let stepv = self.b.use_var(step_var);
+        let stepv = match shared {
+            Some(id) => self.load_num(ct, Loc::Data(id, 8)),
+            None => self.b.use_var(step_var),
+        };
         let next = match ct {
             DataType::Integer => {
                 let a = self.b.ins().ireduce(types::I16, c);

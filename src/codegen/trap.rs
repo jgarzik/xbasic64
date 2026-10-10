@@ -51,11 +51,26 @@ impl FnGen<'_> {
         }
     }
 
+    /// The blocks RESUME and RESUME NEXT jump to when the error was in the
+    /// handler's own code, made on first use and filled with the rest.
+    fn local_resume_blocks(&mut self) -> (Block, Block) {
+        if let Some(b) = self.local_resume {
+            return b;
+        }
+        let b = (self.b.create_block(), self.b.create_block());
+        self.local_resume = Some(b);
+        b
+    }
+
     /// The fault blocks of this function's statements.
     pub(super) fn fill_fault_blocks(&mut self) {
-        let mut faults: Vec<_> = self.faults.values().copied().collect();
-        faults.sort_by_key(|(f, _, _)| *f);
-        for (fault, st, sn) in faults {
+        let mut faults: Vec<_> = self.faults.iter().map(|(id, b)| (*id, *b)).collect();
+        faults.sort_by_key(|(id, _)| *id);
+        if self.kind == FnKind::Handler {
+            self.fill_local_faults(&faults);
+            return self.fill_unwind();
+        }
+        for (_, (fault, st, sn)) in faults {
             let unwind = self.unwind();
             self.b.switch_to_block(fault);
             let p = self.load_rt_word("_err_pending");
@@ -75,7 +90,58 @@ impl FnGen<'_> {
             let is2 = self.b.ins().icmp_imm_s(IntCC::Equal, r, 2);
             self.brif(is2, sn, unwind);
         }
+        self.fill_unwind();
+    }
 
+    /// The handler's fault blocks: an error in its own code goes back to
+    /// its entry, noting the statement, and RESUME then returns there.
+    fn fill_local_faults(&mut self, faults: &[(usize, (Block, Block, Block))]) {
+        let local = self.local_fault.expect("in the handler");
+        let dispatch = self.handler_dispatch.expect("in the handler");
+        for (id, (fault, _, _)) in faults {
+            let unwind = self.unwind();
+            self.b.switch_to_block(*fault);
+            let p = self.load_rt_word("_err_pending");
+            let trapped = self.b.ins().icmp_imm_s(IntCC::Equal, p, 1);
+            let handle = self.b.create_block();
+            self.brif(trapped, handle, unwind);
+            self.b.switch_to_block(handle);
+            self.store_rt_word("_err_pending", 0);
+            let n = self.iconst(types::I64, *id as i64 + 1);
+            self.b.def_var(local, n);
+            self.b.ins().jump(dispatch, &[]);
+        }
+        if let Some((same_b, next_b)) = self.local_resume {
+            let first = faults.first().map_or(0, |(id, _)| *id);
+            for (block, next) in [(same_b, false), (next_b, true)] {
+                self.b.switch_to_block(block);
+                let lf = self.b.use_var(local);
+                let zero = self.iconst(types::I64, 0);
+                self.b.def_var(local, zero);
+                let idx = self.b.ins().iadd_imm_s(lf, -(first as i64) - 1);
+                let last = faults.last().map_or(0, |(id, _)| *id);
+                let bad = self.b.create_block();
+                let targets: Vec<Block> = (first..=last)
+                    .map(|id| match faults.iter().find(|(i, _)| *i == id) {
+                        Some((_, (_, st, sn))) => {
+                            if next {
+                                *sn
+                            } else {
+                                *st
+                            }
+                        }
+                        None => bad,
+                    })
+                    .collect();
+                self.br_table(idx, &targets, bad);
+                self.b.switch_to_block(bad);
+                self.b.ins().trap(TrapCode::unwrap_user(1));
+            }
+        }
+    }
+
+    /// Main's unwind block, or the handler's.
+    fn fill_unwind(&mut self) {
         // Main's unwind: a RESUME <label> arrives here once every procedure
         // between has left, and goes on to the label, by number -- or to a
         // GOSUB return site, when the handler RETURNed (`_err_pending` 3).
@@ -153,6 +219,20 @@ impl FnGen<'_> {
         self.handler_ret = Some(ret);
         self.branch_targets = ssa::branch_targets(&program.statements);
 
+        // An error raised in the handler's own code -- which it reaches by
+        // GOTO, re-armed, and runs as the program from then on -- comes back
+        // here rather than calling the handler again from inside itself:
+        // that nested one call deeper per error, and a program that kept
+        // erroring overflowed the stack. `local_fault` says which statement
+        // it was, for RESUME.
+        let local = self.b.declare_var(types::I64);
+        let zero = self.iconst(types::I64, 0);
+        self.b.def_var(local, zero);
+        self.local_fault = Some(local);
+        let dispatch = self.b.create_block();
+        self.handler_dispatch = Some(dispatch);
+        self.begin_block(dispatch);
+
         // Enter at the armed target, by number.
         let h = self.load_rt_word("_err_handler");
         let idx = self.b.ins().iadd_imm_s(h, -1);
@@ -195,8 +275,22 @@ impl FnGen<'_> {
                 self.raise_if(idle, RtError::ResumeNoError);
                 self.store_rt_word("_err_active", 0);
                 match target {
-                    ResumeTarget::Same => self.handler_return(1),
-                    ResumeTarget::Next => self.handler_return(2),
+                    ResumeTarget::Same | ResumeTarget::Next => {
+                        // Back to a statement of the handler's own code, if
+                        // that is where the error was; otherwise to the
+                        // fault site that called the handler.
+                        let next = matches!(target, ResumeTarget::Next);
+                        let (same_b, next_b) = self.local_resume_blocks();
+                        let local = self.local_fault.expect("in the handler");
+                        let lf = self.b.use_var(local);
+                        let here = self.b.create_block();
+                        let away = self.b.create_block();
+                        self.brif(lf, here, away);
+                        self.switch_sealed(here);
+                        self.jump(if next { next_b } else { same_b });
+                        self.switch_sealed(away);
+                        self.handler_return(if next { 2 } else { 1 });
+                    }
                     ResumeTarget::At(t) => {
                         let idx = self.resume_index(t);
                         let rl = self.rt_label_addr();

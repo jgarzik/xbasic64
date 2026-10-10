@@ -282,6 +282,10 @@ pub struct CodeGen {
     stmt_count: usize,
     /// Module-level scalars that must stay in memory (see `ssa.rs`).
     module_in_memory: HashSet<String>,
+    /// In a trapping program, the limit and step of each FOR in main, by
+    /// the address of its limit expression: shared by main and the handler,
+    /// which is main compiled a second time and may GOTO into the loop.
+    for_slots: HashMap<usize, DataId>,
 }
 
 /// Lower `program` to an object file.
@@ -323,6 +327,7 @@ pub fn generate(
         resume_targets: Vec::new(),
         stmt_count: 0,
         module_in_memory: HashSet::new(),
+        for_slots: HashMap::new(),
     };
 
     for stmt in &program.statements {
@@ -851,6 +856,12 @@ struct FnGen<'a> {
     unwind_block: Option<Block>,
     /// The handler's return, taking the code it returns.
     handler_ret: Option<Block>,
+    /// In the handler: its entry, which dispatches on `_err_handler`; the
+    /// statement that faulted in the handler's own code, plus one, or 0; and
+    /// the blocks RESUME and RESUME NEXT go to when that is set.
+    handler_dispatch: Option<Block>,
+    local_fault: Option<Variable>,
+    local_resume: Option<(Block, Block)>,
 
     func_refs: HashMap<FuncId, FuncRef>,
     data_gvs: HashMap<DataId, GlobalValue>,
@@ -893,6 +904,9 @@ impl<'a> FnGen<'a> {
             faults: HashMap::new(),
             unwind_block: None,
             handler_ret: None,
+            handler_dispatch: None,
+            local_fault: None,
+            local_resume: None,
             func_refs: HashMap::new(),
             data_gvs: HashMap::new(),
             current_line: 0,
