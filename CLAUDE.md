@@ -44,7 +44,8 @@ Source → Lexer → Parser → Sema → CodeGen → Object → Executable
   never has to guess what a name means
 - **codegen/** - Lowers the AST to Cranelift IR with a `FunctionBuilder`, one
   function at a time (`FnGen`), into an `ObjectModule` (`CodeGen`): `storage.rs`
-  (where names live), `ssa.rs` (which scalars live in SSA values), `strings.rs`
+  (where names live), `ssa.rs` (which scalars live in SSA values), `hoist.rs`
+  (array descriptors read once per loop), `strings.rs`
   (string ownership), `expr.rs`, `builtins.rs`, `stmt.rs`, `calls.rs`
   (procedures and by-reference calls), `io.rs`, `trap.rs` (ON ERROR)
 - **rtbuild.rs** - The hand-written x86-64 runtime library's trees
@@ -97,6 +98,10 @@ Integration tests organized by feature area:
   objects, a procedure's own in stack slots zeroed on entry. No plain SSA
   value lives across a statement, since one defined in a statement would not
   dominate the statements GOTO can reach
+- **Clean loops read array descriptors once** (`codegen/hoist.rs`): a loop
+  nothing in which can change one -- no DIM/REDIM/ERASE, call, GOSUB/RETURN,
+  branched-to label, nor ON ERROR anywhere -- reads each array's pointer,
+  counts and lower bounds into `Variable`s before its head
 - **Huge functions are compiled cheaply**: past `HUGE_FUNCTION_BLOCKS` (20,000)
   a function gets no optimizer and the single-pass register allocator, since
   the backtracking one is superlinear with SSA values live across it; that

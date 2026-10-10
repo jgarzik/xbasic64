@@ -581,6 +581,93 @@ PRINT T#
     assert_eq!(got, vec!["9", "23", "90"]);
 }
 
+/// A loop whose body cannot change the array's descriptor reads it once,
+/// before its head: no block of the loop but the cold one that creates the
+/// array loads a word of `_arr_A`.
+///
+/// The loop is found as Cranelift sees it: the blocks that can reach
+/// themselves. A descriptor load is a load from a `symbol_value` of the
+/// array's data object.
+#[test]
+fn test_clean_loop_loads_no_descriptor_word() {
+    let src = "DIM A(99)\nFOR I = 0 TO 99: A(I) = A(I) + 1: NEXT\nPRINT A(5)\n";
+    let clif = compile_to_clif(src).expect("the program must compile");
+    let main = clif
+        .split_once("function u0:0(")
+        .and_then(|(_, f)| f.split_once("\n}\n"))
+        .map(|(f, _)| f)
+        .expect("main is in the IR");
+    let words = |l: &str| -> Vec<String> {
+        l.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':'))
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let data = clif
+        .lines()
+        .find_map(|l| l.strip_prefix("; ")?.strip_suffix(" = _arr_A"))
+        .expect("A has a descriptor");
+    let gv = main
+        .lines()
+        .find_map(|l| {
+            let (gv, sym) = l.trim().split_once(" = ")?;
+            (sym == format!("symbol colocated {data}")).then(|| gv.to_string())
+        })
+        .expect("main reaches the descriptor");
+
+    // Blocks in order: name, whether cold, successors, and whether the block
+    // loads a descriptor word.
+    let mut blocks: Vec<(String, bool, Vec<String>, bool)> = Vec::new();
+    let mut desc_values: Vec<String> = Vec::new();
+    for line in main.lines() {
+        if line.starts_with("block") {
+            let name = words(line)[0].trim_end_matches(':').to_string();
+            blocks.push((name, line.contains(" cold"), Vec::new(), false));
+            continue;
+        }
+        let Some(block) = blocks.last_mut() else {
+            continue;
+        };
+        let w = words(line);
+        if line.contains("symbol_value") && w.contains(&gv) {
+            desc_values.push(w[0].clone());
+        } else if line.contains(" load") && w.iter().any(|x| desc_values.contains(x)) {
+            block.3 = true;
+        }
+        block
+            .2
+            .extend(w.into_iter().filter(|x| x.starts_with("block")));
+    }
+    assert!(
+        blocks.iter().any(|b| b.3),
+        "the descriptor is read somewhere:\n{main}"
+    );
+
+    let index = |n: &str| blocks.iter().position(|b| b.0 == n).unwrap();
+    let in_loop = |start: usize| -> bool {
+        let mut seen = vec![false; blocks.len()];
+        let mut work: Vec<usize> = blocks[start].2.iter().map(|s| index(s)).collect();
+        while let Some(b) = work.pop() {
+            if b == start {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[b], true) {
+                work.extend(blocks[b].2.iter().map(|s| index(s)));
+            }
+        }
+        false
+    };
+    let looping: Vec<usize> = (0..blocks.len()).filter(|&b| in_loop(b)).collect();
+    assert!(!looping.is_empty(), "no loop found:\n{main}");
+    for b in looping {
+        assert!(
+            blocks[b].1 || !blocks[b].3,
+            "{} is in the loop and loads a descriptor word:\n{main}",
+            blocks[b].0
+        );
+    }
+}
+
 /// A scalar nothing else can reach lives in an SSA value, not in memory: the
 /// program's IR never names its storage.
 #[test]

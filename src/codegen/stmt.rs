@@ -237,6 +237,7 @@ impl FnGen<'_> {
                 let head = self.b.create_block();
                 let body_b = self.b.create_block();
                 let exit = self.b.create_block();
+                let saved = self.begin_hoist(Some(condition), body);
                 self.begin_block(head);
                 let c = self.gen_condition(condition);
                 self.free_temps();
@@ -248,6 +249,7 @@ impl FnGen<'_> {
                 self.loop_stack.pop();
                 self.b.ins().jump(head, &[]);
                 self.b.seal_block(head);
+                self.end_hoist(saved);
                 self.switch_sealed(exit);
             }
 
@@ -259,6 +261,7 @@ impl FnGen<'_> {
             } => {
                 let head = self.b.create_block();
                 let exit = self.b.create_block();
+                let saved = self.begin_hoist(condition.as_ref(), body);
                 self.begin_block(head);
                 if *cond_at_start && let Some(cond) = condition {
                     // DO WHILE leaves when false; DO UNTIL when true.
@@ -291,6 +294,7 @@ impl FnGen<'_> {
                     }
                 }
                 self.b.seal_block(head);
+                self.end_hoist(saved);
                 self.switch_sealed(exit);
             }
 
@@ -754,6 +758,7 @@ impl FnGen<'_> {
         let head = self.b.create_block();
         let body_b = self.b.create_block();
         let exit = self.b.create_block();
+        let saved = self.begin_hoist(None, body);
         self.begin_block(head);
         let counter = self.load_place(&place).num();
         let limit = match shared {
@@ -836,6 +841,7 @@ impl FnGen<'_> {
         self.store_place(&place, Val::Num(ct, next));
         self.b.ins().jump(head, &[]);
         self.b.seal_block(head);
+        self.end_hoist(saved);
         self.switch_sealed(exit);
     }
 

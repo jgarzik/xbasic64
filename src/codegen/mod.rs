@@ -44,6 +44,7 @@
 mod builtins;
 mod calls;
 mod expr;
+mod hoist;
 mod io;
 mod ssa;
 mod stmt;
@@ -842,6 +843,9 @@ struct FnGen<'a> {
     ssa_excluded: HashSet<String>,
     /// Labels something branches to; only these get a block.
     branch_targets: HashSet<String>,
+    /// Descriptors of arrays the loops being compiled read before their
+    /// heads, by upper-case name. See `hoist.rs`.
+    hoisted: HashMap<String, hoist::Hoisted>,
 
     /// Blocks of this function's labels, by symbol.
     labels: HashMap<String, Block>,
@@ -908,6 +912,7 @@ impl<'a> FnGen<'a> {
             ssa_enabled: false,
             ssa_excluded: HashSet::new(),
             branch_targets: HashSet::new(),
+            hoisted: HashMap::new(),
             labels: HashMap::new(),
             gosub_first: 0,
             gosub_blocks: Vec::new(),

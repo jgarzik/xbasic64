@@ -383,17 +383,7 @@ impl FnGen<'_> {
             .expect("sema checked the array exists");
         // Touching an element is what creates it; the bound read below is
         // then of the array that exists.
-        let ptr = self.load(types::I64, info.loc);
-        let create = self.b.create_block();
-        let have = self.b.create_block();
-        self.brif(ptr, have, create);
-        self.switch_sealed(create);
-        let desc = self.addr(info.loc);
-        let nd = self.iconst(types::I64, info.ndims as i64);
-        let es = self.iconst(types::I64, i64::from(self.elem_size_for(&arr)));
-        let base = self.iconst(types::I64, self.cg.symbols.option_base);
-        self.call_rt("_rt_array_autodim", &[desc, nd, es, base]);
-        self.begin_sealed(have);
+        self.autodim_if_null(&arr, info);
 
         let is_lower = upper == "LBOUND";
         let constant = match args.get(1) {

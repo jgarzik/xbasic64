@@ -377,7 +377,7 @@ impl FnGen<'_> {
     // ---- arrays ----
 
     /// Whether subscripts of `name` have a lower bound to take off.
-    fn array_has_lower(&self, name: &str) -> bool {
+    pub(super) fn array_has_lower(&self, name: &str) -> bool {
         self.cg.symbols.option_base != 0
             || self
                 .cg
@@ -395,8 +395,14 @@ impl FnGen<'_> {
     }
 
     /// Create `name` with GW-BASIC's default bounds if it has no storage yet.
+    ///
+    /// In a loop that read the descriptor before its head, the test is of
+    /// the pointer it read, and creating the array reads it again.
     pub(super) fn autodim_if_null(&mut self, name: &str, info: ArrayInfo) {
-        let ptr = self.load(types::I64, info.loc);
+        let ptr = match self.hoisted(name) {
+            Some(h) => self.b.use_var(h.ptr),
+            None => self.load(types::I64, info.loc),
+        };
         let create = self.b.create_block();
         let have = self.b.create_block();
         self.b.set_cold_block(create);
@@ -407,6 +413,7 @@ impl FnGen<'_> {
         let es = self.iconst(types::I64, i64::from(self.elem_size_for(name)));
         let base = self.iconst(types::I64, self.cg.symbols.option_base);
         self.call_rt("_rt_array_autodim", &[desc, nd, es, base]);
+        self.reread_hoisted(name, info);
         self.begin_sealed(have);
     }
 
@@ -440,7 +447,8 @@ impl FnGen<'_> {
     }
 
     /// The address of the element of `name` at the evaluated subscripts
-    /// `subs`, bounds-checked against the descriptor as it is now.
+    /// `subs`, bounds-checked against the descriptor as it is now -- or as a
+    /// loop that cannot change it read it before its head.
     pub(super) fn elem_addr(&mut self, name: &str, subs: &[Value]) -> Value {
         let info = self
             .lookup_array(name)
@@ -448,16 +456,23 @@ impl FnGen<'_> {
         let elem_size = self.elem_size_for(name);
         let ndims = subs.len() as i32;
         let has_lower = self.array_has_lower(name);
+        let hoisted = self.hoisted(name).filter(|h| h.counts.len() == subs.len());
 
         // Row-major: linear = ((i * dim1) + j) * dim2 + k.
         let mut linear: Option<Value> = None;
         for (i, &sub) in subs.iter().enumerate() {
             let mut sub = sub;
             if has_lower {
-                let lo = self.load(types::I64, info.loc.offset(8 * (1 + ndims + i as i32)));
+                let lo = match hoisted.as_ref().and_then(|h| h.lowers.get(i)) {
+                    Some(&v) => self.b.use_var(v),
+                    None => self.load(types::I64, info.loc.offset(8 * (1 + ndims + i as i32))),
+                };
                 sub = self.b.ins().isub(sub, lo);
             }
-            let count = self.load(types::I64, info.loc.offset(8 * (1 + i as i32)));
+            let count = match &hoisted {
+                Some(h) => self.b.use_var(h.counts[i]),
+                None => self.load(types::I64, info.loc.offset(8 * (1 + i as i32))),
+            };
             // One unsigned compare catches both a subscript below the lower
             // bound and one past the end.
             if self.cg.opts.checks {
@@ -477,7 +492,10 @@ impl FnGen<'_> {
         }
         let linear = linear.expect("at least one subscript");
         let off = self.b.ins().imul_imm_s(linear, i64::from(elem_size));
-        let base = self.load(types::I64, info.loc);
+        let base = match &hoisted {
+            Some(h) => self.b.use_var(h.ptr),
+            None => self.load(types::I64, info.loc),
+        };
         self.b.ins().iadd(base, off)
     }
 

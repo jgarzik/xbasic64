@@ -491,3 +491,250 @@ fn test_redim_preserve_shape_is_checked_under_unsafe() {
         run.stderr
     );
 }
+
+// ---- descriptors cached across a loop ----
+//
+// A loop whose body cannot change an array's descriptor reads the pointer,
+// counts and lower bounds once, before its head. These are the programs where
+// that would go wrong: the array created, moved or replaced inside the loop,
+// or the body entered other than through the head.
+
+/// An array first used inside a loop is created there, and later iterations
+/// use the array that now exists -- including when it is created on an
+/// iteration after the first.
+#[test]
+fn test_hoisted_loop_creates_array() {
+    let output = compile_and_run(
+        "\
+FOR I = 0 TO 10: B(I) = I * 2: NEXT
+PRINT B(3); B(10); UBOUND(B)
+FOR I = 1 TO 3
+IF I >= 2 THEN C(I) = I: T = T + C(I - 1)
+NEXT
+PRINT C(2); C(3); T
+I = 0
+WHILE I < 4: D%(I) = D%(I) + I: I = I + 1: WEND
+DO: E$(I) = STR$(I): I = I - 1: LOOP UNTIL I < 0
+PRINT D%(3); E$(4); LBOUND(E$); UBOUND(E$)
+",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["6  20  10", "2  3  2", "3  4 0  10"]
+    );
+}
+
+/// A loop that never runs creates nothing, so a DIM after it is not a
+/// Duplicate definition.
+#[test]
+fn test_zero_trip_loop_then_dim() {
+    let output = compile_and_run(
+        "\
+FOR I = 1 TO 0: A(I) = 1: NEXT
+DIM A(5)
+A(5) = 7
+N = 0
+WHILE N > 0: B%(N) = 1: WEND
+DIM B%(2 TO 3)
+B%(3) = 8
+DO WHILE N > 0: C$(N) = \"x\": LOOP
+DIM C$(1)
+C$(1) = \"y\"
+PRINT A(5); B%(3); C$(1)
+",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "7  8 y");
+}
+
+/// GOTO into a loop's body, from outside it and from inside it.
+#[test]
+fn test_goto_into_loop_body() {
+    let output = compile_and_run(
+        "\
+DIM A(5)
+I = 3
+GOTO Inside
+WHILE I < 5
+I = I + 1
+Inside:
+A(I) = A(I) + I
+WEND
+PRINT A(3); A(4); A(5)
+DIM B(5)
+FOR I = 0 TO 5
+IF I = 2 THEN GOTO Skip
+B(I) = I
+Skip:
+B(I) = B(I) + 10
+NEXT
+PRINT B(1); B(2); B(5)
+",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["3  4  5", "11  10  15"]);
+}
+
+/// REDIM and ERASE inside a loop: later iterations see the new block.
+#[test]
+fn test_redim_inside_loop() {
+    let output = compile_and_run(
+        "\
+DIM A(2)
+FOR I = 0 TO 5
+IF I > UBOUND(A) THEN REDIM PRESERVE A(I)
+A(I) = I * I
+NEXT
+PRINT A(5); UBOUND(A); A(3)
+FOR I = 0 TO 2
+B(I) = B(I) + 1
+IF I = 1 THEN ERASE B
+NEXT
+PRINT B(0); B(1); B(2)
+",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["25  5  9", "0  0  1"]);
+}
+
+/// A procedure called in the loop -- a SUB, or a FUNCTION in an expression --
+/// that REDIMs the shared array the loop indexes.
+#[test]
+fn test_loop_calling_procedure_that_redims() {
+    let output = compile_and_run(
+        "\
+DIM SHARED A(2)
+SUB Grow (N)
+REDIM PRESERVE A(N)
+END SUB
+FUNCTION Fit (N)
+IF N > UBOUND(A) THEN REDIM PRESERVE A(N + 1)
+Fit = N
+END FUNCTION
+FOR I = 0 TO 5
+IF I > UBOUND(A) THEN Grow I + 0
+A(I) = I + 100
+NEXT
+PRINT A(0); A(5); UBOUND(A)
+FOR I = 6 TO 9
+A(Fit(I)) = A(I - 1) + 1
+NEXT
+PRINT A(9); UBOUND(A)
+",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["100  105  5", "109  9"]);
+}
+
+/// Nested loops: one array indexed at both levels, one only inside.
+#[test]
+fn test_nested_hoisted_loops() {
+    let output = compile_and_run(
+        "\
+DIM M(3, 4), R(3)
+FOR I = 0 TO 3
+FOR J = 0 TO 4
+M(I, J) = I * 10 + J
+R(I) = R(I) + M(I, J)
+NEXT
+NEXT
+PRINT R(0); R(3); M(3, 4)
+I = 0
+WHILE I < 3
+J = 0
+DO WHILE J < 3
+Q%(I * 3 + J) = I + J
+J = J + 1
+LOOP
+R(I) = Q%(I * 3 + 2)
+I = I + 1
+WEND
+PRINT R(0); R(2); Q%(8)
+",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["10  160  34", "2  4  4"]
+    );
+}
+
+/// A SUB's loops over an array parameter, a local array and a STATIC one.
+#[test]
+fn test_hoisted_loop_in_sub() {
+    let output = compile_and_run(
+        "\
+SUB Fill (A(), N)
+FOR I = LBOUND(A) TO UBOUND(A)
+A(I) = I * N
+NEXT
+END SUB
+SUB Work
+DIM L(4)
+STATIC S()
+FOR I = 0 TO 4: L(I) = I + 1: NEXT
+FOR I = 0 TO 3: S(I) = S(I) + L(I + 1): NEXT
+PRINT L(4); S(3)
+END SUB
+DIM X(1 TO 4)
+Fill X(), 3
+PRINT X(1); X(4)
+Work
+Work
+",
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["3  12", "5  5", "5  10"]
+    );
+}
+
+/// Lower bounds from OPTION BASE 1 and from `lo TO hi`, read before the loop.
+#[test]
+fn test_hoisted_loop_lower_bounds() {
+    let output = compile_and_run(
+        "\
+OPTION BASE 1
+DIM A(3), B(5 TO 9), G(2 TO 3, 4 TO 5)
+FOR I = 1 TO 3: A(I) = I: NEXT
+FOR I = 5 TO 9: B(I) = I * A(1 + (I MOD 3)): NEXT
+FOR I = 2 TO 3: FOR J = 4 TO 5: G(I, J) = I * J: NEXT: NEXT
+FOR I = 1 TO 10: H(I) = I: NEXT
+PRINT B(5); B(9); G(3, 5); G(2, 4); H(10); LBOUND(H)
+",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "15  9  15  8  10  1");
+}
+
+/// A subscript out of range in a loop is reported on its own line, whether
+/// below a lower bound or past the end, in either dimension.
+#[test]
+fn test_hoisted_loop_subscript_errors() {
+    for (source, line) in [
+        ("DIM A(5)\nFOR I = 0 TO 9\nA(I) = I\nNEXT\n", 3),
+        (
+            "DIM B(5 TO 9)\nFOR I = 9 TO 0 STEP -1\nX = 1\nB(I) = I\nNEXT\n",
+            4,
+        ),
+        (
+            "DIM M(2, 3)\nFOR I = 0 TO 2\nFOR J = 0 TO 4\n\nM(I, J) = 1\nNEXT\nNEXT\n",
+            5,
+        ),
+        (
+            "OPTION BASE 1\nI = 3\nWHILE I >= 0\nC(I) = 1\nI = I - 1\nWEND\n",
+            4,
+        ),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr
+                .contains(&format!("Subscript out of range in {line}")),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
+}
