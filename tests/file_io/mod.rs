@@ -841,9 +841,12 @@ PRINT A$; B$
     assert_eq!(crate::common::lines(&output), vec!["onetwo"]);
 }
 
-/// INPUT # reads a numeric field as VAL reads a string, and reading when no
-/// field is left is "Input past end of file" (62). It used to read an empty
-/// field there, so a loop that forgot EOF() read zeros forever.
+/// INPUT # reads a numeric field's text as VAL reads a string, and reading
+/// when no field is left is "Input past end of file" (62). It used to read an
+/// empty field there, so a loop that forgot EOF() read zeros forever.
+///
+/// Unlike VAL, a blank ends a number read by INPUT #, so "1 2" is two numbers
+/// rather than 12: see `test_input_hash_number_ends_at_a_space`.
 #[test]
 fn test_input_hash_numbers_and_the_end_of_the_file() {
     let output = compile_and_run(
@@ -853,9 +856,9 @@ PRINT #1, "1 2, &HFF, 1D2, abc"
 CLOSE #1
 ON ERROR GOTO 100
 OPEN "n.txt" FOR INPUT AS #1
-INPUT #1, A, B, C, D
-PRINT A; B; C; D
-INPUT #1, E
+INPUT #1, A, B, C, D, E
+PRINT A; B; C; D; E
+INPUT #1, F
 PRINT "not reached"
 END
 100 PRINT "ERR"; ERR
@@ -864,7 +867,75 @@ END
     .unwrap();
     assert_eq!(
         crate::common::lines(&output),
-        vec!["12  255  100  0", "ERR 62"]
+        vec!["1  2  255  100  0", "ERR 62"]
+    );
+}
+
+/// A number read by INPUT # ends at a space, as in GW-BASIC: leading blanks
+/// and line breaks are skipped, and the number then runs to a space, a comma,
+/// CR or LF.
+///
+/// The field used to run to the next comma or line end with blanks inside it
+/// ignored, as VAL ignores them. So `PRINT #1, 1; 2; 3`, which writes
+/// " 1  2  3 " on one line, read back as the single number 123 and the next
+/// INPUT # failed with "Input past end of file"; " 1  2 -3 " read as 12.
+#[test]
+fn test_input_hash_number_ends_at_a_space() {
+    let output = compile_and_run(
+        r#"
+OPEN "s.txt" FOR OUTPUT AS #1
+PRINT #1, 1; 2; 3
+PRINT #1, 1; 2; -3
+PRINT #1, 4.5; -6
+CLOSE #1
+OPEN "s.txt" FOR INPUT AS #1
+INPUT #1, A, B, C
+PRINT A; B; C
+INPUT #1, A, B, C
+PRINT A; B; C
+INPUT #1, A, B
+PRINT A; B; EOF(1)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["1  2  3", "1  2 -3", "4.5 -6 -1"]
+    );
+}
+
+/// The other separators still separate, and a blank before one belongs to
+/// it: " 4 , 5 " is two numbers, not 4 then an empty field. A line read after
+/// the last number on a line is the next line, whether the file's lines end
+/// in LF or CRLF, and a string item still runs to its comma, blanks and all.
+#[test]
+fn test_input_hash_number_separators() {
+    let (output, _tmp) = compile_and_run_with_files(
+        r#"
+OPEN "sep.txt" FOR INPUT AS #1
+INPUT #1, A, B, C
+INPUT #1, D, E
+INPUT #1, F
+LINE INPUT #1, L$
+INPUT #1, G
+LINE INPUT #1, K$
+INPUT #1, S$, H
+LINE INPUT #1, M$
+PRINT A; B; C; D; E; F
+PRINT "["; L$; "]"; G; "["; K$; "]"; "["; S$; "]"; H; "["; M$; "]"
+"#,
+        |dir| {
+            fs::write(
+                dir.join("sep.txt"),
+                "1,2\n3\n 4 , 5 \n6\r\nline\n7  \r\nnext\na b,8\nlast\n",
+            )
+            .map_err(|e| e.to_string())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["1  2  3  4  5  6", "[line] 7 [next][a b] 8 [last]"]
     );
 }
 

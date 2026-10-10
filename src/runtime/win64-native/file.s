@@ -757,8 +757,14 @@ _rt_file_getc:
 # delimiter is discarded, or runs to the next comma, newline or end of file
 # with trailing blanks trimmed. The delimiter is consumed.
 #
+# An unquoted field read for a number also ends at a blank, as GW-BASIC's
+# INPUT # does; see the System V twin. Putting back the character that starts
+# the next field is a step back of one byte: reads here go straight to the
+# handle a byte at a time, so there is no buffer to push it into.
+#
 # Arguments:
 #   rcx = file number
+#   edx = 1 for a numeric item, 0 for a string
 #
 # Returns:
 #   rax = pointer to the field (in _file_input_buf), rdx = its length
@@ -771,10 +777,12 @@ _rt_file_read_field:
     push rbx
     push rsi
     push r12
-    sub rsp, 40                 # three pushes plus the return address
+    push r13
+    sub rsp, 32                 # shadow space; four pushes keep it aligned
 
     mov ebx, ecx                # file number, reloaded before every read
     xor r12d, r12d              # length written so far
+    mov r13d, edx               # numeric item
 
     # INPUT # needs a file that is open, and open for reading. _rt_file_getc
     # answers end-of-file for one that is not, so this read an empty field.
@@ -820,10 +828,62 @@ _rt_file_read_field:
     je .Lfield_trim
     cmp eax, CHAR_LF
     je .Lfield_trim
+    test r13d, r13d
+    jnz .Lfield_num_char
     cmp eax, CHAR_CR
     je .Lfield_plain_next
     mov esi, eax
     jmp .Lfield_plain_store
+
+.Lfield_num_char:
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9                  # tab
+    je .Lfield_num_blanks
+    cmp eax, CHAR_CR
+    je .Lfield_num_cr
+    mov esi, eax
+    jmp .Lfield_plain_store
+
+.Lfield_num_blanks:
+    # The number has ended at a blank. More blanks, then a comma or a line
+    # break, all belong to this field's delimiter.
+    mov ecx, ebx
+    call _rt_file_getc
+    cmp eax, ' '
+    je .Lfield_num_blanks
+    cmp eax, 9
+    je .Lfield_num_blanks
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, ','
+    je .Lfield_done
+    cmp eax, CHAR_LF
+    je .Lfield_done
+    cmp eax, CHAR_CR
+    je .Lfield_num_cr
+    jmp .Lfield_unread
+
+.Lfield_num_cr:
+    # A CR ends the number, and the LF of a CRLF goes with it: left behind, it
+    # would be an empty line to a LINE INPUT # that follows.
+    mov ecx, ebx
+    call _rt_file_getc
+    cmp eax, -1
+    je .Lfield_done
+    cmp eax, CHAR_LF
+    je .Lfield_done
+
+.Lfield_unread:
+    # Not a separator: the next field starts here, so step back over it.
+    # SetFilePointer(h, -1, NULL, FILE_CURRENT)
+    lea rax, [rip + _file_handles]
+    mov rcx, [rax + rbx*8]
+    mov edx, -1
+    xor r8d, r8d
+    mov r9d, 1                  # FILE_CURRENT
+    call SetFilePointer
+    jmp .Lfield_done
 
 .Lfield_trim:
     # Drop trailing blanks, which are separators rather than data.
@@ -874,7 +934,8 @@ _rt_file_read_field:
     mov BYTE PTR [rax + r12], 0
     mov rdx, r12
 
-    add rsp, 40
+    add rsp, 32
+    pop r13
     pop r12
     pop rsi
     pop rbx
@@ -896,6 +957,7 @@ _rt_file_input_number:
     mov rbp, rsp
     sub rsp, 32                 # shadow space
 
+    mov edx, 1                  # a number ends at a blank
     call _rt_file_read_field
     mov rcx, rax
     call _rt_scan_number        # rdx is the field's length already
@@ -915,6 +977,7 @@ _rt_file_input_number:
 # Returns:   rax = pointer, rdx = length
 .globl _rt_file_input_string
 _rt_file_input_string:
+    xor edx, edx                # a string runs to its comma
     jmp _rt_file_read_field
 
 # _rt_file_line_input - LINE INPUT #: read a whole line
