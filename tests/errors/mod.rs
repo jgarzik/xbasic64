@@ -1916,6 +1916,60 @@ fn test_swap_of_mismatched_record_fields_is_diagnosed() {
         .expect("two numeric fields are a legal SWAP");
 }
 
+/// SWAP's two operands must have the same type, not merely both be numbers
+/// or both strings: QuickBASIC's rule. Only "string against number" was
+/// checked, so an INTEGER swapped with a DOUBLE was converted both ways, and a
+/// record swapped with a number reached codegen.
+#[test]
+fn test_swap_operands_must_have_the_same_type() {
+    let ty = "TYPE R\n  N AS STRING * 4\n  V AS INTEGER\n  D AS DOUBLE\nEND TYPE\n\
+              TYPE Q\n  V AS INTEGER\nEND TYPE\nDIM P AS R, P2 AS R, O AS Q\nDIM A(3) AS R\n";
+    let refused = [
+        ("SWAP A%, B#\n", "'A%' is an INTEGER and 'B#' is a DOUBLE"),
+        ("SWAP C&, D!\n", "'C&' is a LONG and 'D!' is a SINGLE"),
+        (
+            "DIM X(3)\nSWAP X(1), N%\n",
+            "is a DOUBLE and 'N%' is an INTEGER",
+        ),
+        (
+            "SWAP P.V, P.D\n",
+            "'P.V' is an INTEGER and 'P.D' is a DOUBLE",
+        ),
+        ("SWAP P, Z\n", "'P' is a TYPE R record and 'Z' is a DOUBLE"),
+        ("SWAP Z, A(1)\n", "is a TYPE R record"),
+        (
+            "SWAP P, O\n",
+            "'P' is a TYPE R record and 'O' is a TYPE Q record",
+        ),
+        (
+            "DIM N AS INTEGER\nSWAP N, Z\n",
+            "'N' is an INTEGER and 'Z' is a DOUBLE",
+        ),
+    ];
+    for (source, expected) in refused {
+        expect_rejected(
+            &format!("{ty}{source}"),
+            "SWAP requires both values to be the same type",
+        );
+        expect_rejected(&format!("{ty}{source}"), expected);
+    }
+    // The same type is fine, however it was spelled: a fixed-length string
+    // with a variable-length one, two records of one TYPE, a declared type
+    // with the matching suffix.
+    for source in [
+        "SWAP P.N, S$\n",
+        "SWAP P, P2\n",
+        "SWAP P, A(2)\n",
+        "DIM N AS INTEGER\nSWAP N, M%\n",
+        "DIM S AS STRING\nSWAP S, P.N\n",
+        "SWAP X, Y\n",
+    ] {
+        if let Err(e) = compile_only(&format!("{ty}{source}")) {
+            panic!("{source:?} should pass sema, got:\n{}", e.stderr);
+        }
+    }
+}
+
 /// Out-of-range arguments to the string builtins are refused.
 ///
 /// Each of these returned something plausible instead. The negative-length

@@ -1895,10 +1895,26 @@ impl Analyzer {
                 // carries no suffix, so a string field and a numeric one both
                 // looked non-string and the mismatch reached codegen, which
                 // stored a string pointer into an INTEGER slot and crashed.
-                let a_str = self.expr_is_string(&lvalue_as_expr(a), scope);
-                let b_str = self.expr_is_string(&lvalue_as_expr(b), scope);
-                if a_str.is_some() && b_str.is_some() && a_str != b_str {
-                    self.error(line, "SWAP requires both values to be the same type");
+                //
+                // And the whole type, not only string against number, which
+                // is QuickBASIC's rule: `SWAP A%, B#` converted each value as
+                // an assignment would, losing B#'s fraction, and a record
+                // against a number reached codegen. A fixed-length string and
+                // a variable-length one are both strings, and two records
+                // match when they are of one TYPE.
+                if let (Some(ta), Some(tb)) = (self.swap_type(a, scope), self.swap_type(b, scope))
+                    && !same_swap_type(&ta, &tb)
+                {
+                    self.error(
+                        line,
+                        format!(
+                            "SWAP requires both values to be the same type, but '{}' is {} and '{}' is {}",
+                            lvalue_text(a),
+                            describe_type(&ta),
+                            lvalue_text(b),
+                            describe_type(&tb)
+                        ),
+                    );
                 }
             }
             StmtKind::Open {
@@ -3232,6 +3248,36 @@ impl Analyzer {
         }
     }
 
+    /// The type of a SWAP operand, as codegen will store it, or None when it
+    /// does not resolve (a bad field path, already reported elsewhere).
+    ///
+    /// An array element is typed by its name's suffix unless its array holds
+    /// records, because that is all codegen consults for one.
+    fn swap_type(&self, target: &LValue, scope: &Scope) -> Option<TypeRef> {
+        let declared = self.symbols.typed_var(scope, &target.name);
+        let mut ty = match (&target.indices, declared) {
+            (Some(_), Some(t @ TypeRef::Record(_))) | (None, Some(t)) => t.clone(),
+            (Some(_), _) => suffix_type(&target.name),
+            (None, None) => match self.function_result(&target.name.to_uppercase()) {
+                Some(t) => t.clone(),
+                None => suffix_type(&target.name),
+            },
+        };
+        for field in &target.fields {
+            let TypeRef::Record(rec) = &ty else {
+                return None;
+            };
+            ty = self
+                .symbols
+                .records
+                .get(&rec.to_uppercase())?
+                .field(field)?
+                .ty
+                .clone();
+        }
+        Some(ty)
+    }
+
     /// Whether the scalar `name` holds a string.
     ///
     /// A `$` suffix says so, and so does a declaration without one: `DIM S AS
@@ -3422,6 +3468,50 @@ fn subscript_count(body: &[Stmt], name: &str) -> Option<usize> {
         }
     });
     found
+}
+
+/// The declared-type form of the type a name's suffix gives it.
+fn suffix_type(name: &str) -> TypeRef {
+    match DataType::from_suffix(name) {
+        DataType::Integer => TypeRef::Integer,
+        DataType::Long => TypeRef::Long,
+        DataType::Single => TypeRef::Single,
+        DataType::Double => TypeRef::Double,
+        // Width 0: a plain string, as `TypeRef::FixedString` documents.
+        DataType::String => TypeRef::FixedString(0),
+    }
+}
+
+/// Whether SWAP may exchange values of these two types: the same type, with
+/// every string alike whatever its width, and records alike by TYPE.
+fn same_swap_type(a: &TypeRef, b: &TypeRef) -> bool {
+    match (a, b) {
+        (TypeRef::FixedString(_), TypeRef::FixedString(_)) => true,
+        (TypeRef::Record(x), TypeRef::Record(y)) => x.eq_ignore_ascii_case(y),
+        _ => a == b,
+    }
+}
+
+/// A declared type in words, for diagnostics: "an INTEGER", "a TYPE R record".
+fn describe_type(ty: &TypeRef) -> String {
+    match ty {
+        TypeRef::Record(r) => format!("a TYPE {} record", r.to_uppercase()),
+        t => type_name(DataType::from_type_ref(t)).to_string(),
+    }
+}
+
+/// An assignment target as the program wrote it, near enough to recognise:
+/// `A(...)` for an element, with any field path.
+fn lvalue_text(target: &LValue) -> String {
+    let mut text = target.name.clone();
+    if target.indices.is_some() {
+        text.push_str("(...)");
+    }
+    for field in &target.fields {
+        text.push('.');
+        text.push_str(field);
+    }
+    text
 }
 
 /// The BASIC name of a numeric or string type, for diagnostics.
