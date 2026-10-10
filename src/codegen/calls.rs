@@ -346,8 +346,10 @@ impl FnGen<'_> {
             .is_some_and(|p| p.is_function);
 
         let mut vals = Vec::new();
-        // By-reference temporaries holding strings, freed after the call.
-        let mut string_temps = Vec::new();
+        // By-reference temporaries holding strings go on `str_slots`, from
+        // here, and are freed after the call -- or on the way to the fault
+        // block, by a check while an argument is evaluated or after the call.
+        let mark = self.str_slots.len();
         // Arrays an element of which is passed by reference.
         let mut locked = Vec::new();
         // Fixed-length strings passed as such temporaries, and their widths.
@@ -395,7 +397,7 @@ impl FnGen<'_> {
                         self.store_str_raw((z, z), loc);
                         let v = self.load_typed(now, &TypeRef::FixedString(width));
                         self.assign_str(loc, v);
-                        string_temps.push(loc);
+                        self.str_slots.push(loc);
                         copy_backs.push((loc, target, width));
                         vals.push(self.addr(loc));
                         continue;
@@ -416,7 +418,7 @@ impl FnGen<'_> {
                                     let z = self.iconst(types::I64, 0);
                                     self.store_str_raw((z, z), loc);
                                     self.assign_str(loc, v);
-                                    string_temps.push(loc);
+                                    self.str_slots.push(loc);
                                 }
                                 v => {
                                     let n = self.coerce(v, ty).num();
@@ -459,9 +461,14 @@ impl FnGen<'_> {
         }
         // The procedure's statements stored lines of their own.
         self.err_line_block = None;
+        // A FUNCTION's string result is this statement's to free, whichever
+        // way it goes on: the result variable is gone.
+        let string_result = is_function && self.cg.proc_return_type(&upper) == DataType::String;
+        if string_result {
+            self.temps.push(rets[0]);
+        }
         // An error left pending goes to the fault block before any copy
-        // back, so the target keeps its value; the temporary is not freed
-        // on that path, which leaks it but frees nothing twice.
+        // back, so the target keeps its value.
         self.error_check();
         for (loc, target, width) in copy_backs {
             let dst = match target {
@@ -477,7 +484,7 @@ impl FnGen<'_> {
             let (p, l) = self.load_str(loc);
             self.store_typed(dst, &TypeRef::FixedString(width), Val::Str(p, l));
         }
-        for loc in string_temps {
+        for loc in self.str_slots.split_off(mark) {
             self.free_slot_str(loc);
         }
         if !is_function {
@@ -485,12 +492,7 @@ impl FnGen<'_> {
         }
         let t = self.cg.proc_return_type(&upper);
         Some(match t {
-            // The FUNCTION's result variable is gone; its string is this
-            // statement's to free.
-            DataType::String => {
-                self.temps.push(rets[0]);
-                Val::Str(rets[0], rets[1])
-            }
+            DataType::String => Val::Str(rets[0], rets[1]),
             t => Val::Num(t, rets[0]),
         })
     }

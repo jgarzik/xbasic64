@@ -623,6 +623,67 @@ PRINT LEN(A$); LEN(B$); LEN(C$); LEN(S$(3))
     );
 }
 
+/// A statement left by a trapped error frees its temporaries too: the
+/// copies made for by-reference string arguments, a fixed-length string's
+/// copy, and the statement's own string results. Each iteration here faults
+/// with about 60 KB of them live, once while the arguments are evaluated
+/// and once when the call itself is left by a RESUME to a label; leaking
+/// them is over 2 GB, against a 256 MB address-space limit.
+#[cfg(unix)]
+#[test]
+fn test_error_path_frees_temporaries() {
+    let src = r#"
+SUB P(A$, B$, C$)
+  PRINT "never"
+END SUB
+SUB Q(A$, B$)
+  ERROR 5
+END SUB
+ON ERROR GOTO H
+DIM F AS STRING * 20000
+BIG$ = STRING$(20000, "x")
+PH = 1
+FOR I& = 1 TO 20000
+  P F, BIG$ + "y", CHR$(-1)
+NEXT I&
+PH = 2
+I& = 0
+TOP:
+I& = I& + 1
+IF I& > 20000 THEN GOTO DONE
+Q F, BIG$ + "z"
+GOTO TOP
+H:
+IF PH = 1 THEN RESUME NEXT
+RESUME TOP
+DONE:
+PRINT LEN(F); I&
+"#;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bas = tmp.path().join("leak.bas");
+    let exe = tmp.path().join("leak");
+    std::fs::write(&bas, src).unwrap();
+    let c = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let run = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v 262144 && exec {}", exe.display()))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "20000  20001");
+}
+
 /// The places a string changes hands, each with a later reassignment that
 /// would free it twice -- or free it while still in use -- if ownership
 /// were wrong. glibc aborts on a double free, so a mistake is not quiet.

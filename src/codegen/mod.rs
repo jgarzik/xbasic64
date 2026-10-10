@@ -832,6 +832,10 @@ struct FnGen<'a> {
     /// Fresh strings this statement made and nothing has taken yet; freed
     /// when it is done. See `strings.rs`.
     temps: Vec<Value>,
+    /// String slots this statement owns while it runs -- the copies made
+    /// for by-reference arguments, a SELECT's string selector -- freed by
+    /// whoever pushed them, and on the way to its fault block.
+    str_slots: Vec<Loc>,
     /// Whether this statement calls a user FUNCTION, which could free a
     /// string value already loaded: string loads are then copies.
     copy_loads: bool,
@@ -861,6 +865,9 @@ struct FnGen<'a> {
     cur_stmt: Option<(usize, Block, Block)>,
     /// Fault blocks wanted so far: (fault, start, next).
     faults: HashMap<usize, (Block, Block, Block)>,
+    /// Cold blocks that free what a check site had live, then go on to its
+    /// error exit: (block, exit, temporaries, string slots).
+    cleanups: Vec<(Block, Block, Vec<Value>, Vec<Loc>)>,
     /// Where this function goes to be left on the way to a RESUME label.
     unwind_block: Option<Block>,
     /// The handler's return, taking the code it returns.
@@ -903,6 +910,7 @@ impl<'a> FnGen<'a> {
             proc_record_elem_words: HashMap::new(),
             zeroed_slots: Vec::new(),
             temps: Vec::new(),
+            str_slots: Vec::new(),
             copy_loads: false,
             ssa: HashMap::new(),
             ssa_enabled: false,
@@ -917,6 +925,7 @@ impl<'a> FnGen<'a> {
             error_blocks: HashMap::new(),
             cur_stmt: None,
             faults: HashMap::new(),
+            cleanups: Vec::new(),
             unwind_block: None,
             handler_ret: None,
             handler_dispatch: None,
@@ -934,6 +943,7 @@ impl<'a> FnGen<'a> {
     /// close the function.
     fn finish(mut self) {
         self.fill_error_blocks();
+        self.fill_cleanups();
         self.fill_fault_blocks();
         self.b.seal_all_blocks();
         let config = self.cg.module.isa().frontend_config();
@@ -1252,11 +1262,13 @@ impl<'a> FnGen<'a> {
         let rets = self.b.inst_results(inst).to_vec();
         if name.starts_with("_rt_") {
             let h = rtsig::lookup(name);
-            if h.fresh {
-                self.temps.push(rets[0]);
-            }
+            // Checked before its result is a temporary: a helper that
+            // raised returned no string, and the way out must not free it.
             if h.fallible {
                 self.error_check();
+            }
+            if h.fresh {
+                self.temps.push(rets[0]);
             }
             if h.noreturn {
                 self.unreachable();
@@ -1319,7 +1331,7 @@ impl<'a> FnGen<'a> {
     fn error_block(&mut self, kind: RtError) -> Block {
         let line = self.report_line();
         let exit = if self.cg.traps && kind.trappable() {
-            Some(self.error_exit())
+            Some(self.trap_exit())
         } else {
             None
         };
@@ -1366,7 +1378,7 @@ impl<'a> FnGen<'a> {
         if !self.cg.traps {
             return;
         }
-        let exit = self.error_exit();
+        let exit = self.trap_exit();
         let p = self.load_rt_word("_err_pending");
         let cont = self.b.create_block();
         self.brif(p, exit, cont);
