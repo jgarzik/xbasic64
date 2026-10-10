@@ -35,6 +35,37 @@ impl FnGen<'_> {
         }
     }
 
+    /// Where a trapped error at this check site goes: the error exit, or --
+    /// when the statement has strings live here -- a cold block of the
+    /// site's own that frees them first. Whichever way the handler resumes,
+    /// the statement is done with them: a retry makes them again.
+    pub(super) fn trap_exit(&mut self) -> Block {
+        let exit = self.error_exit();
+        if self.temps.is_empty() && self.str_slots.is_empty() {
+            return exit;
+        }
+        let b = self.b.create_block();
+        self.b.set_cold_block(b);
+        let (temps, slots) = (self.temps.clone(), self.str_slots.clone());
+        self.cleanups.push((b, exit, temps, slots));
+        b
+    }
+
+    /// The cold blocks `trap_exit` made. Each has one predecessor, its
+    /// check site, which every value it frees dominates.
+    pub(super) fn fill_cleanups(&mut self) {
+        for (block, exit, temps, slots) in std::mem::take(&mut self.cleanups) {
+            self.b.switch_to_block(block);
+            for p in temps {
+                self.call("free", &[p]);
+            }
+            for loc in slots {
+                self.free_slot_str(loc);
+            }
+            self.b.ins().jump(exit, &[]);
+        }
+    }
+
     /// Where this function goes to be left on the way to a RESUME label.
     fn unwind(&mut self) -> Block {
         if self.kind == FnKind::Proc {

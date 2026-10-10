@@ -72,7 +72,10 @@ impl FnGen<'_> {
     pub(super) fn gen_stmt(&mut self, stmt: &Stmt) {
         // Each statement has temporaries of its own, freed when it is done;
         // an enclosing statement's were freed before it branched here.
+        // So are its string slots: an error in this one leaves the enclosing
+        // statement running, and they are not this one's to free.
         let outer_temps = std::mem::take(&mut self.temps);
+        let outer_slots = std::mem::take(&mut self.str_slots);
         let outer_copy = self.copy_loads;
         self.copy_loads = self.calls_user_function(stmt);
         self.err_line_block = None;
@@ -80,7 +83,9 @@ impl FnGen<'_> {
         // The enclosing statement's line is no longer the one stored.
         self.err_line_block = None;
         self.free_temps();
+        debug_assert!(self.str_slots.is_empty(), "each slot's owner frees it");
         self.temps = outer_temps;
+        self.str_slots = outer_slots;
         self.copy_loads = outer_copy;
     }
 
@@ -97,6 +102,10 @@ impl FnGen<'_> {
         self.begin_block(st);
         let outer = self.cur_stmt.replace((id, st, sn));
         self.gen_stmt_inner(stmt);
+        // Freed on the way out of the statement, not in its next block:
+        // RESUME NEXT arrives there from a fault, which has freed them, or
+        // -- before they were made -- has nothing to free.
+        self.free_temps();
         self.cur_stmt = outer;
         self.begin_block(sn);
     }
@@ -400,8 +409,12 @@ impl FnGen<'_> {
                 len,
                 value,
             } => {
-                let cur = self.gen_expr(&Self::lvalue_expr(target));
-                let (tp, tl) = cur.str();
+                // Written in place: the target itself, not a copy of it.
+                let (loc, ty) = self.lvalue_loc(target);
+                if let TypeRef::FixedString(w @ 1..) = ty {
+                    self.own_fixed(loc, w);
+                }
+                let (tp, tl) = self.load_str(loc);
                 let s = self.gen_i64(start);
                 let n = match len {
                     Some(e) => self.gen_i64(e),
@@ -436,8 +449,8 @@ impl FnGen<'_> {
                         // A fixed-length string keeps its width, so each side
                         // takes a copy of the other's value, stored -- and
                         // padded or cut -- as an assignment would.
-                        let (pa, la_len) = self.load_str(la);
-                        let (pb, lb_len) = self.load_str(lb);
+                        let (pa, la_len) = self.load_typed(la, &ta).str();
+                        let (pb, lb_len) = self.load_typed(lb, &tb).str();
                         let ca = self.call_rt("_rt_strdup", &[pa, la_len]);
                         let cb = self.call_rt("_rt_strdup", &[pb, lb_len]);
                         self.store_typed(la, &ta, Val::Str(cb[0], cb[1]));
@@ -875,6 +888,7 @@ impl FnGen<'_> {
             let z = self.iconst(types::I64, 0);
             self.store_str_raw((z, z), Loc::Stack(slot, 0));
             self.assign_str(Loc::Stack(slot, 0), v);
+            self.str_slots.push(Loc::Stack(slot, 0));
         } else {
             let d = self.double_of(v);
             self.b.ins().stack_store(types::I64, d, slot, 0);
@@ -899,6 +913,7 @@ impl FnGen<'_> {
         }
         self.begin_sealed(end);
         if is_string {
+            self.str_slots.pop();
             self.free_slot_str(Loc::Stack(slot, 0));
         }
     }

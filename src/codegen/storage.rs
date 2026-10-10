@@ -348,8 +348,36 @@ impl FnGen<'_> {
         match ty {
             // A whole record has no scalar value; sema rejects using one here.
             TypeRef::Record(_) => Val::Num(DataType::Double, self.f64const(0.0)),
+            // A fixed-length string never assigned -- its slot still zero,
+            // as storage starts -- is its width of CHR$(0), as in
+            // QuickBASIC: borrowed from one zeroed object as wide as the
+            // widest, which nothing writes. Once assigned it is never empty.
+            TypeRef::FixedString(width @ 1..) => {
+                let (p, l) = self.load_str(loc);
+                let empty = self.b.ins().icmp_imm_s(IntCC::Equal, l, 0);
+                let nuls = self.global_addr("_fixed_nuls", *width as u32);
+                let w = self.iconst(types::I64, *width as i64);
+                let p = self.b.ins().select(empty, nuls, p);
+                let l = self.b.ins().select(empty, w, l);
+                Val::Str(p, l)
+            }
             t => self.load_val(DataType::from_type_ref(t), loc),
         }
+    }
+
+    /// Make the fixed-length string at `loc` safe to write in place, as a
+    /// MID$ statement does: one never assigned is given NULs of its own
+    /// first, not the shared ones `load_typed` lends it.
+    pub(super) fn own_fixed(&mut self, loc: Loc, width: usize) {
+        let (_, l) = self.load_str(loc);
+        let fill = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(l, done, fill);
+        self.switch_sealed(fill);
+        let nuls = self.global_addr("_fixed_nuls", width as u32);
+        let w = self.iconst(types::I64, width as i64);
+        self.assign_str(loc, Val::Str(nuls, w));
+        self.begin_sealed(done);
     }
 
     /// Store `v` into `loc`, of declared type `ty`, converting it.

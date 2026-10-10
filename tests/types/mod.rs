@@ -844,3 +844,35 @@ fn test_plain_as_string_field_is_refused() {
     // One diagnostic, not a cascade: the rest of the TYPE still parses.
     assert!(err.contains("1 error"), "got:\n{}", err.stderr);
 }
+
+/// A fixed-length string has its width from the start, as in QuickBASIC,
+/// which fills it with CHR$(0) until it is first assigned: a variable, an
+/// array element, a record field, and a procedure's local alike.
+#[test]
+fn test_unassigned_fixed_length_string_has_its_width() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS STRING * 3
+END TYPE
+DIM F AS STRING * 5
+DIM A(2) AS STRING * 4
+DIM T AS R
+DIM U(1) AS R
+PRINT LEN(F); LEN(A(1)); LEN(T.N); LEN(U(0).N)
+PRINT ASC(F); ASC(T.N); ASC(MID$(A(2), 4))
+F = "ab"
+PRINT "["; F; "]"
+SUB S
+  DIM L AS STRING * 6
+  PRINT LEN(L)
+END SUB
+S
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["5  4  3  3", "0  0  0", "[ab   ]", "6"]
+    );
+}

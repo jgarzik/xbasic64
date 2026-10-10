@@ -3055,6 +3055,23 @@ fn test_resume_after_an_error_in_the_handlers_code() {
     );
 }
 
+/// A statement that faults after making a string temporary -- or before,
+/// with one still to come -- compiles, and RESUME NEXT goes on past it.
+/// Its temporaries were freed in the statement's next block, where RESUME
+/// NEXT arrives from paths that never made them: the verifier refused
+/// these, in main for a check ahead of the temporary and in the handler's
+/// copy of main for any.
+#[test]
+fn test_resume_next_past_a_statement_with_string_temporaries() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nDIM A$(2)\nB$ = \"b\"\nI = 7\n\
+         X$ = A$(I) + B$ + \"x\"\nY$ = MID$(B$ + \"r\", 0)\n\
+         PRINT \"[\"; X$; \"][\"; Y$; \"]\"\nEND\nH:\nPRINT ERR;\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["9  5 [][]"]);
+}
+
 /// A CONST cannot be the target of anything that stores into it.
 ///
 /// Every one of these compiled, and the store went nowhere: the name is

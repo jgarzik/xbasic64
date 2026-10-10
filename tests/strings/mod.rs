@@ -375,6 +375,22 @@ fn test_mid_assignment_into_array() {
     assert_eq!(output.trim(), "Jello");
 }
 
+/// MID$ writes into the target even in a statement that calls a user
+/// FUNCTION, where a string load is a copy: it wrote into that copy, and
+/// the target kept its old value. A fixed-length string never assigned is
+/// given NULs of its own to write into, not the ones every such string
+/// reads as.
+#[test]
+fn test_mid_assignment_beside_a_function_call() {
+    let output = compile_and_run(
+        "FUNCTION F(N)\nF = N\nEND FUNCTION\nA$ = \"hello\"\nMID$(A$, F(2)) = \"XY\"\n\
+         DIM G AS STRING * 3, H AS STRING * 3\nMID$(G, F(2)) = \"Z\"\n\
+         PRINT A$; ASC(G); ASC(MID$(G, 2)); ASC(MID$(H, 2))\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "hXYlo 0  90  0");
+}
+
 /// Two calls to the same string builtin in one expression must not alias.
 ///
 /// STR$, CHR$, HEX$ and OCT$ each formatted into a buffer they owned outright,
@@ -605,6 +621,67 @@ PRINT LEN(A$); LEN(B$); LEN(C$); LEN(S$(3))
         String::from_utf8_lossy(&run.stdout).trim(),
         "1006  10  1000  100"
     );
+}
+
+/// A statement left by a trapped error frees its temporaries too: the
+/// copies made for by-reference string arguments, a fixed-length string's
+/// copy, and the statement's own string results. Each iteration here faults
+/// with about 60 KB of them live, once while the arguments are evaluated
+/// and once when the call itself is left by a RESUME to a label; leaking
+/// them is over 2 GB, against a 256 MB address-space limit.
+#[cfg(unix)]
+#[test]
+fn test_error_path_frees_temporaries() {
+    let src = r#"
+SUB P(A$, B$, C$)
+  PRINT "never"
+END SUB
+SUB Q(A$, B$)
+  ERROR 5
+END SUB
+ON ERROR GOTO H
+DIM F AS STRING * 20000
+BIG$ = STRING$(20000, "x")
+PH = 1
+FOR I& = 1 TO 20000
+  P F, BIG$ + "y", CHR$(-1)
+NEXT I&
+PH = 2
+I& = 0
+TOP:
+I& = I& + 1
+IF I& > 20000 THEN GOTO DONE
+Q F, BIG$ + "z"
+GOTO TOP
+H:
+IF PH = 1 THEN RESUME NEXT
+RESUME TOP
+DONE:
+PRINT LEN(F); I&
+"#;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bas = tmp.path().join("leak.bas");
+    let exe = tmp.path().join("leak");
+    std::fs::write(&bas, src).unwrap();
+    let c = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let run = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v 262144 && exec {}", exe.display()))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "20000  20001");
 }
 
 /// The places a string changes hands, each with a later reassignment that
