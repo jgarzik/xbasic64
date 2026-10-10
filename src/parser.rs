@@ -506,6 +506,12 @@ pub enum Expr {
         base: Box<Expr>,
         field: String,
     },
+    /// A variable, element, field or call in parentheses: `(A)`. The value
+    /// is the operand's, but it is an expression rather than a variable, so
+    /// a by-reference parameter is given a copy of it, as in QuickBASIC.
+    /// Sema removes every one not passed to a by-reference parameter, where
+    /// it is only grouping; parentheses around anything else leave none.
+    Paren(Box<Expr>),
 }
 
 #[derive(Debug, Clone)]
@@ -1218,6 +1224,34 @@ impl Parser {
             i += 1;
         }
         matches!(self.peek_at(i), Token::Eq | Token::Dot)
+    }
+
+    /// True if the parenthesis at the current position opens one argument of
+    /// a call statement, `D (A)` or `D (A) + 1, B`, rather than an argument
+    /// list or the subscripts of an assignment target: what it encloses is
+    /// not empty and has no comma of its own, and no `=` or `.` follows it.
+    fn at_parenthesized_argument(&self) -> bool {
+        if matches!(self.peek_at(1), Token::RParen) {
+            return false;
+        }
+        let mut depth = 0;
+        let mut i = 0;
+        loop {
+            match self.peek_at(i) {
+                Token::LParen => depth += 1,
+                Token::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                Token::Comma if depth == 1 => return false,
+                Token::Newline | Token::Colon | Token::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        !matches!(self.peek_at(i + 1), Token::Eq | Token::Dot)
     }
 
     /// True if the token after the current one is any identifier.
@@ -2134,8 +2168,11 @@ impl Parser {
             });
         }
 
-        // Check for array subscript or function call
-        if matches!(self.peek(), Token::LParen) {
+        // Check for array subscript or function call. A call without CALL
+        // takes its arguments without parentheses, so `D (A)` -- however it
+        // is spaced -- passes the expression `(A)`, a copy, as QuickBASIC
+        // does; only a list, `D(A, B)`, is taken as the argument list.
+        if matches!(self.peek(), Token::LParen) && !self.at_parenthesized_argument() {
             self.advance();
 
             // Could be array assignment or subroutine call
@@ -3790,7 +3827,13 @@ impl Parser {
                 self.advance();
                 let expr = self.parse_expression()?;
                 self.expect(Token::RParen)?;
-                Ok(expr)
+                Ok(match expr {
+                    Expr::Variable(_)
+                    | Expr::ArrayAccess { .. }
+                    | Expr::FnCall { .. }
+                    | Expr::Field { .. } => Expr::Paren(Box::new(expr)),
+                    e => e,
+                })
             }
             tok => err(format!(
                 "unexpected {} in an expression",

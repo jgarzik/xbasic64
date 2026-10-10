@@ -1665,7 +1665,11 @@ Parameters are passed **by reference**, as in QuickBASIC: a variable, array
 element or record field given as an argument is changed by what the procedure
 does to its parameter. `BYVAL` passes a copy instead, and an argument that is
 any other expression -- `A + 0`, `CINT(B#)`, a literal -- is a copy whatever
-the parameter says.
+the parameter says. So is a variable in parentheses, `(A)`: QuickBASIC's way
+to protect one variable at one call. A call statement without `CALL` takes
+its arguments without parentheses, so `Double (A)` -- or `Double(A)` -- passes
+the expression `(A)`; only a list, `Double(A, B)`, is an argument list. A
+record or array argument in parentheses is still passed itself.
 
 ```basic
 SUB Double(X)
@@ -1679,6 +1683,7 @@ A = 5
 Double A            ' A is now 10
 Show A              ' A is still 10
 Double A + 0        ' an expression: A is still 10
+Double (A)          ' in parentheses: A is still 10
 ```
 
 The parameter *is* the caller's storage, not a copy that goes back at the
@@ -1686,9 +1691,16 @@ end: a write through it is seen at once through every other name for the same
 storage -- the same variable passed twice, a SHARED name, an error handler that
 runs while the procedure is active.
 
+The one exception is a fixed-length string -- a `STRING * n` variable, array
+element or record field -- given to an ordinary string parameter. As in
+QuickBASIC, the procedure works on a variable-length copy, which is copied
+back when it returns, padded with spaces or cut to the width as an assignment
+would be; until then the original keeps its value. A procedure that ends in
+an error, never to return, is not copied back.
+
 A variable passed by reference must be the parameter's type -- an INTEGER
 variable for an INTEGER parameter -- as QuickBASIC requires; to pass another
-type, pass an expression, which is converted.
+type, pass an expression, such as `(A%)`, which is converted.
 
 An **array parameter** is written `name()`, and takes an array, written the
 same way, by reference: the procedure works on the caller's elements and
@@ -1872,7 +1884,8 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 4. **Array indices start at 0** by default - `DIM A(10)` creates 11 elements
    (0-10); `OPTION BASE 1` and `DIM A(1 TO 10)` change that
 5. **String indices are 1-based** - `MID$` and `INSTR` use 1-based positions
-6. **Parameters are by reference**, as in QuickBASIC; `BYVAL` passes a copy
+6. **Parameters are by reference**, as in QuickBASIC; `BYVAL` passes a copy,
+   as does an argument in parentheses, `(A)`
 
 ### Deliberate Differences from GW-BASIC
 

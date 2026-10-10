@@ -389,7 +389,7 @@ impl FnGen<'_> {
     }
 
     /// Create `name` with GW-BASIC's default bounds if it has no storage yet.
-    fn autodim_if_null(&mut self, name: &str, info: ArrayInfo) {
+    pub(super) fn autodim_if_null(&mut self, name: &str, info: ArrayInfo) {
         let ptr = self.load(types::I64, info.loc);
         let create = self.b.create_block();
         let have = self.b.create_block();
@@ -406,28 +406,46 @@ impl FnGen<'_> {
 
     /// An array element's address, bounds-checked.
     pub(super) fn array_addr(&mut self, name: &str, indices: &[Expr]) -> Value {
+        self.array_addr_and_subs(name, indices).0
+    }
+
+    /// `array_addr`, and the subscripts' values, from which `elem_addr`
+    /// finds the element again once something may have moved the array.
+    pub(super) fn array_addr_and_subs(
+        &mut self,
+        name: &str,
+        indices: &[Expr],
+    ) -> (Value, Vec<Value>) {
+        // An array with no storage yet -- never DIMmed, or ERASEd -- is
+        // created by this use, as GW-BASIC does.
         let info = self
             .lookup_array(name)
             .expect("sema checked the array is declared");
-        let elem_size = self.elem_size_for(name);
-
-        // An array with no storage yet -- never DIMmed, or ERASEd -- is
-        // created by this use, as GW-BASIC does.
         self.autodim_if_null(name, info);
 
-        let ndims = indices.len() as i32;
-        let has_lower = self.array_has_lower(name);
-
-        // Row-major: linear = ((i * dim1) + j) * dim2 + k. Every subscript
-        // is evaluated, in order, before the descriptor is read: evaluating
-        // one may call a procedure that REDIMs the array.
+        // Every subscript is evaluated, in order, before the descriptor is
+        // read: evaluating one may call a procedure that REDIMs the array.
         let mut subs = Vec::with_capacity(indices.len());
         for idx in indices {
             let v = self.gen_expr(idx);
             subs.push(self.i64_of(v));
         }
+        (self.elem_addr(name, &subs), subs)
+    }
+
+    /// The address of the element of `name` at the evaluated subscripts
+    /// `subs`, bounds-checked against the descriptor as it is now.
+    pub(super) fn elem_addr(&mut self, name: &str, subs: &[Value]) -> Value {
+        let info = self
+            .lookup_array(name)
+            .expect("sema checked the array is declared");
+        let elem_size = self.elem_size_for(name);
+        let ndims = subs.len() as i32;
+        let has_lower = self.array_has_lower(name);
+
+        // Row-major: linear = ((i * dim1) + j) * dim2 + k.
         let mut linear: Option<Value> = None;
-        for (i, sub) in subs.into_iter().enumerate() {
+        for (i, &sub) in subs.iter().enumerate() {
             let mut sub = sub;
             if has_lower {
                 let lo = self.load(types::I64, info.loc.offset(8 * (1 + ndims + i as i32)));

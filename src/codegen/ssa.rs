@@ -74,7 +74,8 @@ pub(super) fn shallow(stmt: &Stmt) -> Stmt {
 }
 
 /// Upper-case names in `body` that are passed directly as arguments to a
-/// user procedure, and so may be shared with a by-reference parameter.
+/// user procedure, and so may be shared with a by-reference parameter. One
+/// in parentheses, `(A)`, is a copy, and is not.
 pub(super) fn passed_to_procedures(body: &[Stmt], symbols: &Symbols) -> HashSet<String> {
     let mut taken = HashSet::new();
     let procs = &symbols.procs;
@@ -108,7 +109,7 @@ pub(super) fn passed_to_procedures(body: &[Stmt], symbols: &Symbols) -> HashSet<
                 }
                 exprs.extend(args);
             }
-            Expr::Unary { operand, .. } => exprs.push(*operand),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => exprs.push(*operand),
             Expr::Binary { left, right, .. } => {
                 exprs.push(*left);
                 exprs.push(*right);
@@ -152,7 +153,7 @@ fn names_in(body: &[Stmt]) -> HashSet<String> {
             Expr::FnCall { args, .. } | Expr::ArrayAccess { indices: args, .. } => {
                 exprs.extend(args)
             }
-            Expr::Unary { operand, .. } => exprs.push(*operand),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => exprs.push(*operand),
             Expr::Binary { left, right, .. } => {
                 exprs.push(*left);
                 exprs.push(*right);

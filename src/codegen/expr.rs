@@ -118,7 +118,7 @@ impl FnGen<'_> {
             Expr::Unary {
                 op: UnaryOp::Not, ..
             } => DataType::Long,
-            Expr::Unary { operand, .. } => self.expr_type(operand),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => self.expr_type(operand),
             Expr::Binary { left, right, op } => {
                 promote_types(self.expr_type(left), self.expr_type(right), *op)
             }
@@ -322,6 +322,8 @@ impl FnGen<'_> {
                 let v = self.array_load(name, indices);
                 self.guard_load(v)
             }
+
+            Expr::Paren(inner) => self.gen_expr(inner),
 
             Expr::Unary { op, operand } => {
                 let v = self.gen_expr(operand);

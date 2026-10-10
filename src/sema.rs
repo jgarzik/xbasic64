@@ -604,7 +604,7 @@ fn rewrite_names(stmts: &mut [Stmt], table: &[DataType; 26], procs: &HashSet<Str
             _ => {}
         }
         match e {
-            Expr::Unary { operand, .. } => expr(operand, table, procs),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => expr(operand, table, procs),
             Expr::Binary { left, right, .. } => {
                 expr(left, table, procs);
                 expr(right, table, procs);
@@ -1500,7 +1500,11 @@ impl Analyzer {
     /// firing. Both would have been invisible except as lost performance.
     fn resolve_array_accesses(&mut self, stmts: &mut [Stmt], scope: &Scope) {
         for stmt in stmts {
-            for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+            if let StmtKind::Call { name, args } = &mut stmt.kind {
+                Self::resolve_args(&self.symbols, name, args, scope);
+            } else {
+                for_each_expr_mut(stmt, &mut |e| Self::resolve_expr(&self.symbols, e, scope));
+            }
 
             // Nested bodies, entering procedure scope where there is one.
             match &mut stmt.kind {
@@ -1535,6 +1539,23 @@ impl Analyzer {
         }
     }
 
+    /// Rewrite the arguments of a call to `name`. One in parentheses keeps
+    /// them only for a by-reference scalar parameter of a user procedure,
+    /// where they make it a copy; for any other parameter, and a builtin's,
+    /// they are only grouping, so a record or array is still passed itself.
+    fn resolve_args(symbols: &Symbols, name: &str, args: &mut [Expr], scope: &Scope) {
+        let params = symbols.procs.get(normalized(name)).map(|p| &p.params[..]);
+        for (i, a) in args.iter_mut().enumerate() {
+            let by_ref = params
+                .and_then(|ps| ps.get(i))
+                .is_some_and(|p| !p.byval && !p.array && !matches!(p.ty, Some(TypeRef::Record(_))));
+            match a {
+                Expr::Paren(inner) if by_ref => Self::resolve_expr(symbols, inner, scope),
+                _ => Self::resolve_expr(symbols, a, scope),
+            }
+        }
+    }
+
     /// Rewrite one expression tree, innermost first.
     fn resolve_expr(symbols: &Symbols, expr: &mut Expr, scope: &Scope) {
         match expr {
@@ -1550,10 +1571,12 @@ impl Analyzer {
                     Self::resolve_expr(symbols, i, scope);
                 }
             }
-            Expr::FnCall { args, .. } => {
-                for a in args.iter_mut() {
-                    Self::resolve_expr(symbols, a, scope);
-                }
+            Expr::FnCall { name, args } => Self::resolve_args(symbols, name, args, scope),
+            // Only grouping, which the tree already records.
+            Expr::Paren(inner) => {
+                Self::resolve_expr(symbols, inner, scope);
+                *expr = std::mem::replace(&mut **inner, Expr::Literal(Literal::Integer(0)));
+                return;
             }
         }
 
@@ -2108,6 +2131,7 @@ impl Analyzer {
         match e {
             Expr::Literal(l) => Some(l.clone()),
             Expr::Variable(n) => self.symbols.consts.get(normalized(n)).cloned(),
+            Expr::Paren(inner) => self.const_eval(inner),
             Expr::Unary {
                 op: UnaryOp::Neg,
                 operand,
@@ -3102,6 +3126,11 @@ impl Analyzer {
                 }
             }
             Expr::Unary { operand, .. } => self.check_expr(operand, scope, line),
+            // A value, so not a whole record.
+            Expr::Paren(inner) => {
+                self.check_expr(inner, scope, line);
+                self.reject_record_value(inner, scope, line);
+            }
             Expr::Binary { op, left, right } => {
                 self.check_expr(left, scope, line);
                 self.check_expr(right, scope, line);
@@ -3237,6 +3266,7 @@ impl Analyzer {
                 None => name.ends_with('$'),
             }),
             Expr::Unary { .. } => Some(false),
+            Expr::Paren(inner) => self.expr_is_string(inner, scope),
             Expr::Binary { op, left, .. } => {
                 if matches!(
                     op,
@@ -3461,7 +3491,7 @@ fn subscript_count(body: &[Stmt], name: &str) -> Option<usize> {
             Expr::Binary { left, right, .. } => {
                 in_expr(left, name).or_else(|| in_expr(right, name))
             }
-            Expr::Unary { operand, .. } => in_expr(operand, name),
+            Expr::Unary { operand, .. } | Expr::Paren(operand) => in_expr(operand, name),
             Expr::Field { base, .. } => in_expr(base, name),
             Expr::Literal(_) | Expr::Variable(_) => None,
         }
