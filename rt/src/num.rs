@@ -169,47 +169,113 @@ fn scan_radix(text: &[u8], mut i: usize) -> Scanned {
     }
 }
 
-/// A formatted number: at most `NumText::CAP` bytes, no terminator.
+/// A formatted number: the bytes `buf[start..end]`, no terminator.
 ///
-/// Built without a path that could panic: the runtime object carries no
-/// part of `core`'s panic machinery, so a bounds check that could fail would
-/// be an undefined symbol at link time.
+/// `fmt_double` always leaves a byte free before `start`, so `fmt_basic`
+/// adds its blank there, and room after `end` for PRINT's blank, rather
+/// than either copying the text. Built without a path that could panic:
+/// the runtime object carries no part of `core`'s panic machinery, so a
+/// bounds check that could fail would be an undefined symbol at link time.
+/// Every index is masked to the buffer instead; no number comes near it.
 #[derive(Clone, Copy)]
 pub struct NumText {
     buf: [u8; NumText::CAP],
-    len: usize,
+    start: usize,
+    end: usize,
 }
 
 impl NumText {
-    pub const CAP: usize = 48;
-
-    const EMPTY: NumText = NumText {
-        buf: [0; NumText::CAP],
-        len: 0,
-    };
+    /// A power of two, for the masks. The longest text is about 25 bytes.
+    pub const CAP: usize = 64;
+    const MASK: usize = NumText::CAP - 1;
 
     pub fn as_bytes(&self) -> &[u8] {
-        self.buf.get(..self.len).unwrap_or(&[])
+        self.buf.get(self.start..self.end).unwrap_or(&[])
     }
 
-    /// Append `c`; no number is long enough to fill the buffer. Not inlined:
-    /// the loops calling it are unrolled into kilobytes otherwise.
-    #[inline(never)]
-    fn push(&mut self, c: u8) {
-        if let Some(b) = self.buf.get_mut(self.len) {
-            *b = c;
-            self.len += 1;
+    /// The text with a blank after it, as PRINT writes a number.
+    pub fn with_trailing_blank(mut self) -> NumText {
+        self.buf[self.end & NumText::MASK] = b' ';
+        self.end += 1;
+        self
+    }
+}
+
+/// Writes a `NumText` front to back through a local cursor, so a digit is a
+/// store, not a call.
+struct Cursor {
+    buf: [u8; NumText::CAP],
+    k: usize,
+}
+
+impl Cursor {
+    /// Text starts at byte 1: byte 0 is `fmt_basic`'s.
+    fn new() -> Cursor {
+        Cursor {
+            buf: [0; NumText::CAP],
+            k: 1,
         }
     }
 
-    fn extend<'a>(&mut self, bytes: impl IntoIterator<Item = &'a u8>) {
-        for &c in bytes {
-            self.push(c);
+    #[inline(always)]
+    fn put(&mut self, c: u8) {
+        self.buf[self.k & NumText::MASK] = c;
+        self.k += 1;
+    }
+
+    /// Append `src` in one copy: per-byte loops unroll into kilobytes.
+    fn copy(&mut self, src: &[u8]) {
+        if let Some(d) = self.buf.get_mut(self.k..self.k + src.len()) {
+            d.copy_from_slice(src);
+            self.k += src.len();
+        }
+    }
+
+    fn done(self) -> NumText {
+        NumText {
+            buf: self.buf,
+            start: 1,
+            end: self.k,
         }
     }
 }
 
 const FMT_SCI: &[u8] = b"%.*e\0";
+
+/// A whole number of at most `p` digits, as `fmt_double` writes it, without
+/// the C library: such a value prints in full, every digit exact, so its
+/// text is just its integer's. `None` for any other value.
+fn fmt_whole(x: f64, single: bool) -> Option<NumText> {
+    // 10^P: past it the value has more digits than the type shows.
+    let limit = if single { 1E7 } else { 1E16 };
+    // NaN fails both comparisons; -0.0 never gets here.
+    if !(x > -limit && x < limit) {
+        return None;
+    }
+    let i = x as i64; // exact within the limit, so the test is exact
+    if i as f64 != x {
+        return None; // a fraction
+    }
+    // Written back to front, ending at 24: 16 digits and a sign fit, and
+    // byte `start - 1` stays free for `fmt_basic`.
+    let mut buf = [0u8; NumText::CAP];
+    let end = 24;
+    let mut k = end;
+    let mut u = i.unsigned_abs();
+    loop {
+        k -= 1;
+        buf[k & NumText::MASK] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if i < 0 {
+        k -= 1;
+        buf[k & NumText::MASK] = b'-';
+    }
+    Some(NumText { buf, start: k, end })
+}
 
 /// A number's digits as GW-BASIC writes them, without the leading blank
 /// (`_rt_fmt_double`): 7 significant digits for a SINGLE, 16 for a DOUBLE.
@@ -222,14 +288,23 @@ const FMT_SCI: &[u8] = b"%.*e\0";
 /// has no leading zero, and the exponent is spelled E for a SINGLE and D for
 /// a DOUBLE, with at least two digits. A SINGLE arrives widened to double.
 pub fn fmt_double(x: f64, single: bool) -> NumText {
-    let p: usize = if single { 7 } else { 16 };
-    let mut out = NumText::EMPTY;
     // Zero, of either sign, is 0.
     if x == 0.0 {
-        out.push(b'0');
-        return out;
+        let mut out = Cursor::new();
+        out.put(b'0');
+        return out.done();
     }
+    // Whole numbers, every integer variable's among them, need no snprintf.
+    match fmt_whole(x, single) {
+        Some(t) => t,
+        None => fmt_sci(x, single),
+    }
+}
 
+/// `fmt_double` of a nonzero value, through the C library's rounding.
+fn fmt_sci(x: f64, single: bool) -> NumText {
+    let p: usize = if single { 7 } else { 16 };
+    let mut out = Cursor::new();
     // "[-]d.ddd...e[+-]xx": P significant digits, rounded by the C library.
     let mut sci = [0u8; 64];
     unsafe {
@@ -245,7 +320,7 @@ pub fn fmt_double(x: f64, single: bool) -> NumText {
     // buffer, which the C library's text never fills, so none can panic.
     let mut start = 0;
     if sci[0] == b'-' {
-        out.push(b'-');
+        out.put(b'-');
         start = 1;
     }
     let at = |i: usize| sci[(start + i) & 63];
@@ -253,17 +328,18 @@ pub fn fmt_double(x: f64, single: bool) -> NumText {
         // inf or nan: as the C library wrote it.
         let mut i = 0;
         while at(i) != 0 && i < 63 {
-            out.push(at(i));
+            out.put(at(i));
             i += 1;
         }
-        return out;
+        return out.done();
     }
 
     // The P digits, without the point.
     let mut digits = [0u8; 16];
     digits[0] = at(0);
-    for i in 1..p {
-        digits[i & 15] = at(i + 1);
+    // Both are P-1 long: the copy cannot fail.
+    if let (Some(d), Some(s)) = (digits.get_mut(1..p), sci.get(start + 2..start + 1 + p)) {
+        d.copy_from_slice(s);
     }
     // The decimal exponent X, so the value is d.ddd * 10^X.
     let mut x: i32 = 0;
@@ -281,10 +357,8 @@ pub fn fmt_double(x: f64, single: bool) -> NumText {
         n -= 1;
     }
     let (pi, ni) = (p as i32, n as i32);
-    let put = |out: &mut NumText, from: usize, to: usize| {
-        for i in from..to {
-            out.push(digits[i & 15]);
-        }
+    let put = |out: &mut Cursor, from: usize, to: usize| {
+        out.copy(digits.get(from..to).unwrap_or(&[]));
     };
 
     // Fixed point when it shows the value in at most P digits, as GW-BASIC
@@ -295,34 +369,34 @@ pub fn fmt_double(x: f64, single: bool) -> NumText {
         let int = x as usize + 1;
         put(&mut out, 0, int);
         if int < n {
-            out.push(b'.');
+            out.put(b'.');
             put(&mut out, int, n);
         }
     } else if x < 0 && -x - 1 + ni <= pi {
-        out.push(b'.'); // no leading zero, as .5
-        for _ in 0..-x - 1 {
-            out.push(b'0');
-        }
+        out.put(b'.'); // no leading zero, as .5
+        // At most P-1 zeros, by the test above.
+        const ZEROS: [u8; 16] = [b'0'; 16];
+        out.copy(ZEROS.get(..(-x - 1) as usize).unwrap_or(&[]));
         put(&mut out, 0, n);
     } else {
         // d[.ddd]E+xx, D for a DOUBLE.
-        out.push(digits[0]);
+        out.put(digits[0]);
         if n > 1 {
-            out.push(b'.');
+            out.put(b'.');
             put(&mut out, 1, n);
         }
-        out.push(if single { b'E' } else { b'D' });
-        out.push(if x < 0 { b'-' } else { b'+' });
+        out.put(if single { b'E' } else { b'D' });
+        out.put(if x < 0 { b'-' } else { b'+' });
         let mut e = x.unsigned_abs();
         if e >= 100 {
             // Two digits at least, three if needed.
-            out.push(b'0' + (e / 100) as u8);
+            out.put(b'0' + (e / 100) as u8);
             e %= 100;
         }
-        out.push(b'0' + (e / 10) as u8);
-        out.push(b'0' + (e % 10) as u8);
+        out.put(b'0' + (e / 10) as u8);
+        out.put(b'0' + (e % 10) as u8);
     }
-    out
+    out.done()
 }
 
 /// `fmt_double` with the blank that stands where a minus sign would go, as
@@ -332,16 +406,16 @@ pub fn fmt_double(x: f64, single: bool) -> NumText {
 /// `PRINT 1; 2` reads " 1  2 " and why STR$(5) is " 5" -- the
 /// `MID$(STR$(N), 2)` idiom exists to strip exactly this blank. Not folded
 /// into `fmt_double`, because WRITE and PRINT USING render numbers through
-/// that and must not gain the blank.
+/// that and must not gain the blank. `fmt_double` leaves the byte before
+/// its text free for it.
 pub fn fmt_basic(x: f64, single: bool) -> NumText {
-    let t = fmt_double(x, single);
-    if t.buf[0] == b'-' {
-        return t; // '-' already occupies the sign position
+    let mut t = fmt_double(x, single);
+    if t.buf[t.start & NumText::MASK] != b'-' {
+        // '-' already occupies the sign position; anything else gets a blank.
+        t.start = t.start.wrapping_sub(1);
+        t.buf[t.start & NumText::MASK] = b' ';
     }
-    let mut out = NumText::EMPTY;
-    out.push(b' ');
-    out.extend(t.as_bytes());
-    out
+    t
 }
 
 export! {
@@ -497,6 +571,76 @@ mod tests {
         for &(x, want) in cases {
             assert_eq!(double(x), want, "{x:e}");
         }
+    }
+
+    #[test]
+    fn whole_numbers_print_as_the_c_library_rounds_them() {
+        // The fast path's boundaries, and either side of each.
+        let cases: &[(f64, bool, &str)] = &[
+            (-0.0, false, " 0"),
+            (-0.0, true, " 0"),
+            (1.0, false, " 1"),
+            (-1.0, true, "-1"),
+            (0.5, false, " .5"),
+            (-0.5, true, "-.5"),
+            (1.5, true, " 1.5"),
+            (9999999.0, true, " 9999999"),
+            (-9999999.0, true, "-9999999"),
+            (10000000.0, true, " 1E+07"),
+            (-10000000.0, true, "-1E+07"),
+            (9999999.5, true, " 1E+07"),
+            (9999999.4, true, " 9999999"),
+            (16777216.0, true, " 1.677722E+07"),
+            (10000000.0, false, " 10000000"),
+            (999999999999999.0, false, " 999999999999999"),
+            (1E15, false, " 1000000000000000"),
+            (-1E15, false, "-1000000000000000"),
+            (1E15 + 1.0, false, " 1000000000000001"),
+            (9999999999999998.0, false, " 9999999999999998"),
+            (-9999999999999998.0, false, "-9999999999999998"),
+            (1E16, false, " 1D+16"),
+            (1E16 + 2.0, false, " 1D+16"),
+            (-1E16, false, "-1D+16"),
+            (4503599627370497.0, false, " 4503599627370497"),
+            (2147483647.0, false, " 2147483647"),
+            (-2147483648.0, false, "-2147483648"),
+            (32767.0, true, " 32767"),
+            (-32768.0, true, "-32768"),
+            (1E300, false, " 1D+300"),
+        ];
+        for &(x, single, want) in cases {
+            let got = fmt_basic(x, single);
+            assert_eq!(got.as_bytes(), want.as_bytes(), "{x:e} single={single}");
+            assert_eq!(
+                got.with_trailing_blank().as_bytes(),
+                format!("{want} ").as_bytes()
+            );
+        }
+        // The fast path agrees with the C library's for every whole number
+        // it takes, near zero and near each limit.
+        for (limit, single) in [(1E7, true), (1E16, false)] {
+            for k in 0..2000 {
+                // Past 2^53 a DOUBLE holds only the even integers.
+                for x in [k as f64, limit - 2.0 - k as f64 * 2.0] {
+                    for x in [x, -x] {
+                        if x == 0.0 {
+                            continue;
+                        }
+                        let fast = fmt_whole(x, single).expect("whole and in range");
+                        assert_eq!(
+                            fast.as_bytes(),
+                            fmt_sci(x, single).as_bytes(),
+                            "{x:e} single={single}"
+                        );
+                    }
+                }
+            }
+            assert!(fmt_whole(limit, single).is_none());
+            assert!(fmt_whole(-limit, single).is_none());
+        }
+        assert!(fmt_whole(0.5, false).is_none());
+        assert!(fmt_whole(f64::NAN, false).is_none());
+        assert!(fmt_whole(f64::INFINITY, true).is_none());
     }
 
     #[test]
