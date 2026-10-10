@@ -1595,6 +1595,9 @@ impl Analyzer {
                         why.to_string(),
                     );
                 }
+                if indices.is_none() {
+                    self.reject_const_target(name, line, "an assignment");
+                }
                 if let Some(idx) = indices {
                     self.check_array_use(name, idx.len(), scope, line);
                     for e in idx {
@@ -1693,6 +1696,7 @@ impl Analyzer {
                 }
                 for var in vars {
                     self.check_lvalue(var, scope, line);
+                    self.reject_const_lvalue(var, line, "INPUT");
                 }
             }
             StmtKind::LineInput { file_num, var, .. } => {
@@ -1700,6 +1704,7 @@ impl Analyzer {
                     self.check_file_num(file_num, scope, line);
                 }
                 self.check_lvalue(var, scope, line);
+                self.reject_const_lvalue(var, line, "LINE INPUT");
                 // Codegen reads a string and stores it as-is, so a numeric
                 // target used to be handed a pointer to reinterpret as a
                 // double.
@@ -1716,6 +1721,7 @@ impl Analyzer {
             StmtKind::Read(vars) => {
                 for var in vars {
                     self.check_lvalue(var, scope, line);
+                    self.reject_const_lvalue(var, line, "READ");
                 }
             }
             StmtKind::If {
@@ -1739,6 +1745,7 @@ impl Analyzer {
                 if var.ends_with('$') {
                     self.error(line, "a FOR control variable must be numeric");
                 }
+                self.reject_const_target(var, line, "a FOR loop");
                 self.check_expr(start, scope, line);
                 self.require_numeric(start, scope, line, "a FOR start value");
                 self.check_expr(end, scope, line);
@@ -1850,6 +1857,7 @@ impl Analyzer {
             }
             StmtKind::Swap(a, b) => {
                 for t in [a, b] {
+                    self.reject_const_lvalue(t, line, "SWAP");
                     if let Some(indices) = &t.indices {
                         self.check_array_use(&t.name, indices.len(), scope, line);
                         for e in indices {
@@ -1893,6 +1901,7 @@ impl Analyzer {
                 self.check_file_num(file_num, scope, line);
                 for f in fields {
                     self.check_expr(&f.width, scope, line);
+                    self.reject_const_lvalue(&f.target, line, "FIELD");
                     // A field names a slice of the record buffer, so only a
                     // string variable can hold one.
                     if !f.target.name.ends_with('$') {
@@ -1916,6 +1925,7 @@ impl Analyzer {
             } => {
                 self.check_expr(value, scope, line);
                 let word = if *right { "RSET" } else { "LSET" };
+                self.reject_const_lvalue(target, line, word);
                 if !target.name.ends_with('$') {
                     self.error(
                         line,
@@ -2040,6 +2050,9 @@ impl Analyzer {
                 for e in seed.iter() {
                     self.check_numeric_operand(e, scope, line, "RANDOMIZE");
                 }
+            }
+            StmtKind::MidAssign { target, .. } => {
+                self.reject_const_lvalue(target, line, "MID$");
             }
             StmtKind::Erase(names) => {
                 for name in names {
@@ -2337,6 +2350,29 @@ impl Analyzer {
         let e = lvalue_as_expr(target);
         self.check_expr(&e, scope, line);
         self.reject_record_value(&e, scope, line);
+    }
+
+    /// Refuse a statement that stores into a CONST, named `by` in the message.
+    ///
+    /// A CONST is replaced by its value wherever it is read, so a store into
+    /// one compiled and went nowhere: `CONST MAX = 100: MAX = 5: PRINT MAX`
+    /// printed 100. QuickBASIC refuses every such store ("Duplicate
+    /// definition"), and so does this.
+    fn reject_const_target(&mut self, name: &str, line: u32, by: &str) {
+        if self.symbols.consts.contains_key(&name.to_uppercase()) {
+            self.error(
+                line,
+                format!("'{}' is a CONST and cannot be changed by {}", name, by),
+            );
+        }
+    }
+
+    /// [`Self::reject_const_target`] for a target that may be an array
+    /// element or a record field, neither of which is the CONST itself.
+    fn reject_const_lvalue(&mut self, target: &LValue, line: u32, by: &str) {
+        if target.indices.is_none() && target.fields.is_empty() {
+            self.reject_const_target(&target.name, line, by);
+        }
     }
 
     /// A file number must be numeric, and within the runtime's handle table.

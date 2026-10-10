@@ -2779,3 +2779,34 @@ fn test_failed_redim_leaves_the_array_unchanged() {
         &["error 9", "10  10", "5", "error 7", "1", "error 9"]
     );
 }
+
+/// A CONST cannot be the target of anything that stores into it.
+///
+/// Every one of these compiled, and the store went nowhere: the name is
+/// replaced by its value wherever it is read, so `CONST MAX = 100: MAX = 5:
+/// PRINT MAX` printed 100. QuickBASIC refuses them all ("Duplicate
+/// definition").
+#[test]
+fn test_a_const_cannot_be_assigned() {
+    let cases = [
+        "CONST MAX = 100: MAX = 5: PRINT MAX\n",
+        "CONST MAX = 100\nLET MAX = 5\n",
+        "CONST MAX = 100\nFOR MAX = 1 TO 2: NEXT\n",
+        "CONST MAX = 100\nINPUT MAX\n",
+        "CONST MAX = 100\nINPUT \"n\"; A, MAX\n",
+        "CONST MAX = 100\nREAD MAX\nDATA 1\n",
+        "CONST M$ = \"x\"\nLINE INPUT M$\n",
+        "CONST MAX = 100\nX = 1\nSWAP MAX, X\n",
+        "CONST MAX = 100\nX = 1\nSWAP X, MAX\n",
+        "CONST M$ = \"abc\"\nMID$(M$, 1) = \"z\"\n",
+        "CONST M$ = \"abc\"\nLSET M$ = \"z\"\n",
+        // Inside a procedure too: a module-level CONST is visible there.
+        "CONST MAX = 100\nSUB S\nMAX = 1\nEND SUB\nS\n",
+    ];
+    for source in cases {
+        expect_rejected(source, "is a CONST");
+    }
+    // Reading one is of course still fine.
+    let out = compile_and_run("CONST MAX = 100\nX = MAX: PRINT X; MAX\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["100  100"]);
+}
