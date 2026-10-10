@@ -1145,11 +1145,16 @@ mod tests {
         assert!(stream(1).is_null());
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            b"abc           x    ,\"q, r\",tail  \n10,,20\r\na\0b\r\nlast"
+            [
+                &b"abc           x    ,\"q, r\",tail  "[..],
+                sys::NEWLINE,
+                b"10,,20\r\na\0b\r\nlast"
+            ]
+            .concat()
         );
 
         open(&path, INPUT, 2);
-        assert_eq!(unsafe { _rt_file_lof(2) }, 51.0);
+        assert_eq!(unsafe { _rt_file_lof(2) }, 50.0 + sys::NEWLINE.len() as f64);
         assert_eq!(unsafe { _rt_file_eof(2) }, 0);
         let field = || text(unsafe { _rt_file_input_string(2) });
         assert_eq!(field(), "abc           x");

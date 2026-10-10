@@ -145,6 +145,14 @@ unsafe fn fatal(msg: *const u8, line: i64) -> ! {
     } else {
         _err_line.get() as i64
     };
+    // In the unit tests, an error nothing expected would exit the whole test
+    // binary without naming the test; a panic names it. A test expecting
+    // the exit runs in a child process (`num::testing::expect_fatal`).
+    #[cfg(test)]
+    if !crate::num::testing::in_child() {
+        let text = unsafe { core::ffi::CStr::from_ptr(msg.cast()) };
+        panic!("unexpected fatal error: {text:?} in {line}");
+    }
     sys::flush_all();
     let msg = msg.cast::<c_char>();
     unsafe {
@@ -279,5 +287,6 @@ mod tests {
         _err_pending.set(0);
         _err_active.set(0);
         _err_handler.set(0);
+        _err_line.set(0);
     }
 }

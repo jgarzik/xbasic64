@@ -385,7 +385,12 @@ pub(crate) mod testing {
             .env(TMP_VAR, tmp.path())
             .output()
             .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
+        // A program puts stderr in binary mode at startup and writes CRLF
+        // itself on Windows; this child's stderr is still in text mode, so
+        // that comes out as CR CR LF. Either way it is one line end.
+        let err = String::from_utf8_lossy(&out.stderr)
+            .replace("\r\r\n", "\n")
+            .replace("\r\n", "\n");
         assert_eq!(out.status.code(), Some(1), "{name}: {err}");
         assert!(err.contains(msg), "{name}: wanted {msg:?}, got {err:?}");
     }
