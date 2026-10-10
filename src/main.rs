@@ -10,8 +10,6 @@
 mod codegen;
 mod lexer;
 mod parser;
-#[cfg(test)]
-mod rtbuild;
 mod rtsig;
 mod runtime;
 mod sema;
@@ -197,7 +195,7 @@ fn main() {
         eprintln!("Error writing the object file: {}", e);
         std::process::exit(1);
     }
-    // The runtime, assembled when the compiler was built.
+    // The runtime, built when the compiler was built.
     if let Err(e) = fs::write(&rt_file, runtime::OBJECT) {
         eprintln!("Error writing the runtime object: {}", e);
         std::process::exit(1);
@@ -215,8 +213,8 @@ fn main() {
             &obj_file,
             &rt_file,
             "/SUBSYSTEM:CONSOLE",
-            // Discard the runtime helpers this program never calls. Each is
-            // emitted into a COMDAT section of its own for exactly this;
+            // Discard the runtime helpers this program never calls. rustc
+            // emits each into a COMDAT section of its own;
             // /OPT:REF is the default for a non-/DEBUG link, but the whole
             // point is lost if that ever stops being true.
             "/OPT:REF",
@@ -227,11 +225,10 @@ fn main() {
         ])
         .output();
 
-    // --gc-sections drops the runtime helpers this program never calls. The
-    // runtime emits each into a section of its own for exactly this; without
-    // that the flag has nothing to work with, since a linker discards
-    // unreferenced sections, never unreferenced labels. All 69 helpers used to
-    // be linked into every program: `PRINT "hi"` calls three of them.
+    // --gc-sections drops the runtime helpers this program never calls:
+    // rustc emits each function into a section of its own, which is what the
+    // flag works with, since a linker discards unreferenced sections, never
+    // unreferenced labels. `PRINT "hi"` calls three of the 85 helpers.
     #[cfg(not(windows))]
     let cc_output = Command::new("cc")
         .args([

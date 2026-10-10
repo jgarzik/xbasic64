@@ -94,20 +94,18 @@ Source → Lexer → Parser → Semantic Analysis → Code Generator → Object 
 4. **Code Generator** - Lowers the AST to Cranelift IR; Cranelift does instruction
    selection and register allocation and writes the object file
 
-The runtime library provides I/O, string operations, and math functions as hand-written x86-64 assembly using libc for portability. It is assembled once, when the compiler is built, and linked beside each program.
+The runtime library (I/O, strings, number formatting, math) is a `no_std` Rust crate in `rt/` that calls the C library. It is built once, when the compiler is built, and linked beside each program.
 
 Key design choices:
 - No IR of its own: the AST is lowered directly to Cranelift's
-- Each platform's standard ABI, for libc interoperability
+- A portable `no_std` Rust runtime over the C library
 - GW-BASIC type semantics (division always returns Double)
 
 ## Requirements
 
 - Rust 1.96 or later
-- Linux: the system assembler (`as`) to build the compiler, which assembles
-  its runtime library; the C compiler/linker (`cc`) with libc to link programs
-- Windows: Clang to build the compiler (it assembles the runtime), and the MSVC
-  linker (`link.exe`) to link programs
+- Linux: the C compiler/linker (`cc`) with libc, to link programs
+- Windows: the MSVC linker (`link.exe`) and its C runtime, to link programs
 
 ## Platforms
 
