@@ -46,6 +46,7 @@ mod io;
 mod ssa;
 mod stmt;
 mod storage;
+mod strings;
 mod trap;
 
 use crate::parser::*;
@@ -87,6 +88,11 @@ pub struct Output {
     /// Each function's Cranelift IR as text, when asked for (`-S`).
     pub clif: String,
 }
+
+/// Bit 63 of a string slot's length word: set when the slot owns its bytes,
+/// which assignment then frees. A FIELD variable's bytes are the record
+/// buffer's, an unassigned string has none, and both have it clear.
+const OWNED: i64 = i64::MIN;
 
 /// GOSUB stack size in bytes (64K entries * 8 bytes = 512KB)
 const GOSUB_STACK_SIZE: i64 = 524288;
@@ -807,6 +813,12 @@ struct FnGen<'a> {
     proc_record_elem_words: HashMap<String, i32>,
     /// Stack slots to zero on entry, with their sizes in bytes.
     zeroed_slots: Vec<(StackSlot, u32)>,
+    /// Fresh strings this statement made and nothing has taken yet; freed
+    /// when it is done. See `strings.rs`.
+    temps: Vec<Value>,
+    /// Whether this statement calls a user FUNCTION, which could free a
+    /// string value already loaded: string loads are then copies.
+    copy_loads: bool,
     /// Scalars held in SSA variables, by name, and whether this function
     /// may hold any; names this function passes to procedures may not.
     ssa: HashMap<String, (Variable, DataType)>,
@@ -862,6 +874,8 @@ impl<'a> FnGen<'a> {
             proc_types: HashMap::new(),
             proc_record_elem_words: HashMap::new(),
             zeroed_slots: Vec::new(),
+            temps: Vec::new(),
+            copy_loads: false,
             ssa: HashMap::new(),
             ssa_enabled: false,
             ssa_excluded: HashSet::new(),
@@ -1119,13 +1133,22 @@ impl<'a> FnGen<'a> {
         }
     }
 
+    /// A string slot's (pointer, length), the owned bit masked off.
     fn load_str(&mut self, loc: Loc) -> (Value, Value) {
+        let (p, raw) = self.load_str_raw(loc);
+        let l = self.b.ins().band_imm_s(raw, i64::MAX);
+        (p, l)
+    }
+
+    /// A string slot's two words as stored, owned bit and all.
+    fn load_str_raw(&mut self, loc: Loc) -> (Value, Value) {
         let p = self.load(types::I64, loc);
         let l = self.load(types::I64, loc.offset(8));
         (p, l)
     }
 
-    fn store_str(&mut self, (p, l): (Value, Value), loc: Loc) {
+    /// Store a string slot's two words as given.
+    fn store_str_raw(&mut self, (p, l): (Value, Value), loc: Loc) {
         self.store(p, loc);
         self.store(l, loc.offset(8));
     }
@@ -1185,6 +1208,9 @@ impl<'a> FnGen<'a> {
         let rets = self.b.inst_results(inst).to_vec();
         if name.starts_with("_rt_") {
             let h = rtsig::lookup(name);
+            if h.fresh {
+                self.temps.push(rets[0]);
+            }
             if h.fallible {
                 self.error_check();
             }

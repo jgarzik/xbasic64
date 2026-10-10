@@ -70,6 +70,19 @@ impl FnGen<'_> {
     /// goes to its fault block. A nested statement is its own: an error in a
     /// FOR body's statement resumes there, one in the FOR's limit at the FOR.
     pub(super) fn gen_stmt(&mut self, stmt: &Stmt) {
+        // Each statement has temporaries of its own, freed when it is done;
+        // an enclosing statement's were freed before it branched here.
+        let outer_temps = std::mem::take(&mut self.temps);
+        let outer_copy = self.copy_loads;
+        self.copy_loads = self.calls_user_function(stmt);
+        self.gen_stmt_framed(stmt);
+        self.free_temps();
+        self.temps = outer_temps;
+        self.copy_loads = outer_copy;
+    }
+
+    /// `gen_stmt`, bracketed by its resume points when trapping.
+    fn gen_stmt_framed(&mut self, stmt: &Stmt) {
         if !self.cg.traps {
             self.gen_stmt_inner(stmt);
             return;
@@ -123,19 +136,13 @@ impl FnGen<'_> {
                         }
                         _ => None,
                     };
+                    let _ = words;
                     if let Some(src) = src {
-                        for w in 0..words {
-                            let v =
-                                self.b
-                                    .ins()
-                                    .load(types::I64, MemFlagsData::trusted(), src, 8 * w);
-                            self.store(v, loc.offset(8 * w));
-                        }
+                        self.copy_record(loc, src, &ty);
                     }
                     return;
                 }
                 let v = self.gen_expr(value);
-                let v = self.own_string(v, value);
                 self.store_typed(loc, &ty, v);
             }
 
@@ -147,8 +154,14 @@ impl FnGen<'_> {
                 // The element's address first, then the value, as GW-BASIC
                 // evaluates them.
                 let a = self.array_addr(name, indices);
+                // An element of an array of records takes a whole record.
+                if let Some(ty @ TypeRef::Record(_)) = self.array_elem_type(name) {
+                    if let Some(src) = self.record_addr(value) {
+                        self.copy_record(Loc::Ptr(a, 0), src, &ty);
+                    }
+                    return;
+                }
                 let v = self.gen_expr(value);
-                let v = self.own_string(v, value);
                 let ty = storage::type_ref_of(DataType::from_suffix(name));
                 self.store_typed(Loc::Ptr(a, 0), &ty, v);
             }
@@ -159,14 +172,12 @@ impl FnGen<'_> {
                 value,
             } => {
                 let v = self.gen_expr(value);
-                let v = self.own_string(v, value);
                 let place = self.var_place(name);
                 self.store_place(&place, v);
             }
 
             StmtKind::FieldAssign { target, value } => {
                 let v = self.gen_expr(value);
-                let v = self.own_string(v, value);
                 let (loc, ty) = self.lvalue_loc(target);
                 self.store_typed(loc, &ty, v);
             }
@@ -199,6 +210,7 @@ impl FnGen<'_> {
                 let else_b = self.b.create_block();
                 let end = self.b.create_block();
                 let c = self.gen_condition(condition);
+                self.free_temps();
                 self.brif(c, then_b, else_b);
                 self.switch_sealed(then_b);
                 self.gen_body(then_branch);
@@ -224,6 +236,7 @@ impl FnGen<'_> {
                 let exit = self.b.create_block();
                 self.begin_block(head);
                 let c = self.gen_condition(condition);
+                self.free_temps();
                 self.brif(c, body_b, exit);
                 self.switch_sealed(body_b);
                 // WHILE is a DO-family loop for EXIT DO purposes.
@@ -247,6 +260,7 @@ impl FnGen<'_> {
                 if *cond_at_start && let Some(cond) = condition {
                     // DO WHILE leaves when false; DO UNTIL when true.
                     let c = self.gen_condition(cond);
+                    self.free_temps();
                     let body_b = self.b.create_block();
                     if *is_until {
                         self.brif(c, exit, body_b);
@@ -262,6 +276,7 @@ impl FnGen<'_> {
                     Some(cond) if !*cond_at_start => {
                         // LOOP WHILE repeats while true; LOOP UNTIL while false.
                         let c = self.gen_condition(cond);
+                        self.free_temps();
                         if *is_until {
                             self.brif(c, exit, head);
                         } else {
@@ -349,7 +364,7 @@ impl FnGen<'_> {
                         let r = self.call_rt("_rt_read_number", &[line]);
                         Val::Num(DataType::Double, r[0])
                     };
-                    self.store_lvalue(var, v, false);
+                    self.store_lvalue(var, v);
                 }
             }
 
@@ -390,17 +405,24 @@ impl FnGen<'_> {
                 self.call_rt("_rt_mid_assign", &[tp, tl, s, n, vp, vl]);
             }
 
+            // Both are read before either is written, so `SWAP A(I), A(J)`
+            // is right even when the subscripts alias.
             StmtKind::Swap(a, b) => {
-                // Both are read before either is written, so `SWAP A(I),
-                // A(J)` is right even when the subscripts alias. Each value
-                // is parked in a slot while the other target is addressed.
-                let va = self.gen_expr(&Self::lvalue_expr(a));
-                let vb = self.gen_expr(&Self::lvalue_expr(b));
-                let (sa, sb) = (self.park(va), self.park(vb));
-                let vb = self.unpark(sb);
-                self.store_lvalue_raw(a, vb);
-                let va = self.unpark(sa);
-                self.store_lvalue_raw(b, va);
+                if self.expr_type(&Self::lvalue_expr(a)) == DataType::String {
+                    // A string's two words move as they are, ownership and
+                    // all: neither side is copied, and nothing is freed.
+                    let (la, _) = self.lvalue_loc(a);
+                    let (lb, _) = self.lvalue_loc(b);
+                    let wa = self.load_str_raw(la);
+                    let wb = self.load_str_raw(lb);
+                    self.store_str_raw(wb, la);
+                    self.store_str_raw(wa, lb);
+                } else {
+                    let va = self.gen_expr(&Self::lvalue_expr(a));
+                    let vb = self.gen_expr(&Self::lvalue_expr(b));
+                    self.store_lvalue_raw(a, vb);
+                    self.store_lvalue_raw(b, va);
+                }
             }
 
             StmtKind::ExitLoop { is_for } => {
@@ -426,10 +448,10 @@ impl FnGen<'_> {
                     let Some(info) = self.lookup_array(name) else {
                         continue; // sema has already complained
                     };
-                    // ERASE releases the storage and nulls the descriptor, so
-                    // the array reads as undimensioned again.
-                    let p = self.load(types::I64, info.loc);
-                    self.call("free", &[p]);
+                    // ERASE releases the storage, and the strings in it, and
+                    // nulls the descriptor, so the array reads as
+                    // undimensioned again.
+                    self.free_array_storage(name, info.loc, info.ndims);
                     let z = self.iconst(types::I64, 0);
                     self.store(z, info.loc);
                 }
@@ -470,73 +492,7 @@ impl FnGen<'_> {
         }
     }
 
-    /// A string about to be stored, copied unless the expression already
-    /// produced one nothing else holds.
-    pub(super) fn own_string(&mut self, v: Val, expr: &Expr) -> Val {
-        match v {
-            Val::Str(p, l) if !self.expr_owns_its_string(expr) => {
-                let r = self.call_rt("_rt_strdup", &[p, l]);
-                Val::Str(r[0], r[1])
-            }
-            v => v,
-        }
-    }
-
-    /// Whether evaluating `expr` leaves a string in memory nothing else
-    /// holds: these helpers allocate, so a copy would be a second malloc of
-    /// bytes no one else can reach.
-    fn expr_owns_its_string(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Binary {
-                op: BinaryOp::Add, ..
-            } => self.expr_type(expr) == DataType::String,
-            Expr::FnCall { name, .. } => {
-                let upper = name.to_uppercase();
-                !self.cg.symbols.procs.contains_key(&upper)
-                    && matches!(
-                        upper.as_str(),
-                        "STR$"
-                            | "CHR$"
-                            | "HEX$"
-                            | "OCT$"
-                            | "SPACE$"
-                            | "STRING$"
-                            | "UCASE$"
-                            | "LCASE$"
-                            | "MKI$"
-                            | "MKL$"
-                            | "MKS$"
-                            | "MKD$"
-                    )
-            }
-            _ => false,
-        }
-    }
-
-    /// Keep a value in a fresh slot while other code runs.
-    fn park(&mut self, v: Val) -> (StackSlot, DataType) {
-        let slot = self.stack_slot(16);
-        match v {
-            Val::Str(p, l) => self.store_str((p, l), Loc::Stack(slot, 0)),
-            Val::Num(t, n) => {
-                self.b.ins().stack_store(types::I64, n, slot, 0);
-                return (slot, t);
-            }
-        }
-        (slot, DataType::String)
-    }
-
-    fn unpark(&mut self, (slot, t): (StackSlot, DataType)) -> Val {
-        if t == DataType::String {
-            let (p, l) = self.load_str(Loc::Stack(slot, 0));
-            Val::Str(p, l)
-        } else {
-            Val::Num(t, self.b.ins().stack_load(types::I64, num_type(t), slot, 0))
-        }
-    }
-
-    /// Store into a target without copying a string: SWAP moves values
-    /// between targets that each own theirs.
+    /// Store a number into a target: SWAP's numeric half.
     fn store_lvalue_raw(&mut self, target: &LValue, v: Val) {
         let place = self.lvalue_place(target);
         self.store_place(&place, v);
@@ -661,6 +617,7 @@ impl FnGen<'_> {
     /// fall through; a value no byte holds is Illegal function call.
     fn on_selector(&mut self, expr: &Expr) -> Value {
         let n = self.gen_i64(expr);
+        self.free_temps();
         self.check_range(n, 0, Some(255), RtError::Domain);
         n
     }
@@ -706,6 +663,7 @@ impl FnGen<'_> {
         };
         let step_var = self.b.declare_var(ty);
         self.b.def_var(step_var, st);
+        self.free_temps();
 
         // Which way the loop runs is the step's sign, almost always written
         // into the program and so decided here.
@@ -818,11 +776,16 @@ impl FnGen<'_> {
         let v = self.gen_expr(expr);
         let slot = self.stack_slot(16);
         if is_string {
-            self.store_str(v.str(), Loc::Stack(slot, 0));
+            // Owned for the whole statement: a CASE body may assign the
+            // variable it was read from, and a later CASE still compares.
+            let z = self.iconst(types::I64, 0);
+            self.store_str_raw((z, z), Loc::Stack(slot, 0));
+            self.assign_str(Loc::Stack(slot, 0), v);
         } else {
             let d = self.double_of(v);
             self.b.ins().stack_store(types::I64, d, slot, 0);
         }
+        self.free_temps();
 
         for (clauses, body) in cases {
             let next = self.b.create_block();
@@ -841,6 +804,9 @@ impl FnGen<'_> {
             self.switch_sealed(next);
         }
         self.begin_sealed(end);
+        if is_string {
+            self.free_slot_str(Loc::Stack(slot, 0));
+        }
     }
 
     /// One CASE alternative: go to `body` when it matches.
@@ -857,9 +823,11 @@ impl FnGen<'_> {
                 let (rp, rl) = f.gen_expr(e).str();
                 let (lp, ll) = f.load_str(Loc::Stack(slot, 0));
                 let c = f.call_rt("_rt_strcmp", &[lp, ll, rp, rl])[0];
+                f.free_temps();
                 f.b.ins().icmp_imm_s(expr::int_cc(op), c, 0)
             } else {
                 let x = f.gen_double(e);
+                f.free_temps();
                 let sel = f.b.ins().stack_load(types::I64, types::F64, slot, 0);
                 f.b.ins().fcmp(expr::float_cc(op), sel, x)
             }

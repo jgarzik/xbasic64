@@ -48,6 +48,10 @@ pub struct RtHelper {
     /// program; `_rt_error` is not one of them, since it returns when a
     /// handler traps the error.
     pub noreturn: bool,
+    /// Whether a string result is a fresh allocation the caller owns and
+    /// must free -- rather than a slice of its argument, a static buffer, or
+    /// a pointer into DATA or a record buffer.
+    pub fresh: bool,
 }
 
 const STR: &[Ty] = &[I64, I64];
@@ -59,11 +63,17 @@ const fn h(name: &'static str, params: &'static [Ty], rets: &'static [Ty]) -> Rt
         rets,
         fallible: false,
         noreturn: false,
+        fresh: false,
     }
 }
 
 const fn fallible(mut helper: RtHelper) -> RtHelper {
     helper.fallible = true;
+    helper
+}
+
+const fn fresh(mut helper: RtHelper) -> RtHelper {
+    helper.fresh = true;
     helper
 }
 
@@ -89,7 +99,7 @@ pub static HELPERS: &[RtHelper] = &[
     h("_rt_input_string", &[], STR),
     fallible(h("_rt_input_line", &[I64, I64, I64, I64], &[])),
     h("_rt_input_field_num", &[I64], &[F64]),
-    h("_rt_input_field_str", &[I64], STR),
+    fresh(h("_rt_input_field_str", &[I64], STR)),
     h("_rt_cls", &[], &[]),
     h("_rt_beep", &[], &[]),
     h("_rt_pos", &[], &[I32]),
@@ -143,7 +153,7 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_lock", &[I64, I64, I64, I64], &[])),
     fallible(h("_rt_unlock", &[I64, I64, I64, I64], &[])),
     // (value bits, width)
-    h("_rt_mk", &[I64, I64], STR),
+    fresh(h("_rt_mk", &[I64, I64], STR)),
     // (pointer, length, line)
     fallible(h("_rt_cvi", &[I64, I64, I64], &[F64])),
     fallible(h("_rt_cvl", &[I64, I64, I64], &[F64])),
@@ -156,28 +166,28 @@ pub static HELPERS: &[RtHelper] = &[
     fallible(h("_rt_array_autodim", &[I64, I64, I64, I64], &[])),
     // Strings
     fallible(h("_rt_val", STR, &[F64])),
-    h("_rt_str", &[F64], STR),
-    h("_rt_str_single", &[F64], STR),
-    h("_rt_chr", &[I64], STR),
-    h("_rt_space", &[I64], STR),
-    h("_rt_hex", &[I64], STR),
-    h("_rt_oct", &[I64], STR),
+    fresh(h("_rt_str", &[F64], STR)),
+    fresh(h("_rt_str_single", &[F64], STR)),
+    fresh(h("_rt_chr", &[I64], STR)),
+    fresh(h("_rt_space", &[I64], STR)),
+    fresh(h("_rt_hex", &[I64], STR)),
+    fresh(h("_rt_oct", &[I64], STR)),
     // (count, character code)
-    h("_rt_string_n", &[I64, I64], STR),
+    fresh(h("_rt_string_n", &[I64, I64], STR)),
     h("_rt_ltrim", STR, STR),
     h("_rt_rtrim", STR, STR),
-    h("_rt_ucase", STR, STR),
-    h("_rt_lcase", STR, STR),
-    h("_rt_strdup", STR, STR),
+    fresh(h("_rt_ucase", STR, STR)),
+    fresh(h("_rt_lcase", STR, STR)),
+    fresh(h("_rt_strdup", STR, STR)),
     // (pointer, length, width)
-    h("_rt_fixed", &[I64, I64, I64], STR),
+    fresh(h("_rt_fixed", &[I64, I64, I64], STR)),
     // (pointer, length, count)
     h("_rt_left", &[I64, I64, I64], STR),
     h("_rt_right", &[I64, I64, I64], STR),
     // (pointer, length, start, count)
     h("_rt_mid", &[I64, I64, I64, I64], STR),
     // (left pointer, left length, right pointer, right length)
-    h("_rt_strcat", &[I64, I64, I64, I64], STR),
+    fresh(h("_rt_strcat", &[I64, I64, I64, I64], STR)),
     h("_rt_strcmp", &[I64, I64, I64, I64], &[I32]),
     // (haystack pointer, haystack length, needle pointer, needle length, start)
     fallible(h("_rt_instr", &[I64, I64, I64, I64, I64], &[I64])),
@@ -187,8 +197,8 @@ pub static HELPERS: &[RtHelper] = &[
     h("_rt_rnd", &[F64], &[F64]),
     h("_rt_randomize", &[F64], &[]),
     h("_rt_timer", &[], &[F64]),
-    h("_rt_date", &[], STR),
-    h("_rt_time", &[], STR),
+    fresh(h("_rt_date", &[], STR)),
+    fresh(h("_rt_time", &[], STR)),
 ];
 
 /// The helper called `name`.
@@ -278,6 +288,42 @@ mod tests {
             }
         }
         false
+    }
+
+    /// Every helper that says its string result is fresh allocates, in both
+    /// trees: generated code frees such a result, and freeing a slice or a
+    /// static buffer instead would corrupt the heap.
+    #[test]
+    fn test_fresh_helpers_allocate() {
+        for (tree, source) in crate::runtime::tree_sources() {
+            let (edges, _) = control_flow(&source);
+            for helper in HELPERS.iter().filter(|h| h.fresh) {
+                let mut seen = BTreeSet::new();
+                let mut work = vec![helper.name.to_string()];
+                let mut found = false;
+                while let Some(label) = work.pop() {
+                    if label == "malloc" {
+                        found = true;
+                        break;
+                    }
+                    if seen.insert(label.clone())
+                        && let Some(next) = edges.get(&label)
+                    {
+                        work.extend(next.iter().cloned());
+                    }
+                }
+                assert!(
+                    found,
+                    "{} is marked fresh but never calls malloc in the {tree} runtime",
+                    helper.name
+                );
+                assert_eq!(
+                    helper.rets, STR,
+                    "{} is fresh, so returns a string",
+                    helper.name
+                );
+            }
+        }
     }
 
     /// Every helper in the table is exported by both runtime trees.

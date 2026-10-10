@@ -609,3 +609,17 @@ PRINT MID$("hello", 2, 3)
     let lines = crate::common::lines(&output);
     assert_eq!(lines, &["4", "4", "ell"]);
 }
+
+/// Assigning one element of an array of records to another, or to and from
+/// a record variable, copies the whole record -- string fields included --
+/// so the two never share a string.
+#[test]
+fn test_record_element_assignment_copies() {
+    let output = compile_and_run(
+        "TYPE R\nN AS STRING * 5\nV AS INTEGER\nEND TYPE\nDIM P(3) AS R\nDIM Q AS R\n\
+         P(1).N = \"one\": P(1).V = 1\nP(2) = P(1)\nP(1).N = \"uno\"\nQ = P(2)\nP(3) = Q\nQ.N = \"q\"\n\
+         PRINT P(1).N; P(1).V; P(2).N; P(2).V; P(3).N; P(3).V; Q.N\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "uno   1 one   1 one   1 q");
+}

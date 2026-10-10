@@ -134,7 +134,7 @@ impl FnGen<'_> {
                             let r = self.call_rt("_rt_file_input_number", &[f]);
                             Val::Num(DataType::Double, r[0])
                         };
-                        self.store_lvalue(var, v, false);
+                        self.store_lvalue(var, v);
                     }
                     return;
                 }
@@ -178,7 +178,7 @@ impl FnGen<'_> {
                         let r = self.call_rt("_rt_input_field_num", &[idx]);
                         Val::Num(DataType::Double, r[0])
                     };
-                    self.store_lvalue(var, v, false);
+                    self.store_lvalue(var, v);
                 }
             }
 
@@ -199,7 +199,7 @@ impl FnGen<'_> {
                     }
                     None => self.call_rt("_rt_input_string", &[]),
                 };
-                self.store_lvalue(var, Val::Str(r[0], r[1]), false);
+                self.store_lvalue(var, Val::Str(r[0], r[1]));
             }
 
             StmtKind::Open {

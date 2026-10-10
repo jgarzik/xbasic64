@@ -1,6 +1,7 @@
 # BASIC Runtime: String Functions (Win64 Native - Pure Win32 API)
 #
-# String manipulation functions. Uses HeapAlloc instead of malloc.
+# String manipulation functions. Every string they allocate comes from
+# malloc, since generated code frees the strings it owns with free.
 # Keeps UCRT functions: strtod, sprintf, memcpy, memcmp
 #
 # String Representation:
@@ -13,7 +14,7 @@
 #
 # Memory Management:
 #   - Substring functions return pointers into original string (no allocation)
-#   - String concatenation uses HeapAlloc(GetProcessHeap(), 0, size)
+#   - String concatenation allocates with malloc
 #   - Conversion functions (STR$, CHR$, HEX$, OCT$) format into a scratch
 #     buffer and return a heap copy of it, so that two of them in one
 #     expression cannot alias; see the System V tree for the failure
@@ -554,15 +555,10 @@ _rt_strcat:
     mov r14, r8             # right ptr
     mov r15, r9             # right len
 
-    # Get process heap handle
-    call GetProcessHeap
-    mov rsi, rax            # save heap handle
-
-    # HeapAlloc(hHeap, 0, size)
-    mov rcx, rax            # hHeap
-    xor rdx, rdx            # dwFlags = 0
-    lea r8, [r13 + r15 + 1] # dwBytes = left_len + right_len + 1
-    call HeapAlloc
+    # malloc(left_len + right_len + 1). malloc rather than HeapAlloc,
+    # because generated code frees the result with free.
+    lea rcx, [r13 + r15 + 1]
+    call malloc
 
     mov rdi, rax            # save result ptr
 

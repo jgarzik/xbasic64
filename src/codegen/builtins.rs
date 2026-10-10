@@ -343,7 +343,10 @@ impl FnGen<'_> {
                 self.gen_print_position(&upper, &args[0], console);
                 double(self.f64const(0.0))
             }
-            _ => self.array_load(&upper, args),
+            _ => {
+                let v = self.array_load(&upper, args);
+                self.guard_load(v)
+            }
         }
     }
 

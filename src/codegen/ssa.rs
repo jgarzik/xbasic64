@@ -25,7 +25,7 @@ use std::collections::HashSet;
 
 /// A copy of `stmt` without its nested bodies, which `walk_stmts` visits on
 /// their own: copying them at every level would be quadratic in nesting.
-fn shallow(stmt: &Stmt) -> Stmt {
+pub(super) fn shallow(stmt: &Stmt) -> Stmt {
     let kind = match &stmt.kind {
         StmtKind::If { condition, .. } => StmtKind::If {
             condition: condition.clone(),

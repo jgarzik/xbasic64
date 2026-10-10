@@ -287,7 +287,8 @@ impl FnGen<'_> {
                 }
                 // A variable declared with `AS` lives in typed storage.
                 if let Some((loc, ty)) = self.typed_storage(name) {
-                    return self.load_typed(loc, &ty);
+                    let v = self.load_typed(loc, &ty);
+                    return self.guard_load(v);
                 }
                 let upper = name.to_uppercase();
                 // The builtins that take no argument are named bare.
@@ -313,10 +314,14 @@ impl FnGen<'_> {
                     return Val::Num(t, self.b.use_var(var));
                 }
                 let info = self.get_var_info(name);
-                self.load_val(info.data_type, info.loc)
+                let v = self.load_val(info.data_type, info.loc);
+                self.guard_load(v)
             }
 
-            Expr::ArrayAccess { name, indices } => self.array_load(name, indices),
+            Expr::ArrayAccess { name, indices } => {
+                let v = self.array_load(name, indices);
+                self.guard_load(v)
+            }
 
             Expr::Unary { op, operand } => {
                 let v = self.gen_expr(operand);
@@ -357,14 +362,16 @@ impl FnGen<'_> {
                         .field_byte_offset(&base, &fields)
                         .expect("sema checked the field path");
                     let a = self.array_addr(&name, &indices);
-                    return self.load_typed(Loc::Ptr(a, offset), &ty);
+                    let v = self.load_typed(Loc::Ptr(a, offset), &ty);
+                    return self.guard_load(v);
                 }
                 let (name, fields) =
                     Self::flatten_field_path(expr).expect("sema rejects a field of a non-record");
                 let (loc, ty) = self
                     .resolve_field_path(&name, &fields)
                     .expect("sema resolved this field path");
-                self.load_typed(loc, &ty)
+                let v = self.load_typed(loc, &ty);
+                self.guard_load(v)
             }
         }
     }

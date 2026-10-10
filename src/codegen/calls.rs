@@ -124,18 +124,10 @@ impl FnGen<'_> {
                         );
                     } else if let Some(ty @ TypeRef::Record(_)) = &p.ty {
                         let loc = if p.byval {
-                            // A copy of the caller's record.
+                            // A copy of the caller's record, strings and all.
                             let words = self.cg.symbols.type_words(ty);
                             let slot = self.local_slot(8 * words as u32);
-                            for w in 0..words {
-                                let v = self.b.ins().load(
-                                    types::I64,
-                                    MemFlagsData::trusted(),
-                                    ptr,
-                                    8 * w,
-                                );
-                                self.b.ins().stack_store(types::I64, v, slot, 8 * w);
-                            }
+                            self.copy_record(Loc::Stack(slot, 0), ptr, ty);
                             Loc::Stack(slot, 0)
                         } else {
                             Loc::Ptr(ptr, 0)
@@ -155,9 +147,11 @@ impl FnGen<'_> {
                 Pass::Str => {
                     let ptr = args.next().expect("a string pointer");
                     let len = args.next().expect("a string length");
+                    // A copy of its own, which the procedure may assign and
+                    // frees at exit; the caller's string is left alone.
                     let slot = self.local_slot(16);
                     let loc = Loc::Stack(slot, 0);
-                    self.store_str((ptr, len), loc);
+                    self.assign_str(loc, Val::Str(ptr, len));
                     self.proc_vars.insert(
                         pname,
                         VarInfo {
@@ -226,6 +220,7 @@ impl FnGen<'_> {
             self.gen_stmt(s);
         }
         self.begin_block(exit);
+        self.free_locals(name);
         if let Some(slot) = gosub_mark {
             let v = self.b.ins().stack_load(types::I64, types::I64, slot, 0);
             let sp = self.global_addr("_gosub_sp", 8);
@@ -271,6 +266,52 @@ impl FnGen<'_> {
         self.after_terminator();
     }
 
+    /// Free what this procedure's own storage holds, at its exit: string
+    /// locals and BYVAL strings, the strings of local records, and local
+    /// arrays with the strings in them. Not a by-reference parameter, which
+    /// is the caller's; not a STATIC, which outlives the call; and not the
+    /// FUNCTION's result, which is returned.
+    fn free_locals(&mut self, own_name: &str) {
+        let mut vars: Vec<(String, VarInfo)> = self
+            .proc_vars
+            .iter()
+            .map(|(n, i)| (n.clone(), *i))
+            .collect();
+        vars.sort_by(|a, b| a.0.cmp(&b.0));
+        for (n, info) in vars {
+            if n != own_name
+                && info.data_type == DataType::String
+                && matches!(info.loc, Loc::Stack(..))
+            {
+                self.free_slot_str(info.loc);
+            }
+        }
+        let mut records: Vec<(String, Loc)> = self
+            .proc_record_vars
+            .iter()
+            .map(|(n, l)| (n.clone(), *l))
+            .collect();
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        for (n, loc) in records {
+            if matches!(loc, Loc::Stack(..))
+                && let Some(ty) = self.typed_var(&n)
+            {
+                self.free_record_strings(loc, &ty);
+            }
+        }
+        let mut arrays: Vec<(String, ArrayInfo)> = self
+            .proc_arrays
+            .iter()
+            .map(|(n, i)| (n.clone(), *i))
+            .collect();
+        arrays.sort_by(|a, b| a.0.cmp(&b.0));
+        for (n, info) in arrays {
+            if matches!(info.loc, Loc::Stack(..)) {
+                self.free_array_storage(&n, info.loc, info.ndims);
+            }
+        }
+    }
+
     /// Call a user SUB or FUNCTION; a FUNCTION's result.
     pub(super) fn gen_call(&mut self, name: &str, args: &[Expr]) -> Option<Val> {
         let upper = name.to_uppercase();
@@ -289,6 +330,8 @@ impl FnGen<'_> {
             .is_some_and(|p| p.is_function);
 
         let mut vals = Vec::new();
+        // By-reference temporaries holding strings, freed after the call.
+        let mut string_temps = Vec::new();
         for (arg, p) in args.iter().zip(&params) {
             match param_pass(p) {
                 Pass::Pointer if p.array => {
@@ -323,7 +366,14 @@ impl FnGen<'_> {
                             let slot = self.stack_slot(8 * storage::words_for(ty) as u32);
                             let loc = Loc::Stack(slot, 0);
                             match v {
-                                Val::Str(p, l) => self.store_str((p, l), loc),
+                                Val::Str(..) => {
+                                    // The procedure may assign it, freeing
+                                    // what it held, so it owns a copy.
+                                    let z = self.iconst(types::I64, 0);
+                                    self.store_str_raw((z, z), loc);
+                                    self.assign_str(loc, v);
+                                    string_temps.push(loc);
+                                }
                                 v => {
                                     let n = self.coerce(v, ty).num();
                                     self.store_num(ty, n, loc);
@@ -351,12 +401,20 @@ impl FnGen<'_> {
         let inst = self.b.ins().call(fref, &vals);
         let rets = self.b.inst_results(inst).to_vec();
         self.error_check();
+        for loc in string_temps {
+            self.free_slot_str(loc);
+        }
         if !is_function {
             return None;
         }
         let t = self.cg.proc_return_type(&upper);
         Some(match t {
-            DataType::String => Val::Str(rets[0], rets[1]),
+            // The FUNCTION's result variable is gone; its string is this
+            // statement's to free.
+            DataType::String => {
+                self.temps.push(rets[0]);
+                Val::Str(rets[0], rets[1])
+            }
             t => Val::Num(t, rets[0]),
         })
     }

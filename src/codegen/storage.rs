@@ -339,14 +339,14 @@ impl FnGen<'_> {
     pub(super) fn store_typed(&mut self, loc: Loc, ty: &TypeRef, v: Val) {
         match ty {
             // A plain string variable: see `type_ref_of`.
-            TypeRef::FixedString(0) => self.store_str(v.str(), loc),
+            TypeRef::FixedString(0) => self.assign_str(loc, v),
             TypeRef::FixedString(width) => {
                 // A fixed-length string holds exactly its declared width: a
                 // short value is space-padded, a long one truncated.
                 let (p, l) = v.str();
                 let w = self.iconst(types::I64, *width as i64);
                 let r = self.call_rt("_rt_fixed", &[p, l, w]);
-                self.store_str((r[0], r[1]), loc);
+                self.assign_str(loc, Val::Str(r[0], r[1]));
             }
             TypeRef::Record(_) => {}
             t => {
@@ -516,6 +516,15 @@ impl FnGen<'_> {
 
         let counts: Vec<Value> = bounds.iter().map(|(_, c)| *c).collect();
         let size = self.checked_size(&counts, elem_size);
+        if preserve {
+            // Elements past the new end are lost to realloc: free the
+            // strings they hold first.
+            let mut new_count = self.iconst(types::I64, 1);
+            for c in &counts {
+                new_count = self.b.ins().imul(new_count, *c);
+            }
+            self.free_array_strings_from(&arr.name, loc, ndims, new_count);
+        }
         let (mem, old_size) = if preserve {
             let n = ndims as i32;
             let old_counts: Vec<Value> = (0..n)
@@ -536,6 +545,10 @@ impl FnGen<'_> {
             self.raise_if(null, RtError::OutOfMemory);
         }
 
+        if !preserve {
+            // The old elements, if any, and the strings they hold.
+            self.free_array_storage(&arr.name, loc, ndims);
+        }
         self.store(mem, loc);
         let n = ndims as i32;
         for (i, (lo, count)) in bounds.into_iter().enumerate() {
@@ -563,6 +576,41 @@ impl FnGen<'_> {
         } else {
             self.cg.arrays.insert(arr.name.clone(), info);
         }
+    }
+
+    /// The number of elements the descriptor at `loc` describes.
+    fn element_count(&mut self, loc: Loc, ndims: usize) -> Value {
+        let mut n = self.iconst(types::I64, 1);
+        for i in 0..ndims {
+            let c = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
+            n = self.b.ins().imul(n, c);
+        }
+        n
+    }
+
+    /// Free the strings of elements `from..` of the array `name` whose
+    /// descriptor is at `loc`, if it has storage and holds strings.
+    fn free_array_strings_from(&mut self, name: &str, loc: Loc, ndims: usize, from: Value) {
+        let Some((es, offsets)) = self.array_string_layout(name) else {
+            return;
+        };
+        let ptr = self.load(types::I64, loc);
+        let some = self.b.create_block();
+        let done = self.b.create_block();
+        self.brif(ptr, some, done);
+        self.switch_sealed(some);
+        let count = self.element_count(loc, ndims);
+        self.free_element_strings(ptr, from, count, es, &offsets);
+        self.begin_sealed(done);
+    }
+
+    /// Free the array `name`'s element block and the strings in it. The
+    /// descriptor is left as it is.
+    pub(super) fn free_array_storage(&mut self, name: &str, loc: Loc, ndims: usize) {
+        let zero = self.iconst(types::I64, 0);
+        self.free_array_strings_from(name, loc, ndims, zero);
+        let ptr = self.load(types::I64, loc);
+        self.call("free", &[ptr]);
     }
 
     /// The bytes `counts` elements of `elem_size` take.
@@ -751,15 +799,8 @@ impl FnGen<'_> {
     }
 
     /// Store `v` into `target`, converting it to the target's type. A
-    /// string is copied, so the target owns what it holds.
-    pub(super) fn store_lvalue(&mut self, target: &LValue, v: Val, owned: bool) {
-        let v = match v {
-            Val::Str(p, l) if !owned => {
-                let r = self.call_rt("_rt_strdup", &[p, l]);
-                Val::Str(r[0], r[1])
-            }
-            other => other,
-        };
+    /// string target owns what it holds: a temporary, or a copy.
+    pub(super) fn store_lvalue(&mut self, target: &LValue, v: Val) {
         let place = self.lvalue_place(target);
         self.store_place(&place, v);
     }
@@ -768,7 +809,7 @@ impl FnGen<'_> {
     /// variable alias the record buffer.
     pub(super) fn bind_alias(&mut self, target: &LValue, p: Value, l: Value) {
         let (loc, _) = self.lvalue_loc(target);
-        self.store_str((p, l), loc);
+        self.bind_str(loc, p, l);
     }
 }
 

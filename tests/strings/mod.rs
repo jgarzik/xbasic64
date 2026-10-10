@@ -539,3 +539,133 @@ fn test_val_overflow_is_an_error() {
     assert_eq!(run.exit_code, Some(1), "{}", run.stderr);
     assert!(run.stderr.contains("Overflow"), "{}", run.stderr);
 }
+
+/// Strings are freed when nothing holds them any more, so a program that
+/// churns strings runs in bounded memory. This loop allocated over 2 GB
+/// when no string was ever freed; under a 256 MB address-space limit it
+/// must still finish. The cases are each place a string can be dropped:
+/// reassignment, a temporary, a FUNCTION result, a BYVAL copy, a local
+/// array, REDIM, a record field and record copy, and a SELECT selector.
+#[cfg(unix)]
+#[test]
+fn test_string_churn_runs_in_bounded_memory() {
+    let src = r#"
+TYPE R
+  N AS STRING * 50
+  V AS INTEGER
+END TYPE
+DIM P(10) AS R
+SUB WORK(BYVAL S$, T$)
+  DIM L$(20)
+  FOR K = 0 TO 20: L$(K) = S$ + T$: NEXT K
+  T$ = LEFT$(S$, 10)
+END SUB
+FUNCTION MAKE$(BYVAL N)
+  MAKE$ = STRING$(200, "y") + STR$(N)
+END FUNCTION
+FOR I& = 1 TO 50000
+  A$ = STRING$(1000, "x") + STR$(I&)
+  B$ = LEFT$(A$, 500)
+  C$ = UCASE$(B$) + LCASE$(B$)
+  IF LEN(MAKE$(I&) + C$) = 0 THEN PRINT "never"
+  WORK A$, B$
+  REDIM S$(50)
+  FOR J = 0 TO 50: S$(J) = MID$(A$, J + 1, 100): NEXT J
+  P(I& MOD 10).N = B$
+  P(4) = P(5)
+  SELECT CASE MAKE$(1)
+    CASE "z": PRINT "no"
+  END SELECT
+NEXT I&
+PRINT LEN(A$); LEN(B$); LEN(C$); LEN(S$(3))
+"#;
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bas = tmp.path().join("churn.bas");
+    let exe = tmp.path().join("churn");
+    std::fs::write(&bas, src).unwrap();
+    let c = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
+    let run = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v 262144 && exec {}", exe.display()))
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "stdout {} stderr {}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout).trim(),
+        "1006  10  1000  100"
+    );
+}
+
+/// The places a string changes hands, each with a later reassignment that
+/// would free it twice -- or free it while still in use -- if ownership
+/// were wrong. glibc aborts on a double free, so a mistake is not quiet.
+#[test]
+fn test_string_ownership_edges() {
+    let out = compile_and_run(
+        r#"
+DIM SHARED G$
+FUNCTION BUMP$
+  G$ = G$ + "!"
+  BUMP$ = "f"
+END FUNCTION
+SUB TAKE(BYVAL V$, R$)
+  V$ = V$ + "v"
+  R$ = R$ + "r"
+END SUB
+FUNCTION REC$(BYVAL N)
+  L$ = STR$(N)
+  IF N > 0 THEN L$ = L$ + REC$(N - 1)
+  REC$ = L$
+END FUNCTION
+A$ = "a": B$ = "b"
+FOR I = 1 TO 3
+  SWAP A$, B$
+  A$ = A$ + "1": B$ = B$ + "2"
+NEXT I
+PRINT A$; " "; B$
+G$ = "g"
+X$ = G$ + BUMP$
+PRINT X$; " "; G$
+S$ = "sel"
+SELECT CASE S$
+  CASE "sel": S$ = "changed"
+  CASE "x": PRINT "no"
+END SELECT
+PRINT S$
+K$ = "k"
+TAKE K$, K$ + "t"
+TAKE K$, K$
+PRINT K$
+DIM Z$(3)
+Z$(1) = "z1": REDIM PRESERVE Z$(1): REDIM PRESERVE Z$(5): Z$(5) = "z5"
+PRINT Z$(1); Z$(5); LEN(Z$(3))
+ERASE Z$
+DIM Z$(2): Z$(2) = "again": PRINT Z$(2)
+PRINT REC$(3)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec![
+            "b121 a212",
+            "gf g!",
+            "changed",
+            "kr",
+            "z1z5 0",
+            "again",
+            "3 2 1 0"
+        ]
+    );
+}

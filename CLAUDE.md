@@ -117,6 +117,13 @@ Integration tests organized by feature area:
 - **String builtins returning a static buffer must copy**: two calls in one
   expression would otherwise alias, which is why `_rt_str`, `_rt_chr`, `_rt_hex`,
   `_rt_oct` and `_rt_mk` end in `_rt_strdup`
+- **Strings are owned and freed** (`codegen/strings.rs`): bit 63 of a string
+  slot's length word marks bytes the slot owns, which assignment frees; a
+  FIELD window owns nothing. A helper's result is a temporary to free only if
+  `rtsig` marks it `fresh` -- which a test checks reaches `malloc` -- so a new
+  helper that allocates must say so, and one that returns a slice or a static
+  buffer must not. The runtime allocates every string with `malloc`, never
+  `HeapAlloc`, since generated code frees with `free`
 - **No jumps to code addresses**: GOSUB pushes a return site *number* and
   RETURN dispatches on it with a `br_table` over its scope's sites; ON
   GOTO/GOSUB, the ON ERROR handler's entry (`_err_handler` holds a number) and
