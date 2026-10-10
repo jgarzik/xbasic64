@@ -268,9 +268,15 @@ impl FnGen<'_> {
                 value,
                 right,
             } => {
-                // LSET writes *through* the field's existing pointer.
+                // LSET writes *through* the field's existing pointer. When
+                // the statement calls a FUNCTION, a load would be a copy --
+                // see `guard_load` -- so the target is read from its slot.
                 let (sp, sl) = self.gen_expr(value).str();
-                let (dp, dl) = self.gen_expr(&Self::lvalue_expr(target)).str();
+                let (dp, dl) = if self.copy_loads {
+                    self.in_place_str(target, None)
+                } else {
+                    self.gen_expr(&Self::lvalue_expr(target)).str()
+                };
                 let f = if *right { "_rt_rset" } else { "_rt_lset" };
                 self.call_rt(f, &[dp, dl, sp, sl]);
             }

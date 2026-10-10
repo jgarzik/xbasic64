@@ -461,6 +461,13 @@ impl FnGen<'_> {
     ) -> (Value, Vec<Value>) {
         // An array with no storage yet -- never DIMmed, or ERASEd -- is
         // created by this use, as GW-BASIC does.
+        let subs = self.array_subs(name, indices);
+        (self.elem_addr(name, &subs), subs)
+    }
+
+    /// The subscripts of an element of `name`, evaluated now, the array
+    /// created first if it has no storage yet.
+    pub(super) fn array_subs(&mut self, name: &str, indices: &[Expr]) -> Vec<Value> {
         let info = self
             .lookup_array(name)
             .expect("sema checked the array is declared");
@@ -473,7 +480,17 @@ impl FnGen<'_> {
             let v = self.gen_expr(idx);
             subs.push(self.i64_of(v));
         }
-        (self.elem_addr(name, &subs), subs)
+        subs
+    }
+
+    /// `elem_addr` after code that may have REDIMmed the array -- or ERASEd
+    /// it, which this use creates again, as any other would.
+    pub(super) fn elem_addr_again(&mut self, name: &str, subs: &[Value]) -> Value {
+        let info = self
+            .lookup_array(name)
+            .expect("sema checked the array is declared");
+        self.autodim_if_null(name, info);
+        self.elem_addr(name, subs)
     }
 
     /// The address of the element of `name` at the evaluated subscripts
@@ -950,30 +967,85 @@ impl FnGen<'_> {
     /// Where an assignment target lives and its declared type, its address
     /// computed now -- after any value it is to receive.
     pub(super) fn lvalue_loc(&mut self, target: &LValue) -> (Loc, TypeRef) {
+        if let Some(indices) = &target.indices {
+            let a = self.array_addr(&target.name, indices);
+            return self.element_loc(target, a);
+        }
         if !target.fields.is_empty() {
-            if let Some(indices) = &target.indices {
-                let base = self
-                    .array_elem_type(&target.name)
-                    .expect("sema checked this is an array of records");
-                let (offset, ty) = self
-                    .field_byte_offset(&base, &target.fields)
-                    .expect("sema checked the field path");
-                let a = self.array_addr(&target.name, indices);
-                return (Loc::Ptr(a, offset), ty);
-            }
             return self
                 .resolve_field_path(&target.name, &target.fields)
                 .expect("sema resolved this field path");
-        }
-        if let Some(indices) = &target.indices {
-            let a = self.array_addr(&target.name, indices);
-            return (Loc::Ptr(a, 0), self.array_value_type(&target.name));
         }
         if let Some((loc, ty)) = self.typed_storage(&target.name) {
             return (loc, ty);
         }
         let info = self.get_var_info(&target.name);
         (info.loc, type_ref_of(info.data_type))
+    }
+
+    /// Where an element target lives, its element at `a`: the element, or
+    /// the field of it the target names.
+    fn element_loc(&self, target: &LValue, a: Value) -> (Loc, TypeRef) {
+        if target.fields.is_empty() {
+            return (Loc::Ptr(a, 0), self.array_value_type(&target.name));
+        }
+        let base = self
+            .array_elem_type(&target.name)
+            .expect("sema checked this is an array of records");
+        let (offset, ty) = self
+            .field_byte_offset(&base, &target.fields)
+            .expect("sema checked the field path");
+        (Loc::Ptr(a, offset), ty)
+    }
+
+    /// An assignment target's subscripts, evaluated now, for `lvalue_loc_at`
+    /// to find it with once code that may move its array has run. None for
+    /// a target that is no element.
+    pub(super) fn target_subs(&mut self, target: &LValue) -> Option<Vec<Value>> {
+        let indices = target.indices.as_ref()?;
+        Some(self.array_subs(&target.name, indices))
+    }
+
+    /// `lvalue_loc` of a target whose subscripts `target_subs` evaluated:
+    /// an element is found again in its array as it is now.
+    pub(super) fn lvalue_loc_at(
+        &mut self,
+        target: &LValue,
+        subs: Option<&[Value]>,
+    ) -> (Loc, TypeRef) {
+        match subs {
+            Some(subs) => {
+                let a = self.elem_addr_again(&target.name, subs);
+                self.element_loc(target, a)
+            }
+            None => self.lvalue_loc(target),
+        }
+    }
+
+    /// `lvalue_place` of a target whose subscripts `target_subs` evaluated.
+    pub(super) fn lvalue_place_at(&mut self, target: &LValue, subs: Option<&[Value]>) -> Place {
+        match subs {
+            Some(_) => {
+                let (loc, ty) = self.lvalue_loc_at(target, subs);
+                Place::Mem(loc, ty)
+            }
+            None => self.lvalue_place(target),
+        }
+    }
+
+    /// The string a statement writes into in place, as MID$ and LSET do:
+    /// `target`, at the subscripts `subs` if they were evaluated earlier,
+    /// a fixed-length one made its own first.
+    pub(super) fn in_place_str(
+        &mut self,
+        target: &LValue,
+        subs: Option<&[Value]>,
+    ) -> (Value, Value) {
+        let (loc, ty) = self.lvalue_loc_at(target, subs);
+        if let TypeRef::FixedString(w @ 1..) = ty {
+            self.own_fixed(loc, w);
+        }
+        self.load_str(loc)
     }
 
     /// Where an assignment target lives: in memory, or -- a plain scalar

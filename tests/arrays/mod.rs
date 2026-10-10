@@ -738,3 +738,89 @@ fn test_hoisted_loop_subscript_errors() {
         );
     }
 }
+
+/// A FUNCTION called on the right of an assignment to an array element may
+/// REDIM or ERASE that array; the value lands in the array as it is after
+/// the call, not in the block the call freed. Likewise a record field of
+/// an element, a string element, SWAP and the MID$ statement.
+#[test]
+fn test_element_target_outlives_a_redim_in_the_statement() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS INTEGER
+END TYPE
+DIM SHARED A(3), S$(3), T(3) AS R
+FUNCTION G(X)
+  REDIM A(100000), S$(100000), T(100000) AS R
+  G = X
+END FUNCTION
+FUNCTION K$(X)
+  ERASE S$
+  K$ = "k" + STR$(X)
+END FUNCTION
+FUNCTION P$
+  REDIM PRESERVE S$(100000)
+  P$ = "ZZ"
+END FUNCTION
+A(1) = G(7)
+PRINT A(1); UBOUND(A)
+S$(2) = K$(5)
+PRINT S$(2)
+T(1).N = G(9)
+PRINT T(1).N
+B = 4
+SWAP B, A(G(2))
+PRINT A(2); B
+S$(1) = "abcdef"
+MID$(S$(1), 2) = P$
+PRINT S$(1)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["7  100000", "k 5", "9", "4  0", "aZZdef"]
+    );
+}
+
+/// The rest of the statements that write into an element: a whole record,
+/// SWAP of records and of strings, and LSET, which writes in place -- into
+/// the target, not into the copy a load is in a statement that calls a
+/// FUNCTION.
+#[test]
+fn test_element_targets_outlive_a_redim_elsewhere_in_the_statement() {
+    let out = compile_and_run(
+        r#"
+TYPE R
+  N AS INTEGER
+END TYPE
+DIM SHARED T(3) AS R, U(3) AS R, S$(3)
+FUNCTION G(X)
+  REDIM T(100000) AS R, S$(100000)
+  G = X
+END FUNCTION
+FUNCTION F$
+  REDIM PRESERVE S$(200000)
+  F$ = "LL"
+END FUNCTION
+U(2).N = 5
+T(1) = U(G(2))
+PRINT T(1).N
+SWAP U(2), T(G(1))
+PRINT U(2).N; T(1).N
+S$(1) = "x"
+S$(2) = "y"
+SWAP S$(2), S$(G(1))
+PRINT "[" + S$(1) + S$(2) + "]"
+S$(1) = "abcdef"
+LSET S$(1) = F$
+PRINT S$(1); "|"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        vec!["5", "0  5", "[]", "LL    |"]
+    );
+}

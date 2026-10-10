@@ -166,17 +166,32 @@ impl FnGen<'_> {
                 indices: Some(indices),
                 value,
             } => {
-                // The element's address first, then the value, as GW-BASIC
-                // evaluates them.
-                let a = self.array_addr(name, indices);
+                // The subscripts first, then the value, as GW-BASIC
+                // evaluates them. A value that calls a FUNCTION may REDIM or
+                // ERASE the array, so the element's address is taken after
+                // it, from the subscripts' values.
+                let (subs, early) = if self.calls_user_function(stmt) {
+                    (self.array_subs(name, indices), None)
+                } else {
+                    let (a, subs) = self.array_addr_and_subs(name, indices);
+                    (subs, Some(a))
+                };
                 // An element of an array of records takes a whole record.
                 if let Some(ty @ TypeRef::Record(_)) = self.array_elem_type(name) {
                     if let Some(src) = self.record_addr(value) {
+                        let a = match early {
+                            Some(a) => a,
+                            None => self.elem_addr_again(name, &subs),
+                        };
                         self.copy_record(Loc::Ptr(a, 0), src, &ty);
                     }
                     return;
                 }
                 let v = self.gen_expr(value);
+                let a = match early {
+                    Some(a) => a,
+                    None => self.elem_addr_again(name, &subs),
+                };
                 let ty = self.array_value_type(name);
                 self.store_typed(Loc::Ptr(a, 0), &ty, v);
             }
@@ -412,12 +427,16 @@ impl FnGen<'_> {
                 len,
                 value,
             } => {
-                // Written in place: the target itself, not a copy of it.
-                let (loc, ty) = self.lvalue_loc(target);
-                if let TypeRef::FixedString(w @ 1..) = ty {
-                    self.own_fixed(loc, w);
-                }
-                let (tp, tl) = self.load_str(loc);
+                // Written in place: the target itself, not a copy of it --
+                // found after the operands when one calls a FUNCTION, which
+                // may REDIM or ERASE the target's array.
+                let late = self
+                    .calls_user_function(stmt)
+                    .then(|| self.target_subs(target));
+                let early = match late {
+                    None => Some(self.in_place_str(target, None)),
+                    Some(_) => None,
+                };
                 let s = self.gen_i64(start);
                 let n = match len {
                     Some(e) => self.gen_i64(e),
@@ -425,18 +444,38 @@ impl FnGen<'_> {
                     None => self.iconst(types::I64, 0x7FFF_FFFF),
                 };
                 let (vp, vl) = self.gen_expr(value).str();
+                let (tp, tl) = match early {
+                    Some(t) => t,
+                    None => self.in_place_str(target, late.flatten().as_deref()),
+                };
                 self.call_rt("_rt_mid_assign", &[tp, tl, s, n, vp, vl]);
             }
 
             // Both are read before either is written, so `SWAP A(I), A(J)`
             // is right even when the subscripts alias.
+            //
+            // A subscript that calls a FUNCTION may REDIM or ERASE either
+            // array, so then both sides' subscripts are evaluated, and each
+            // once, before either address is taken.
             StmtKind::Swap(a, b) => {
                 let (ea, eb) = (Self::lvalue_expr(a), Self::lvalue_expr(b));
+                let late = self
+                    .calls_user_function(stmt)
+                    .then(|| (self.target_subs(a), self.target_subs(b)));
                 if let Some(ty) = self.record_type_of(&ea) {
                     // Two records exchange every word, their strings' with
                     // the rest: each string stays owned by exactly one.
-                    let pa = self.record_addr(&ea).expect("a record lvalue");
-                    let pb = self.record_addr(&eb).expect("sema matched the types");
+                    let (pa, pb) = match &late {
+                        Some((sa, sb)) => {
+                            let (la, _) = self.lvalue_loc_at(a, sa.as_deref());
+                            let (lb, _) = self.lvalue_loc_at(b, sb.as_deref());
+                            (self.addr(la), self.addr(lb))
+                        }
+                        None => (
+                            self.record_addr(&ea).expect("a record lvalue"),
+                            self.record_addr(&eb).expect("sema matched the types"),
+                        ),
+                    };
                     for w in 0..self.cg.symbols.type_words(&ty) {
                         let flags = MemFlagsData::trusted();
                         let va = self.b.ins().load(types::I64, flags, pa, 8 * w);
@@ -445,8 +484,13 @@ impl FnGen<'_> {
                         self.b.ins().store(flags, va, pb, 8 * w);
                     }
                 } else if self.expr_type(&ea) == DataType::String {
-                    let (la, ta) = self.lvalue_loc(a);
-                    let (lb, tb) = self.lvalue_loc(b);
+                    let ((la, ta), (lb, tb)) = match &late {
+                        Some((sa, sb)) => (
+                            self.lvalue_loc_at(a, sa.as_deref()),
+                            self.lvalue_loc_at(b, sb.as_deref()),
+                        ),
+                        None => (self.lvalue_loc(a), self.lvalue_loc(b)),
+                    };
                     let fixed = |t: &TypeRef| matches!(t, TypeRef::FixedString(1..));
                     if fixed(&ta) || fixed(&tb) {
                         // A fixed-length string keeps its width, so each side
@@ -467,6 +511,13 @@ impl FnGen<'_> {
                         self.store_str_raw(wb, la);
                         self.store_str_raw(wa, lb);
                     }
+                } else if let Some((sa, sb)) = &late {
+                    let pa = self.lvalue_place_at(a, sa.as_deref());
+                    let pb = self.lvalue_place_at(b, sb.as_deref());
+                    let va = self.load_place(&pa);
+                    let vb = self.load_place(&pb);
+                    self.store_place(&pa, vb);
+                    self.store_place(&pb, va);
                 } else {
                     let va = self.gen_expr(&Self::lvalue_expr(a));
                     let vb = self.gen_expr(&Self::lvalue_expr(b));
