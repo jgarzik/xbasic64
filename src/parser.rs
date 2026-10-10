@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::lexer::{DataTypeWord, Token};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Binary operator precedence levels (higher = tighter binding)
 ///
@@ -371,7 +371,10 @@ pub enum TypeRef {
     Long,
     Single,
     Double,
-    /// `STRING * n` -- a fixed-length string field.
+    /// `STRING * n` -- a fixed-length string. Width 0 is a plain `AS STRING`:
+    /// a variable-length string, exactly what a `$` suffix makes, which is the
+    /// convention codegen's `type_ref_of` already used for a `$` name. No
+    /// declared width is ever 0, so the two cannot be confused.
     FixedString(usize),
     /// A user-defined TYPE, by name.
     Record(String),
@@ -1015,6 +1018,13 @@ pub struct Parser {
     /// the next one up before reading another token, so the terminator reaches
     /// every loop it names as the recursion unwinds outward.
     pending_next: VecDeque<String>,
+    /// Every CONST parsed so far, by upper-case name, with its value when that
+    /// is a whole-number literal -- what `STRING * W` may name as a width.
+    ///
+    /// The width has to be known while the type is parsed, and QuickBASIC
+    /// requires the CONST to come first, so the parser can track them itself
+    /// rather than wait for sema's folded values.
+    consts: HashMap<String, Option<i64>>,
 }
 
 impl Parser {
@@ -1848,6 +1858,11 @@ impl Parser {
         };
         self.expect(Token::Eq)?;
         let value = self.parse_expression()?;
+        let whole = match &value {
+            Expr::Literal(Literal::Integer(n) | Literal::Long(n)) => Some(*n),
+            _ => None,
+        };
+        self.consts.insert(name.to_uppercase(), whole);
         Ok(StmtKind::Const { name, value })
     }
 
@@ -2857,18 +2872,30 @@ impl Parser {
             "SINGLE" => Ok(TypeRef::Single),
             "DOUBLE" => Ok(TypeRef::Double),
             "STRING" => {
-                // STRING * n declares a fixed-length field.
+                // STRING * n declares a fixed-length string, whose width may
+                // be a CONST defined earlier.
                 if matches!(self.peek(), Token::Star) {
                     self.advance();
                     match self.advance() {
                         Token::Integer(n) if n > 0 => Ok(TypeRef::FixedString(n as usize)),
+                        Token::Ident(c) => match self.consts.get(&c.to_uppercase()) {
+                            Some(Some(n)) if *n > 0 => Ok(TypeRef::FixedString(*n as usize)),
+                            Some(_) => err(format!(
+                                "STRING * {c} needs a positive whole number, but CONST '{c}' is not written as one"
+                            )),
+                            None => err(format!(
+                                "STRING * {c} needs a length, and '{c}' is not a CONST defined before this line"
+                            )),
+                        },
                         tok => err(format!(
                             "Expected a positive length after STRING *, got {}",
                             describe_token(&tok)
                         )),
                     }
                 } else {
-                    err("A STRING field needs a fixed length, as in STRING * 20")
+                    // A plain STRING is variable-length. A TYPE field cannot
+                    // be, and `parse_type_def` says so.
+                    Ok(TypeRef::FixedString(0))
                 }
             }
             _ => Ok(TypeRef::Record(name)),
@@ -2907,8 +2934,24 @@ impl Parser {
                 return err("Expected a field name");
             };
             self.expect(Token::As)?;
-            let ty = self.parse_type_ref()?;
-            fields.push(FieldDecl { name: field, ty });
+            // A bad field costs only its own line, so the END TYPE is still
+            // found: returning the error left the rest of the TYPE to be read
+            // as statements, and each field became a complaint of its own.
+            let ty = match self.parse_type_ref() {
+                Ok(TypeRef::FixedString(0)) => Err(ParseError::Error(
+                    "A STRING field needs a fixed length, as in STRING * 20".to_string(),
+                )),
+                other => other,
+            };
+            match ty {
+                Ok(ty) => fields.push(FieldDecl { name: field, ty }),
+                Err(e) => {
+                    self.record(e);
+                    while !matches!(self.peek(), Token::Newline | Token::Eof) {
+                        self.advance();
+                    }
+                }
+            }
             self.skip_newlines();
         }
 

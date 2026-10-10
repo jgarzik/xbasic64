@@ -1223,6 +1223,25 @@ impl Analyzer {
                         let Some(dims) = &decl.dimensions else {
                             continue;
                         };
+                        // An array's elements are typed by its name's suffix,
+                        // and codegen does not consult an AS clause for them,
+                        // so `DIM A(5) AS STRING` would be an array of numbers.
+                        if matches!(decl.ty, Some(TypeRef::FixedString(_)))
+                            && !decl.name.ends_with('$')
+                        {
+                            self.error_with_note(
+                                stmt.line,
+                                format!(
+                                    "array '{}' is declared AS STRING, but its name has no $ suffix",
+                                    decl.name
+                                ),
+                                format!(
+                                    "an array's element type comes from its name; write {}$({})",
+                                    decl.name,
+                                    if dims.len() == 1 { "..." } else { "..., ..." }
+                                ),
+                            );
+                        }
                         if dims.is_empty() {
                             self.error(
                                 stmt.line,
@@ -1604,9 +1623,13 @@ impl Analyzer {
                         self.check_expr(e, scope, line);
                         self.require_numeric(e, scope, line, "an array subscript");
                     }
-                    // An array element is typed like a scalar of the same name.
-                    self.check_assign_types(name, value, scope, line);
+                    // An array element is typed by its name's suffix.
+                    self.check_assign_types(name, name.ends_with('$'), value, scope, line);
                 } else if let Some(target_ty) = self.symbols.typed_var(scope, name).cloned() {
+                    if !matches!(target_ty, TypeRef::Record(_)) {
+                        let is_string = matches!(target_ty, TypeRef::FixedString(_));
+                        self.check_assign_types(name, is_string, value, scope, line);
+                    }
                     if let TypeRef::Record(rname) = &target_ty {
                         // The source may be another record variable, or an
                         // element of an array of the same record type.
@@ -1631,7 +1654,8 @@ impl Analyzer {
                         }
                     }
                 } else {
-                    self.check_assign_types(name, value, scope, line);
+                    let is_string = self.scalar_is_string(name, scope);
+                    self.check_assign_types(name, is_string, value, scope, line);
                 }
             }
             StmtKind::FieldAssign { target, value } => {
@@ -2781,7 +2805,12 @@ impl Analyzer {
     fn lvalue_type(&self, arg: &Expr, scope: &Scope) -> Option<DataType> {
         match arg {
             Expr::Variable(n) => {
-                if self.symbols.consts.contains_key(normalized(n)) || is_zero_arg_builtin(n) {
+                // A FUNCTION's name is a call, evaluated into a temporary as
+                // codegen's `lvalue_addr` does.
+                if self.symbols.consts.contains_key(normalized(n))
+                    || is_zero_arg_builtin(n)
+                    || self.symbols.procs.contains_key(&n.to_uppercase())
+                {
                     return None;
                 }
                 Some(match self.symbols.typed_var(scope, n) {
@@ -2947,8 +2976,18 @@ impl Analyzer {
 
     /// Reject assigning a string to a numeric variable or vice versa. These
     /// used to reach codegen and abort it with a panic.
-    fn check_assign_types(&mut self, name: &str, value: &Expr, scope: &Scope, line: u32) {
-        let target_is_string = name.ends_with('$');
+    ///
+    /// The caller says whether the target is a string, since a suffix is not
+    /// the only way to be one: `DIM S AS STRING`, and a FUNCTION declared
+    /// `AS STRING` whose result is assigned to its name.
+    fn check_assign_types(
+        &mut self,
+        name: &str,
+        target_is_string: bool,
+        value: &Expr,
+        scope: &Scope,
+        line: u32,
+    ) {
         if let Some(value_is_string) = self.expr_is_string(value, scope)
             && target_is_string != value_is_string
         {
@@ -3136,12 +3175,11 @@ impl Analyzer {
             // one: `DIM S AS STRING * 4` says so with no suffix at all, and
             // without consulting that, `LEN(S)` and `S = "xy"` were both
             // rejected as numeric.
-            Expr::Variable(name) | Expr::ArrayAccess { name, .. } => {
-                Some(match self.symbols.typed_var(scope, name) {
-                    Some(t) => matches!(t, TypeRef::FixedString(_)),
-                    None => name.ends_with('$'),
-                })
-            }
+            Expr::Variable(name) => Some(self.scalar_is_string(name, scope)),
+            Expr::ArrayAccess { name, .. } => Some(match self.symbols.typed_var(scope, name) {
+                Some(t) => matches!(t, TypeRef::FixedString(_)),
+                None => name.ends_with('$'),
+            }),
             Expr::Unary { .. } => Some(false),
             Expr::Binary { op, left, .. } => {
                 if matches!(
@@ -3172,7 +3210,9 @@ impl Analyzer {
             }
             Expr::FnCall { name, .. } => {
                 let upper = name.to_uppercase();
-                if self.symbols.lookup_array(scope, &upper).is_some()
+                if let Some(ty) = self.function_result(&upper) {
+                    Some(matches!(ty, TypeRef::FixedString(_)))
+                } else if self.symbols.lookup_array(scope, &upper).is_some()
                     || self.symbols.procs.contains_key(&upper)
                     || builtin(&upper).is_some()
                 {
@@ -3182,6 +3222,31 @@ impl Analyzer {
                 }
             }
         }
+    }
+
+    /// Whether the scalar `name` holds a string.
+    ///
+    /// A `$` suffix says so, and so does a declaration without one: `DIM S AS
+    /// STRING`, or a FUNCTION declared `AS STRING`, whose name is its result
+    /// inside the body and a call outside it. Judging by the suffix alone
+    /// refused `F = "x"` in `FUNCTION F AS STRING` as a type mismatch.
+    fn scalar_is_string(&self, name: &str, scope: &Scope) -> bool {
+        match self.symbols.typed_var(scope, name) {
+            Some(t) => matches!(t, TypeRef::FixedString(_)),
+            None => match self.function_result(&name.to_uppercase()) {
+                Some(t) => matches!(t, TypeRef::FixedString(_)),
+                None => name.ends_with('$'),
+            },
+        }
+    }
+
+    /// The declared result type of the FUNCTION `upper`, when it has one.
+    fn function_result(&self, upper: &str) -> Option<&TypeRef> {
+        self.symbols
+            .procs
+            .get(upper)
+            .filter(|p| p.is_function)
+            .and_then(|p| p.ret_ty.as_ref())
     }
 }
 
