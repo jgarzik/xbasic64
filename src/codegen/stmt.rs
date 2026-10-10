@@ -476,11 +476,14 @@ impl FnGen<'_> {
                         continue; // sema has already complained
                     };
                     // ERASE releases the storage, and the strings in it, and
-                    // nulls the descriptor, so the array reads as
-                    // undimensioned again.
+                    // nulls the pointer and the counts, so the array reads
+                    // as undimensioned again and has no elements to keep.
+                    self.check_unlocked(info);
                     self.free_array_storage(name, info.loc, info.ndims);
                     let z = self.iconst(types::I64, 0);
-                    self.store(z, info.loc);
+                    for w in 0..=info.ndims as i32 {
+                        self.store(z, info.loc.offset(8 * w));
+                    }
                 }
             }
 

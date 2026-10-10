@@ -332,6 +332,8 @@ impl FnGen<'_> {
         let mut vals = Vec::new();
         // By-reference temporaries holding strings, freed after the call.
         let mut string_temps = Vec::new();
+        // Arrays an element of which is passed by reference.
+        let mut locked = Vec::new();
         for (arg, p) in args.iter().zip(&params) {
             match param_pass(p) {
                 Pass::Pointer if p.array => {
@@ -352,6 +354,7 @@ impl FnGen<'_> {
                         .record_addr(arg)
                         .expect("sema checked a record argument");
                     vals.push(a);
+                    locked.extend(self.indexed_array(arg));
                 }
                 Pass::Pointer => {
                     // A variable, an array element or a field of the
@@ -360,7 +363,10 @@ impl FnGen<'_> {
                     // evaluated into a temporary, whose address is passed.
                     let ty = param_value_type(p);
                     match self.lvalue_addr(arg, ty) {
-                        Some(a) => vals.push(a),
+                        Some(a) => {
+                            vals.push(a);
+                            locked.extend(self.indexed_array(arg));
+                        }
                         None => {
                             let v = self.gen_expr(arg);
                             let slot = self.stack_slot(8 * storage::words_for(ty) as u32);
@@ -398,8 +404,21 @@ impl FnGen<'_> {
         let sym = format!("_proc_{}", mangle(&upper));
         let id = self.cg.funcs[&sym];
         let fref = self.func_ref(id);
+        // The arrays are locked while the call runs, so that ERASE or
+        // REDIM cannot free an element under its parameter. Every argument
+        // is evaluated first, and the lock comes off before an error the
+        // call left pending is looked at, so no path leaves it on.
+        if !self.cg.opts.checks {
+            locked.clear();
+        }
+        for info in &locked {
+            self.add_lock(*info, 1);
+        }
         let inst = self.b.ins().call(fref, &vals);
         let rets = self.b.inst_results(inst).to_vec();
+        for info in &locked {
+            self.add_lock(*info, -1);
+        }
         self.error_check();
         for loc in string_temps {
             self.free_slot_str(loc);
@@ -417,6 +436,27 @@ impl FnGen<'_> {
             }
             t => Val::Num(t, rets[0]),
         })
+    }
+
+    /// The array `arg` is an element of, or a field of an element of.
+    fn indexed_array(&self, arg: &Expr) -> Option<ArrayInfo> {
+        let name = match arg {
+            Expr::ArrayAccess { name, indices }
+            | Expr::FnCall {
+                name,
+                args: indices,
+            } if !indices.is_empty() => name.clone(),
+            Expr::Field { .. } => Self::flatten_indexed_field_path(arg)?.0,
+            _ => return None,
+        };
+        self.lookup_array(&name.to_uppercase())
+    }
+
+    /// Add `n` to the lock count of an array's descriptor.
+    fn add_lock(&mut self, info: ArrayInfo, n: i64) {
+        let locks = self.load(types::I64, info.lock());
+        let v = self.b.ins().iadd_imm_s(locks, n);
+        self.store(v, info.lock());
     }
 
     /// The address of `arg` when it is a variable, an array element or a

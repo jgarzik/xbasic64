@@ -237,6 +237,14 @@ struct ArrayInfo {
     ndims: usize,
 }
 
+impl ArrayInfo {
+    /// The descriptor's last word: how many running calls hold an element
+    /// of the array by reference. ERASE and REDIM refuse while it is not 0.
+    fn lock(&self) -> Loc {
+        self.loc.offset(8 * (1 + 2 * self.ndims as i32))
+    }
+}
+
 /// Module-wide state: the object being built and what every function shares.
 pub struct CodeGen {
     module: ObjectModule,

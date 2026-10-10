@@ -306,8 +306,9 @@ with as many dimensions as that use has subscripts, each running from the
 `OPTION BASE` to 10. The same happens to a declared array used before its
 `DIM` has run, or after `ERASE`. A `DIM` of an array that already exists -- by
 an earlier `DIM`, or by a use -- is `Duplicate definition` (10); `REDIM` may
-always resize one. Two `DIM` statements naming one array are refused when
-compiling, even on paths that cannot both run. Since a mistyped function would quietly become such an
+resize one, unless it is locked (see [ERASE](#beep-erase-and-system)). Two
+`DIM` statements naming one array are refused when compiling, even on paths
+that cannot both run. Since a mistyped function would quietly become such an
 array, a name close to a function or procedure draws a warning.
 
 Arrays can hold any type:
@@ -1017,6 +1018,23 @@ or a variable elsewhere. It takes a list, `ERASE A, B$`, and each name must be
 an array -- DIMed somewhere, or created by a use -- since a name that is not one
 is a mistake, not a statement that does nothing.
 
+An array is **locked** while a procedure call that was passed one of its
+elements by reference is running, as QuickBASIC's "array temporarily locked":
+`ERASE` or `REDIM` of it then is `Duplicate definition` (10), trappable like
+any other error, since it would free the element the parameter refers to. A
+`BYVAL` element, or an element inside an expression, is a copy and locks
+nothing, and the lock comes off when the call returns. `--unsafe` removes this
+check with the others.
+
+```basic
+SUB Wipe(X)
+    SHARED Z()
+    ERASE Z       ' Duplicate definition: X is Z(1)
+END SUB
+DIM SHARED Z(3)
+Wipe Z(1)
+```
+
 ### LOCATE and COLOR
 
 Console control, written as ANSI escape sequences:
@@ -1119,7 +1137,10 @@ REDIM PRESERVE Items(30)    ' contents kept
 ```
 
 Only the last dimension's upper bound may change under `PRESERVE`; changing
-another dimension is `Subscript out of range`.
+another dimension is `Subscript out of range`, even under `--unsafe`. After
+`ERASE` there is nothing to keep, and every element starts as 0 or `""`.
+`REDIM` of a locked array is `Duplicate definition` (see
+[ERASE](#beep-erase-and-system)).
 
 ### OPTION BASE
 
@@ -1764,7 +1785,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | 7   | `Out of memory`          | A string or array allocation that failed     |
 | 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
 | 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
-| 10  | `Duplicate definition`   | A `DIM` of an array that already exists      |
+| 10  | `Duplicate definition`   | A `DIM` of an array that already exists; `ERASE` or `REDIM` of a locked one |
 | 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
 | 13  | `Type mismatch`          | A `PRINT USING` value of the wrong kind for its field |
 | 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |

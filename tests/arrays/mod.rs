@@ -404,3 +404,90 @@ fn test_array_declared_as_string() {
     .unwrap();
     assert_eq!(out.trim(), "one+ 0");
 }
+
+/// ERASE leaves an array with no elements, so REDIM PRESERVE after it keeps
+/// nothing: every element starts empty, not as whatever the heap held.
+#[test]
+fn test_redim_preserve_after_erase() {
+    let out = compile_and_run(
+        r#"
+DIM A$(1000)
+FOR I = 0 TO 1000: A$(I) = "x" + STR$(I): NEXT
+ERASE A$
+DIM B$(1000)
+FOR I = 0 TO 1000: B$(I) = "yyyyyyyyyyyyyyyyyyyy" + STR$(I): NEXT
+ERASE B$
+REDIM PRESERVE A$(1001)
+PRINT LEN(A$(5)); "["; A$(5); "]"
+DIM C#(5)
+C#(1) = 3.5
+ERASE C#
+REDIM PRESERVE C#(6)
+PRINT C#(1)
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["0 []", "0"]);
+}
+
+/// An array whose element is passed by reference is locked while the call
+/// runs: ERASE or REDIM of it there is error 10, as QuickBASIC's "array is
+/// temporarily locked", rather than leaving the parameter in freed memory.
+#[test]
+fn test_erase_of_an_array_whose_element_is_an_argument() {
+    for stmt in ["ERASE Z", "REDIM Z(100000)"] {
+        let src = format!(
+            "SUB M(X)\n  SHARED Z()\n  {stmt}\n  X = 99\nEND SUB\nDIM SHARED Z(3)\nZ(1) = 4\nM Z(1)\nPRINT \"no\"\n"
+        );
+        let run = crate::common::compile_and_run_raw(&src, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{stmt}: {:?}", run.stdout);
+        assert!(
+            run.stderr.contains("Duplicate definition"),
+            "{stmt}: {:?}",
+            run.stderr
+        );
+    }
+    // Once the call is over the array is free to change again, and a BYVAL
+    // element or an element in an expression locks nothing.
+    let out = compile_and_run(
+        r#"
+SUB M(X)
+  X = 7
+END SUB
+SUB N(BYVAL X)
+  SHARED Z()
+  REDIM Z(5)
+  PRINT X
+END SUB
+DIM SHARED Z(3)
+Z(1) = 4
+M Z(1)
+PRINT Z(1)
+N Z(1)
+Z(1) = 2
+N Z(1) + 1
+ERASE Z
+PRINT "ok"
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["7", "7", "3", "ok"]);
+}
+
+/// The shape check of a many-dimensional REDIM PRESERVE stays under
+/// `--unsafe`: without it the copy would write past the new block.
+#[test]
+fn test_redim_preserve_shape_is_checked_under_unsafe() {
+    let run = crate::common::compile_and_run_flags(
+        "DIM A(9, 3)\nA(9, 3) = 1\nREDIM PRESERVE A(1, 3)\nPRINT \"no\"\n",
+        "",
+        &["--unsafe"],
+    )
+    .unwrap();
+    assert_eq!(run.exit_code, Some(1));
+    assert!(
+        run.stderr.contains("Subscript out of range"),
+        "{:?}",
+        run.stderr
+    );
+}

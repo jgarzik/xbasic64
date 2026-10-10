@@ -44,6 +44,12 @@ pub(super) fn words_for(data_type: DataType) -> i32 {
 }
 
 /// Size in bytes of one element of an array of `ty`, stored at its width.
+/// Bytes of an array descriptor of `rank` dimensions: the element
+/// pointer, a count and a lower bound per dimension, and the lock count.
+pub(super) fn descriptor_bytes(rank: usize) -> u32 {
+    8 * (2 + 2 * rank as u32)
+}
+
 pub(super) fn elem_size(ty: DataType) -> i32 {
     match ty {
         DataType::String => 16,
@@ -166,7 +172,7 @@ impl FnGen<'_> {
             if self.lookup_array(&name).is_some() {
                 continue;
             }
-            let bytes = 8 * (1 + 2 * rank as u32);
+            let bytes = descriptor_bytes(rank);
             let loc = match self.current_proc.clone() {
                 Some(proc) if self.cg.symbols.is_static(&proc, &name, true) => {
                     let sym = format!("_sarr_{}_{}", mangle(&proc), mangle(&name));
@@ -467,8 +473,9 @@ impl FnGen<'_> {
     /// Allocate or reallocate an array's storage.
     ///
     /// The descriptor -- word 0 the element pointer, word 1+i dimension i's
-    /// element count, word 1+n+i its lower bound -- is reused when the array
-    /// already exists, so REDIM resizes in place rather than orphaning it.
+    /// element count, word 1+n+i its lower bound, word 1+2n its lock count
+    /// -- is reused when the array already exists, so REDIM resizes in
+    /// place rather than orphaning it.
     pub(super) fn gen_array_alloc(&mut self, arr: &ArrayDecl, redim: bool, preserve: bool) {
         let elem_size = i64::from(self.elem_size_for(&arr.name));
         let ndims = arr.dimensions.len();
@@ -476,22 +483,27 @@ impl FnGen<'_> {
         let loc = match self.lookup_array(&arr.name).map(|i| i.loc) {
             Some(existing) => existing,
             None if self.current_proc.is_some() => {
-                Loc::Stack(self.local_slot(8 * (1 + 2 * ndims as u32)), 0)
+                Loc::Stack(self.local_slot(descriptor_bytes(ndims)), 0)
             }
             None => Loc::Data(
                 self.cg.global(
                     &format!("_arr_{}", mangle(&arr.name)),
-                    8 * (1 + 2 * ndims as u32),
+                    descriptor_bytes(ndims),
                 ),
                 0,
             ),
         };
+        let info = ArrayInfo { loc, ndims };
 
-        // A DIM of an array that exists already is "Duplicate definition".
+        // A DIM of an array that exists already is "Duplicate definition",
+        // as is a REDIM of one a running call holds an element of.
         if !redim && self.cg.opts.checks {
             let p = self.load(types::I64, loc);
             let exists = self.b.ins().icmp_imm_s(IntCC::NotEqual, p, 0);
             self.raise_if(exists, RtError::DuplicateDefinition);
+        }
+        if redim {
+            self.check_unlocked(info);
         }
 
         // Each dimension: the lower bound as written, or the OPTION BASE, and
@@ -527,36 +539,54 @@ impl FnGen<'_> {
 
         let counts: Vec<Value> = bounds.iter().map(|(_, c)| *c).collect();
         let size = self.checked_size(&counts, elem_size);
-        // PRESERVE of a many-dimensional array: elements are stored row by
-        // row, the last subscript fastest, so a new last dimension changes
-        // where every row starts, and realloc would scramble them. Each row
-        // is copied to a fresh block instead.
-        if preserve && ndims > 1 {
-            let mem = self.preserve_rows(&arr.name, loc, ndims, &bounds, size, elem_size);
-            let n = ndims as i32;
-            self.store(mem, loc);
-            for (i, (lo, count)) in bounds.into_iter().enumerate() {
-                self.store(count, loc.offset(8 * (1 + i as i32)));
-                self.store(lo, loc.offset(8 * (1 + n + i as i32)));
-            }
-            let info = ArrayInfo { loc, ndims };
-            if self.current_proc.is_some() {
-                self.proc_arrays.insert(arr.name.clone(), info);
-            } else {
-                self.cg.arrays.insert(arr.name.clone(), info);
-            }
-            return;
+        let mem = if preserve && ndims > 1 {
+            // PRESERVE of a many-dimensional array: elements are stored row
+            // by row, the last subscript fastest, so a new last dimension
+            // changes where every row starts, and realloc would scramble
+            // them. Each row is copied to a fresh block instead.
+            self.preserve_rows(&arr.name, loc, ndims, &bounds, size, elem_size)
+        } else {
+            self.alloc_flat(&arr.name, info, &counts, size, elem_size, preserve)
+        };
+
+        self.store(mem, loc);
+        let n = ndims as i32;
+        for (i, (lo, count)) in bounds.into_iter().enumerate() {
+            self.store(count, loc.offset(8 * (1 + i as i32)));
+            self.store(lo, loc.offset(8 * (1 + n + i as i32)));
         }
+        if self.current_proc.is_some() {
+            self.proc_arrays.insert(arr.name.clone(), info);
+        } else {
+            self.cg.arrays.insert(arr.name.clone(), info);
+        }
+    }
+
+    /// The new element block, of `size` bytes, for a DIM, a REDIM, or a
+    /// one-dimensional REDIM PRESERVE, which keeps the old elements where
+    /// they are. Without PRESERVE the old block, if any, is freed.
+    fn alloc_flat(
+        &mut self,
+        name: &str,
+        info: ArrayInfo,
+        counts: &[Value],
+        size: Value,
+        elem_size: i64,
+        preserve: bool,
+    ) -> Value {
+        let ArrayInfo { loc, ndims } = info;
         if preserve {
             // Elements past the new end are lost to realloc: free the
             // strings they hold first.
             let mut new_count = self.iconst(types::I64, 1);
-            for c in &counts {
+            for c in counts {
                 new_count = self.b.ins().imul(new_count, *c);
             }
-            self.free_array_strings_from(&arr.name, loc, ndims, new_count);
+            self.free_array_strings_from(name, loc, ndims, new_count);
         }
         let (mem, old_size) = if preserve {
+            // An array with no storage -- never DIMmed, or ERASEd -- has
+            // counts of 0, so nothing of it is kept.
             let n = ndims as i32;
             let old_counts: Vec<Value> = (0..n)
                 .map(|i| self.load(types::I64, loc.offset(8 * (1 + i))))
@@ -576,37 +606,24 @@ impl FnGen<'_> {
             self.raise_if(null, RtError::OutOfMemory);
         }
 
-        if !preserve {
+        match old_size {
             // The old elements, if any, and the strings they hold.
-            self.free_array_storage(&arr.name, loc, ndims);
-        }
-        self.store(mem, loc);
-        let n = ndims as i32;
-        for (i, (lo, count)) in bounds.into_iter().enumerate() {
-            self.store(count, loc.offset(8 * (1 + i as i32)));
-            self.store(lo, loc.offset(8 * (1 + n + i as i32)));
-        }
-
-        if let Some(old) = old_size {
+            None => self.free_array_storage(name, loc, ndims),
             // Zero the newly added tail, from the old size up to the new one.
-            let grown = self.b.ins().icmp(IntCC::UnsignedLessThan, old, size);
-            let zero_it = self.b.create_block();
-            let done = self.b.create_block();
-            self.brif(grown, zero_it, done);
-            self.switch_sealed(zero_it);
-            let start = self.b.ins().iadd(mem, old);
-            let len = self.b.ins().isub(size, old);
-            let z = self.iconst(types::I32, 0);
-            self.call("memset", &[start, z, len]);
-            self.begin_sealed(done);
+            Some(old) => {
+                let grown = self.b.ins().icmp(IntCC::UnsignedLessThan, old, size);
+                let zero_it = self.b.create_block();
+                let done = self.b.create_block();
+                self.brif(grown, zero_it, done);
+                self.switch_sealed(zero_it);
+                let start = self.b.ins().iadd(mem, old);
+                let len = self.b.ins().isub(size, old);
+                let z = self.iconst(types::I32, 0);
+                self.call("memset", &[start, z, len]);
+                self.begin_sealed(done);
+            }
         }
-
-        let info = ArrayInfo { loc, ndims };
-        if self.current_proc.is_some() {
-            self.proc_arrays.insert(arr.name.clone(), info);
-        } else {
-            self.cg.arrays.insert(arr.name.clone(), info);
-        }
+        mem
     }
 
     /// The new element block for `REDIM PRESERVE` of a many-dimensional
@@ -626,22 +643,21 @@ impl FnGen<'_> {
         let n = ndims as i32;
         let old = self.load(types::I64, loc);
         // An array with no elements yet has nothing to keep, and no shape
-        // the new one must match.
-        if self.cg.opts.checks {
-            let has = self.b.create_block();
-            let fine = self.b.create_block();
-            self.brif(old, has, fine);
-            self.switch_sealed(has);
-            for (i, (lo, count)) in bounds.iter().enumerate().take(ndims - 1) {
-                let old_count = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
-                let old_lo = self.load(types::I64, loc.offset(8 * (1 + n + i as i32)));
-                let c = self.b.ins().icmp(IntCC::NotEqual, old_count, *count);
-                let l = self.b.ins().icmp(IntCC::NotEqual, old_lo, *lo);
-                let bad = self.b.ins().bor(c, l);
-                self.raise_if(bad, RtError::Subscript);
-            }
-            self.begin_sealed(fine);
+        // the new one must match. The check stays under --unsafe: the copy
+        // below goes by the old shape, and would write past the new block.
+        let has = self.b.create_block();
+        let fine = self.b.create_block();
+        self.brif(old, has, fine);
+        self.switch_sealed(has);
+        for (i, (lo, count)) in bounds.iter().enumerate().take(ndims - 1) {
+            let old_count = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
+            let old_lo = self.load(types::I64, loc.offset(8 * (1 + n + i as i32)));
+            let c = self.b.ins().icmp(IntCC::NotEqual, old_count, *count);
+            let l = self.b.ins().icmp(IntCC::NotEqual, old_lo, *lo);
+            let bad = self.b.ins().bor(c, l);
+            self.raise_if(bad, RtError::Subscript);
         }
+        self.begin_sealed(fine);
 
         let one = self.iconst(types::I64, 1);
         let mem = self.call("calloc", &[one, size])[0];
@@ -654,11 +670,7 @@ impl FnGen<'_> {
         let done = self.b.create_block();
         self.brif(old, copy, done);
         self.switch_sealed(copy);
-        let mut rows = self.iconst(types::I64, 1);
-        for i in 0..ndims - 1 {
-            let c = self.load(types::I64, loc.offset(8 * (1 + i as i32)));
-            rows = self.b.ins().imul(rows, c);
-        }
+        let rows = self.element_count(loc, ndims - 1);
         let old_last = self.load(types::I64, loc.offset(8 * n));
         let new_last = bounds[ndims - 1].1;
         let keep_lt = self
@@ -703,7 +715,8 @@ impl FnGen<'_> {
         mem
     }
 
-    /// The number of elements the descriptor at `loc` describes.
+    /// The number of elements the descriptor at `loc` describes -- or, with
+    /// `ndims` short of its rank, the product of its leading dimensions.
     fn element_count(&mut self, loc: Loc, ndims: usize) -> Value {
         let mut n = self.iconst(types::I64, 1);
         for i in 0..ndims {
@@ -727,6 +740,17 @@ impl FnGen<'_> {
         let count = self.element_count(loc, ndims);
         self.free_element_strings(ptr, from, count, es, &offsets);
         self.begin_sealed(done);
+    }
+
+    /// Raise "Duplicate definition" if a running call holds an element of
+    /// the array by reference: ERASE or REDIM would free it under the
+    /// parameter, so the array is locked until the call returns.
+    pub(super) fn check_unlocked(&mut self, info: ArrayInfo) {
+        if self.cg.opts.checks {
+            let locks = self.load(types::I64, info.lock());
+            let locked = self.b.ins().icmp_imm_s(IntCC::NotEqual, locks, 0);
+            self.raise_if(locked, RtError::DuplicateDefinition);
+        }
     }
 
     /// Free the array `name`'s element block and the strings in it. The
