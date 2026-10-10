@@ -818,16 +818,33 @@ fn test_option_base_rules() {
     assert_eq!(run.exit_code, Some(1));
 }
 
-/// REDIM must keep the array's rank, and PRESERVE may only change the last
-/// dimension -- QuickBASIC's own rule, since any other change would need the
-/// elements remapped rather than the block simply grown.
+/// REDIM must keep the array's rank, with or without PRESERVE.
 #[test]
 fn test_redim_rules() {
-    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimension(s)");
+    expect_rejected("DIM A(2,2)\nREDIM A(3)\n", "must keep its 2 dimensions");
+    expect_rejected("DIM A(2)\nREDIM A(3, 3)\n", "must keep its 1 dimension");
     expect_rejected(
-        "DIM A(2,2)\nREDIM PRESERVE A(2,3)\n",
-        "may only change its last dimension",
+        "DIM A(2,2)\nREDIM PRESERVE A(3)\n",
+        "REDIM PRESERVE of 'A' must keep its 2 dimensions; only the last one's upper bound may change",
     );
+}
+
+/// PRESERVE on an array of several dimensions is QuickBASIC's, as long as
+/// the rank is unchanged: only the last dimension's upper bound may change,
+/// which is checked when the program runs. It was refused outright, with a
+/// message -- "may only change its last dimension" -- that said the opposite
+/// of what had gone wrong when that was all the program did.
+#[test]
+fn test_redim_preserve_of_several_dimensions_compiles() {
+    for source in [
+        "DIM A(2, 3)\nREDIM PRESERVE A(2, 5)\n",
+        "DIM A(1 TO 2, 3, 4)\nREDIM PRESERVE A(1 TO 2, 3, 9)\n",
+        "REDIM B$(2, 2)\nREDIM PRESERVE B$(2, 4)\n",
+    ] {
+        if let Err(e) = compile_only(source) {
+            panic!("{source:?} should compile, got:\n{}", e.stderr);
+        }
+    }
 }
 
 /// TYPE declarations and uses are checked.
@@ -1405,6 +1422,67 @@ fn test_documented_unimplemented_names_are_all_in_the_table() {
     }
 }
 
+/// Every GW-BASIC name the compiler does not provide is refused with its
+/// reason, whatever shape the statement takes.
+///
+/// Two gaps. Some names were missing from the table: `EXTERR(0)` compiled as
+/// an array nobody declared and read 0, and ENVIRON, LCOPY and DELETE fell
+/// through to "unknown subroutine". Others were in it, but their statement
+/// form -- `NAME a AS b`, `CIRCLE (x,y), r`, `KEY(1) ON` -- is not the shape of
+/// a call, so the parser failed on the AS, the comma or the ON before sema
+/// could give the reason, and the program was told only "unexpected AS".
+#[test]
+fn test_unsupported_statements_are_refused_with_their_reason() {
+    let cases = [
+        ("X = EXTERR(0): PRINT X\n", "MS-DOS"),
+        ("ENVIRON \"A=B\"\n", "not implemented yet"),
+        ("LCOPY\n", "printer"),
+        ("LLIST\n", "interpreter command"),
+        ("DELETE 10\n", "interpreter command"),
+        ("DELETE 10-20\n", "interpreter command"),
+        ("NAME \"a\" AS \"b\"\n", "NAME is not implemented yet"),
+        ("CIRCLE (5,5), 3\n", "graphics is not supported"),
+        ("VIEW (0,0)-(10,10)\n", "console windowing"),
+        ("WINDOW (0,0)-(1,1)\n", "graphics is not supported"),
+        ("VIEW PRINT 1 TO 10\n", "console windowing"),
+        ("KEY(1) ON\n", "KEY is not implemented yet"),
+        ("COM(1) ON\n", "serial-port event trapping"),
+        ("PEN ON\n", "light-pen input"),
+        ("STRIG ON\n", "joystick input"),
+        ("PLAY ON\n", "PLAY is not implemented yet"),
+        // Inside a block and a single-line IF, the refusal costs only the
+        // statement: the END IF and the rest of the program still parse.
+        ("IF 1 THEN\nPEN ON\nEND IF\nPRINT 1\n", "light-pen input"),
+        ("IF 1 THEN KEY(1) ON\n", "KEY is not implemented yet"),
+    ];
+    for (source, reason) in cases {
+        let err = compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains("is not supported") && err.contains(reason),
+            "{source:?} should be refused with its reason ({reason:?}), got:\n{}",
+            err.stderr
+        );
+        assert!(
+            !err.contains("unexpected") && !err.contains("unknown subroutine"),
+            "{source:?} fell through to a generic message:\n{}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// Refusing an unsupported statement at its first word must not take the
+/// name away where a program may still use it: as a label, or as the name of
+/// its own SUB.
+#[test]
+fn test_unsupported_names_still_work_as_labels_and_procedures() {
+    let out = compile_and_run("GOTO NAME\nPRINT \"skipped\"\nNAME: PRINT \"label\"\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["label"]);
+
+    let out = compile_and_run("SUB PEN (X)\nPRINT X\nEND SUB\nPEN 5\nCALL PEN(6)\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["5", "6"]);
+}
+
 /// A name cannot be both an array and a procedure, or an array and a builtin.
 ///
 /// `A(1)` has to resolve to one thing. Sema resolved such a clash in favour of
@@ -1921,6 +1999,60 @@ fn test_swap_of_mismatched_record_fields_is_diagnosed() {
     // Matching fields still swap.
     compile_only("TYPE R\n  A AS INTEGER\n  B AS INTEGER\nEND TYPE\nDIM P AS R\nSWAP P.A, P.B\n")
         .expect("two numeric fields are a legal SWAP");
+}
+
+/// SWAP's two operands must have the same type, not merely both be numbers
+/// or both strings: QuickBASIC's rule. Only "string against number" was
+/// checked, so an INTEGER swapped with a DOUBLE was converted both ways, and a
+/// record swapped with a number reached codegen.
+#[test]
+fn test_swap_operands_must_have_the_same_type() {
+    let ty = "TYPE R\n  N AS STRING * 4\n  V AS INTEGER\n  D AS DOUBLE\nEND TYPE\n\
+              TYPE Q\n  V AS INTEGER\nEND TYPE\nDIM P AS R, P2 AS R, O AS Q\nDIM A(3) AS R\n";
+    let refused = [
+        ("SWAP A%, B#\n", "'A%' is an INTEGER and 'B#' is a DOUBLE"),
+        ("SWAP C&, D!\n", "'C&' is a LONG and 'D!' is a SINGLE"),
+        (
+            "DIM X(3)\nSWAP X(1), N%\n",
+            "is a DOUBLE and 'N%' is an INTEGER",
+        ),
+        (
+            "SWAP P.V, P.D\n",
+            "'P.V' is an INTEGER and 'P.D' is a DOUBLE",
+        ),
+        ("SWAP P, Z\n", "'P' is a TYPE R record and 'Z' is a DOUBLE"),
+        ("SWAP Z, A(1)\n", "is a TYPE R record"),
+        (
+            "SWAP P, O\n",
+            "'P' is a TYPE R record and 'O' is a TYPE Q record",
+        ),
+        (
+            "DIM N AS INTEGER\nSWAP N, Z\n",
+            "'N' is an INTEGER and 'Z' is a DOUBLE",
+        ),
+    ];
+    for (source, expected) in refused {
+        expect_rejected(
+            &format!("{ty}{source}"),
+            "SWAP requires both values to be the same type",
+        );
+        expect_rejected(&format!("{ty}{source}"), expected);
+    }
+    // The same type is fine, however it was spelled: a fixed-length string
+    // with a variable-length one, two records of one TYPE, a declared type
+    // with the matching suffix.
+    for source in [
+        "SWAP P.N, S$\n",
+        "SWAP P, P2\n",
+        "SWAP P, A(2)\n",
+        "DIM N AS INTEGER\nSWAP N, M%\n",
+        "DIM S AS STRING\nSWAP S, P.N\n",
+        "SWAP X, Y\n",
+    ] {
+        if let Err(e) = compile_only(&format!("{ty}{source}")) {
+            panic!("{source:?} should pass sema, got:\n{}", e.stderr);
+        }
+    }
 }
 
 /// Out-of-range arguments to the string builtins are refused.
@@ -2904,4 +3036,71 @@ fn test_resume_after_an_error_in_the_handlers_code() {
         crate::common::lines(&out),
         vec!["h1", "h2 300", "after 300"]
     );
+}
+
+/// A CONST cannot be the target of anything that stores into it.
+///
+/// Every one of these compiled, and the store went nowhere: the name is
+/// replaced by its value wherever it is read, so `CONST MAX = 100: MAX = 5:
+/// PRINT MAX` printed 100. QuickBASIC refuses them all ("Duplicate
+/// definition").
+#[test]
+fn test_a_const_cannot_be_assigned() {
+    let cases = [
+        "CONST MAX = 100: MAX = 5: PRINT MAX\n",
+        "CONST MAX = 100\nLET MAX = 5\n",
+        "CONST MAX = 100\nFOR MAX = 1 TO 2: NEXT\n",
+        "CONST MAX = 100\nINPUT MAX\n",
+        "CONST MAX = 100\nINPUT \"n\"; A, MAX\n",
+        "CONST MAX = 100\nREAD MAX\nDATA 1\n",
+        "CONST M$ = \"x\"\nLINE INPUT M$\n",
+        "CONST MAX = 100\nX = 1\nSWAP MAX, X\n",
+        "CONST MAX = 100\nX = 1\nSWAP X, MAX\n",
+        "CONST M$ = \"abc\"\nMID$(M$, 1) = \"z\"\n",
+        "CONST M$ = \"abc\"\nLSET M$ = \"z\"\n",
+        // Inside a procedure too: a module-level CONST is visible there.
+        "CONST MAX = 100\nSUB S\nMAX = 1\nEND SUB\nS\n",
+    ];
+    for source in cases {
+        expect_rejected(source, "is a CONST");
+    }
+    // Reading one is of course still fine.
+    let out = compile_and_run("CONST MAX = 100\nX = MAX: PRINT X; MAX\n").unwrap();
+    assert_eq!(crate::common::lines(&out), &["100  100"]);
+}
+
+/// A parameter and a FUNCTION result must be variable-length strings, as
+/// QuickBASIC requires. A `STRING * 8` parameter was accepted and its width
+/// ignored, and a `STRING * 3` result failed later as a confusing "type
+/// mismatch" on the assignment to the FUNCTION's name.
+#[test]
+fn test_fixed_length_parameters_and_results_are_refused() {
+    let cases = [
+        (
+            "SUB S(T AS STRING * 8)\nPRINT T\nEND SUB\nS \"x\"\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+        (
+            "FUNCTION F(N, BYVAL T AS STRING * 2)\nF = N\nEND FUNCTION\nPRINT F(1, \"x\")\n",
+            "parameter 'T' of 'F' is declared AS STRING * 2",
+        ),
+        (
+            "FUNCTION F AS STRING * 3\nF = \"abc\"\nEND FUNCTION\nPRINT F\n",
+            "the result of 'F' is declared AS STRING * 3",
+        ),
+        (
+            "DECLARE SUB S (T AS STRING * 8)\nSUB S (T AS STRING)\nEND SUB\n",
+            "parameter 'T' of 'S' is declared AS STRING * 8",
+        ),
+    ];
+    for (source, expected) in cases {
+        expect_rejected(source, expected);
+        expect_rejected(source, "must be a variable-length string");
+        let err = compile_only(source).unwrap_err();
+        assert!(
+            !err.contains("type mismatch"),
+            "{source:?} should be refused for the declaration alone:\n{}",
+            err.stderr
+        );
+    }
 }

@@ -356,7 +356,7 @@ fn test_as_typed_variables() {
 #[test]
 fn test_as_typed_parameters_and_result() {
     let output = compile_and_run(
-        "SUB T(N AS INTEGER, S AS STRING * 10)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
+        "SUB T(N AS INTEGER, S AS STRING)\nPRINT N; S\nEND SUB\nFUNCTION F AS INTEGER\nF = 42\nEND FUNCTION\nT(7, \"hi\")\nPRINT F\n",
     )
     .unwrap();
     let lines = crate::common::lines(&output);
@@ -640,4 +640,207 @@ fn test_swap_records_and_fixed_strings() {
         crate::common::lines(&output),
         vec!["2 r    1 q", "1  2", "[lon][abc] 3"]
     );
+}
+
+/// A fixed-length string's width may be a CONST, as QuickBASIC allows.
+///
+/// The parser took only a number after `STRING *`, so `CONST W = 20: DIM S AS
+/// STRING * W` -- the usual way to keep a record's widths in one place -- was
+/// "Expected a positive length after STRING *, got identifier 'W'".
+#[test]
+fn test_fixed_length_string_width_from_a_const() {
+    let output = compile_and_run(
+        r#"
+CONST W = 5
+CONST NW% = 3
+DIM S AS STRING * W
+S = "ab"
+PRINT "["; S; "]"; LEN(S)
+TYPE R
+  N AS STRING * NW%
+  V AS INTEGER
+END TYPE
+DIM P AS R
+P.N = "abcdef": P.V = 7
+PRINT "["; P.N; "]"; P.V
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), &["[ab   ] 5", "[abc] 7"]);
+}
+
+/// The CONST must come first and be a positive whole number, and saying
+/// which rule was broken is the point.
+#[test]
+fn test_fixed_length_string_width_const_rules() {
+    let cases = [
+        (
+            "DIM S AS STRING * W\nCONST W = 5\n",
+            "not a CONST defined before",
+        ),
+        ("DIM S AS STRING * W\n", "not a CONST defined before"),
+        (
+            "CONST W = 0\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = -4\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = 2.5\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = \"x\"\nDIM S AS STRING * W\n",
+            "positive whole number",
+        ),
+        (
+            "CONST W = 4\nTYPE R\nN AS STRING * Z\nEND TYPE\n",
+            "not a CONST defined before",
+        ),
+    ];
+    for (source, expected) in cases {
+        let err =
+            crate::common::compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains(expected),
+            "{source:?}: expected {expected:?}, got:\n{}",
+            err.stderr
+        );
+        assert!(err.is_clean_rejection());
+    }
+}
+
+/// A plain `AS STRING` is a variable-length string, exactly what a `$` suffix
+/// is, for a variable, an array, a parameter and a FUNCTION result.
+///
+/// It was refused everywhere with "A STRING field needs a fixed length",
+/// which is the rule for a TYPE field and only for one.
+#[test]
+fn test_plain_as_string_is_a_variable_length_string() {
+    let output = compile_and_run(
+        r#"
+DIM S AS STRING
+S = "hi"
+S = S + " there"
+PRINT S; LEN(S); UCASE$(S); MID$(S, 4)
+IF S = "hi there" THEN PRINT "equal"
+DIM A$(2) AS STRING
+A$(1) = "one": A$(2) = A$(1) + "+"
+PRINT A$(1); A$(2); LEN(A$(0))
+DIM T$
+T$ = S
+SWAP S, T$
+PRINT S
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &["hi there 8 HI THEREthere", "equal", "oneone+ 0", "hi there"]
+    );
+}
+
+#[test]
+fn test_plain_as_string_parameters_and_result() {
+    let output = compile_and_run(
+        r#"
+SUB Shout (T AS STRING)
+  T = UCASE$(T) + "!"
+END SUB
+SUB Keep (BYVAL T AS STRING)
+  T = "lost"
+  PRINT T
+END SUB
+FUNCTION Twice (T AS STRING) AS STRING
+  Twice = T + T
+END FUNCTION
+FUNCTION Greet AS STRING
+  Greet = "hello"
+END FUNCTION
+A$ = "hey"
+Shout A$
+PRINT A$
+DIM B AS STRING
+B = "bee"
+Shout B
+PRINT B
+Keep B
+PRINT B
+PRINT Twice("ab"); LEN(Twice(B)); Greet; UCASE$(Greet)
+C$ = Twice(Greet)
+PRINT C$
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        &[
+            "HEY!",
+            "BEE!",
+            "lost",
+            "BEE!",
+            "abab 8 helloHELLO",
+            "hellohello"
+        ]
+    );
+}
+
+/// A string is a string whichever way it was declared, so a number cannot be
+/// stored in one declared `AS STRING`, nor a string in one declared `AS
+/// INTEGER` -- the declared type used to go unchecked on assignment.
+#[test]
+fn test_declared_types_are_checked_on_assignment() {
+    for (source, expected) in [
+        (
+            "DIM S AS STRING\nS = 5\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "DIM S AS STRING * 4\nS = 5\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "DIM N AS INTEGER\nN = \"x\"\n",
+            "cannot assign string value to numeric",
+        ),
+        (
+            "FUNCTION F AS STRING\nF = 1\nEND FUNCTION\n",
+            "cannot assign numeric value to string",
+        ),
+        (
+            "FUNCTION F AS STRING\nF = \"x\"\nEND FUNCTION\nX = F\n",
+            "cannot assign string value to numeric",
+        ),
+        // An array's elements have its declared type.
+        (
+            "DIM A(3) AS STRING\nA(1) = 5\n",
+            "cannot assign numeric value to string",
+        ),
+    ] {
+        let err =
+            crate::common::compile_only(source).expect_err(&format!("{source:?} must be refused"));
+        assert!(
+            err.contains(expected),
+            "{source:?}: expected {expected:?}, got:\n{}",
+            err.stderr
+        );
+    }
+}
+
+/// Only a TYPE field needs a fixed length, and the message still says so.
+#[test]
+fn test_plain_as_string_field_is_refused() {
+    let err = crate::common::compile_only(
+        "TYPE R\nN AS STRING\nV AS INTEGER\nEND TYPE\nDIM P AS R\nP.V = 1\n",
+    )
+    .expect_err("a TYPE field needs a fixed length");
+    assert!(
+        err.contains("A STRING field needs a fixed length"),
+        "got:\n{}",
+        err.stderr
+    );
+    // One diagnostic, not a cascade: the rest of the TYPE still parses.
+    assert!(err.contains("1 error"), "got:\n{}", err.stderr);
 }

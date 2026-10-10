@@ -1071,5 +1071,8 @@ PRINT "["; X$; "]["; Y$; "]["; Z$; "]"
         fs::write(path.join("e.txt"), "10,,20\nab,,cd\n").map_err(|e| e.to_string())
     })
     .unwrap();
-    assert_eq!(crate::common::lines(&output), vec!["10  0  20", "[ab][][cd]"]);
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["10  0  20", "[ab][][cd]"]
+    );
 }
