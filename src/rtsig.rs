@@ -119,10 +119,11 @@ pub static HELPERS: &[RtHelper] = &[
     // (file, character code)
     fallible(h("_rt_file_print_char", &[I64, I64], &[])),
     fallible(h("_rt_file_print_newline", &[I64], &[])),
-    // (width, decimals, flags, value)
-    fallible(h("_rt_print_using_num", &[I64, I64, I64, F64], &[])),
-    // (pointer, length, width)
-    fallible(h("_rt_print_using_str", &[I64, I64, I64], &[])),
+    // PRINT USING: (file, format pointer, format length), then each value
+    h("_rt_using_start", &[I64, I64, I64], &[]),
+    fallible(h("_rt_using_num", &[F64], &[])),
+    fallible(h("_rt_using_str", &[I64, I64], &[])),
+    fallible(h("_rt_using_end", &[], &[])),
     // Files
     // (name pointer, name length, mode, file)
     fallible(h("_rt_file_open", &[I64, I64, I64, I64], &[])),

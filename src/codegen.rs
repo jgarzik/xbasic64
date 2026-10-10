@@ -209,7 +209,6 @@ use crate::parser::TypeRef;
 use crate::parser::*;
 use crate::rtsig;
 use crate::sema::{Scope as SemaScope, Symbols};
-use crate::using;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::LazyLock;
@@ -3232,14 +3231,16 @@ impl CodeGen {
             }
 
             StmtKind::Print {
+                file_num,
                 items,
                 newline,
                 using: Some(fmt),
                 ..
             } => {
-                self.gen_print_using(fmt, items);
+                let sink = self.gen_sink(file_num.as_ref());
+                self.gen_print_using(fmt, items, &sink);
                 if *newline {
-                    self.emit_arg_imm(0, CONSOLE);
+                    self.emit_arg_file_num(0, &sink);
                     self.call_rt("_rt_file_print_newline");
                 }
             }
@@ -5928,90 +5929,40 @@ impl CodeGen {
     /// are consumed in order by the fields that take one; if the values run out
     /// the format stops there, and if values remain the format restarts, which
     /// is what GW-BASIC does.
-    fn gen_print_using(&mut self, fmt: &Expr, items: &[PrintItem]) {
-        let Expr::Literal(Literal::String(format)) = fmt else {
-            unreachable!("sema requires a literal PRINT USING format")
-        };
-        let parts = using::parse(format);
-
-        let values: Vec<&Expr> = items
-            .iter()
-            .filter_map(|i| match i {
-                PrintItem::Expr(e) => Some(e),
-                _ => None,
-            })
-            .collect();
-
-        let fields = parts.iter().filter(|p| p.consumes_value()).count();
-        if fields == 0 || values.is_empty() {
-            // No fields to fill: the format is just text.
-            for part in &parts {
-                if let using::UsingPart::Literal(text) = part {
-                    self.emit_literal_string(text);
-                }
-            }
-            return;
-        }
-
-        let mut next = 0usize;
-        while next < values.len() {
-            let before = next;
-            for part in &parts {
-                match part {
-                    using::UsingPart::Literal(text) => self.emit_literal_string(text),
-                    using::UsingPart::Num {
-                        width,
-                        decimals,
-                        flags,
-                    } => {
-                        if next >= values.len() {
-                            return;
-                        }
-                        let value = values[next];
-                        next += 1;
-                        self.gen_expr_to_double(value);
-                        self.emit_arg_imm(0, *width as i64);
-                        self.emit_arg_imm(1, *decimals as i64);
-                        self.emit_arg_imm(2, *flags);
-                        self.emit_arg_float_from_xmm0(3, 0);
-                        self.call_rt("_rt_print_using_num");
-                    }
-                    using::UsingPart::Str { kind, width } => {
-                        if next >= values.len() {
-                            return;
-                        }
-                        let value = values[next];
-                        next += 1;
-                        self.gen_expr(value);
-                        // rax = ptr, rdx = len from gen_expr
-                        self.emit("    mov r10, rax");
-                        self.emit("    mov r11, rdx");
-                        self.emit_arg_reg(0, "r10");
-                        self.emit_arg_reg(1, "r11");
-                        let w = match kind {
-                            using::StrFieldKind::Whole => 0,
-                            using::StrFieldKind::First => 1,
-                            using::StrFieldKind::Fixed => *width as i64,
-                        };
-                        self.emit_arg_imm(2, w);
-                        self.call_rt("_rt_print_using_str");
-                    }
-                }
-            }
-            // A format with fields must consume at least one value per pass,
-            // otherwise restarting would loop forever.
-            if next == before {
-                return;
+    /// PRINT USING: the format is read at run time, as the statement runs,
+    /// so it may be any string expression, and the output may go to a file.
+    ///
+    /// Each value goes to `_rt_using_num` or `_rt_using_str`, which print the
+    /// format's text up to the next field and then the value in it -- going
+    /// back to the format's start when it runs out, as GW-BASIC does -- and
+    /// `_rt_using_end` prints the text after the last field used. The format
+    /// used to be parsed here, which allowed only a literal and the console.
+    fn gen_print_using(&mut self, fmt: &Expr, items: &[PrintItem], sink: &FileNum) {
+        self.gen_expr(fmt);
+        self.emit("    mov r10, rax");
+        self.emit("    mov r11, rdx");
+        self.emit_arg_reg(1, "r10");
+        self.emit_arg_reg(2, "r11");
+        self.emit_arg_file_num(0, sink);
+        self.call_rt("_rt_using_start");
+        for item in items {
+            let PrintItem::Expr(value) = item else {
+                continue;
+            };
+            if self.expr_type(value) == DataType::String {
+                self.gen_expr(value);
+                self.emit("    mov r10, rax");
+                self.emit("    mov r11, rdx");
+                self.emit_arg_reg(0, "r10");
+                self.emit_arg_reg(1, "r11");
+                self.call_rt("_rt_using_str");
+            } else {
+                self.gen_expr_to_double(value);
+                self.emit_arg_float_from_xmm0(0, 0);
+                self.call_rt("_rt_using_num");
             }
         }
-    }
-
-    /// Print a literal string constant.
-    fn emit_literal_string(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.gen_console_prompt(text);
+        self.call_rt("_rt_using_end");
     }
 
     /// Emit one CASE alternative: jump to `body_label` when it matches.

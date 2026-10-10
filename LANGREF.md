@@ -471,12 +471,15 @@ PRINT "Enter value: ";
 
 ### PRINT USING
 
-Formatted output. The format is a string literal:
+Formatted output. The format is any string expression, read as the statement
+runs, and `PRINT #n, USING` writes to a file:
 
 ```basic
 PRINT USING "###.##"; 3.14159       '   3.14
 PRINT USING "Total: ###"; 42        ' Total:  42
 PRINT USING "## and ##"; 1; 2       '   1 and  2
+F$ = "$$#,###.##"
+PRINT USING F$; 1234.5              '  $1,234.50
 ```
 
 Numeric fields:
@@ -503,7 +506,9 @@ String fields:
 
 `_` emits the next character literally. A value too wide for its field is
 printed in full, preceded by `%`. If values remain after the format is
-exhausted, the format restarts.
+exhausted, the format restarts; after the last value, its text is printed up
+to the next field. A value of the wrong kind for its field is `Type mismatch`
+(13), and a format with no field for a value is `Illegal function call`.
 
 A field is at most 255 characters wide with at most 40 fractional digits;
 a format asking for more is clamped to those.
@@ -1588,6 +1593,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
 | 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
 | 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
+| 13  | `Type mismatch`          | A `PRINT USING` value of the wrong kind for its field |
 | 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
 | 52  | `Bad file number`        | A file number outside 1 to 15, or not open   |
 | 53  | `File not found`         | Opening a file for `INPUT` that is not there |
@@ -1675,7 +1681,6 @@ yet implemented. Each refused name says which of the two it is.
 
 - Single module: no `COMMON`, and no separate compilation
 - A `FUNCTION` cannot return a `TYPE` record; pass one to a `SUB` instead
-- `PRINT USING` has no file form -- `PRINT #n, USING` is refused
 
 ---
 

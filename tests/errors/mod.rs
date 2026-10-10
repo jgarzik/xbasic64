@@ -682,10 +682,7 @@ fn test_new_statement_misuse_is_diagnosed() {
         "SWAP requires both values to be the same type",
     );
     expect_rejected("X = 1\nCONST C = X\n", "must have a constant value");
-    expect_rejected(
-        "F$ = \"##\"\nPRINT USING F$; 1\n",
-        "PRINT USING requires a literal format string",
-    );
+    expect_rejected("PRINT USING 5; 1\n", "PRINT USING needs a string format");
 }
 
 /// OPTION BASE placement and value are checked, and subscript 0 becomes out of

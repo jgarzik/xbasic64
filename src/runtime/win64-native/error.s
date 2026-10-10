@@ -24,6 +24,7 @@ _stop_fmt_bare: .asciz "Break\r\n"
 
 _err_syntax:    .asciz "Syntax error"
 _err_subscript: .asciz "Subscript out of range"
+_err_typemismatch: .asciz "Type mismatch"
 _err_div0:      .asciz "Division by zero"
 _err_domain:    .asciz "Illegal function call"
 _err_overflow:  .asciz "Overflow"
@@ -72,6 +73,7 @@ _err_codes:
     .quad _err_subscript,   9
     .quad _err_undim,       9
     .quad _err_div0,        11
+    .quad _err_typemismatch, 13
     .quad _err_fieldovf,    50
     .quad _err_badfile,     52
     .quad _err_notfound,    53

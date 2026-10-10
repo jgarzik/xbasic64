@@ -565,3 +565,79 @@ fn test_width_arguments_are_checked() {
         assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
     }
 }
+
+/// The format of PRINT USING may be any string expression, read as the
+/// statement runs, and `PRINT #n, USING` writes to a file. Both used to be
+/// refused, because the format was parsed when compiling.
+#[test]
+fn test_print_using_with_a_computed_format_and_a_file() {
+    let output = compile_and_run(
+        r###"
+F$ = "##.##"
+PRINT USING F$; 3.14159
+PRINT USING "[" + "&" + "]"; "ok"
+FOR W = 2 TO 4
+PRINT USING STRING$(W, "#"); 7
+NEXT W
+OPEN "u.txt" FOR OUTPUT AS #1
+PRINT #1, USING "Total: $$###.##"; 12.5
+PRINT #1, USING F$; 1; 2;
+PRINT #1, "!"
+CLOSE #1
+OPEN "u.txt" FOR INPUT AS #1
+LINE INPUT #1, A$
+LINE INPUT #1, B$
+PRINT A$
+PRINT B$
+"###,
+    )
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            " 3.14",
+            "[ok]",
+            " 7",
+            "  7",
+            "   7",
+            "Total:   $12.50",
+            " 1.00 2.00!"
+        ]
+    );
+}
+
+/// The text after the last value stops at the next field, as GW-BASIC's does,
+/// and widths and digits are clamped to what the runtime lays out.
+#[test]
+fn test_print_using_stops_at_the_next_unused_field() {
+    let wide = "#".repeat(600);
+    let output = compile_and_run(&format!(
+        "PRINT USING \"A=## B=## C\"; 5\nPRINT USING \"{wide}\"; 1\nPRINT USING \"#.{}\"; 1\n",
+        "#".repeat(200)
+    ))
+    .unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines[0], "A= 5 B=");
+    assert_eq!(lines[1].len(), 255, "a width is at most 255");
+    assert_eq!(
+        lines[2],
+        format!("1.{}", "0".repeat(40)),
+        "at most 40 decimals"
+    );
+}
+
+/// A value of the wrong kind for its field is Type mismatch (13), and a format
+/// with no field to put a value in is Illegal function call, as in GW-BASIC.
+#[test]
+fn test_print_using_errors() {
+    for (source, msg) in [
+        ("PRINT USING \"##\"; \"text\"\n", "Type mismatch"),
+        ("PRINT USING \"&\"; 5\n", "Type mismatch"),
+        ("PRINT USING \"no fields\"; 5\n", "Illegal function call"),
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(run.stderr.contains(msg), "{source:?}: {}", run.stderr);
+    }
+}

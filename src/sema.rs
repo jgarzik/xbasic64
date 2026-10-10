@@ -1502,12 +1502,14 @@ impl Analyzer {
                 ..
             } => {
                 if let Some(file_num) = file_num {
-                    if using.is_some() {
-                        self.error(line, "PRINT # USING is not supported");
-                    }
                     self.check_file_num(file_num, scope, line);
-                } else {
-                    self.check_using(using.as_ref(), line);
+                }
+                // The format is read at run time, so any string will do.
+                if let Some(fmt) = using {
+                    self.check_expr(fmt, scope, line);
+                    if self.expr_is_string(fmt, scope) == Some(false) {
+                        self.error(line, "PRINT USING needs a string format");
+                    }
                 }
                 for item in items {
                     if let PrintItem::Expr(e) = item {
@@ -2197,19 +2199,6 @@ impl Analyzer {
                 line,
                 format!("file number {} is not between 1 and {}", n, MAX_FILE_NUM),
             );
-        }
-    }
-
-    /// A PRINT USING format must be a string literal, since it is parsed at
-    /// compile time into a sequence of runtime calls.
-    fn check_using(&mut self, using: Option<&Expr>, line: u32) {
-        match using {
-            None => {}
-            Some(Expr::Literal(Literal::String(_))) => {}
-            Some(_) => self.error(
-                line,
-                "PRINT USING requires a literal format string".to_string(),
-            ),
         }
     }
 

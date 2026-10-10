@@ -42,7 +42,6 @@ Source → Lexer → Parser → Sema → CodeGen → Assembly → Executable
   records, constants, labels) and reports errors with a source line, so codegen
   never has to guess what a name means
 - **codegen.rs** - Direct AST-to-x86-64 assembly translation using System V AMD64 ABI
-- **using.rs** - `PRINT USING` format strings, parsed at compile time
 - **runtime.rs** - Hand-written x86-64 assembly runtime library (I/O, strings, math) using libc
 - **rtsig.rs** - Signature of every runtime helper generated code calls, and
   whether it can raise an error. Every call goes through `CodeGen::call_rt`,
