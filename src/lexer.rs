@@ -130,7 +130,13 @@ pub enum DataTypeWord {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Literals
+    /// A whole number: an INTEGER if it fits 16 bits, otherwise a LONG.
     Integer(i64),
+    /// A whole number written as a LONG (`5&`, `&HFFFF&`), whatever its size.
+    Long(i64),
+    /// A number written as a SINGLE (`1.5!`), already rounded to one.
+    Single(f64),
+    /// A DOUBLE: any number with a point or exponent, or written with `#`.
     Float(f64),
     String(String),
 
@@ -264,6 +270,11 @@ impl<'a> Lexer<'a> {
         self.chars.peek().copied()
     }
 
+    /// The character `n` places ahead, without consuming anything.
+    fn peek_at(&self, n: usize) -> Option<char> {
+        self.chars.clone().nth(n)
+    }
+
     fn skip_whitespace(&mut self) {
         while let Some(c) = self.peek() {
             if c == ' ' || c == '\t' || c == '\r' {
@@ -374,6 +385,18 @@ impl<'a> Lexer<'a> {
         // Replace D with E for parsing
         let s = s.replace(['d', 'D'], "e");
 
+        // A type suffix, as GW-BASIC allows: `5%`, `5&`, `1.5!`, `1.5#`. `&`
+        // before H, O, B or a digit starts a radix literal instead, which no
+        // number is followed by.
+        let suffix = match (self.peek(), self.peek_at(1)) {
+            (Some(c @ ('%' | '!' | '#')), _) => Some(c),
+            (Some('&'), next) if !next.is_some_and(|n| n.is_ascii_alphanumeric()) => Some('&'),
+            _ => None,
+        };
+        if suffix.is_some() {
+            self.advance();
+        }
+
         // `parse::<f64>()` answers `inf` for a literal too large to represent
         // rather than failing, so an overflow used to slip through as a silent
         // infinity -- the one numeric form in this lexer that guessed.
@@ -385,28 +408,64 @@ impl<'a> Lexer<'a> {
             }
         };
 
-        if is_float {
-            return match s.parse::<f64>() {
+        match suffix {
+            Some(c @ ('%' | '&')) => {
+                // The lexer sees no sign, so only the top of the range can be
+                // exceeded here; -32768% is -(32768%), which is refused, as it
+                // is in GW-BASIC.
+                let (name, hi) = if c == '%' {
+                    ("INTEGER", i64::from(i16::MAX))
+                } else {
+                    ("LONG", i64::from(i32::MAX))
+                };
+                if is_float {
+                    return Err(format!(
+                        "'{}{}' is an {} and cannot have a fraction or exponent",
+                        s, c, name
+                    ));
+                }
+                match s.parse::<i64>() {
+                    Ok(n) if n <= hi => Ok(if c == '%' {
+                        Token::Integer(n)
+                    } else {
+                        Token::Long(n)
+                    }),
+                    _ => Err(format!("'{}{}' does not fit an {}", s, c, name)),
+                }
+            }
+            Some('!') => match s.parse::<f64>() {
+                Ok(v) if (v as f32).is_finite() => Ok(Token::Single(f64::from(v as f32))),
+                Ok(_) => Err(format!("'{}!' does not fit a SINGLE", s)),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            },
+            Some(_) => match s.parse::<f64>() {
                 Ok(v) => finite(v, &s),
                 Err(_) => Err(format!("malformed number '{}'", s)),
-            };
-        }
-
-        match s.parse::<i32>() {
-            Ok(n) => Ok(Token::Integer(n as i64)),
-            // Outside LONG range: widen to Double, as MS BASIC does, rather
-            // than truncating to 32 bits.
-            Err(_) => match s.parse::<f64>() {
+            },
+            None if is_float => match s.parse::<f64>() {
                 Ok(v) => finite(v, &s),
-                Err(_) => Err(format!("number '{}' is too large", s)),
+                Err(_) => Err(format!("malformed number '{}'", s)),
+            },
+            None => match s.parse::<i32>() {
+                Ok(n) => Ok(Token::Integer(n as i64)),
+                // Outside LONG range: widen to Double, as MS BASIC does, rather
+                // than truncating to 32 bits.
+                Err(_) => match s.parse::<f64>() {
+                    Ok(v) => finite(v, &s),
+                    Err(_) => Err(format!("number '{}' is too large", s)),
+                },
             },
         }
     }
 
     /// Scan the digits of a radix literal (`&H`, `&O`, `&B`, or bare `&`).
     ///
-    /// GW-BASIC treats these as 32-bit values, so `&HFFFFFFFF` is -1. An empty
-    /// digit run or an out-of-range value is an error; both used to yield 0.
+    /// QuickBASIC's widths: a value that fits 16 bits is an INTEGER, read as
+    /// two's complement, so `&HFFFF` is -1 and `&H8000` is -32768; one that
+    /// fits 32 bits is a LONG, likewise, so `&HFFFFFFFF` is -1. A trailing `&`
+    /// makes it a LONG whatever its size (`&HFFFF&` is 65535), and `%` insists
+    /// on an INTEGER. An empty digit run or an out-of-range value is an error;
+    /// both used to yield 0, and the suffix used to be ignored.
     fn read_radix(&mut self, radix: u32, sigil: &str) -> Result<Token, String> {
         let mut s = String::new();
         while let Some(c) = self.peek() {
@@ -422,13 +481,22 @@ impl<'a> Lexer<'a> {
                 sigil
             ));
         }
-        // An optional type suffix may follow the digits, e.g. &HFFFF&
-        if matches!(self.peek(), Some('%') | Some('&')) {
-            self.advance();
-        }
-        match u32::from_str_radix(&s, radix) {
-            Ok(v) => Ok(Token::Integer(v as i32 as i64)),
-            Err(_) => Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        let suffix = match self.peek() {
+            Some(c @ ('%' | '&')) => {
+                self.advance();
+                Some(c)
+            }
+            _ => None,
+        };
+        let v = match u32::from_str_radix(&s, radix) {
+            Ok(v) => v,
+            Err(_) => return Err(format!("{}{} does not fit in 32 bits", sigil, s)),
+        };
+        match suffix {
+            Some('&') => Ok(Token::Long(i64::from(v as i32))),
+            Some(_) if v > 0xFFFF => Err(format!("{}{}% does not fit an INTEGER", sigil, s)),
+            _ if v <= 0xFFFF => Ok(Token::Integer(i64::from(v as u16 as i16))),
+            _ => Ok(Token::Long(i64::from(v as i32))),
         }
     }
 

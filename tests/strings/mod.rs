@@ -312,9 +312,29 @@ fn test_case_conversion_does_not_mutate_source() {
 /// Radix conversions.
 #[test]
 fn test_hex_and_oct() {
-    let output = compile_and_run("PRINT HEX$(255)\nPRINT OCT$(15)\nPRINT HEX$(16)\n").unwrap();
+    let output = compile_and_run(
+        "PRINT HEX$(255)\nPRINT OCT$(15)\nPRINT HEX$(16)\nPRINT HEX$(-1)\nPRINT HEX$(-1&)\n\
+         A% = -2: PRINT HEX$(A%)\nPRINT HEX$(65535)\nPRINT HEX$(-1#)\nPRINT OCT$(-1)\nPRINT OCT$(-1&)\n",
+    )
+    .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["FF", "17", "10"]);
+    // A negative value is shown in its own type's width, two's complement, as
+    // QuickBASIC does: -1 is an INTEGER, so FFFF. It used to be 64 bits wide.
+    assert_eq!(
+        lines,
+        vec![
+            "FF",
+            "17",
+            "10",
+            "FFFF",
+            "FFFFFFFF",
+            "FFFE",
+            "FFFF",
+            "FFFFFFFF",
+            "177777",
+            "37777777777"
+        ]
+    );
 }
 
 /// String assignment copies, so mutating one variable is not visible through

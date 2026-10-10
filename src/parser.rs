@@ -9,39 +9,33 @@ use std::collections::{HashSet, VecDeque};
 /// Binary operator precedence levels (higher = tighter binding)
 ///
 /// These are LANGREF's table read upside down -- it numbers 1 as tightest, this
-/// numbers 1 as loosest. `XOR` used to sit alone at 3, binding tighter than
-/// `AND`, which contradicted both LANGREF and GW-BASIC and made
-/// `-1 OR 0 XOR -1` give -1 instead of 0.
+/// numbers 1 as loosest -- and the table is GW-BASIC's and QuickBASIC's: each
+/// logical operator has a level of its own, in the order NOT, AND, OR, XOR,
+/// EQV, IMP, and `\` and MOD sit below `*` and `/`, each on its own. OR and
+/// XOR used to share a level, as did all four multiplicative operators, so
+/// `1 XOR 1 OR 1` gave 1 and `6 \ 2 * 3` gave 9.
 ///
 /// Returns (precedence, BinaryOp) or None if not a binary operator
 fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
     match token {
-        // Precedence 1: implication (lowest)
         Token::Imp => Some((1, BinaryOp::Imp)),
-        // Precedence 2: equivalence
         Token::Eqv => Some((2, BinaryOp::Eqv)),
-        // Precedence 3: logical OR and XOR, which share a level
-        Token::Or => Some((3, BinaryOp::Or)),
         Token::Xor => Some((3, BinaryOp::Xor)),
-        // Precedence 4: logical AND
-        Token::And => Some((4, BinaryOp::And)),
-        // Precedence 5 is NOT, a prefix operator; see `parse_prec_inner`.
-        // Precedence 6: comparison
+        Token::Or => Some((4, BinaryOp::Or)),
+        Token::And => Some((5, BinaryOp::And)),
+        // 6 is NOT, a prefix operator; see `parse_prec_inner`.
         Token::Eq => Some((CMP_PREC, BinaryOp::Eq)),
         Token::Ne => Some((CMP_PREC, BinaryOp::Ne)),
         Token::Lt => Some((CMP_PREC, BinaryOp::Lt)),
         Token::Gt => Some((CMP_PREC, BinaryOp::Gt)),
         Token::Le => Some((CMP_PREC, BinaryOp::Le)),
         Token::Ge => Some((CMP_PREC, BinaryOp::Ge)),
-        // Precedence 7: additive
-        Token::Plus => Some((7, BinaryOp::Add)),
-        Token::Minus => Some((7, BinaryOp::Sub)),
-        // Precedence 8: multiplicative
-        Token::Star => Some((8, BinaryOp::Mul)),
-        Token::Slash => Some((8, BinaryOp::Div)),
-        Token::Backslash => Some((8, BinaryOp::IntDiv)),
-        Token::Mod => Some((8, BinaryOp::Mod)),
-        // Precedence 9: power
+        Token::Plus => Some((8, BinaryOp::Add)),
+        Token::Minus => Some((8, BinaryOp::Sub)),
+        Token::Mod => Some((9, BinaryOp::Mod)),
+        Token::Backslash => Some((10, BinaryOp::IntDiv)),
+        Token::Star => Some((11, BinaryOp::Mul)),
+        Token::Slash => Some((11, BinaryOp::Div)),
         Token::Caret => Some((POWER_PREC, BinaryOp::Pow)),
         _ => None,
     }
@@ -52,10 +46,10 @@ fn binary_op_info(token: &Token) -> Option<(u8, BinaryOp)> {
 /// Named because `NOT` sits directly below it: `NOT` takes an operand at this
 /// level, which is what makes `NOT A = B` group as `NOT (A = B)` while
 /// `NOT A AND B` groups as `(NOT A) AND B`.
-const CMP_PREC: u8 = 6;
+const CMP_PREC: u8 = 7;
 
 /// Precedence of `^`, the tightest-binding binary operator.
-const POWER_PREC: u8 = 9;
+const POWER_PREC: u8 = 12;
 
 /// How deeply expressions and blocks may nest before the parser gives up.
 ///
@@ -463,9 +457,38 @@ pub enum Expr {
 
 #[derive(Debug, Clone)]
 pub enum Literal {
+    /// A whole number, typed by its size: INTEGER if it fits 16 bits, else
+    /// LONG. The lexer makes anything wider than LONG a `Float`.
     Integer(i64),
+    /// A whole number that is a LONG whatever its size (`5&`, `&HFFFF&`).
+    Long(i64),
+    /// A SINGLE (`1.5!`), its value already rounded to one.
+    Single(f64),
+    /// A DOUBLE.
     Float(f64),
     String(String),
+}
+
+impl Literal {
+    /// The type a numeric literal has, or None for a string.
+    pub fn numeric_type(&self) -> Option<DataType> {
+        match self {
+            Literal::Integer(n) if i16::try_from(*n).is_ok() => Some(DataType::Integer),
+            Literal::Integer(_) | Literal::Long(_) => Some(DataType::Long),
+            Literal::Single(_) => Some(DataType::Single),
+            Literal::Float(_) => Some(DataType::Double),
+            Literal::String(_) => None,
+        }
+    }
+
+    /// The value of a numeric literal as a double.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Literal::Integer(n) | Literal::Long(n) => Some(*n as f64),
+            Literal::Single(f) | Literal::Float(f) => Some(*f),
+            Literal::String(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3267,6 +3290,14 @@ impl Parser {
             Token::Float(f) => {
                 self.advance();
                 Ok(Expr::Literal(Literal::Float(f)))
+            }
+            Token::Long(n) => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Long(n)))
+            }
+            Token::Single(f) => {
+                self.advance();
+                Ok(Expr::Literal(Literal::Single(f)))
             }
             Token::String(s) => {
                 self.advance();

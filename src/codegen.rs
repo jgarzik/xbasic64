@@ -1086,11 +1086,7 @@ impl CodeGen {
             } => return self.const_double(operand).map(|v| -v),
             _ => return None,
         };
-        match lit {
-            Literal::Integer(n) => Some(*n as f64),
-            Literal::Float(f) => Some(*f),
-            Literal::String(_) => None,
-        }
+        lit.as_f64()
     }
 
     /// The value of an integer constant that fits an instruction's imm32.
@@ -1111,7 +1107,7 @@ impl CodeGen {
             _ => return None,
         };
         match lit {
-            Literal::Integer(n) => i32::try_from(*n).ok(),
+            Literal::Integer(n) | Literal::Long(n) => i32::try_from(*n).ok(),
             _ => None,
         }
     }
@@ -1326,18 +1322,12 @@ impl CodeGen {
     /// Determine the result type of an expression
     fn expr_type(&self, expr: &Expr) -> DataType {
         match expr {
-            Expr::Literal(lit) => match lit {
-                Literal::Integer(_) => DataType::Long, // Integer literals are Long
-                Literal::Float(_) => DataType::Double,
-                Literal::String(_) => DataType::String,
-            },
+            Expr::Literal(lit) => lit.numeric_type().unwrap_or(DataType::String),
             Expr::Variable(name) if crate::sema::is_zero_arg_builtin(name) => {
                 self.fn_return_type(name)
             }
             Expr::Variable(name) => match self.symbols.consts.get(normalized(name)) {
-                Some(Literal::Integer(_)) => DataType::Long,
-                Some(Literal::Float(_)) => DataType::Double,
-                Some(Literal::String(_)) => DataType::String,
+                Some(lit) => lit.numeric_type().unwrap_or(DataType::String),
                 // A variable declared with `AS` carries that type rather than
                 // the one its name's suffix would imply.
                 // An already-allocated slot knows its own type -- which for a
@@ -4248,11 +4238,12 @@ impl CodeGen {
     fn gen_expr(&mut self, expr: &Expr) -> DataType {
         match expr {
             Expr::Literal(lit) => match lit {
-                Literal::Integer(n) => match i32::try_from(*n) {
+                Literal::Integer(n) | Literal::Long(n) => match i32::try_from(*n) {
                     Ok(v) => {
-                        // Load as integer into eax
+                        // Load as integer into eax; an INTEGER is held
+                        // sign-extended to 32 bits like any other.
                         emit!(self, "    mov eax, {}", v);
-                        DataType::Long
+                        lit.numeric_type().expect("numeric")
                     }
                     // Wider than LONG: emit as a Double rather than truncating
                     // to 32 bits, which silently turned 1000000000000001 into
@@ -4267,6 +4258,11 @@ impl CodeGen {
                     // Load as double into xmm0
                     self.gen_double_const(*f);
                     DataType::Double
+                }
+                Literal::Single(f) => {
+                    emit!(self, "    mov eax, 0x{:X}", (*f as f32).to_bits());
+                    self.emit("    movd xmm0, eax");
+                    DataType::Single
                 }
                 Literal::String(s) => {
                     let idx = self.add_string_literal(s);
@@ -6189,7 +6185,18 @@ impl CodeGen {
                 Builtin::CallLong(sym) => {
                     let arg_type = self.gen_expr(&args[0]);
                     self.gen_coercion(arg_type, DataType::Long);
-                    self.emit("    movsxd rax, eax");
+                    if matches!(upper_name.as_str(), "HEX$" | "OCT$") {
+                        // Two's complement in the argument's own width, as
+                        // QuickBASIC shows it: HEX$(-1) of an INTEGER is FFFF,
+                        // of a LONG FFFFFFFF. It used to be 64 bits wide.
+                        if arg_type == DataType::Integer {
+                            self.emit("    movzx eax, ax");
+                        } else {
+                            self.emit("    mov eax, eax");
+                        }
+                    } else {
+                        self.emit("    movsxd rax, eax");
+                    }
                     if let Some((min, max)) = Self::long_arg_range(&upper_name) {
                         self.emit_arg_range_check("rax", min, max);
                     }
@@ -7052,8 +7059,8 @@ impl CodeGen {
         let mut rows: Vec<(u8, String)> = Vec::with_capacity(data_items.len());
         for item in &data_items {
             rows.push(match item {
-                Literal::Integer(n) => (0, n.to_string()),
-                Literal::Float(f) => (1, format!("0x{:X}", f.to_bits())),
+                Literal::Integer(n) | Literal::Long(n) => (0, n.to_string()),
+                Literal::Float(f) | Literal::Single(f) => (1, format!("0x{:X}", f.to_bits())),
                 Literal::String(s) => {
                     let idx = self.add_string_literal(s);
                     (2, format!("_str_{}", idx))

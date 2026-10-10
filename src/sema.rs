@@ -874,6 +874,9 @@ struct Analyzer {
     checks: bool,
     /// Whether an OPTION BASE has already been seen.
     seen_option_base: bool,
+    /// Set by `const_eval` when a fold failed because the value overflowed its
+    /// type, so the caller can say so rather than "not constant".
+    fold_overflowed: std::cell::Cell<bool>,
 }
 
 impl Analyzer {
@@ -993,10 +996,15 @@ impl Analyzer {
                     if self.symbols.consts.contains_key(&upper) {
                         self.error(stmt.line, format!("'{}' is already defined", name));
                     }
+                    self.fold_overflowed.set(false);
                     match self.const_eval(value) {
                         Some(lit) => {
                             self.symbols.consts.insert(upper, lit);
                         }
+                        None if self.fold_overflowed.get() => self.error(
+                            stmt.line,
+                            format!("Overflow: CONST '{}' does not fit its type", name),
+                        ),
                         None => self.error(
                             stmt.line,
                             format!("CONST '{}' must have a constant value", name),
@@ -1860,44 +1868,123 @@ impl Analyzer {
     /// Fold a constant expression, or return None when it is not constant.
     ///
     /// Small on purpose: literals, references to earlier CONSTs, and the
-    /// arithmetic that appears in real constant declarations.
+    /// arithmetic that appears in real constant declarations. It folds in the
+    /// types the program's own arithmetic uses, so `300 * 300` is an INTEGER
+    /// product and overflows, as it would at run time -- the fold used to
+    /// widen it to 90000. An overflow sets `fold_overflowed` and yields None.
     fn const_eval(&self, e: &Expr) -> Option<Literal> {
+        let overflow = || {
+            self.fold_overflowed.set(true);
+            None
+        };
         match e {
             Expr::Literal(l) => Some(l.clone()),
             Expr::Variable(n) => self.symbols.consts.get(normalized(n)).cloned(),
-            Expr::Unary { op, operand } => {
-                let v = self.const_eval(operand)?;
-                match (op, v) {
-                    (UnaryOp::Neg, Literal::Integer(n)) => Some(Literal::Integer(-n)),
-                    (UnaryOp::Neg, Literal::Float(f)) => Some(Literal::Float(-f)),
-                    _ => None,
-                }
-            }
+            Expr::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => match self.const_eval(operand)? {
+                // Typed by size, so -32768 comes back an INTEGER.
+                Literal::Integer(n) => Some(Literal::Integer(-n)),
+                Literal::Long(n) if n == i64::from(i32::MIN) => overflow(),
+                Literal::Long(n) => Some(Literal::Long(-n)),
+                Literal::Single(f) => Some(Literal::Single(-f)),
+                Literal::Float(f) => Some(Literal::Float(-f)),
+                Literal::String(_) => None,
+            },
             Expr::Binary { op, left, right } => {
                 let (l, r) = (self.const_eval(left)?, self.const_eval(right)?);
-                let (a, b) = match (&l, &r) {
-                    (Literal::Integer(a), Literal::Integer(b)) => {
-                        // Integer arithmetic stays integer where it can.
-                        return match op {
-                            BinaryOp::Add => Some(Literal::Integer(a.checked_add(*b)?)),
-                            BinaryOp::Sub => Some(Literal::Integer(a.checked_sub(*b)?)),
-                            BinaryOp::Mul => Some(Literal::Integer(a.checked_mul(*b)?)),
-                            BinaryOp::IntDiv if *b != 0 => Some(Literal::Integer(a / b)),
-                            BinaryOp::Mod if *b != 0 => Some(Literal::Integer(a % b)),
-                            BinaryOp::Div if *b != 0 => Some(Literal::Float(*a as f64 / *b as f64)),
-                            _ => None,
-                        };
-                    }
-                    (Literal::Integer(a), Literal::Float(b)) => (*a as f64, *b),
-                    (Literal::Float(a), Literal::Integer(b)) => (*a, *b as f64),
-                    (Literal::Float(a), Literal::Float(b)) => (*a, *b),
-                    _ => return None,
+                let (lt, rt) = (l.numeric_type()?, r.numeric_type()?);
+                let (a, b) = (l.as_f64()?, r.as_f64()?);
+                let int_of = |x: &Literal| match x {
+                    Literal::Integer(n) | Literal::Long(n) => Some(*n),
+                    _ => None,
                 };
                 match op {
-                    BinaryOp::Add => Some(Literal::Float(a + b)),
-                    BinaryOp::Sub => Some(Literal::Float(a - b)),
-                    BinaryOp::Mul => Some(Literal::Float(a * b)),
-                    BinaryOp::Div if b != 0.0 => Some(Literal::Float(a / b)),
+                    BinaryOp::Div => {
+                        if b == 0.0 {
+                            return None;
+                        }
+                        let q = a / b;
+                        if q.is_finite() {
+                            Some(Literal::Float(q))
+                        } else {
+                            overflow()
+                        }
+                    }
+                    // `\` and MOD convert their operands to LONG, rounding.
+                    BinaryOp::IntDiv | BinaryOp::Mod => {
+                        let round = |x: f64| {
+                            let r = x.round_ties_even();
+                            (r >= f64::from(i32::MIN) && r <= f64::from(i32::MAX))
+                                .then_some(r as i64)
+                        };
+                        let (Some(x), Some(y)) = (round(a), round(b)) else {
+                            return overflow();
+                        };
+                        if y == 0 {
+                            return None;
+                        }
+                        let v = if *op == BinaryOp::IntDiv {
+                            x / y
+                        } else {
+                            x % y
+                        };
+                        if i32::try_from(v).is_err() {
+                            return overflow();
+                        }
+                        Some(Literal::Long(v))
+                    }
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul => {
+                        let ty = [lt, rt]
+                            .into_iter()
+                            .max_by_key(|t| match t {
+                                DataType::Integer => 0,
+                                DataType::Long => 1,
+                                DataType::Single => 2,
+                                _ => 3,
+                            })
+                            .expect("two types");
+                        match ty {
+                            DataType::Integer | DataType::Long => {
+                                let (x, y) = (int_of(&l)?, int_of(&r)?);
+                                let v = match op {
+                                    BinaryOp::Add => x + y,
+                                    BinaryOp::Sub => x - y,
+                                    _ => x * y,
+                                };
+                                if ty == DataType::Integer {
+                                    if i16::try_from(v).is_err() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Integer(v))
+                                } else {
+                                    if i32::try_from(v).is_err() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Long(v))
+                                }
+                            }
+                            _ => {
+                                let v = match op {
+                                    BinaryOp::Add => a + b,
+                                    BinaryOp::Sub => a - b,
+                                    _ => a * b,
+                                };
+                                if ty == DataType::Single {
+                                    let v = v as f32;
+                                    if !v.is_finite() {
+                                        return overflow();
+                                    }
+                                    Some(Literal::Single(f64::from(v)))
+                                } else if v.is_finite() {
+                                    Some(Literal::Float(v))
+                                } else {
+                                    overflow()
+                                }
+                            }
+                        }
+                    }
                     _ => None,
                 }
             }
@@ -1929,7 +2016,7 @@ impl Analyzer {
             // A constant dimension is checked here; a computed one is checked
             // at run time, where reading past the descriptor used to return
             // whatever happened to follow it.
-            if let Some(Literal::Integer(n)) = self.const_eval(dim)
+            if let Some(Literal::Integer(n) | Literal::Long(n)) = self.const_eval(dim)
                 && (n < 1 || n as usize > rank)
             {
                 return Some(format!(
@@ -2077,11 +2164,11 @@ impl Analyzer {
     /// inside it twice.
     fn check_file_num_value(&mut self, e: &Expr, scope: &Scope, line: u32) {
         self.require_numeric(e, scope, line, "a file number");
-        if let Some(n) = self.const_eval(e).and_then(|l| match l {
-            Literal::Integer(n) => Some(n),
-            Literal::Float(f) => Some(f as i64),
-            Literal::String(_) => None,
-        }) && !(1..=MAX_FILE_NUM).contains(&n)
+        if let Some(n) = self
+            .const_eval(e)
+            .and_then(|l| l.as_f64())
+            .map(|f| f.round_ties_even() as i64)
+            && !(1..=MAX_FILE_NUM).contains(&n)
         {
             self.error(
                 line,

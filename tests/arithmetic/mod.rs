@@ -275,14 +275,25 @@ PRINT &B1010
 PRINT &17
 PRINT &HFFFFFFFF
 PRINT &H10 + &H10
+PRINT &HFFFF
+PRINT &H8000
+PRINT &HFFFF&
+PRINT &H10000
+PRINT &O177777
+PRINT &B1111111111111111
+PRINT &H7FFF%
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
     assert_eq!(
         lines,
-        vec!["255", "15", "10", "15", "-1", "32"],
-        "hex, octal, binary, bare-& octal; &H values are 32-bit signed"
+        vec![
+            "255", "15", "10", "15", "-1", "32", "-1", "-32768", "65535", "65536", "-1", "-1",
+            "32767"
+        ],
+        "hex, octal, binary, bare-& octal; QuickBASIC's widths: up to 16 bits is an \
+         INTEGER, two's complement, unless written with &; up to 32 is a LONG"
     );
 }
 
@@ -450,22 +461,29 @@ fn test_logical_operator_precedence() {
 A% = 0 : B% = 0
 PRINT NOT A% AND B%
 PRINT (NOT A%) AND B%
-PRINT -1 OR 0 XOR -1
-PRINT (-1 OR 0) XOR -1
+PRINT 1 XOR 1 OR 1
+PRINT (1 XOR 1) OR 1
 PRINT 1 AND 0 OR 1
 PRINT 12 XOR 10 AND 6
+PRINT 0 EQV 1 XOR 1
+PRINT 1 IMP 0 EQV 0
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
     // NOT binds tighter than AND, so the first two agree.
     assert_eq!(&lines[0..2], &["0", "0"], "NOT binds tighter than AND");
-    // OR and XOR share a level and associate left to right, so these agree too.
-    assert_eq!(&lines[2..4], &["0", "0"], "OR and XOR share a level");
+    // OR binds tighter than XOR, as in GW-BASIC and QuickBASIC: 1 XOR (1 OR 1).
+    // They used to share a level and give 1.
+    assert_eq!(&lines[2..4], &["0", "1"], "OR binds tighter than XOR");
     // AND binds tighter than OR: (1 AND 0) OR 1 = 1.
     assert_eq!(lines[4], "1", "AND binds tighter than OR");
     // AND binds tighter than XOR: 12 XOR (10 AND 6) = 12 XOR 2 = 14.
     assert_eq!(lines[5], "14", "AND binds tighter than XOR");
+    // XOR binds tighter than EQV: 0 EQV (1 XOR 1) = 0 EQV 0 = -1.
+    assert_eq!(lines[6], "-1", "XOR binds tighter than EQV");
+    // EQV binds tighter than IMP: 1 IMP (0 EQV 0) = 1 IMP -1 = -1.
+    assert_eq!(lines[7], "-1", "EQV binds tighter than IMP");
 }
 
 /// `NOT` still binds looser than a comparison, which is the form that matters.
@@ -827,4 +845,114 @@ fn test_unsafe_skips_overflow_checks() {
     .unwrap();
     run.assert_ran_to_completion("unchecked overflow");
     assert_eq!(run.lines(), vec!["-32768"]);
+}
+
+/// `\` binds looser than `*` and `/`, and MOD looser than `\`, as in GW-BASIC
+/// and QuickBASIC. All four used to share one level, left to right.
+#[test]
+fn test_integer_division_and_mod_have_their_own_levels() {
+    let output = compile_and_run(
+        r#"
+PRINT 6 \ 2 * 3
+PRINT 12 \ 2 / 2
+PRINT 7 MOD 4 \ 2
+PRINT 10 - 7 MOD 4
+PRINT 2 * 7 MOD 4
+PRINT 20 MOD 7 * 2
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["1", "12", "1", "7", "2", "6"]
+    );
+}
+
+/// An unsuffixed whole number is an INTEGER when it fits 16 bits, a LONG when
+/// it fits 32, and a DOUBLE beyond; a number with a point or an exponent is a
+/// DOUBLE. INTEGER arithmetic is checked at 16 bits, so -- as in QuickBASIC --
+/// `X% * 300` can overflow where `X% * 300&` cannot.
+#[test]
+fn test_literal_types_follow_their_size() {
+    let output = compile_and_run(
+        r#"
+X% = 300
+PRINT X% * 300&
+PRINT X% * 40000
+PRINT 32767 + 1&
+PRINT 100000 * 3
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["90000", "12000000", "32768", "300000"]
+    );
+    for source in [
+        "X% = 300\nPRINT X% * 300\n",
+        "PRINT 200 * 200\n",
+        "PRINT 32767 + 1\n",
+    ] {
+        assert_raises(source, "Overflow");
+    }
+}
+
+/// A literal may carry a type suffix, as in GW-BASIC: `%` INTEGER, `&` LONG,
+/// `!` SINGLE, `#` DOUBLE. They used to be refused.
+#[test]
+fn test_literal_suffixes() {
+    let output = compile_and_run(
+        r#"
+PRINT 1.5#
+PRINT 100!
+A# = .1!
+PRINT A# = .1#
+PRINT A# = CDBL(CSNG(.1))
+B& = 5&
+PRINT B&
+PRINT 32767% + 0&
+PRINT 1D3
+PRINT 2.5! * 2
+X% = 300
+PRINT X% * 300&
+PRINT 7#
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec![
+            "1.5", "100", "0", "-1", "5", "32767", "1000", "5", "90000", "7"
+        ]
+    );
+}
+
+/// A suffix the value does not fit is refused when the program is compiled.
+#[test]
+fn test_literal_suffix_out_of_range_is_refused() {
+    for (source, what) in [
+        ("PRINT 32768%\n", "INTEGER"),
+        ("PRINT 3000000000&\n", "LONG"),
+        ("PRINT 1.5%\n", "INTEGER"),
+        ("PRINT 1E39!\n", "SINGLE"),
+        ("PRINT &H10000%\n", "INTEGER"),
+        ("PRINT &H100000000&\n", "32 bits"),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(source);
+        assert!(err.is_clean_rejection(), "{source:?}: {}", err.stderr);
+        assert!(err.contains(what), "{source:?}: {}", err.stderr);
+    }
+}
+
+/// A constant expression is folded in its type, so one that overflows is an
+/// error when the program is compiled, as QuickBASIC reports it.
+#[test]
+fn test_constant_folding_respects_types() {
+    let output = compile_and_run(
+        "CONST A = 300 * 300&\nCONST B = 1 / 4\nCONST C = 100 * 100\nCONST D = 7 \\ 2\nPRINT A; B; C; D\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["90000  .25  10000  3"]);
+    let err = crate::common::compile_only("CONST A = 300 * 300\nPRINT A\n").unwrap_err();
+    assert!(err.contains("Overflow"), "{}", err.stderr);
 }

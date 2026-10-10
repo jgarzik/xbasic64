@@ -116,6 +116,16 @@ E = &377        ' Octal too: a bare & introduces octal
 F = &B1010      ' Binary (10)
 ```
 
+A whole number is an INTEGER if it fits 16 bits, a LONG if it fits 32, and a
+DOUBLE beyond that. This matters because INTEGER arithmetic is checked at 16
+bits: with `X% = 300`, `X% * 300` is `Overflow`, as in QuickBASIC, where
+`X% * 300&` is 90000.
+
+A hexadecimal, octal or binary literal of up to 16 bits is an INTEGER, read as
+two's complement, so `&HFFFF` is -1 and `&H8000` is -32768; one of up to 32
+bits is a LONG, likewise, so `&HFFFFFFFF` is -1. Write `&` after it for a LONG
+whatever its size: `&HFFFF&` is 65535.
+
 **Floating-point:**
 ```basic
 A = 3.14
@@ -123,6 +133,21 @@ B = .5
 C = 1E+10
 D = 2.5D-3      ' Double precision
 ```
+
+A number with a point or an exponent is a DOUBLE.
+
+**Type suffixes** may follow any number, as in GW-BASIC: `%` makes it an
+INTEGER, `&` a LONG, `!` a SINGLE and `#` a DOUBLE. A value the type cannot
+hold -- `32768%`, `1.5%`, `1E39!` -- is refused when the program is compiled.
+
+```basic
+A& = 5&         ' LONG
+B! = 2.5!       ' SINGLE: rounded to a SINGLE's precision
+C# = 100#       ' DOUBLE
+```
+
+A `CONST` is folded in these types too, so `CONST A = 300 * 300` is an
+`Overflow`, and `CONST A = 300 * 300&` is 90000.
 
 **Strings:**
 ```basic
@@ -336,16 +361,21 @@ FullName$ = First$ + " " + Last$
 From highest to lowest:
 1. `^` (exponentiation)
 2. `-` (unary negation)
-3. `*`, `/`, `\`, `MOD`
-4. `+`, `-`
-5. `=`, `<>`, `<`, `>`, `<=`, `>=`
-6. `NOT`
-7. `AND`
-8. `OR`, `XOR`
-9. `EQV`
-10. `IMP`
+3. `*`, `/`
+4. `\` (integer division)
+5. `MOD`
+6. `+`, `-`
+7. `=`, `<>`, `<`, `>`, `<=`, `>=`
+8. `NOT`
+9. `AND`
+10. `OR`
+11. `XOR`
+12. `EQV`
+13. `IMP`
 
-Because `^` binds tighter than unary negation, `-2 ^ 2` is `-(2 ^ 2)` = -4.
+This is GW-BASIC's and QuickBASIC's table. Because `^` binds tighter than unary
+negation, `-2 ^ 2` is `-(2 ^ 2)` = -4. Because `\` and `MOD` sit below `*`,
+`6 \ 2 * 3` is `6 \ 6` = 1, and `10 - 7 MOD 4` is 7.
 
 Operators of equal precedence associate left to right, `^` included: `2 ^ 3 ^ 2`
 is `(2 ^ 3) ^ 2` = 64, and `100 - 10 - 5` is 85.
@@ -1099,6 +1129,10 @@ nobody to ask, so it takes the clock.
 
 **String indexing is 1-based** for `MID$` and `INSTR`.
 
+`HEX$` and `OCT$` show a negative number as two's complement in its own type's
+width, as QuickBASIC does: `HEX$(-1)` is `FFFF`, since -1 is an INTEGER, and
+`HEX$(-1&)` is `FFFFFFFF`. Any other type is converted to a LONG first.
+
 `MID$` may also be assigned to, overwriting characters in place. The target's
 length never changes:
 
@@ -1610,9 +1644,6 @@ are choices, not oversights.
    error, because the implicit version silently hides a typo; one whose `DIM`
    has not run yet is `Array used before DIM` at run time.
 
-8. **A numeric literal takes no type suffix** - GW-BASIC accepts `1.5#` and
-   `100!`; write `CDBL(1.5)` or assign to a suffixed variable instead.
-
-9. **`LOC` on a sequential file counts 128-byte blocks**, which is what
+8. **`LOC` on a sequential file counts 128-byte blocks**, which is what
     GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
     because the number is useful.
