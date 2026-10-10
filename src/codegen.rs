@@ -661,6 +661,8 @@ pub struct CodeGen {
     /// after another, and the count is taken before the scope is compiled so
     /// that a RETURN ahead of a GOSUB already knows its range.
     gosub_scope: (usize, usize),
+    /// ON ... GOTO/GOSUB jump tables: (table label, target labels).
+    on_tables: Vec<(String, Vec<String>)>,
     /// One entry per module-level statement, in emission order, when trapping.
     ///
     /// Only the count matters -- the labels are `_rs_<i>` and `_rn_<i>` -- but
@@ -1590,6 +1592,26 @@ impl CodeGen {
         self.emit_check("jb", RtError::GosubOverflow);
         emit!(self, "    mov QWORD PTR [rcx], {}", id);
         self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+    }
+
+    /// Evaluate an ON ... GOTO/GOSUB selector into `rax`, truncated to an
+    /// integer whatever its type.
+    fn gen_on_selector(&mut self, expr: &Expr) {
+        self.gen_expr_to_long(expr);
+        self.emit("    movsxd rax, eax");
+    }
+
+    /// Jump to `targets[sel - 1]` through a table, `sel` (in `reg`) already
+    /// known to lie in 1..=targets.len().
+    ///
+    /// A table rather than a compare per target: it is one bounded indexed
+    /// jump whatever the list's length, which is the shape a `br_table` has.
+    fn emit_on_dispatch(&mut self, reg: &str, targets: &[GotoTarget]) {
+        let table = self.new_label("on_table");
+        emit!(self, "    lea rcx, [rip + {}]", table);
+        emit!(self, "    jmp QWORD PTR [rcx + {}*8 - 8]", reg);
+        let labels = targets.iter().map(Self::branch_label).collect();
+        self.on_tables.push((table, labels));
     }
 
     fn preprocess(&mut self, stmt: &Stmt) {
@@ -3444,19 +3466,15 @@ impl CodeGen {
             }
 
             StmtKind::OnGoto { expr, targets } => {
-                let expr_type = self.gen_expr(expr);
-                // Convert to integer in rax
-                if expr_type.is_integer() {
-                    self.emit("    movsxd rax, eax");
-                } else {
-                    self.emit("    cvttsd2si rax, xmm0");
-                }
-                // Create jump table
-                for (i, target) in targets.iter().enumerate() {
-                    let label = Self::branch_label(target);
-                    emit!(self, "    cmp rax, {}", i + 1);
-                    emit!(self, "    je {}", label);
-                }
+                // A selector outside 1..=n matches nothing and falls through.
+                self.gen_on_selector(expr);
+                let after = self.new_label("on_goto_none");
+                self.emit("    cmp rax, 1");
+                emit!(self, "    jl {}", after);
+                emit!(self, "    cmp rax, {}", targets.len());
+                emit!(self, "    jg {}", after);
+                self.emit_on_dispatch("rax", targets);
+                self.emit_label(&after);
             }
 
             StmtKind::OnGosub { expr, targets } => {
@@ -3470,12 +3488,7 @@ impl CodeGen {
                 // checked first, and out-of-range branches past the push --
                 // to the very label the return site names, since
                 // "matched nothing" and "came back" continue identically.
-                let expr_type = self.gen_expr(expr);
-                if expr_type.is_integer() {
-                    self.emit("    movsxd rax, eax");
-                } else {
-                    self.emit("    cvttsd2si rax, xmm0");
-                }
+                self.gen_on_selector(expr);
                 // The push sequence below needs rax and rcx, so the selector
                 // is parked in r8: caller-saved on both ABIs, and nothing is
                 // called between here and the dispatch.
@@ -3488,12 +3501,7 @@ impl CodeGen {
                 emit!(self, "    jg {}", after);
 
                 self.emit_gosub_push(&after);
-
-                for (i, target) in targets.iter().enumerate() {
-                    let label = Self::branch_label(target);
-                    emit!(self, "    cmp r8, {}", i + 1);
-                    emit!(self, "    je {}", label);
-                }
+                self.emit_on_dispatch("r8", targets);
                 self.emit_label(&after);
             }
 
@@ -6897,6 +6905,15 @@ impl CodeGen {
             self.emit("_resume_next:");
             for i in &self.resume_points {
                 emit!(self, "    .quad _rn_{}", i);
+            }
+        }
+
+        // ON ... GOTO/GOSUB jump tables.
+        for (table, labels) in std::mem::take(&mut self.on_tables) {
+            self.emit(".p2align 3");
+            self.emit_label(&table);
+            for label in labels {
+                emit!(self, "    .quad {}", label);
             }
         }
 

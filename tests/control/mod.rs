@@ -751,6 +751,62 @@ RETURN
     );
 }
 
+/// ON GOTO and ON GOSUB dispatch on a selector variable of every numeric type,
+/// over the whole range and both sides of it.
+///
+/// Variables rather than literals, which a constant-folding change could
+/// satisfy without the dispatch itself working.
+#[test]
+fn test_on_dispatch_with_every_selector_type() {
+    for suffix in ["%", "&", "!", "#", ""] {
+        let src = format!(
+            r#"
+FOR K{s} = 0 TO 4
+  ON K{s} GOTO G1, G2, G3
+  PRINT "goto none"
+  GOTO Gosubs
+G1: PRINT "goto 1"
+  GOTO Gosubs
+G2: PRINT "goto 2"
+  GOTO Gosubs
+G3: PRINT "goto 3"
+Gosubs:
+  ON K{s} GOSUB S1, S2, S3
+  PRINT "back"
+NEXT K{s}
+END
+S1: PRINT "gosub 1"
+RETURN
+S2: PRINT "gosub 2"
+RETURN
+S3: PRINT "gosub 3"
+RETURN
+"#,
+            s = suffix
+        );
+        let output = compile_and_run(&src).unwrap();
+        assert_eq!(
+            crate::common::lines(&output),
+            vec![
+                "goto none",
+                "back",
+                "goto 1",
+                "gosub 1",
+                "back",
+                "goto 2",
+                "gosub 2",
+                "back",
+                "goto 3",
+                "gosub 3",
+                "back",
+                "goto none",
+                "back"
+            ],
+            "selector suffix {suffix:?}"
+        );
+    }
+}
+
 /// The return stack is left balanced, so an ordinary GOSUB still works after
 /// an ON ... GOSUB -- including after one that matched nothing.
 #[test]
