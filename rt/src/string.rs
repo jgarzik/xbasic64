@@ -306,7 +306,7 @@ mod tests {
     fn freed(r: Str) -> Vec<u8> {
         let v = s(r);
         assert!(!r.ptr.is_null());
-        unsafe { sys::free(r.ptr.cast_mut()) };
+        unsafe { sys::free(r.ptr.cast_mut().cast()) };
         v
     }
 

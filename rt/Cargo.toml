@@ -1,6 +1,8 @@
 [package]
 name = "xbasic64-rt"
 version = "1.0.2"
+# Also passed to rustc by the compiler's build.rs, which does not read this
+# file: change both together.
 edition = "2024"
 authors = ["Jeff Garzik <jgarzik@pobox.com>"]
 description = "The runtime library linked into every program xbasic64 compiles"

@@ -148,7 +148,7 @@ pub const fn cstr<const N: usize>(s: &str) -> [u8; N] {
 /// comes from here, which is what rtsig's `fresh` means. Out of memory is
 /// raised, and an empty string returned, when there is none.
 pub fn alloc_str(len: usize) -> *mut u8 {
-    let p = unsafe { sys::malloc(len.max(1)) };
+    let p = unsafe { sys::malloc(len.max(1)) }.cast::<u8>();
     if p.is_null() {
         error::raise(&error::_err_memory[..], 0);
     }

@@ -71,6 +71,8 @@ fn build_rt(out: &std::path::Path) {
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let target = env::var("TARGET").expect("cargo sets TARGET");
     let lib = out.join("rt.a");
+    // rustc is run directly, so rt/Cargo.toml is not read: the edition here
+    // must be the one declared there, which clippy and the unit tests use.
     let output = Command::new(rustc)
         .args(["--edition", "2024", "--crate-type", "staticlib"])
         .args(["--crate-name", "xbasic64_rt", "--target", &target])

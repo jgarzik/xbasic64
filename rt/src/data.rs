@@ -167,7 +167,7 @@ export! {
                 }
             }
         }
-        let p = unsafe { sys::calloc(1, bytes as usize) };
+        let p = unsafe { sys::calloc(1, bytes as usize) }.cast::<u8>();
         if p.is_null() {
             error::raise(&_err_memory[..], 0);
             return;
@@ -277,12 +277,12 @@ mod tests {
         let p = desc[0] as *mut u8;
         let all = unsafe { std::slice::from_raw_parts(p, 8 * 1000) };
         assert!(all.iter().all(|&b| b == 0));
-        unsafe { sys::free(p) };
+        unsafe { sys::free(p.cast()) };
 
         let mut desc = [0u64; 3];
         unsafe { _rt_array_autodim(desc.as_mut_ptr(), 1, 16, 0) };
         assert_eq!(&desc[1..], &[11, 0]);
-        unsafe { sys::free(desc[0] as *mut u8) };
+        unsafe { sys::free(desc[0] as *mut core::ffi::c_void) };
     }
 
     #[test]

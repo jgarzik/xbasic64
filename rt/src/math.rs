@@ -373,7 +373,7 @@ mod tests {
 
     fn owned(s: Str) -> Vec<u8> {
         let v = unsafe { s.bytes() }.to_vec();
-        unsafe { sys::free(s.ptr as *mut u8) };
+        unsafe { sys::free(s.ptr.cast_mut().cast()) };
         v
     }
 

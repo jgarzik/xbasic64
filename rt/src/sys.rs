@@ -13,11 +13,15 @@ use core::ffi::{c_char, c_int, c_void};
 /// The C library's `FILE`, only ever handled by pointer.
 pub enum FILE {}
 
+// UCRT's printf family are inline functions in its headers; their exported
+// definitions are in legacy_stdio_definitions.lib, which programs link and
+// so must the runtime's unit tests.
+#[cfg_attr(windows, link(name = "legacy_stdio_definitions"))]
 unsafe extern "C" {
-    pub fn malloc(size: usize) -> *mut u8;
-    pub fn calloc(n: usize, size: usize) -> *mut u8;
-    pub fn realloc(p: *mut u8, size: usize) -> *mut u8;
-    pub fn free(p: *mut u8);
+    pub fn malloc(size: usize) -> *mut c_void;
+    pub fn calloc(n: usize, size: usize) -> *mut c_void;
+    pub fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
+    pub fn free(p: *mut c_void);
     pub fn abort() -> !;
     pub fn exit(code: c_int) -> !;
 
