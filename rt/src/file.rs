@@ -299,11 +299,8 @@ fn zone_target(col: i64, width: i64) -> Option<i64> {
 /// after it. Under a WIDTH, a number that does not fit on the rest of the
 /// line starts the next one, as in GW-BASIC, rather than being split.
 fn print_number(n: i64, text: num::NumText) {
-    let t = text.as_bytes();
-    let k = t.len().min(num::NumText::CAP);
-    let mut buf = [b' '; num::NumText::CAP + 1];
-    buf[..k].copy_from_slice(&t[..k]);
-    let s = &buf[..k + 1];
+    let text = text.with_trailing_blank();
+    let s = text.as_bytes();
     let (w, c) = (width(n), col(n));
     if w != 0 && c != 0 && (c + s.len() as i64) as u64 > w as u64 {
         newline(n);
