@@ -485,7 +485,6 @@ pub fn analyze(program: &mut Program, checks: bool) -> (Symbols, Vec<Diagnostic>
     a.collect(&program.statements, &Scope::Module);
     a.check_name_collisions();
     a.check_return_has_a_gosub(&program.statements);
-    a.check_gosub_scope_when_trapping(&program.statements);
     a.check_resume_has_a_handler(&program.statements);
     a.resolve_array_accesses(&mut program.statements, &Scope::Module);
     a.check(&program.statements, &Scope::Module);
@@ -1412,54 +1411,6 @@ impl Analyzer {
                 line,
                 "RESUME without an error handler".to_string(),
                 "RESUME ends an ON ERROR handler; this program has no ON ERROR".to_string(),
-            );
-        }
-    }
-
-    /// A trapping program may not GOSUB from inside a procedure.
-    ///
-    /// The GOSUB stack is deliberately left alone by a trap, because that is
-    /// what lets a handler -- and later RESUME -- return correctly from a
-    /// subroutine the error interrupted. That is right for a module-level
-    /// GOSUB and unsafe for one inside a procedure: its return address is a
-    /// label in a frame the unwind has discarded, so a later RETURN would jump
-    /// into dead code with main's `rbp`.
-    ///
-    /// Refused rather than worked around. Vintage listings, which are what
-    /// error trapping is for, have no procedures at all.
-    fn check_gosub_scope_when_trapping(&mut self, stmts: &[Stmt]) {
-        let mut traps = false;
-        walk_stmts(stmts, &mut |stmt| {
-            if matches!(stmt.kind, StmtKind::OnError(_)) {
-                traps = true;
-            }
-        });
-        if !traps {
-            return;
-        }
-        let mut offenders = Vec::new();
-        for stmt in stmts {
-            let (StmtKind::Sub { name, body, .. } | StmtKind::Function { name, body, .. }) =
-                &stmt.kind
-            else {
-                continue;
-            };
-            walk_stmts(body, &mut |s| {
-                if matches!(s.kind, StmtKind::Gosub(_) | StmtKind::OnGosub { .. }) {
-                    offenders.push((s.line, name.clone()));
-                }
-            });
-        }
-        for (line, name) in offenders {
-            self.error_with_note(
-                line,
-                format!(
-                    "GOSUB inside '{}' is not allowed in a program that uses ON ERROR",
-                    name
-                ),
-                "a trapped error unwinds out of the procedure, leaving the GOSUB's return \
-                 address pointing into a frame that no longer exists"
-                    .to_string(),
             );
         }
     }

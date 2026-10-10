@@ -101,11 +101,17 @@ Integration tests organized by feature area:
 - **ON ERROR is error-status propagation**: a trapped `_rt_error` sets
   `_err_pending` and returns. A helper that raised leaves through its own
   epilogue; generated code tests the flag after each fallible call and each
-  procedure call, leaving a procedure through its epilogue and main through
-  `_err_dispatch`, which resets rsp and jumps to the handler. Main saves the
-  callee-saved registers itself when it traps, and nothing in main keeps a value
-  in one across a statement then (FOR promotion is off). Only programs with
-  ON ERROR pay for any of this
+  procedure call, to the statement's fault block. That calls
+  `_err_handler_fn` -- main's code compiled a second time, entered at the ON
+  ERROR target -- on top of the faulting frame, so RESUME and RESUME NEXT go
+  back into a SUB as in QuickBASIC: the handler returns 1 or 2 and the fault
+  block jumps to the statement's start or end. A RESUME label returns 3 and sets
+  `_err_pending` to 2, so each procedure leaves through its epilogue and main
+  dispatches through `_err_resume_targets`. Every trapping function saves the
+  callee-saved registers, and a fault block resets rsp to its frame, so no
+  value lives in one across a statement (FOR promotion is off). By-reference
+  parameters, copied in and out, are synced around the handler call. Only
+  programs with ON ERROR pay for any of this
 - **Every helper follows its platform's standard ABI**: a double goes where the
   ABI puts it -- by position on Win64, so `(file, value)` passes the value in
   xmm1 there; `Abi::float_arg_reg` knows the rule. `rtsig.rs` lists one

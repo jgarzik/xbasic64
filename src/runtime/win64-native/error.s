@@ -48,7 +48,6 @@ _err_unprintable: .asciz "Unprintable error"
 # RESUME's own failures. Never trapped -- a handler that trapped them would be
 # re-entered by its own RESUME, forever.
 _err_resnoerr: .asciz "RESUME without error"
-_err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 
 # GW-BASIC's own error numbers, so that a listing's `IF ERR = 53` means what it
 # meant in 1983. Pairs of (message, number), terminated by a zero message.
@@ -101,14 +100,12 @@ _err_bytes_written: .skip 8
 .bss
 .p2align 3
 _err_handler: .skip 8       # which ON ERROR target, numbered from 1; 0 = trapping off
-_err_pending: .skip 8       # nonzero from a trapped error until the handler is entered
+_err_pending: .skip 8       # 1 from a trapped error until its handler runs;
+                            # 2 while procedures unwind toward a RESUME label
 _err_active:  .skip 8       # nonzero while a handler runs
 _err_code:    .skip 8       # what ERR returns
 _err_line:    .skip 8       # the line now running; codegen stores it per statement
 _err_erl:     .skip 8       # what ERL returns: _err_line as it was when trapped
-_err_stmt:    .skip 8       # index of the module-level statement now running
-_err_resume:  .skip 8       # _err_stmt as it was when trapped; -1 = not resumable
-_err_depth:   .skip 8       # procedure nesting, so an error inside one is known
 
 .text
 
@@ -205,24 +202,14 @@ _rt_error:
     mov r9, QWORD PTR [rip + _err_line]
     mov QWORD PTR [rip + _err_erl], r9
 
-    # And what RESUME would go back to. The handler is ordinary module-level
-    # code, so its own statements overwrite _err_stmt the moment it starts;
-    # -1 when the error came from inside a procedure, whose frame is left on
-    # the way to the handler, leaving nothing for a bare RESUME to return to.
-    mov r9, QWORD PTR [rip + _err_stmt]
-    cmp QWORD PTR [rip + _err_depth], 0
-    je .Ltrap_resumable
-    mov r9, -1
-.Ltrap_resumable:
-    mov QWORD PTR [rip + _err_resume], r9
     mov QWORD PTR [rip + _err_active], 1
 
     # Return to whoever raised it. Generated code tests _err_pending after
-    # every call that can fail and leaves for the handler: a procedure through
-    # its own epilogue -- which is what brings _err_depth back to 0 -- and main
-    # through a dispatch on _err_handler. A runtime helper that called this
-    # returns first, through its own epilogue. Nothing is abandoned, so there
-    # is no register state to restore.
+    # every call that can fail; the statement's fault block then calls the
+    # handler, on top of whatever faulted, and RESUMEs from what it returns.
+    # A runtime helper that called this returns first, through its own
+    # epilogue. Nothing is abandoned, so there is no register state to
+    # restore.
     mov QWORD PTR [rip + _err_pending], 1
 .Ltrap_return:
     ret

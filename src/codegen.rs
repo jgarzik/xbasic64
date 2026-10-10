@@ -401,8 +401,6 @@ enum RtError {
     ReturnWithoutGosub,
     /// RESUME with nothing to return from.
     ResumeNoError,
-    /// RESUME after an error raised inside a procedure, whose frame is gone.
-    ResumeInProc,
 }
 
 impl RtError {
@@ -419,7 +417,6 @@ impl RtError {
             RtError::ReturnWithoutGosub => "_err_noreturn",
             RtError::BadFileNum => "_err_badfile",
             RtError::ResumeNoError => "_err_resnoerr",
-            RtError::ResumeInProc => "_err_resproc",
         }
     }
 
@@ -428,7 +425,7 @@ impl RtError {
     /// RESUME's own two failures may not: the handler would be re-entered by
     /// the very RESUME that failed, and would never stop.
     fn trappable(self) -> bool {
-        !matches!(self, RtError::ResumeNoError | RtError::ResumeInProc)
+        !matches!(self, RtError::ResumeNoError)
     }
 
     /// Short tag used to build a unique trampoline label.
@@ -444,7 +441,6 @@ impl RtError {
             RtError::ReturnWithoutGosub => "noret",
             RtError::BadFileNum => "badfile",
             RtError::ResumeNoError => "resnoerr",
-            RtError::ResumeInProc => "resproc",
         }
     }
 }
@@ -539,7 +535,20 @@ struct Promoted {
     loc: Loc,
 }
 
+/// What kind of function is being generated, for error trapping.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum FnKind {
+    #[default]
+    Main,
+    Proc,
+    /// `_err_handler_fn`: main's code compiled a second time, entered at an
+    /// ON ERROR target when an error is trapped, returning to the fault site
+    /// when it RESUMEs.
+    Handler,
+}
+
 /// A by-reference parameter's way back to the caller, at procedure exit.
+#[derive(Clone)]
 enum CopyBack {
     /// A scalar or string, at its own width.
     Typed { ptr: Loc, local: Loc, ty: DataType },
@@ -683,7 +692,24 @@ pub struct CodeGen {
     ///
     /// Only the count matters -- the labels are `_rs_<i>` and `_rn_<i>` -- but
     /// keeping the vector makes the table emission read as what it is.
-    resume_points: Vec<usize>,
+    /// What is being generated: main, a procedure, or the handler copy of
+    /// main. Only consulted when the program traps.
+    fn_kind: FnKind,
+    /// The statement being generated, when the program traps: an error
+    /// raised in it goes to its fault block.
+    cur_stmt: Option<usize>,
+    /// Statements numbered so far, program-wide, for unique labels.
+    stmt_count: usize,
+    /// Statements of the current function whose fault blocks are wanted.
+    faults: Vec<usize>,
+    /// The current procedure's by-reference parameters. A fault block syncs
+    /// them around the handler, which may read or write the caller's copy.
+    copy_backs: Vec<CopyBack>,
+    /// Labels RESUME <label> may go to, in main, numbered from 0.
+    resume_targets: Vec<String>,
+    /// Main's range of GOSUB return sites, which a RETURN in the handler copy
+    /// may name: the handler leaving through the GOSUB the error interrupted.
+    main_gosub_scope: (usize, usize),
     /// Whether the program contains `ON ERROR`, and so pays for trapping.
     ///
     /// Everything trapping costs is behind this: the context capture, the
@@ -1275,6 +1301,32 @@ impl CodeGen {
         }
     }
 
+    /// Copy every by-reference parameter of this procedure back to the
+    /// caller's variable, or, when `inward`, in from it again. Uses r10 and
+    /// rax only.
+    fn emit_copy_backs(&mut self, inward: bool) {
+        for cb in self.copy_backs.clone() {
+            match cb {
+                CopyBack::Typed { ptr, local, ty } => {
+                    emit!(self, "    mov r10, {}", ptr.q(0));
+                    self.emit_copy_typed("r10", &local, ty, inward);
+                }
+                CopyBack::Words { ptr, local, words } => {
+                    emit!(self, "    mov r10, {}", ptr.q(0));
+                    for w in 0..words {
+                        if inward {
+                            emit!(self, "    mov rax, QWORD PTR [r10 + {}]", w * 8);
+                            emit!(self, "    mov {}, rax", local.q(w));
+                        } else {
+                            emit!(self, "    mov rax, {}", local.q(w));
+                            emit!(self, "    mov QWORD PTR [r10 + {}], rax", w * 8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Keep an incoming address in a frame slot of its own, for the copy
     /// back at exit.
     fn park_pointer(&mut self, src: &str) -> Loc {
@@ -1685,6 +1737,9 @@ impl CodeGen {
         }
 
         self.output.push_str(&main_asm);
+        if self.traps {
+            self.gen_handler_fn(program);
+        }
 
         // Error trampolines, past every function body so the checked fast path
         // is only a compare and a never-taken branch.
@@ -1746,11 +1801,11 @@ impl CodeGen {
         // them, so each function starts again with no line number reached.
         self.basic_line = 0;
 
-        // A trapping program saves every callee-saved register in main's own
-        // frame and restores them on the way out. A trapped error leaves
-        // whatever it interrupted -- a helper's saved registers included --
-        // and the handler dispatch resets only rsp, so the registers' values
-        // in between are nobody's: no main code keeps a value in one across a
+        // A trapping program saves every callee-saved register in each
+        // function's frame and restores them on the way out. A fault block
+        // resets rsp to the frame, dropping whatever a statement had pushed --
+        // a LEFT$ saves r12 and r13 that way -- so the registers' values in
+        // between are nobody's: no code keeps a value in one across a
         // statement when trapping, since FOR-loop promotion is off.
         let saved: &[&str] = if self.traps {
             PlatformAbi::CALLEE_SAVED
@@ -1792,6 +1847,7 @@ impl CodeGen {
 
         // Generate main body
         self.begin_gosub_scope(&program.statements);
+        self.main_gosub_scope = self.gosub_scope;
         for stmt in &program.statements {
             match stmt.kind {
                 StmtKind::Sub { .. } | StmtKind::Function { .. } => {}
@@ -1812,17 +1868,22 @@ impl CodeGen {
         self.emit("    ret");
         self.emit("");
 
-        // Where every trapped error in main, and every one a procedure passed
-        // up, goes: back to main's own frame, with rsp where it is between
-        // statements -- an error raised mid-expression leaves temporaries
-        // behind -- and on to the handler ON ERROR named, by number.
+        // A RESUME <label> arrives here once every procedure between has
+        // left: back to main's frame, and on to the label, by number.
         if self.traps {
-            self.emit_label("_err_dispatch");
-            self.emit("    lea rsp, [rbp - 0]         # MAIN_FRAME");
+            self.emit_fault_blocks("main");
+            self.emit_label(".Lunwind_main");
+            self.emit("    cmp QWORD PTR [rip + _err_pending], 3");
             self.emit("    mov QWORD PTR [rip + _err_pending], 0");
-            self.emit("    mov rax, QWORD PTR [rip + _err_handler]");
-            self.emit("    lea rcx, [rip + _err_handlers]");
-            self.emit("    jmp QWORD PTR [rcx + rax*8 - 8]");
+            self.emit("    lea rsp, [rbp - 0]         # FRAME_main");
+            self.emit("    mov rax, QWORD PTR [rip + _err_resume_label]");
+            self.emit("    lea rcx, [rip + _err_resume_targets]");
+            if self.gosub_used {
+                // 3: a return site, not a RESUME label.
+                self.emit("    lea rdx, [rip + _gosub_sites]");
+                self.emit("    cmove rcx, rdx");
+            }
+            self.emit("    jmp QWORD PTR [rcx + rax*8]");
             self.emit("");
         }
 
@@ -1844,11 +1905,74 @@ impl CodeGen {
         let new = format!("    sub rsp, {}        # STACK_RESERVE", stack_size);
         self.output = self.output.replace(old, &new);
         if self.traps {
-            self.output = self.output.replace(
-                "    lea rsp, [rbp - 0]         # MAIN_FRAME",
-                &format!("    lea rsp, [rbp - {}]         # MAIN_FRAME", frame),
-            );
+            self.patch_frame("main", frame);
         }
+    }
+
+    /// `_err_handler_fn`: main's code compiled a second time, as a function.
+    ///
+    /// A trapped error runs the handler on top of whatever faulted, as
+    /// QuickBASIC does -- a procedure keeps its frame while the handler runs,
+    /// so RESUME can go back into it. The fault site calls this; it enters at
+    /// the armed handler's copy, through `_err_handlers`, and its RESUME
+    /// returns to the fault site with what to do. Every statement of main is
+    /// here, not just the handler's, since a handler may GOTO anywhere in the
+    /// module and is still the handler until it RESUMEs; running off the end
+    /// of the program ends it, as it would in main.
+    fn gen_handler_fn(&mut self, program: &Program) {
+        self.fn_kind = FnKind::Handler;
+        self.basic_line = 0;
+        let saved = PlatformAbi::CALLEE_SAVED;
+        let save_bytes = (saved.len() as i32 * 8 + 15) & !15;
+        self.stack_offset = -save_bytes;
+
+        self.emit_label("_err_handler_fn");
+        self.emit("    push rbp");
+        self.emit("    mov rbp, rsp");
+        for reg in saved {
+            emit!(self, "    push {}", reg);
+        }
+        if save_bytes > saved.len() as i32 * 8 {
+            self.emit("    sub rsp, 8");
+        }
+        self.emit("    sub rsp, 0         # STACK_RESERVE_HANDLER");
+        self.emit("    mov rax, QWORD PTR [rip + _err_handler]");
+        self.emit("    lea rcx, [rip + _err_handlers]");
+        self.emit("    jmp QWORD PTR [rcx + rax*8 - 8]");
+
+        self.begin_gosub_scope(&program.statements);
+        for stmt in &program.statements {
+            match stmt.kind {
+                StmtKind::Sub { .. } | StmtKind::Function { .. } => {}
+                _ => self.gen_stmt(stmt),
+            }
+        }
+        self.end_gosub_scope();
+        self.call_rt("_rt_end");
+
+        self.emit_label(".Lhandler_ret");
+        emit!(self, "    lea rsp, [rbp - {}]", saved.len() * 8);
+        for reg in saved.iter().rev() {
+            emit!(self, "    pop {}", reg);
+        }
+        self.emit("    leave");
+        self.emit("    ret");
+        self.emit_label(".Lunwind_handler");
+        self.emit("    mov eax, 3");
+        self.emit("    jmp .Lhandler_ret");
+        self.emit_fault_blocks("handler");
+
+        let frame = ((-self.stack_offset) + 15) & !15;
+        self.output = self.output.replace(
+            "    sub rsp, 0         # STACK_RESERVE_HANDLER",
+            &format!(
+                "    sub rsp, {}        # STACK_RESERVE_HANDLER",
+                frame - save_bytes
+            ),
+        );
+        self.patch_frame("handler", frame);
+        self.fn_kind = FnKind::Main;
+        self.emit("");
     }
 
     /// Number of GOSUB return sites in `stmts`, not counting procedure bodies,
@@ -1918,7 +2042,7 @@ impl CodeGen {
         let table = self.new_label("on_table");
         emit!(self, "    lea rcx, [rip + {}]", table);
         emit!(self, "    jmp QWORD PTR [rcx + {}*8 - 8]", reg);
-        let labels = targets.iter().map(Self::branch_label).collect();
+        let labels = targets.iter().map(|t| self.branch_label(t)).collect();
         self.on_tables.push((table, labels));
     }
 
@@ -2043,14 +2167,22 @@ impl CodeGen {
         self.emit_label(&skip);
     }
 
-    /// The assembly label a branch target names.
-    ///
-    /// One place rather than the four that spelled it out, now that ON ERROR
-    /// is a fifth.
-    fn branch_label(target: &GotoTarget) -> String {
+    /// The assembly label a branch target names in main.
+    fn main_label(target: &GotoTarget) -> String {
         match target {
             GotoTarget::Line(n) => format!("_line_{}", n),
             GotoTarget::Label(s) => format!("_label_{}", mangle(s)),
+        }
+    }
+
+    /// The assembly label a branch target names in the code being generated:
+    /// main's own label, or in the handler copy of main, its copy's.
+    fn branch_label(&self, target: &GotoTarget) -> String {
+        let label = Self::main_label(target);
+        if self.fn_kind == FnKind::Handler {
+            format!("_h{}", label)
+        } else {
+            label
         }
     }
 
@@ -2077,38 +2209,110 @@ impl CodeGen {
         } else {
             String::new()
         };
-        // Main's trampolines keep the plain name; a procedure's say whose.
-        let label = match &self.current_proc {
-            Some(proc) if !exit.is_empty() => {
-                format!(".Lerr_{}_{}_{}", kind.tag(), line, mangle(proc))
-            }
-            _ => format!(".Lerr_{}_{}", kind.tag(), line),
+        // One trampoline per (error, line, way out). In a trapping program
+        // the way out is the statement's fault block, so the same line can
+        // need several, and the number keeps their names apart.
+        let key = (kind, line, exit);
+        if let Some(label) = self.error_sites.get(&key) {
+            return label.clone();
+        }
+        let label = if key.2.is_empty() {
+            format!(".Lerr_{}_{}", kind.tag(), line)
+        } else {
+            format!(".Lerr_{}_{}_{}", kind.tag(), line, self.error_sites.len())
         };
-        self.error_sites
-            .entry((kind, line, exit))
-            .or_insert(label)
-            .clone()
+        self.error_sites.insert(key, label.clone());
+        label
     }
 
-    /// Where a trapped error goes from here: out through this procedure's
-    /// epilogue, so that its caller sees the error next, or -- in main -- to
-    /// the dispatch on to the handler.
-    fn error_exit(&self) -> String {
-        self.proc_exit_label
-            .clone()
-            .unwrap_or_else(|| "_err_dispatch".to_string())
+    /// Where a trapped error goes from here: the current statement's fault
+    /// block, which runs the handler and resumes. Outside any statement -- a
+    /// procedure's prologue -- the function is left, and its caller's
+    /// statement faults instead.
+    fn error_exit(&mut self) -> String {
+        match self.cur_stmt {
+            Some(id) => {
+                if !self.faults.contains(&id) {
+                    self.faults.push(id);
+                }
+                format!(".Lfault_{}", id)
+            }
+            None => self.unwind_label(),
+        }
+    }
+
+    /// Where a function goes to be left on the way to a `RESUME label`.
+    fn unwind_label(&self) -> String {
+        match self.fn_kind {
+            FnKind::Main => ".Lunwind_main".to_string(),
+            FnKind::Handler => ".Lunwind_handler".to_string(),
+            FnKind::Proc => self
+                .proc_exit_label
+                .clone()
+                .expect("a procedure has an exit"),
+        }
+    }
+
+    /// The fault blocks of the current function's statements, and its frame
+    /// placeholder for the rsp reset in them.
+    ///
+    /// A fault block runs when a statement's error check finds an error
+    /// pending. `_err_pending` is 1 for an error just trapped: rsp drops back
+    /// to the frame (an expression may have left temporaries), the handler
+    /// runs as a call, and its answer picks the way on -- 1 retries the
+    /// statement, 2 goes past it, 3 means the handler is going somewhere in
+    /// main: a RESUME label (`_err_pending` 2) or the return site of a GOSUB
+    /// it RETURNed from (3). Then, as when a procedure this statement called
+    /// was already on its way out, the function is left the same way.
+    fn emit_fault_blocks(&mut self, frame_tag: &str) {
+        let unwind = self.unwind_label();
+        for id in std::mem::take(&mut self.faults) {
+            self.emit_label(&format!(".Lfault_{}", id));
+            self.emit("    cmp QWORD PTR [rip + _err_pending], 1");
+            emit!(self, "    jne {}", unwind);
+            self.emit("    mov QWORD PTR [rip + _err_pending], 0");
+            emit!(self, "    lea rsp, [rbp - 0]         # FRAME_{}", frame_tag);
+            // A by-reference parameter is the caller's variable, so the
+            // handler must see what this procedure wrote to it, and this
+            // procedure what the handler wrote. Only this frame's: a caller's
+            // own copy-in is still stale until it returns.
+            self.emit_copy_backs(false);
+            self.emit("    call _err_handler_fn");
+            if !self.copy_backs.is_empty() {
+                self.emit("    mov r11d, eax");
+                self.emit_copy_backs(true);
+                self.emit("    mov eax, r11d");
+            }
+            self.emit("    cmp eax, 1");
+            emit!(self, "    je .Lst_{}", id);
+            self.emit("    cmp eax, 2");
+            emit!(self, "    je .Lsn_{}", id);
+            emit!(self, "    jmp {}", unwind);
+        }
+    }
+
+    /// Set the frame size the fault blocks of `frame_tag` reset rsp to.
+    fn patch_frame(&mut self, frame_tag: &str, frame: i32) {
+        self.output = self.output.replace(
+            &format!("    lea rsp, [rbp - 0]         # FRAME_{}", frame_tag),
+            &format!(
+                "    lea rsp, [rbp - {}]         # FRAME_{}",
+                frame, frame_tag
+            ),
+        );
     }
 
     /// In a program that traps, leave for the error exit if the call just
     /// made raised an error a handler trapped.
     ///
     /// Right after the call, before anything the call sequence would restore:
-    /// a procedure leaves through `leave`, and main's dispatch resets rsp, so
-    /// neither depends on the sequence's own cleanup.
+    /// the statement's fault block resets rsp to the frame, so it does not
+    /// depend on the sequence's own cleanup.
     fn emit_error_check(&mut self) {
         if self.traps {
+            let exit = self.error_exit();
             self.emit("    cmp QWORD PTR [rip + _err_pending], 0");
-            emit!(self, "    jne {}", self.error_exit());
+            emit!(self, "    jne {}", exit);
         }
     }
 
@@ -2308,14 +2512,12 @@ impl CodeGen {
         end: &Expr,
         step: Option<&Expr>,
     ) -> bool {
-        // A trapped error leaves the loop for the handler, which RESUME can
-        // send back into the middle of it. A promoted counter's register does
-        // not survive that trip -- main keeps no value in a callee-saved
-        // register across a statement when trapping, which is what lets the
-        // dispatch reset only rsp -- and its memory copy is written back only
-        // at the loop's exit label. The promotion's `sub rsp, 16` save slots
-        // would also be discarded by that rsp reset. So a program that traps
-        // keeps its loop variables in memory.
+        // A trapped error's fault block resets rsp to the frame, which would
+        // discard the promotion's `sub rsp, 16` save slots, and the handler
+        // reads the counter's memory copy, written back only at the loop's
+        // exit label. A RESUME label can also land in the middle of the loop,
+        // where the register holds nothing. So a program that traps keeps
+        // its loop variables in memory.
         if self.traps {
             return false;
         }
@@ -3008,12 +3210,20 @@ impl CodeGen {
     /// The loop is bottom-tested, so a zero-sized frame runs no iterations, and
     /// it derives its bounds from the registers rather than the reserve size, so
     /// it cannot drift out of step with the backpatched `sub rsp, N`.
-    fn emit_zero_frame(&mut self) {
+    /// Zero the locals: from rsp up to the registers saved below rbp, which
+    /// `save_bytes` covers (0 unless the program traps).
+    fn emit_zero_frame(&mut self, save_bytes: i32) {
         let body = self.new_label("zero");
         let check = self.new_label("zchk");
-        self.emit("    # zero locals: [rsp, rbp)");
-        self.emit("    mov r11, rsp");
-        self.emit("    mov r10, rbp");
+        if save_bytes == 0 {
+            self.emit("    # zero locals: [rsp, rbp)");
+            self.emit("    mov r11, rsp");
+            self.emit("    mov r10, rbp");
+        } else {
+            self.emit("    # zero locals: [rsp, rbp - saved)");
+            self.emit("    mov r11, rsp");
+            emit!(self, "    lea r10, [rbp - {}]", save_bytes);
+        }
         emit!(self, "    jmp {}", check);
         self.emit_label(&body);
         self.emit("    mov QWORD PTR [r11], 0");
@@ -3032,12 +3242,32 @@ impl CodeGen {
         self.proc_record_vars.clear();
         self.proc_record_elem_words.clear();
         let old_stack_offset = self.stack_offset;
-        self.stack_offset = 0;
+
+        self.fn_kind = FnKind::Proc;
+        // Known from the start: an error in the prologue -- converting an
+        // argument -- leaves through it, to fault at the caller's statement.
+        let exit_label = format!(".Lproc_exit_{}", mangle(name));
+        let saved_exit = self.proc_exit_label.replace(exit_label.clone());
+        // As in main, a trapping program saves the callee-saved registers,
+        // since a fault block resets rsp past whatever a statement pushed.
+        let saved: &[&str] = if self.traps {
+            PlatformAbi::CALLEE_SAVED
+        } else {
+            &[]
+        };
+        let save_bytes = (saved.len() as i32 * 8 + 15) & !15;
+        self.stack_offset = -save_bytes;
 
         // Procedure label
         self.emit_label(&format!("_proc_{}", mangle(name)));
         self.emit("    push rbp");
         self.emit("    mov rbp, rsp");
+        for reg in saved {
+            emit!(self, "    push {}", reg);
+        }
+        if save_bytes > saved.len() as i32 * 8 {
+            self.emit("    sub rsp, 8");
+        }
 
         // Reserve stack space (will patch later with actual size)
         let placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
@@ -3047,7 +3277,7 @@ impl CodeGen {
         // locals start at 0 / "" on every call the way module-level variables
         // do. Must come before the parameter spill below, which would otherwise
         // be wiped.
-        self.emit_zero_frame();
+        self.emit_zero_frame(save_bytes);
 
         self.reserve_array_descriptors(&SemaScope::Proc(name.to_string()));
 
@@ -3057,6 +3287,7 @@ impl CodeGen {
         let param_types: Vec<DataType> = params.iter().map(Self::param_data_type).collect();
         let (places, _) = Self::classify_params(&param_types);
 
+        let saved_copy_backs = std::mem::take(&mut self.copy_backs);
         let mut copy_backs: Vec<CopyBack> = Vec::new();
         for (param_decl, place) in params.iter().zip(&places) {
             let param = &param_decl.name;
@@ -3196,6 +3427,8 @@ impl CodeGen {
             }
         }
 
+        self.copy_backs = copy_backs;
+
         // If function, allocate return value slot
         if is_function {
             let data_type = self.proc_return_type(name);
@@ -3209,16 +3442,20 @@ impl CodeGen {
             );
         }
 
-        // An error raised in here is trapped like any other, but there is
-        // nothing for a bare RESUME to return to once the error has left this
-        // frame. The counter is what the trap reads to know that.
-        if self.traps {
-            self.emit("    inc QWORD PTR [rip + _err_depth]");
-        }
+        // A RESUME <label> leaves this procedure through its epilogue, with
+        // any GOSUB it made still on the GOSUB stack; the stack pointer goes
+        // back to where it was on entry, so they do not outlive it.
+        let gosub_mark = if self.traps && self.gosub_used {
+            self.stack_offset -= 8;
+            let slot = Loc::Frame(self.stack_offset);
+            self.emit("    mov rax, QWORD PTR [rip + _gosub_sp]");
+            emit!(self, "    mov {}, rax", slot.q(0));
+            Some(slot)
+        } else {
+            None
+        };
 
         // Generate body
-        let exit_label = format!(".Lproc_exit_{}", mangle(name));
-        let saved_exit = self.proc_exit_label.replace(exit_label.clone());
         let saved_loops = std::mem::take(&mut self.loop_stack);
         self.begin_gosub_scope(body);
         for stmt in body {
@@ -3226,32 +3463,14 @@ impl CodeGen {
         }
         self.end_gosub_scope();
         self.loop_stack = saved_loops;
-        self.proc_exit_label = saved_exit;
         self.emit_label(&exit_label);
         // Every route out passes here, so this is where by-reference
         // parameters go back to the caller's variables -- before a FUNCTION's
         // result is loaded into the registers it is returned in.
-        for cb in &copy_backs {
-            match cb {
-                CopyBack::Typed { ptr, local, ty } => {
-                    emit!(self, "    mov r10, {}", ptr.q(0));
-                    self.emit_copy_typed("r10", local, *ty, false);
-                }
-                CopyBack::Words { ptr, local, words } => {
-                    emit!(self, "    mov r10, {}", ptr.q(0));
-                    for w in 0..*words {
-                        emit!(self, "    mov rax, {}", local.q(w));
-                        emit!(self, "    mov QWORD PTR [r10 + {}], rax", w * 8);
-                    }
-                }
-            }
-        }
-        // Every route out passes here, EXIT SUB included, so one decrement
-        // matches the increment above -- a trapped error leaves through here
-        // too, which is what brings the counter back to 0 by the time main's
-        // dispatch reaches the handler.
-        if self.traps {
-            self.emit("    dec QWORD PTR [rip + _err_depth]");
+        self.emit_copy_backs(false);
+        if let Some(slot) = &gosub_mark {
+            emit!(self, "    mov rax, {}", slot.q(0));
+            self.emit("    mov QWORD PTR [rip + _gosub_sp], rax");
         }
 
         // Return - load return value into appropriate register based on type
@@ -3280,13 +3499,27 @@ impl CodeGen {
             }
         }
 
+        if !saved.is_empty() {
+            emit!(self, "    lea rsp, [rbp - {}]", saved.len() * 8);
+            for reg in saved.iter().rev() {
+                emit!(self, "    pop {}", reg);
+            }
+        }
         self.emit("    leave");
         self.emit("    ret");
         self.emit("");
+        let frame_tag = format!("proc_{}", mangle(name));
+        if self.traps {
+            self.emit_fault_blocks(&frame_tag);
+        }
 
         // Patch the stack reserve placeholder with actual size
         let stack_needed = -self.stack_offset;
-        let stack_size = (stack_needed + 15) & !15; // Round up to multiple of 16
+        let frame = (stack_needed + 15) & !15; // Round up to multiple of 16
+        let stack_size = frame - save_bytes; // the saves are already pushed
+        if self.traps {
+            self.patch_frame(&frame_tag, frame);
+        }
         let old_placeholder = format!("    sub rsp, 0         # STACK_RESERVE_PROC_{}", name);
         let new_instruction = format!(
             "    sub rsp, {}        # STACK_RESERVE_PROC_{}",
@@ -3294,7 +3527,10 @@ impl CodeGen {
         );
         self.output = self.output.replace(&old_placeholder, &new_instruction);
 
+        self.proc_exit_label = saved_exit;
+        self.copy_backs = saved_copy_backs;
         self.current_proc = None;
+        self.fn_kind = FnKind::Main;
         self.stack_offset = old_stack_offset;
     }
 
@@ -3310,24 +3546,23 @@ impl CodeGen {
     /// comes that branch's exit jump, and after the last statement of the
     /// program comes main's epilogue. Every awkward case falls out of that.
     fn gen_stmt(&mut self, stmt: &Stmt) {
-        // Module level only. A statement inside a procedure has no resume
-        // point: the unwind discards its frame, so there is nothing to go back
-        // to, and `_err_depth` is what tells the trap so.
-        let point = if self.traps && self.current_proc.is_none() {
-            let idx = self.resume_points.len();
-            self.resume_points.push(idx);
-            self.emit_label(&format!("_rs_{}", idx));
-            emit!(self, "    mov QWORD PTR [rip + _err_stmt], {}", idx);
-            Some(idx)
-        } else {
-            None
-        };
-
-        self.gen_stmt_inner(stmt);
-
-        if let Some(idx) = point {
-            self.emit_label(&format!("_rn_{}", idx));
+        // In a trapping program every statement, at every level and in every
+        // function, is numbered and bracketed: `.Lst_N` is where RESUME goes
+        // back to and `.Lsn_N` where RESUME NEXT goes on from, and an error
+        // raised while it runs goes to its fault block, `.Lfault_N`. A nested
+        // statement is its own: an error in a FOR body's statement resumes
+        // there, one in the FOR's limit at the FOR.
+        if !self.traps {
+            self.gen_stmt_inner(stmt);
+            return;
         }
+        let id = self.stmt_count;
+        self.stmt_count += 1;
+        self.emit_label(&format!(".Lst_{}", id));
+        let outer = self.cur_stmt.replace(id);
+        self.gen_stmt_inner(stmt);
+        self.cur_stmt = outer;
+        self.emit_label(&format!(".Lsn_{}", id));
     }
 
     fn gen_stmt_inner(&mut self, stmt: &Stmt) {
@@ -3350,11 +3585,13 @@ impl CodeGen {
         match &stmt.kind {
             StmtKind::Label(n) => {
                 self.basic_line = *n;
-                self.emit_label(&format!("_line_{}", n));
+                let label = self.branch_label(&GotoTarget::Line(*n));
+                self.emit_label(&label);
             }
 
             StmtKind::LabelName(name) => {
-                self.emit_label(&format!("_label_{}", mangle(name)));
+                let label = self.branch_label(&GotoTarget::Label(name.clone()));
+                self.emit_label(&label);
             }
 
             // Assignment to a record field.
@@ -3949,12 +4186,12 @@ impl CodeGen {
             }
 
             StmtKind::Goto(target) => {
-                let label = Self::branch_label(target);
+                let label = self.branch_label(target);
                 emit!(self, "    jmp {}", label);
             }
 
             StmtKind::Gosub(target) => {
-                let label = Self::branch_label(target);
+                let label = self.branch_label(target);
                 let ret_label = self.new_label("gosub_ret");
                 self.emit_gosub_push(&ret_label);
                 emit!(self, "    jmp {}", label);
@@ -3980,7 +4217,27 @@ impl CodeGen {
                 self.emit("    mov rax, QWORD PTR [rcx]");
                 emit!(self, "    lea rdx, [rax - {}]", first);
                 emit!(self, "    cmp rdx, {}", count);
-                self.emit_check("jae", RtError::ReturnWithoutGosub);
+                if self.fn_kind == FnKind::Handler {
+                    // A handler that RETURNs from the GOSUB the error
+                    // interrupted, as GW-BASIC handlers do, leaves the handler
+                    // for main: the site is main's, so main goes there.
+                    let own = self.new_label("hret_own");
+                    emit!(self, "    jb {}", own);
+                    let (mfirst, mcount) = self.main_gosub_scope;
+                    emit!(self, "    lea rdx, [rax - {}]", mfirst);
+                    emit!(self, "    cmp rdx, {}", mcount);
+                    self.emit_check("jae", RtError::ReturnWithoutGosub);
+                    self.emit("    add rcx, 8");
+                    self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
+                    self.emit("    mov QWORD PTR [rip + _err_resume_label], rax");
+                    self.emit("    mov QWORD PTR [rip + _err_pending], 3");
+                    self.emit("    mov QWORD PTR [rip + _err_active], 0");
+                    self.emit("    mov eax, 3");
+                    self.emit("    jmp .Lhandler_ret");
+                    self.emit_label(&own);
+                } else {
+                    self.emit_check("jae", RtError::ReturnWithoutGosub);
+                }
                 self.emit("    add rcx, 8");
                 self.emit("    mov QWORD PTR [rip + _gosub_sp], rcx");
                 self.emit("    lea rcx, [rip + _gosub_sites]");
@@ -4190,33 +4447,39 @@ impl CodeGen {
             // that failed and would never stop -- so the branches are emitted
             // whatever `--unsafe` says, and their trampolines call the fatal
             // path directly.
+            // RESUME belongs to the handler, which runs as `_err_handler_fn`:
+            // there it returns to the fault site with what to do -- 1 retry
+            // the statement, 2 go past it, 3 go to a label in main, which
+            // every procedure between leaves through its epilogue on the way.
+            // Anywhere else a handler cannot be running, so RESUME is
+            // "RESUME without error", which is never trapped.
             StmtKind::Resume(target) => {
                 let no_error = self.error_label(RtError::ResumeNoError);
-                self.emit("    mov rax, QWORD PTR [rip + _err_active]");
-                self.emit("    test rax, rax");
-                emit!(self, "    jz {}", no_error);
-
+                if self.fn_kind != FnKind::Handler {
+                    emit!(self, "    jmp {}", no_error);
+                    return;
+                }
+                self.emit("    cmp QWORD PTR [rip + _err_active], 0");
+                emit!(self, "    je {}", no_error);
+                self.emit("    mov QWORD PTR [rip + _err_active], 0");
                 match target {
+                    ResumeTarget::Same => self.emit("    mov eax, 1"),
+                    ResumeTarget::Next => self.emit("    mov eax, 2"),
                     ResumeTarget::At(t) => {
-                        let label = Self::branch_label(t);
-                        self.emit("    mov QWORD PTR [rip + _err_active], 0");
-                        emit!(self, "    jmp {}", label);
-                    }
-                    ResumeTarget::Same | ResumeTarget::Next => {
-                        let in_proc = self.error_label(RtError::ResumeInProc);
-                        self.emit("    mov rax, QWORD PTR [rip + _err_resume]");
-                        self.emit("    test rax, rax");
-                        emit!(self, "    js {}", in_proc);
-                        self.emit("    mov QWORD PTR [rip + _err_active], 0");
-                        let table = match target {
-                            ResumeTarget::Next => "_resume_next",
-                            _ => "_resume_at",
+                        let label = Self::main_label(t);
+                        let idx = match self.resume_targets.iter().position(|l| *l == label) {
+                            Some(i) => i,
+                            None => {
+                                self.resume_targets.push(label);
+                                self.resume_targets.len() - 1
+                            }
                         };
-                        emit!(self, "    lea rcx, [rip + {}]", table);
-                        self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
-                        self.emit("    jmp rax");
+                        emit!(self, "    mov QWORD PTR [rip + _err_resume_label], {}", idx);
+                        self.emit("    mov QWORD PTR [rip + _err_pending], 2");
+                        self.emit("    mov eax, 3");
                     }
                 }
+                self.emit("    jmp .Lhandler_ret");
             }
 
             // `ON ERROR GOTO n` arms the handler; `GOTO 0` disarms it. Both
@@ -4225,9 +4488,10 @@ impl CodeGen {
             StmtKind::OnError(target) => {
                 match target {
                     Some(t) => {
-                        // The handler's number, not its address: main's
-                        // dispatch is a bounded jump through `_err_handlers`.
-                        let label = Self::branch_label(t);
+                        // The handler's number, not its address: the handler
+                        // function's entry is a bounded jump through
+                        // `_err_handlers`, which lists main's labels' copies.
+                        let label = Self::main_label(t);
                         let number = match self.err_handlers.iter().position(|h| *h == label) {
                             Some(i) => i + 1,
                             None => {
@@ -7505,26 +7769,21 @@ impl CodeGen {
         // DATA pointer
         self.emit("_data_ptr: .quad 0");
 
-        // Where RESUME and RESUME NEXT go, one entry per module-level
-        // statement. Two tables rather than one plus arithmetic, because
-        // "the statement after this one" is a position in the emitted code,
-        // not the next index -- a nested body's last statement is followed by
-        // its loop's increment, not by whatever the parser called next.
+        // The handler function's entries, by ON ERROR number, and the labels
+        // in main a RESUME <label> may go to, by the number it leaves in
+        // `_err_resume_label`.
         if self.traps {
             self.emit("");
             self.emit(".p2align 3");
-            self.emit("_resume_at:");
-            for i in &self.resume_points {
-                emit!(self, "    .quad _rs_{}", i);
-            }
-            self.emit("_resume_next:");
-            for i in &self.resume_points {
-                emit!(self, "    .quad _rn_{}", i);
-            }
             self.emit("_err_handlers:");
             for label in std::mem::take(&mut self.err_handlers) {
+                emit!(self, "    .quad _h{}", label);
+            }
+            self.emit("_err_resume_targets:");
+            for label in std::mem::take(&mut self.resume_targets) {
                 emit!(self, "    .quad {}", label);
             }
+            self.emit("_err_resume_label: .quad 0");
         }
 
         // ON ... GOTO/GOSUB jump tables.

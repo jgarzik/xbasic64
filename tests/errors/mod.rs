@@ -2131,13 +2131,11 @@ fn test_no_cost_without_on_error() {
     for symbol in [
         "_err_handler",
         "_err_pending",
-        "_err_dispatch",
         "_err_line",
-        "_rt_trap_capture",
-        "_err_stmt",
-        "_err_depth",
-        "_resume_at",
-        "_resume_next",
+        "_err_resume_targets",
+        ".Lfault_",
+        ".Lst_",
+        ".Lunwind",
     ] {
         assert!(
             !asm.contains(symbol),
@@ -2203,30 +2201,65 @@ fn test_gosub_survives_a_trap() {
     );
 }
 
-/// ...but a GOSUB inside a procedure cannot, so it is refused.
+/// A GOSUB inside a procedure works in a trapping program too.
 ///
-/// Its return address is a label in a frame the unwind discards, so a later
-/// RETURN would jump into dead code with main's frame pointer.
+/// The handler runs on top of the procedure's frame, so the GOSUB's return
+/// site is still there when it RESUMEs; and a RESUME <label> that leaves the
+/// procedure drops the GOSUBs it made, because each procedure puts the GOSUB
+/// stack back as it found it on the way out.
 #[test]
-fn test_gosub_inside_a_procedure_is_refused_when_trapping() {
-    let src = "10 ON ERROR GOTO 100\n20 CALL S\n30 END\n100 END\n\
-               SUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
-    let err = compile_only(src).expect_err("GOSUB in a procedure must be refused when trapping");
-    assert!(err.contains("GOSUB inside"), "got: {}", err.stderr);
-    assert!(err.is_clean_rejection());
-
-    // The same program without ON ERROR is fine: nothing unwinds.
-    let ok = "10 CALL S\n20 END\nSUB S\n  GOSUB 500\n  EXIT SUB\n500 PRINT 1\n  RETURN\nEND SUB\n";
-    compile_only(ok).expect("a GOSUB in a procedure is fine when nothing traps");
+fn test_gosub_inside_a_procedure_when_trapping() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 CALL S
+30 CALL T
+40 GOSUB 300
+50 PRINT "done"
+60 END
+100 PRINT "trapped"; ERR
+110 IF ERL = 600 THEN RESUME 40
+120 RESUME NEXT
+300 PRINT "main gosub"
+310 RETURN
+SUB S
+  GOSUB 500
+  PRINT "back in S"
+  EXIT SUB
+500 ERROR 5
+  PRINT "after error"
+  RETURN
+END SUB
+SUB T
+  GOSUB 600
+  PRINT "never"
+  EXIT SUB
+600 ERROR 7
+  RETURN
+END SUB
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &[
+            "trapped 5",
+            "after error",
+            "back in S",
+            "trapped 7",
+            "main gosub",
+            "done"
+        ]
+    );
 }
 
 /// A trapping program keeps its loop variables in memory.
 ///
 /// FOR-loop register promotion is switched off when a program traps, and that
-/// is load-bearing rather than a concession: main's handler dispatch resets
-/// only `rsp`, so a promoted counter's register does not survive the trip to
-/// the handler and back, and its memory copy is written back only at the
-/// loop's exit label, so a handler would read a stale value.
+/// is load-bearing rather than a concession: a fault block resets `rsp` to
+/// the frame, discarding the promotion's save slots, and the handler reads the
+/// counter's memory copy, written back only at the loop's exit label, so it
+/// would see a stale value.
 #[test]
 fn test_trapping_disables_register_promotion() {
     let hot = "FOR I% = 1 TO 10\nS% = S% + I%\nNEXT I%\nPRINT S%\n";
@@ -2375,24 +2408,69 @@ fn test_resume_without_an_error_is_fatal() {
     );
 }
 
-/// A bare `RESUME` after an error raised inside a procedure fails cleanly.
-///
-/// The unwind discarded that frame, so there is nothing to go back to. The
-/// diagnosis is the point: guessing would resume at the CALL, which looks
-/// plausible and is wrong.
+/// RESUME goes back into the procedure that raised the error, as in
+/// QuickBASIC: the handler runs on top of the faulting frame, so the
+/// statement is still there to retry, or to continue after.
 #[test]
-fn test_resume_after_a_procedure_error_is_refused() {
-    let src = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"no\"\n40 END\n\
-               100 RESUME\nSUB B\nPRINT 1 / 0\nEND SUB\n";
-    let run = compile_and_run_raw(src, "").expect("should compile");
-    assert_eq!(run.exit_code, Some(1));
-    assert!(run.stderr.contains("RESUME"), "got: {:?}", run.stderr);
-    assert!(!run.stdout.contains("no"), "it must not resume anywhere");
+fn test_resume_into_a_procedure() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 D = 0
+30 CALL B
+40 PRINT F(3)
+50 PRINT "landed"
+60 END
+100 PRINT "trapped"; ERR
+110 IF ERR = 5 THEN RESUME NEXT
+120 D = 4
+130 RESUME
+SUB B
+  SHARED D
+  X = 8 / D
+  PRINT "B"; X
+END SUB
+FUNCTION F(N)
+  F = N
+900 ERROR 5
+  F = F * 10
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&out),
+        &["trapped 11", "B 2", "trapped 5", "30", "landed"]
+    );
 
-    // `RESUME <line>` needs no failing statement, so it is allowed.
+    // `RESUME <line>` leaves the procedure for that line.
     let ok = "10 ON ERROR GOTO 100\n20 CALL B\n30 PRINT \"skipped\"\n40 PRINT \"landed\"\n50 END\n\
-              100 RESUME 40\nSUB B\nPRINT 1 / 0\nEND SUB\n";
+              100 RESUME 40\nSUB B\nPRINT 1 / 0\nPRINT \"no\"\nEND SUB\n";
     assert_eq!(compile_and_run(ok).unwrap().trim(), "landed");
+}
+
+/// A recursive procedure's error resumes in the frame that raised it, and a
+/// RESUME <label> from deep inside unwinds every one of them.
+#[test]
+fn test_resume_in_a_recursive_procedure() {
+    let out = compile_and_run(
+        r#"
+10 ON ERROR GOTO 100
+20 PRINT R(3)
+30 ON ERROR GOTO 200
+40 PRINT R(3)
+50 PRINT "unwound"
+60 END
+100 RESUME NEXT
+200 RESUME 50
+FUNCTION R(N)
+  IF N = 0 THEN ERROR 5: R = 100: EXIT FUNCTION
+  R = R(N - 1) + N
+END FUNCTION
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), &["106", "unwound"]);
 }
 
 /// A statement that continues after a call returns is still resumable.

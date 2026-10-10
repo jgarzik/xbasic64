@@ -822,12 +822,11 @@ The rules, which are GW-BASIC's:
   statement again re-arms it, so a handler that ends in `GOTO` rather than
   returning must re-arm to keep trapping.
 - The handler must be **module-level** code, and `ON ERROR` itself may not
-  appear inside a `SUB` or `FUNCTION`: a trapped error unwinds out of every
-  procedure before the handler runs.
-- A `GOSUB` in progress survives, so a handler can `RETURN` from a subroutine
-  the error interrupted. For the same reason a `GOSUB` *inside* a procedure is
-  refused in a program that traps -- its return address would point into a
-  frame the unwind discarded.
+  appear inside a `SUB` or `FUNCTION`. An error raised inside a procedure is
+  still trapped: the handler runs with the procedure still active, as in
+  QuickBASIC, so it can `RESUME` back into it.
+- A `GOSUB` in progress survives, so a handler can `RETURN` from a module-level
+  subroutine the error interrupted, and carry on after its `GOSUB`.
 - `--unsafe` and `ON ERROR` are refused together. `--unsafe` removes the checks
   that raise most trappable errors, so the handler would look right and never
   run.
@@ -862,13 +861,24 @@ The statement, not the line: on line 30 above, `RESUME` returns to
 at line 40. Where the failing statement is the last in a `FOR` or `WHILE` body,
 `RESUME NEXT` continues the loop rather than leaving it.
 
-Two rules follow from where a handler runs:
+`RESUME` must be module-level code, like the handler it ends.
 
-- `RESUME` must be module-level code, like the handler it ends.
-- After an error raised **inside a `SUB` or `FUNCTION`**, a bare `RESUME` or
-  `RESUME NEXT` stops the program with `RESUME cannot return into a SUB or
-  FUNCTION`: the unwind discarded that frame, so there is nothing to go back
-  to. `RESUME n` still works, and is the way out.
+After an error raised **inside a `SUB` or `FUNCTION`**, `RESUME` and
+`RESUME NEXT` go back into that procedure, to the statement that failed or the
+one after it, as QuickBASIC does. `RESUME n` leaves every procedure in between
+and continues at line `n`; any `GOSUB` they made is forgotten with them.
+
+```basic
+10 ON ERROR GOTO 100
+20 CALL Halve(0)
+30 END
+100 PRINT "error"; ERR
+110 RESUME NEXT
+SUB Halve(N)
+  PRINT 1 / N
+  PRINT "still in Halve"
+END SUB
+```
 
 `RESUME` outside a handler stops the program with `RESUME without error`.
 Neither of these two is trappable -- a handler that caught its own failing
