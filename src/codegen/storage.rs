@@ -210,12 +210,14 @@ impl FnGen<'_> {
     }
 
     /// Typed storage for a variable declared with `AS`, if that is where it
-    /// actually lives.
+    /// actually lives: not a numeric one held in an SSA variable.
     pub(super) fn typed_storage(&mut self, name: &str) -> Option<(Loc, TypeRef)> {
-        if self.has_plain_slot(name) && self.record_loc_of(name).is_none() {
+        let ty = self.typed_var(name)?;
+        if self.ssa_var(name).is_some()
+            || (self.has_plain_slot(name) && self.record_loc_of(name).is_none())
+        {
             return None;
         }
-        let ty = self.typed_var(name)?;
         let loc = self.get_record_loc(name, &ty);
         Some((loc, ty))
     }
@@ -869,10 +871,13 @@ impl FnGen<'_> {
                 self.gen_array_alloc(&arr, redim, preserve);
             }
             // A typed scalar: allocating its storage is all that is needed,
-            // since data objects and the frame prologue already zero it.
+            // since data objects and the frame prologue already zero it. One
+            // in an SSA variable needs none, and reads 0 until assigned.
             (None, Some(ty)) => {
-                let ty = ty.clone();
-                self.get_record_loc(&decl.name, &ty);
+                if self.ssa_var(&decl.name).is_none() {
+                    let ty = ty.clone();
+                    self.get_record_loc(&decl.name, &ty);
+                }
             }
             (None, None) => {}
         }

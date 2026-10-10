@@ -1,8 +1,9 @@
 //! Which scalars live in SSA values rather than in memory
 //!
-//! A numeric scalar is held in a Cranelift `Variable` -- so in a register,
-//! with no load or store per use -- when nothing outside the function can
-//! reach its storage:
+//! A numeric scalar, typed by its suffix or declared `AS INTEGER`, `LONG`,
+//! `SINGLE` or `DOUBLE`, is held in a Cranelift `Variable` -- so in a
+//! register, with no load or store per use -- when nothing outside the
+//! function can reach its storage:
 //!
 //! - not passed to a procedure, whose by-reference parameter would need its
 //!   address;
@@ -202,10 +203,17 @@ impl FnGen<'_> {
             return None;
         }
         let upper = name.to_uppercase();
-        let ty = DataType::from_suffix(name);
+        // A name declared `AS` a numeric type has that type, not its
+        // suffix's; records and strings declared `AS` stay in memory.
+        let ty = match self.typed_var(name) {
+            None => DataType::from_suffix(name),
+            Some(t @ (TypeRef::Integer | TypeRef::Long | TypeRef::Single | TypeRef::Double)) => {
+                DataType::from_type_ref(&t)
+            }
+            Some(_) => return None,
+        };
         if ty == DataType::String
             || self.ssa_excluded.contains(&upper)
-            || self.typed_var(name).is_some()
             || self.cg.symbols.consts.contains_key(&upper)
             || self.proc_vars.contains_key(name)
         {
