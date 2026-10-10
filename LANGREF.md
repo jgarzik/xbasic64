@@ -41,7 +41,9 @@ Line numbers are optional and appear at the start of a line:
 20 GOTO 10
 ```
 
-Line numbers serve as labels for `GOTO` and `GOSUB` targets.
+Line numbers serve as labels for `GOTO` and `GOSUB` targets. Each number may
+appear once; GW-BASIC replaces a line typed twice, but in a file the second is
+a mistake, and is refused.
 
 ### Labels
 
@@ -606,6 +608,12 @@ Unconditional jump to line number or label:
 20 GOTO 10
 ```
 
+A branch stays in its own scope -- module-level code, or one `SUB` or
+`FUNCTION` -- for every form: `GOTO`, `GOSUB`, `ON ... GOTO`, `ON ... GOSUB`.
+Each scope has its own frame, so code reached across the boundary would run with
+the wrong one. `RESTORE` is the exception: it names a place in the `DATA`, which
+is one list for the whole program.
+
 ### GOSUB / RETURN
 
 Call subroutine and return:
@@ -815,10 +823,14 @@ COLOR 7               ' Foreground only
 PRINT "positioned"
 ```
 
-Colours are GW-BASIC's 0-15, where 8-15 are the bright half. GW-BASIC's third
-`COLOR` argument sets the border, which a terminal has no equivalent for, and is
-refused rather than ignored. `LOCATE` with no row asks for row 1, since the row
-is not tracked the way the column is.
+Colours are GW-BASIC's: 0 black, 1 blue, 2 green, 3 cyan, 4 red, 5 magenta,
+6 brown, 7 white, and 8-15 the bright half of each. A foreground of 16-31 is
+the same colour blinking. A background is 0-15. GW-BASIC's third `COLOR`
+argument sets the border, which a terminal has no equivalent for, and is
+refused rather than ignored.
+
+An omitted argument leaves that setting as it was, for both statements. A
+value out of range, or a row or column below 1, is `Illegal function call`.
 
 `POS(0)` gives the column the next character will be written to, counting from 1:
 
@@ -1102,7 +1114,7 @@ it.
 
 | Function      | Description                                    |
 |---------------|------------------------------------------------|
-| `TIMER`       | Seconds since midnight, UTC, fractional (Double) |
+| `TIMER`       | Seconds since midnight, local time, fractional (Double) |
 | `LBOUND(a[,d])` | Lowest subscript of an array, of dimension d |
 | `UBOUND(a[,d])` | Highest subscript, of dimension d (default 1) |
 | `EOF(n)`      | True once file n has been read to the end      |
@@ -1127,8 +1139,9 @@ holds, and back. See [Random-Access Files](#random-access-files).
 | `CVS(s$)`  | Those 4 bytes back as a number                  |
 | `CVD(s$)`  | Those 8 bytes back as a number                  |
 
-`TIMER` counts fractional seconds since midnight UTC on every platform, so
-subtracting two readings times a section of code.
+`TIMER` counts fractional seconds since local midnight -- the clock `TIME$`
+reads, through the same C library, so both honour `TZ` -- and subtracting two
+readings times a section of code.
 
 `LBOUND` and `UBOUND` take an array *name*, of any element type. The
 dimension may be any numeric expression; asking for one the array does
@@ -1164,6 +1177,7 @@ One outside that range is refused at compile time, or reported as
 ```basic
 CLOSE #1          ' Close specific file
 CLOSE             ' Close all files
+RESET             ' Close all files, as GW-BASIC spells it
 ```
 
 A file number may be any numeric expression, not only a literal:
@@ -1501,9 +1515,11 @@ The reason says whether waiting will help.
 Each of these is practical on both Linux and Windows and simply has not been
 written. Programs using them are refused today.
 
-- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`
+- **Console control** -- `WIDTH`, `CSRLIN`, `VIEW PRINT`, `INKEY$`, `SLEEP`, `KEY`
 - **Operating system** -- `SHELL`, `ENVIRON$`, `KILL`, `NAME`, `FILES`, `CHDIR`, `MKDIR`, `RMDIR`
-- **Odds and ends** -- `INPUT$`, `SHARED`, `STATIC`
+- **Sound and printer** -- `SOUND`, `PLAY`, `LPRINT`, `LPOS`
+- **Procedures** -- `SHARED`, `STATIC`, `DECLARE`, `BYVAL`
+- **Odds and ends** -- `INPUT$`
 
 ### Out of scope
 
@@ -1511,8 +1527,8 @@ written. Programs using them are refused today.
 `CIRCLE`, `DRAW`, `PAINT`, `POINT`, `VIEW`, `WINDOW`, `PALETTE`, `PMAP`. These
 need a display this compiler does not provide.
 
-**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`, `USR`,
-`INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`. There is no fixed address worth naming
+**The 8086's machine** -- `PEEK`, `POKE`, `DEF SEG`, `VARPTR`, `VARPTR$`,
+`VARSEG`, `USR`, `INP`, `OUT`, `WAIT`, `BLOAD`, `BSAVE`, `PCOPY`. There is no fixed address worth naming
 in a 64-bit hosted program: the video buffer is not memory, addresses are
 randomised, and the pages are protected. A `POKE` that appeared to work would be
 the worst outcome available, so these are refused rather than emulated.
@@ -1522,6 +1538,13 @@ the worst outcome available, so these are refused rather than emulated.
 These operate on program text that a compiled program no longer has.
 
 **Program chaining** -- `CHAIN` and `COMMON` need separate compilation.
+
+**MS-DOS devices** -- `ERDEV`, `ERDEV$`, `IOCTL`, `IOCTL$`, `MOTOR`, the
+light pen (`PEN`) and joysticks (`STICK`, `STRIG`).
+
+**Event trapping** -- `ON TIMER`, `ON KEY`, `ON COM`, `ON PEN`, `ON PLAY`,
+`ON STRIG` and their `ON`/`OFF`/`STOP` switches. These would interrupt the
+program between statements, which compiled code has no point to do.
 
 Everything else GW-BASIC provides that is missing here is listed above as not
 yet implemented. Each refused name says which of the two it is.

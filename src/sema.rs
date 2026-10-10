@@ -186,6 +186,24 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("STICK", "joystick input is not supported"),
     ("STRIG", "joystick input is not supported"),
     ("KEY", "KEY is not implemented yet"),
+    ("DECLARE", "DECLARE is not implemented yet"),
+    ("BYVAL", "BYVAL is not implemented yet"),
+    ("ERDEV", "device error codes are specific to MS-DOS drivers"),
+    (
+        "ERDEV$",
+        "device error codes are specific to MS-DOS drivers",
+    ),
+    (
+        "IOCTL",
+        "device control strings are specific to MS-DOS drivers",
+    ),
+    (
+        "IOCTL$",
+        "device control strings are specific to MS-DOS drivers",
+    ),
+    ("MOTOR", "there is no cassette motor to control"),
+    ("COM", "serial-port event trapping is not supported"),
+    ("PCOPY", "video pages are not supported"),
     ("LPRINT", "LPRINT is not implemented yet"),
     ("LPOS", "LPOS is not implemented yet"),
     (
@@ -294,20 +312,16 @@ pub enum Scope {
 pub struct Symbols {
     pub procs: HashMap<String, ProcInfo>,
     pub arrays: HashMap<(Scope, String), ArrayInfo>,
-    /// Named labels (`Retry:`) available as branch targets.
-    pub labels: HashSet<String>,
-    /// Numeric line-number labels available as branch targets.
-    pub lines: HashSet<u32>,
-    /// The subset of both that sit at module level.
+    /// Named labels (`Retry:`) available as branch targets, and the scope
+    /// each one is in.
     ///
-    /// `labels` and `lines` are one flat program-wide set, so a target inside
-    /// a `SUB` is indistinguishable from a module-level one. That is harmless
-    /// for `GOTO`, which cannot cross a frame boundary at run time anyway
-    /// because sema rejects it earlier -- but an `ON ERROR` handler is jumped
-    /// to *after* the unwind has restored main's frame, so a handler inside a
-    /// procedure would run with the wrong `rbp` and read main's locals.
-    pub module_labels: HashSet<String>,
-    pub module_lines: HashSet<u32>,
+    /// A branch may not leave its scope: module code and each procedure have
+    /// their own frame, so code reached across the boundary would run with the
+    /// wrong one. An `ON ERROR` handler and a `RESUME` target must be at
+    /// module level.
+    pub labels: HashMap<String, Scope>,
+    /// Numeric line-number labels available as branch targets, likewise.
+    pub lines: HashMap<u32, Scope>,
     /// CONST names and their folded values.
     pub consts: HashMap<String, Literal>,
     /// Lowest legal subscript, set by OPTION BASE. Defaults to 0.
@@ -890,17 +904,18 @@ impl Analyzer {
         for stmt in stmts {
             match &stmt.kind {
                 StmtKind::Label(n) => {
-                    self.symbols.lines.insert(*n);
-                    if scope == &Scope::Module {
-                        self.symbols.module_lines.insert(*n);
+                    if self.symbols.lines.insert(*n, scope.clone()).is_some() {
+                        self.error(stmt.line, format!("duplicate line number {}", n));
                     }
                 }
                 StmtKind::LabelName(name) => {
-                    if !self.symbols.labels.insert(name.clone()) {
+                    if self
+                        .symbols
+                        .labels
+                        .insert(name.clone(), scope.clone())
+                        .is_some()
+                    {
                         self.error(stmt.line, format!("duplicate label '{}'", name));
-                    }
-                    if scope == &Scope::Module {
-                        self.symbols.module_labels.insert(name.clone());
                     }
                 }
                 StmtKind::TypeDef { name, fields } => {
@@ -1582,21 +1597,21 @@ impl Analyzer {
                     self.check(body, scope);
                 }
             }
-            StmtKind::Goto(target) => self.check_target(target, line, "GOTO"),
-            StmtKind::Gosub(target) => self.check_target(target, line, "GOSUB"),
+            StmtKind::Goto(target) => self.check_target(target, scope, line, "GOTO"),
+            StmtKind::Gosub(target) => self.check_target(target, scope, line, "GOSUB"),
             StmtKind::OnGoto { expr, targets } => {
                 self.check_expr(expr, scope, line);
                 for t in targets {
-                    self.check_target(t, line, "ON ... GOTO");
+                    self.check_target(t, scope, line, "ON ... GOTO");
                 }
             }
             StmtKind::OnGosub { expr, targets } => {
                 self.check_expr(expr, scope, line);
                 for t in targets {
-                    self.check_target(t, line, "ON ... GOSUB");
+                    self.check_target(t, scope, line, "ON ... GOSUB");
                 }
             }
-            StmtKind::Restore(Some(target)) => self.check_target(target, line, "RESTORE"),
+            StmtKind::Restore(Some(target)) => self.check_restore_target(target, line),
             StmtKind::Dim { decls } => {
                 for decl in decls {
                     for d in decl.dimensions.iter().flatten() {
@@ -1755,10 +1770,12 @@ impl Analyzer {
                     );
                 }
                 if let ResumeTarget::At(t) = target {
-                    self.check_target(t, line, "RESUME");
+                    self.check_target(t, scope, line, "RESUME");
                     let at_module_scope = match t {
-                        GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
-                        GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                        GotoTarget::Line(n) => self.symbols.lines.get(n) == Some(&Scope::Module),
+                        GotoTarget::Label(name) => {
+                            self.symbols.labels.get(name) == Some(&Scope::Module)
+                        }
                     };
                     if !at_module_scope {
                         self.error_with_note(
@@ -1795,10 +1812,12 @@ impl Analyzer {
                 let Some(target) = target else {
                     return; // GOTO 0 names no line to check
                 };
-                self.check_target(target, line, "ON ERROR GOTO");
+                self.check_target(target, scope, line, "ON ERROR GOTO");
                 let at_module_scope = match target {
-                    GotoTarget::Line(n) => self.symbols.module_lines.contains(n),
-                    GotoTarget::Label(name) => self.symbols.module_labels.contains(name),
+                    GotoTarget::Line(n) => self.symbols.lines.get(n) == Some(&Scope::Module),
+                    GotoTarget::Label(name) => {
+                        self.symbols.labels.get(name) == Some(&Scope::Module)
+                    }
                 };
                 if !at_module_scope {
                     self.error_with_note(
@@ -2084,17 +2103,38 @@ impl Analyzer {
         }
     }
 
-    /// Check a branch target exists.
-    fn check_target(&mut self, target: &GotoTarget, line: u32, what: &str) {
-        match target {
-            GotoTarget::Line(n) => {
-                if !self.symbols.lines.contains(n) {
+    /// Check a branch target exists, and is in the scope branching to it.
+    fn check_target(&mut self, target: &GotoTarget, scope: &Scope, line: u32, what: &str) {
+        let (found, shown) = match target {
+            GotoTarget::Line(n) => (self.symbols.lines.get(n).cloned(), format!("line {}", n)),
+            GotoTarget::Label(name) => (
+                self.symbols.labels.get(name).cloned(),
+                format!("'{}'", name),
+            ),
+        };
+        match found {
+            Some(at) if &at == scope => {}
+            Some(at) => {
+                let place = |s: &Scope| match s {
+                    Scope::Module => "module-level code".to_string(),
+                    Scope::Proc(p) => format!("'{}'", p),
+                };
+                self.error_with_note(
+                    line,
+                    format!("{} target {} is in another scope", what, shown),
+                    format!(
+                        "it is in {}, and this is in {}; a branch cannot leave a SUB or FUNCTION",
+                        place(&at),
+                        place(scope)
+                    ),
+                );
+            }
+            None => match target {
+                GotoTarget::Line(n) => {
                     self.error(line, format!("{} target line {} does not exist", what, n));
                 }
-            }
-            GotoTarget::Label(name) => {
-                if !self.symbols.labels.contains(name) {
-                    let known: Vec<&str> = self.symbols.labels.iter().map(|s| s.as_str()).collect();
+                GotoTarget::Label(name) => {
+                    let known: Vec<&str> = self.symbols.labels.keys().map(|s| s.as_str()).collect();
                     match closest(name, &known) {
                         Some(sug) => self.error_with_note(
                             line,
@@ -2106,7 +2146,19 @@ impl Analyzer {
                         }
                     }
                 }
-            }
+            },
+        }
+    }
+
+    /// Check a RESTORE target exists. It names a place in the DATA, which is
+    /// one list for the whole program, so it may be in any scope.
+    fn check_restore_target(&mut self, target: &GotoTarget, line: u32) {
+        let exists = match target {
+            GotoTarget::Line(n) => self.symbols.lines.contains_key(n),
+            GotoTarget::Label(name) => self.symbols.labels.contains_key(name),
+        };
+        if !exists {
+            self.check_target(target, &Scope::Module, line, "RESTORE");
         }
     }
 

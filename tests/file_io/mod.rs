@@ -3,7 +3,7 @@
 // Copyright (c) 2025-2026 Jeff Garzik
 // SPDX-License-Identifier: MIT
 
-use crate::common::{compile_and_run_raw, compile_and_run_with_files};
+use crate::common::{compile_and_run, compile_and_run_raw, compile_and_run_with_files};
 use std::fs;
 
 #[test]
@@ -709,4 +709,26 @@ fn test_reading_past_the_end_is_diagnosed() {
         "stderr: {}",
         run.stderr
     );
+}
+
+/// RESET closes every open file, as a bare CLOSE does: what was written is
+/// flushed, and the numbers are free to open again.
+#[test]
+fn test_reset_closes_every_file() {
+    let output = compile_and_run(
+        r#"
+OPEN "a.txt" FOR OUTPUT AS #1
+OPEN "b.txt" FOR OUTPUT AS #2
+PRINT #1, "one"
+PRINT #2, "two"
+RESET
+OPEN "a.txt" FOR INPUT AS #1
+OPEN "b.txt" FOR INPUT AS #2
+LINE INPUT #1, A$
+LINE INPUT #2, B$
+PRINT A$; B$
+"#,
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["onetwo"]);
 }

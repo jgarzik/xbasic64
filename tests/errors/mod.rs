@@ -1133,13 +1133,25 @@ fn test_unimplemented_gwbasic_names_are_diagnosed() {
         ("PLAY \"cde\"\n", "PLAY"),
         ("LPRINT \"x\"\n", "LPRINT"),
         ("CHAIN \"other\"\n", "CHAIN"),
+        ("X = ERDEV\n", "ERDEV"),
+        ("A$ = IOCTL$(1)\n", "IOCTL$"),
+        ("MOTOR 1\n", "MOTOR"),
+        ("PCOPY 0, 1\n", "PCOPY"),
+        ("ON TIMER(5) GOSUB 10\n10 RETURN\n", "ON TIMER"),
+        ("ON COM(1) GOSUB 10\n10 RETURN\n", "ON COM"),
+        ("ON PLAY(3) GOSUB 10\n10 RETURN\n", "ON PLAY"),
+        ("TIMER ON\n", "TIMER ON"),
+        ("TIMER OFF\n", "TIMER OFF"),
+        ("LINE (0, 0)-(10, 10)\n", "LINE"),
+        ("DEF SEG = 0\n", "DEF SEG"),
+        ("DECLARE SUB S ()\n", "DECLARE"),
     ];
 
     for (source, name) in cases {
         let err = compile_only(source)
             .expect_err(&format!("{} must be refused, not silently accepted", name));
         assert!(
-            err.contains("not supported"),
+            err.contains("not supported") || err.contains("is not supported yet"),
             "{} was refused, but without saying why: {}",
             name,
             err.stderr

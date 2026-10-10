@@ -989,6 +989,14 @@ impl Parser {
         self.tokens.get(self.pos + n).unwrap_or(&Token::Eof)
     }
 
+    /// True if the token after the current one ends the statement.
+    fn next_ends_statement(&self) -> bool {
+        matches!(
+            self.peek_at(1),
+            Token::Newline | Token::Colon | Token::Eof | Token::Else
+        )
+    }
+
     /// True if the token after the current one is `tok`.
     ///
     /// Used to tell the random-access statements apart from ordinary names:
@@ -1415,6 +1423,21 @@ impl Parser {
                     "ERROR" if self.next_is_an_operand() => self.parse_raise_error(),
                     "LSET" if self.next_is_ident() => self.parse_set_field(false),
                     "RSET" if self.next_is_ident() => self.parse_set_field(true),
+                    "DECLARE" if matches!(self.peek_at(1), Token::Sub | Token::Function) => {
+                        err("DECLARE is not supported yet")
+                    }
+                    // RESET closes every file, which is what a bare CLOSE does.
+                    "RESET" if self.next_ends_statement() => {
+                        self.advance();
+                        Ok(StmtKind::Close { file_num: None })
+                    }
+                    // TIMER ON / OFF / STOP switch event trapping.
+                    "TIMER"
+                        if matches!(self.peek_at(1), Token::On | Token::Stop)
+                            || matches!(self.peek_at(1), Token::Ident(w) if w.eq_ignore_ascii_case("OFF")) =>
+                    {
+                        err("TIMER ON, OFF and STOP control event trapping, which is not supported")
+                    }
                     _ => self.parse_assignment_or_call(),
                 }
             }
@@ -1626,6 +1649,11 @@ impl Parser {
         } else {
             return err("Expected a function name after DEF");
         };
+        if name.eq_ignore_ascii_case("SEG") {
+            return err(
+                "DEF SEG is not supported: it selects an 8086 segment, and segmented addressing does not exist on x86-64",
+            );
+        }
         if !name.to_uppercase().starts_with("FN") {
             return err(format!("DEF function name '{}' must begin with FN", name));
         }
@@ -1760,7 +1788,10 @@ impl Parser {
 
     fn parse_line_input(&mut self) -> PResult<StmtKind> {
         self.advance(); // consume LINE
-        self.expect(Token::Input)?;
+        if !matches!(self.peek(), Token::Input) {
+            return err("LINE draws graphics, which is not supported; LINE INPUT reads a line");
+        }
+        self.advance(); // consume INPUT
         self.skip_input_suppressor();
 
         // LINE INPUT #n, Var$ -- documented in LANGREF but never parsed.
@@ -2387,6 +2418,23 @@ impl Parser {
                 return Ok(StmtKind::OnError(None));
             }
             return Ok(StmtKind::OnError(Some(self.parse_goto_target()?)));
+        }
+
+        // `ON TIMER(n) GOSUB` and its kin arm event trapping. They parse as a
+        // computed GOSUB on the value of TIMER(n), which compiled and then
+        // branched on the time of day.
+        if let Token::Ident(n) = self.peek() {
+            let upper = n.to_uppercase();
+            if matches!(
+                upper.as_str(),
+                "TIMER" | "KEY" | "COM" | "PEN" | "PLAY" | "STRIG"
+            ) && matches!(self.peek_at(1), Token::LParen)
+            {
+                return err(format!(
+                    "ON {}(...) is event trapping, which is not supported",
+                    upper
+                ));
+            }
         }
 
         let expr = self.parse_expression()?;

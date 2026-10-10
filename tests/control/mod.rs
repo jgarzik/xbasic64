@@ -1282,3 +1282,48 @@ CALL Wipe
     .unwrap();
     assert_eq!(output.trim(), "ok");
 }
+
+/// A branch cannot cross between module code and a procedure, in either
+/// direction, or between two procedures: each has its own frame, and the code
+/// at the target would run with the wrong one. QuickBASIC refuses it too.
+///
+/// Nothing checked it. `GOTO 100` into a SUB compiled, printed the SUB's line
+/// and the program exited with whatever status was lying in a register.
+#[test]
+fn test_branches_cannot_cross_a_procedure_boundary() {
+    for (source, what) in [
+        (
+            "10 GOTO 100\n20 END\nSUB S\n100 PRINT 1\nEND SUB\n",
+            "GOTO into a SUB",
+        ),
+        (
+            "10 GOSUB 100\n20 END\nSUB S\n100 RETURN\nEND SUB\n",
+            "GOSUB into a SUB",
+        ),
+        (
+            "10 CALL S\n20 END\n30 PRINT 1\nSUB S\nGOTO 30\nEND SUB\n",
+            "GOTO out of a SUB",
+        ),
+        (
+            "X = 1\nON X GOTO Inside\nSUB S\nInside:\nEND SUB\n",
+            "ON GOTO into a SUB",
+        ),
+        (
+            "CALL A\nSUB A\nGOTO There\nEND SUB\nSUB B\nThere:\nEND SUB\n",
+            "GOTO between SUBs",
+        ),
+    ] {
+        let err = crate::common::compile_only(source).expect_err(what);
+        assert!(err.is_clean_rejection(), "{what}: {}", err.stderr);
+        assert!(err.contains("another"), "{what}: {}", err.stderr);
+    }
+}
+
+/// A line number names one line. GW-BASIC replaces a line typed twice; in a
+/// file the second is a mistake, and a branch to it was ambiguous.
+#[test]
+fn test_duplicate_line_numbers_are_diagnosed() {
+    let err = crate::common::compile_only("10 PRINT 1\n10 PRINT 2\n").unwrap_err();
+    assert!(err.is_clean_rejection(), "{}", err.stderr);
+    assert!(err.contains("duplicate line number 10"), "{}", err.stderr);
+}
