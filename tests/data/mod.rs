@@ -246,21 +246,68 @@ PRINT D$
     );
 }
 
-/// And the mirror image, which already worked: a string item read as a number.
+/// An unquoted item is read as a number by the same rules as VAL, so the
+/// forms a literal may take work here too.
 #[test]
-fn test_string_data_read_as_a_number() {
+fn test_data_numbers_read_as_val_reads_them() {
     let output = compile_and_run(
         r#"
-DATA "12", "3.5", "notanumber"
-READ A, B, C
-PRINT A
-PRINT B
-PRINT C
+DATA 12, 3.5, &HFF, 1D3, -7, , 2 5
+READ A, B, C, D, E, F, G
+PRINT A; B; C; D; E; F; G
 "#,
     )
     .unwrap();
     let lines = crate::common::lines(&output);
-    assert_eq!(lines, vec!["12", "3.5", "0"]);
+    assert_eq!(lines, vec!["12  3.5  255  1000 -7  0  25"]);
+}
+
+/// A quoted item, or text that is not a number, read into a numeric variable
+/// is GW-BASIC's "Syntax error" (2), reported for the READ. A quoted item used
+/// to go through strtod, so `DATA "abc"` read as 0 and nothing was said.
+#[test]
+fn test_reading_text_as_a_number_is_a_syntax_error() {
+    for source in [
+        "10 DATA \"12\"\n20 READ X\n",
+        "10 DATA abc\n20 READ X\n",
+        "10 DATA 12abc\n20 READ X\n",
+        "10 DATA 1.2.3\n20 READ X\n",
+    ] {
+        let run = compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Syntax error in 20"),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
+    let run = compile_and_run_raw("DATA 1E400\nREAD X\n", "").unwrap();
+    assert!(run.stderr.contains("Overflow"), "{}", run.stderr);
+    // ERR is 2, and it can be trapped.
+    let output = compile_and_run(
+        "10 ON ERROR GOTO 100\n20 DATA x, 5\n30 READ A\n40 READ B\n50 PRINT B\n60 END\n100 PRINT ERR\n110 RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&output), vec!["2", "5"]);
+}
+
+/// A string READ gets the item as written: an unquoted number keeps its
+/// spelling, so `DATA 007` reads as "007". It used to be classified as a
+/// number when compiled and rendered back through STR$, giving " 7".
+#[test]
+fn test_numeric_data_read_into_a_string_keeps_its_spelling() {
+    let output = compile_and_run(
+        r#"
+DATA 007, 1.50, -0, &HFF, "007", 1E3
+READ A$, B$, C$, D$, E$, F$
+PRINT "["; A$; "]["; B$; "]["; C$; "]["; D$; "]["; E$; "]["; F$; "]"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["[007][1.50][-0][&HFF][007][1E3]"]
+    );
 }
 
 /// READ past the last item is GW-BASIC's error 4, `Out of DATA`.

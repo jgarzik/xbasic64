@@ -597,7 +597,7 @@ pub struct CodeGen {
     /// 0.0 and -0.0 stay distinct, as do NaNs with different payloads.
     f64_pool: Vec<u64>,
     f64_index: HashMap<u64, usize>,
-    data_items: Vec<Literal>,                // DATA values
+    data_items: Vec<DataItem>,               // DATA items, as written
     current_proc: Option<String>,            // current SUB/FUNCTION name
     proc_vars: HashMap<String, VarInfo>,     // local variables for current proc
     proc_arrays: HashMap<String, ArrayInfo>, // arrays DIM'd inside the current proc
@@ -7077,14 +7077,8 @@ impl CodeGen {
         let data_items = std::mem::take(&mut self.data_items);
         let mut rows: Vec<(u8, String)> = Vec::with_capacity(data_items.len());
         for item in &data_items {
-            rows.push(match item {
-                Literal::Integer(n) | Literal::Long(n) => (0, n.to_string()),
-                Literal::Float(f) | Literal::Single(f) => (1, format!("0x{:X}", f.to_bits())),
-                Literal::String(s) => {
-                    let idx = self.add_string_literal(s);
-                    (2, format!("_str_{}", idx))
-                }
-            });
+            let idx = self.add_string_literal(&item.text);
+            rows.push((u8::from(item.quoted), format!("_str_{}", idx)));
         }
 
         // Pass 2: emit. `string_literals` is final from here on.
@@ -7122,15 +7116,11 @@ impl CodeGen {
         // DATA table - always define it (even if empty) to avoid linker errors
         self.output.push_str(".p2align 3\n");
         self.output.push_str("_data_table:\n");
-        for (tag, value) in &rows {
-            let kind = match tag {
-                0 => "int",
-                1 => "float",
-                _ => "string",
-            };
+        for (quoted, text) in &rows {
+            let kind = if *quoted == 1 { "quoted" } else { "unquoted" };
             self.output
-                .push_str(&format!("    .quad {}  # type {}\n", tag, kind));
-            self.output.push_str(&format!("    .quad {}\n", value));
+                .push_str(&format!("    .quad {}  # {}\n", quoted, kind));
+            self.output.push_str(&format!("    .quad {}\n", text));
         }
         self.output
             .push_str(&format!("_data_count: .quad {}\n", rows.len()));

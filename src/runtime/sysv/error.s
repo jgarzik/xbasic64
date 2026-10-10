@@ -20,6 +20,7 @@ _err_fmt_bare: .asciz "?%s\n"
 _stop_fmt_line: .asciz "Break in %ld\n"
 _stop_fmt_bare: .asciz "Break\n"
 
+_err_syntax:    .asciz "Syntax error"
 _err_subscript: .asciz "Subscript out of range"
 _err_div0:      .asciz "Division by zero"
 _err_domain:    .asciz "Illegal function call"
@@ -59,6 +60,7 @@ _err_resproc:  .asciz "RESUME cannot return into a SUB or FUNCTION"
 # two messages share a number the first one listed is the one ERROR n raises.
 .p2align 3
 _err_codes:
+    .quad _err_syntax,      2
     .quad _err_noreturn,    3
     .quad _err_outofdata,   4
     .quad _err_domain,      5

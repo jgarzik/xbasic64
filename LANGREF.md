@@ -860,6 +860,13 @@ DATA hello, World, "a,b", "  padded  "
 DATA 1,,3
 ```
 
+What an item is depends on what reads it, as in GW-BASIC. `READ` into a string
+gives the item as written -- `DATA 007` reads as `"007"`, and a quoted item
+without its quotes. `READ` into a number reads the item as `VAL` does, so
+`&HFF` and `1D3` work, but the whole item must be a number: a quoted item, or
+text that is not a number, is `Syntax error` (2), and an empty item is 0.
+`READ` past the last item is `Out of DATA` (4).
+
 A colon ends a DATA statement, so another statement may follow it on the same
 line.
 
@@ -1559,6 +1566,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 
 | No. | Message                  | Cause                                        |
 |-----|--------------------------|----------------------------------------------|
+| 2   | `Syntax error`           | `READ` of text that is not a number into a numeric variable |
 | 3   | `RETURN without GOSUB`   | A `RETURN` no `GOSUB` of its scope is waiting for |
 | 4   | `Out of DATA`            | A `READ` after the last `DATA` item          |
 | 5   | `Illegal function call`  | `SQR` of a negative, `LOG` of a non-positive, an argument out of range |

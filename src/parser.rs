@@ -217,7 +217,7 @@ pub enum StmtKind {
         target: LValue,
         value: Expr,
     },
-    Data(Vec<Literal>),
+    Data(Vec<DataItem>),
     Read(Vec<LValue>),
     /// `DEFINT A-Z` and friends -- the default type for unsuffixed names whose
     /// first letter falls in one of the ranges.
@@ -846,37 +846,17 @@ fn describe_token(tok: &Token) -> String {
 }
 
 /// One item of a `DATA` statement, as written.
-struct DataItem {
-    text: String,
+///
+/// Kept as text: GW-BASIC decides what an item is when it is READ, so `007`
+/// reads as the string "007" or the number 7, and `"12"` as a string only.
+/// Classifying here, as this used to, turned `DATA 007` into 7 before any
+/// READ asked, so READ A$ gave " 7".
+#[derive(Debug, Clone, PartialEq)]
+pub struct DataItem {
+    pub text: String,
     /// Whether it was written in quotes, which decides both whether the
-    /// surrounding spaces were significant and whether it is a string.
-    quoted: bool,
-}
-
-impl DataItem {
-    /// The value this item denotes.
-    ///
-    /// A quoted item is always a string. An unquoted one is whatever it looks
-    /// like: GW-BASIC decides the type when the item is READ, but the table this
-    /// compiles to is tagged per item, and the runtime already converts a string
-    /// entry to a number with `strtod` -- so classifying here loses nothing and
-    /// keeps numeric DATA on the fast path.
-    ///
-    /// An omitted item is the empty string, which reads as 0 or as "".
-    fn literal(&self) -> Literal {
-        if self.quoted {
-            return Literal::String(self.text.clone());
-        }
-        if let Ok(n) = self.text.parse::<i32>() {
-            return Literal::Integer(n as i64);
-        }
-        if let Ok(f) = self.text.parse::<f64>()
-            && f.is_finite()
-        {
-            return Literal::Float(f);
-        }
-        Literal::String(self.text.clone())
-    }
+    /// surrounding spaces were significant and whether it can be a number.
+    pub quoted: bool,
 }
 
 /// Split a `DATA` operand into its items.
@@ -2758,12 +2738,7 @@ impl Parser {
     /// fresh statement and produce an error about the word rather than the DATA.
     fn parse_data(&mut self, text: &str) -> PResult<StmtKind> {
         self.advance(); // consume the DATA token
-        Ok(StmtKind::Data(
-            split_data_items(text)
-                .iter()
-                .map(|it| it.literal())
-                .collect(),
-        ))
+        Ok(StmtKind::Data(split_data_items(text)))
     }
 
     fn parse_read(&mut self) -> PResult<StmtKind> {
@@ -4120,7 +4095,8 @@ mod tests {
         assert_eq!(prog.statements.len(), 1);
         if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 5);
-            assert!(matches!(values[0], Literal::Integer(1)));
+            assert_eq!(values[0].text, "1");
+            assert!(!values[0].quoted);
         } else {
             panic!("Expected Data");
         }
@@ -4131,9 +4107,9 @@ mod tests {
         let prog = parse(r#"DATA 1, 3.14, "hello""#).unwrap();
         if let StmtKind::Data(values) = &prog.statements[0].kind {
             assert_eq!(values.len(), 3);
-            assert!(matches!(values[0], Literal::Integer(1)));
-            assert!(matches!(values[1], Literal::Float(_)));
-            assert!(matches!(values[2], Literal::String(_)));
+            assert_eq!(values[1].text, "3.14");
+            assert_eq!(values[2].text, "hello");
+            assert!(values[2].quoted);
         } else {
             panic!("Expected Data");
         }
@@ -4143,7 +4119,7 @@ mod tests {
     fn test_data_negative() {
         let prog = parse("DATA -5, -3.14").unwrap();
         if let StmtKind::Data(values) = &prog.statements[0].kind {
-            assert!(matches!(values[0], Literal::Integer(-5)));
+            assert_eq!(values[0].text, "-5");
         } else {
             panic!("Expected Data");
         }
