@@ -3138,3 +3138,92 @@ fn test_fixed_length_parameters_and_results_are_refused() {
         );
     }
 }
+
+// ---- Main's scalars and the handler ----
+//
+// In a trapping program main's scalars live in SSA values unless the
+// handler can reach a statement that mentions them. These pin down what the
+// handler must still see and change, whichever way a variable lives.
+
+/// What the handler writes, main reads after RESUME and after RESUME NEXT;
+/// and a variable the handler never mentions keeps its value across both.
+#[test]
+fn test_handler_writes_are_seen_after_resume() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nK = 7\nD = 0\nX = 10 / D\nPRINT X; D; N; K\n\
+         M = 1\nY = 1 / 0\nPRINT Y; N; K\nEND\n\
+         H:\nN = N + 1\nIF M = 0 THEN D = 2: RESUME\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(crate::common::lines(&out), vec!["5  2  1  7", "0  2  7"]);
+}
+
+/// The handler reads what main wrote just before the fault.
+#[test]
+fn test_handler_reads_what_main_just_wrote() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I = 1 TO 3\nV = I * 10\nZ = 1 / 0\nNEXT\nEND\n\
+         H:\nPRINT V;\nRESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "10  20  30");
+}
+
+/// A handler that leaves by GOTO runs main's code, which reads variables
+/// main set and the handler did not.
+#[test]
+fn test_handler_goto_into_code_using_mains_variables() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nA = 1: B = 2\nFOR I = 1 TO 3: S = S + I: NEXT\n\
+         X = 1 / 0\nPRINT \"never\"\nTail:\nPRINT A; B; S; C; I\nEND\n\
+         H:\nC = 5\nGOTO Tail\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1  2  6  5  4");
+}
+
+/// A subroutine the handler GOSUBs to writes variables main reads.
+#[test]
+fn test_handler_gosub_writes_mains_variables() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nGOSUB Fix\nX = 1 / 0\nPRINT W; Q\nEND\n\
+         H:\nGOSUB Fix\nRESUME NEXT\nFix:\nW = 42: Q = Q + 1\nRETURN\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "42  2");
+}
+
+/// Two handlers, armed one after the other, each write what main reads.
+#[test]
+fn test_two_handlers_at_different_times() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H1\nX = 1 / 0\nON ERROR GOTO H2\nY = 1 / 0\nPRINT P; Q\nEND\n\
+         H1:\nP = 1: RESUME NEXT\nH2:\nQ = P + 1: RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "1  2");
+}
+
+/// A loop whose counter and totals the handler never mentions, faulting
+/// every third iteration, keeps counting through RESUME NEXT.
+#[test]
+fn test_loop_the_handler_never_mentions_survives_faults() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I% = 1 TO 30\nT = T + 1\n\
+         IF I% MOD 3 = 0 THEN X = 1 / 0: S = S + 100\nS = S + I%\nNEXT I%\n\
+         PRINT T; S; E; I%\nEND\nH:\nE = E + 1: RESUME NEXT\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "30  1465  10  31");
+}
+
+/// RESUME to a label inside a loop carries on with the loop.
+#[test]
+fn test_resume_to_a_label_inside_a_loop() {
+    let out = compile_and_run(
+        "ON ERROR GOTO H\nFOR I = 1 TO 5\nIF I = 3 THEN X = 1 / 0\nBack:\nS = S + I\nNEXT I\n\
+         PRINT S; E; I\nEND\nH:\nE = E + 1: RESUME Back\n",
+    )
+    .unwrap();
+    assert_eq!(out.trim(), "15  1  6");
+}

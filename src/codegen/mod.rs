@@ -289,7 +289,8 @@ pub struct CodeGen {
     resume_targets: Vec<String>,
     /// Statements numbered so far, for unique fault blocks.
     stmt_count: usize,
-    /// Module-level scalars that must stay in memory (see `ssa.rs`).
+    /// Module-level scalars that must stay in memory (see `ssa.rs`): among
+    /// them, in a trapping program, whatever the handler's code mentions.
     module_in_memory: HashSet<String>,
     /// In a trapping program, the limit and step of each FOR in main, by
     /// the address of its limit expression: shared by main and the handler,
@@ -343,6 +344,10 @@ pub fn generate(
         cg.preprocess(stmt, true);
     }
     cg.module_in_memory = ssa::module_in_memory(program, &cg.symbols);
+    if cg.traps {
+        let names = ssa::handler_names(program, &cg.err_handlers);
+        cg.module_in_memory.extend(names);
+    }
     cg.declare_procedures(program)?;
 
     // Main first, so every module-level name is known before a procedure

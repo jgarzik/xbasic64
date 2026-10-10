@@ -7,9 +7,11 @@
 //!
 //! - not passed to a procedure, whose by-reference parameter would need its
 //!   address;
-//! - in main, not shared with any procedure or DEF FN, and not in a program
-//!   with ON ERROR, whose handler is a function of its own that reads and
-//!   writes main's variables in memory;
+//! - in main, not shared with any procedure or DEF FN, and not mentioned by
+//!   code the ON ERROR handler can run: the handler is a function of its
+//!   own, main compiled a second time, that reads and writes main's
+//!   variables in memory. What it never mentions it cannot change, so a
+//!   fault block's call to it leaves those `Variable`s as they were;
 //! - in a procedure, not shared and not STATIC, which both live in memory.
 //!
 //! A `Variable` needs no dominance discipline of the code generating it:
@@ -22,7 +24,7 @@
 
 use super::*;
 use crate::sema::{for_each_expr_mut, walk_stmts};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// A copy of `stmt` without its nested bodies, which `walk_stmts` visits on
 /// their own: copying them at every level would be quadratic in nesting.
@@ -262,18 +264,87 @@ impl FnGen<'_> {
 /// line would be one more the SSA builder has to visit.
 pub(super) fn branch_targets(body: &[Stmt]) -> HashSet<String> {
     let mut targets = HashSet::new();
-    walk_stmts(body, &mut |stmt: &Stmt| match &stmt.kind {
+    walk_stmts(body, &mut |stmt: &Stmt| {
+        if let StmtKind::Resume(ResumeTarget::At(t)) = &stmt.kind {
+            targets.insert(storage::main_label(t));
+        }
+        jump_targets(stmt, &mut |t| {
+            targets.insert(storage::main_label(t));
+        });
+    });
+    targets
+}
+
+/// The labels `stmt` itself -- not its nested bodies -- may go on to: those
+/// of GOTO, GOSUB, ON ..., RETURN line and ON ERROR. RESUME line is not
+/// one: it leaves the handler, and goes on in main.
+fn jump_targets(stmt: &Stmt, f: &mut impl FnMut(&GotoTarget)) {
+    match &stmt.kind {
         StmtKind::Goto(t)
         | StmtKind::Gosub(t)
         | StmtKind::Return(Some(t))
-        | StmtKind::Resume(ResumeTarget::At(t))
-        | StmtKind::OnError(Some(t)) => {
-            targets.insert(storage::main_label(t));
-        }
+        | StmtKind::OnError(Some(t)) => f(t),
         StmtKind::OnGoto { targets: ts, .. } | StmtKind::OnGosub { targets: ts, .. } => {
-            targets.extend(ts.iter().map(storage::main_label));
+            ts.iter().for_each(f)
         }
         _ => {}
-    });
-    targets
+    }
+}
+
+/// Upper-case names mentioned by any of main's statements the ON ERROR
+/// handler can run, which must stay in memory: the handler is main compiled
+/// a second time, and reaches main's variables only there.
+///
+/// Conservatively, over main's top-level statements: from each ON ERROR
+/// target on (`handlers`, as `preprocess` collected them), statement by
+/// statement until one that cannot fall through -- END, STOP, RESUME,
+/// RETURN, GOTO -- following every branch on the way but RESUME's, which
+/// leaves the handler. A label in a nested body reaches the whole top-level
+/// statement holding it.
+pub(super) fn handler_names(program: &Program, handlers: &[String]) -> HashSet<String> {
+    let main: Vec<&Stmt> = program
+        .statements
+        .iter()
+        .filter(|s| !matches!(s.kind, StmtKind::Sub { .. } | StmtKind::Function { .. }))
+        .collect();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for (i, stmt) in main.iter().enumerate() {
+        walk_stmts(std::slice::from_ref(*stmt), &mut |s: &Stmt| match &s.kind {
+            StmtKind::Label(n) => {
+                at.insert(storage::main_label(&GotoTarget::Line(*n)), i);
+            }
+            StmtKind::LabelName(name) => {
+                at.insert(storage::main_label(&GotoTarget::Label(name.clone())), i);
+            }
+            _ => {}
+        });
+    }
+    let mut work: Vec<usize> = handlers.iter().filter_map(|l| at.get(l)).copied().collect();
+    let mut reached = vec![false; main.len()];
+    while let Some(mut i) = work.pop() {
+        while i < main.len() && !reached[i] {
+            reached[i] = true;
+            walk_stmts(std::slice::from_ref(main[i]), &mut |s: &Stmt| {
+                jump_targets(s, &mut |t| {
+                    work.extend(at.get(&storage::main_label(t)));
+                });
+            });
+            if matches!(
+                main[i].kind,
+                StmtKind::End
+                    | StmtKind::Stop
+                    | StmtKind::Resume(_)
+                    | StmtKind::Return(_)
+                    | StmtKind::Goto(_)
+            ) {
+                break;
+            }
+            i += 1;
+        }
+    }
+    let mut names = HashSet::new();
+    for (stmt, _) in main.iter().zip(reached).filter(|(_, r)| *r) {
+        names.extend(names_in(std::slice::from_ref(*stmt)));
+    }
+    names
 }
