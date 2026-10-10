@@ -268,7 +268,21 @@ DIM Matrix(5, 5)         ' 6x6 elements
 DIM Cube(3, 3, 3)        ' 4x4x4 elements
 ```
 
-**Array indices start at 0** by default.
+**Array indices start at 0** by default. A dimension may name its own lower
+bound, as in QuickBASIC:
+
+```basic
+DIM Year(1980 TO 1989)   ' 10 elements, 1980 to 1989
+DIM Grid(-5 TO 5, 1 TO 3)
+```
+
+An array no `DIM` declares is **created by its first use**, as in GW-BASIC:
+with as many dimensions as that use has subscripts, each running from the
+`OPTION BASE` to 10. The same happens to a declared array used before its
+`DIM` has run, or after `ERASE`. A `DIM` of an array that already exists -- by
+an earlier `DIM`, or by a use -- is `Duplicate definition` (10); `REDIM` may
+always resize one. Since a mistyped function would quietly become such an
+array, a name close to a function or procedure draws a warning.
 
 Arrays can hold any type:
 ```basic
@@ -851,7 +865,11 @@ DIM A(100)           ' 1D array, indices 0-100
 DIM B(10, 20)        ' 2D array
 DIM C(5, 5, 5)       ' 3D array
 DIM Names$(50)       ' String array
+DIM D(1 TO 12)       ' indices 1-12
 ```
+
+`LBOUND(A, n)` and `UBOUND(A, n)` give dimension `n`'s bounds; `n` defaults
+to 1.
 
 ### DATA / READ / RESTORE
 
@@ -1012,6 +1030,8 @@ Set the lowest legal subscript. It must appear before any `DIM`, and only once:
 OPTION BASE 1
 DIM Items(10)     ' subscripts 1 to 10
 ```
+
+It is the lower bound of every dimension that does not name its own.
 
 ### DEF FN
 
@@ -1565,8 +1585,7 @@ quote, so it reports the source line instead, which is the only number its
 author can act on. A statement ahead of the first line number does the same.
 
 Checked: array subscripts (against every dimension, and against the lower
-bound when `OPTION BASE 1` is in effect), use of an array before its `DIM` has
-run, division by zero for `/`, `\` and `MOD`, every arithmetic result and
+bound), a `DIM` of an array that already exists, division by zero for `/`, `\` and `MOD`, every arithmetic result and
 conversion that does not fit its type, `SQR` of a negative number, `LOG` of a
 non-positive number, a file number outside 1 to 15, `GOSUB` nested deeper than
 the return stack holds, a `RETURN` with no `GOSUB` of its own scope to go back
@@ -1591,7 +1610,7 @@ The message names the fault, and each carries GW-BASIC's number for it:
 | 7   | `Out of memory`          | A string or array allocation that failed     |
 | 7   | `GOSUB stack overflow`   | `GOSUB` nested past the return stack's depth |
 | 9   | `Subscript out of range` | A subscript outside a dimension's bounds     |
-| 9   | `Array used before DIM`  | An array reached before its `DIM` ran        |
+| 10  | `Duplicate definition`   | A `DIM` of an array that already exists      |
 | 11  | `Division by zero`       | A zero divisor in `/`, `\` or `MOD`          |
 | 13  | `Type mismatch`          | A `PRINT USING` value of the wrong kind for its field |
 | 50  | `FIELD overflow`         | `FIELD` widths exceeding the record length   |
@@ -1702,11 +1721,6 @@ xbasic64 aims for compatibility with GW-BASIC and QuickBASIC with these notable 
 These are places where a GW-BASIC program will behave differently here. They
 are choices, not oversights.
 
-7. **Arrays must be declared** - GW-BASIC gives an undeclared array 11
-   elements on first use. Here an array with no `DIM` anywhere is a compile
-   error, because the implicit version silently hides a typo; one whose `DIM`
-   has not run yet is `Array used before DIM` at run time.
-
-8. **`LOC` on a sequential file counts 128-byte blocks**, which is what
+7. **`LOC` on a sequential file counts 128-byte blocks**, which is what
     GW-BASIC reported on MS-DOS. It is preserved for compatibility rather than
     because the number is useful.

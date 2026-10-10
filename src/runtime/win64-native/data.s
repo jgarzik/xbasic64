@@ -140,3 +140,54 @@ _rt_read_string:
 _rt_restore:
     mov QWORD PTR [rip + _data_ptr], rcx
     ret
+
+# _rt_array_autodim - Create an array by using it, as GW-BASIC does
+#
+# See the System V twin.
+#
+# Arguments:
+#   rcx = the descriptor, r8 = element size, r9 = the OPTION BASE,
+#   rdx = the number of dimensions
+# Returns: nothing (Out of memory leaves the pointer null)
+.globl _rt_array_autodim
+_rt_array_autodim:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    sub rsp, 32             # shadow space; 16-byte aligned
+    mov rbx, rcx            # descriptor
+    mov r12, r8             # running size: element size * the counts
+    mov eax, 11
+    sub rax, r9             # elements per dimension: base..10
+    xor r10d, r10d          # dimension
+.Lautodim_dim:
+    cmp r10, rdx
+    jae .Lautodim_alloc
+    mov QWORD PTR [rbx + 8 + r10*8], rax
+    lea r11, [rdx + r10]
+    mov QWORD PTR [rbx + 8 + r11*8], r9
+    imul r12, rax
+    inc r10
+    jmp .Lautodim_dim
+.Lautodim_alloc:
+    mov ecx, 1
+    mov rdx, r12
+    call calloc
+    test rax, rax
+    jz .Lautodim_nomem
+    mov QWORD PTR [rbx], rax
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret
+.Lautodim_nomem:
+    lea rcx, [rip + _err_memory]
+    xor edx, edx
+    call _rt_error          # returns only when trapped
+    add rsp, 32
+    pop r12
+    pop rbx
+    leave
+    ret

@@ -392,7 +392,8 @@ enum RtError {
     DivideByZero,
     Domain,
     Overflow,
-    Undim,
+    /// DIM of an array that already has storage.
+    DuplicateDefinition,
     OutOfMemory,
     GosubOverflow,
     BadFileNum,
@@ -412,7 +413,7 @@ impl RtError {
             RtError::DivideByZero => "_err_div0",
             RtError::Domain => "_err_domain",
             RtError::Overflow => "_err_overflow",
-            RtError::Undim => "_err_undim",
+            RtError::DuplicateDefinition => "_err_dupdef",
             RtError::OutOfMemory => "_err_memory",
             RtError::GosubOverflow => "_err_gosub",
             RtError::ReturnWithoutGosub => "_err_noreturn",
@@ -437,7 +438,7 @@ impl RtError {
             RtError::DivideByZero => "div0",
             RtError::Domain => "dom",
             RtError::Overflow => "ovf",
-            RtError::Undim => "undim",
+            RtError::DuplicateDefinition => "dupdef",
             RtError::OutOfMemory => "mem",
             RtError::GosubOverflow => "gosub",
             RtError::ReturnWithoutGosub => "noret",
@@ -1605,8 +1606,8 @@ impl CodeGen {
     ///
     /// Done before any code is emitted, so that an array used earlier in
     /// program order than its `DIM` still has somewhere to read from. Its
-    /// element pointer is null until the DIM runs, which the bounds check
-    /// reports as "Array used before DIM" rather than crashing.
+    /// element pointer is null until the DIM runs -- or until a use creates
+    /// the array, as GW-BASIC does.
     fn reserve_array_descriptors(&mut self, scope: &SemaScope) {
         let mut decls: Vec<(String, usize)> = self
             .symbols
@@ -1622,7 +1623,7 @@ impl CodeGen {
                 continue;
             }
             let loc = if self.current_proc.is_some() {
-                self.stack_offset -= 8 * (1 + rank as i32);
+                self.stack_offset -= 8 * (1 + 2 * rank as i32);
                 Loc::Frame(self.stack_offset)
             } else {
                 Loc::Global(format!("_arr_{}", mangle(&name)))
@@ -2008,17 +2009,75 @@ impl CodeGen {
         }
     }
 
-    /// With `OPTION BASE 1`, subscript 0 is out of range too.
+    /// Whether subscripts of `name` have a lower bound to take off: some
+    /// DIM of it gave one (`1 TO 10`), or OPTION BASE 1 gives every array one.
+    /// Otherwise the lower bound is 0 and the subtraction is skipped.
+    fn array_has_lower(&self, name: &str) -> bool {
+        self.symbols.option_base != 0
+            || self
+                .symbols
+                .lookup_array(&self.sema_scope(), &name.to_uppercase())
+                .is_some_and(|a| a.has_lower)
+    }
+
+    /// Create `name` with GW-BASIC's default bounds if it has no storage yet.
     ///
-    /// Element storage is still allocated for it -- the descriptor keeps
-    /// holding N+1 elements and slot 0 simply goes unused -- which leaves the
-    /// linear index arithmetic completely unchanged.
-    fn emit_lower_bound_check(&mut self, reg: &str) {
-        if self.symbols.option_base == 0 {
-            return;
+    /// The call clobbers the caller-saved registers, which a FOR loop may be
+    /// keeping a promoted float in -- promotion allows only loops that call
+    /// nothing, and an array access did not call anything before -- so those
+    /// are saved around it. A loop's hoisted descriptor registers are
+    /// callee-saved, but they hold the null pointer and zero bounds read before
+    /// the array existed, so they are reloaded afterwards.
+    fn emit_autodim_if_null(&mut self, name: &str, loc: &Loc) {
+        let have = self.new_label("arrok");
+        let base = self.array_base_operand(name, loc);
+        emit!(self, "    cmp {}, 0", base);
+        emit!(self, "    jne {}", have);
+
+        let floats: Vec<String> = self
+            .promoted
+            .iter()
+            .filter(|p| p.reg.starts_with("xmm"))
+            .map(|p| p.reg.clone())
+            .collect();
+        for reg in &floats {
+            emit!(self, "    sub rsp, {}", STACK_TEMP_SPACE);
+            emit!(self, "    movsd QWORD PTR [rsp], {}", reg);
         }
-        emit!(self, "    cmp {}, {}", reg, self.symbols.option_base);
-        self.emit_check("jb", RtError::Subscript);
+        let ndims = self
+            .lookup_array(name)
+            .expect("sema checked the array exists")
+            .ndims;
+        let addr = match loc {
+            Loc::Global(sym) => format!("[rip + {}]", sym),
+            Loc::Frame(off) => format!("[rbp + {}]", off),
+        };
+        self.emit_arg_lea(0, &addr);
+        self.emit_arg_imm(1, ndims as i64);
+        self.emit_arg_imm(2, i64::from(self.elem_size_for(name)));
+        self.emit_arg_imm(3, self.symbols.option_base);
+        self.call_rt("_rt_array_autodim");
+        for reg in floats.iter().rev() {
+            emit!(self, "    movsd {}, QWORD PTR [rsp]", reg);
+            emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
+        }
+        if let Some(h) = self
+            .hoisted_arrays
+            .iter()
+            .rev()
+            .find(|h| h.name == name)
+            .cloned()
+        {
+            if let Some(reg) = &h.base {
+                emit!(self, "    mov {}, {}", reg, loc.q(0));
+            }
+            for (i, slot) in h.bounds.iter().enumerate() {
+                if let Some(reg) = slot {
+                    emit!(self, "    mov {}, {}", reg, loc.q(1 + i as i32));
+                }
+            }
+        }
+        self.emit_label(&have);
     }
 
     /// A LBOUND/UBOUND dimension known at compile time.
@@ -3800,7 +3859,7 @@ impl CodeGen {
 
             StmtKind::Dim { decls } => {
                 for decl in decls {
-                    self.gen_declarator(decl, false);
+                    self.gen_declarator(decl, false, false);
                 }
             }
 
@@ -3867,7 +3926,7 @@ impl CodeGen {
 
             StmtKind::Redim { decls, preserve } => {
                 for decl in decls {
-                    self.gen_declarator(decl, *preserve);
+                    self.gen_declarator(decl, true, *preserve);
                 }
             }
 
@@ -6444,6 +6503,9 @@ impl CodeGen {
             // Radix conversions.
             // Array bounds. The descriptor stores each dimension's element
             // count, so UBOUND is that minus one and LBOUND is always 0.
+            // LBOUND is the stored lower bound, UBOUND that plus the count, less
+            // one. An array with no storage yet is created first, as any use
+            // of it would.
             "LBOUND" | "UBOUND" => {
                 let Expr::Variable(arr) = &args[0] else {
                     unreachable!("sema requires an array name here")
@@ -6453,44 +6515,41 @@ impl CodeGen {
                     .symbols
                     .lookup_array(&self.sema_scope(), &arr)
                     .expect("sema checked the array exists")
-                    .rank as i64;
-
-                // The lower bound does not depend on which dimension is asked
-                // for, but an out-of-range dimension is still an error.
-                if upper_name == "LBOUND" {
-                    if let Some(dim) = args.get(1)
-                        && self.const_dim(dim).is_none()
-                    {
-                        self.gen_dim_index(dim, rank);
-                    }
-                    emit!(self, "    mov eax, {}", self.symbols.option_base);
-                    return;
-                }
-
+                    .rank as i32;
                 let loc = self
                     .lookup_array(&arr)
                     .expect("sema checked the array exists")
                     .loc
                     .clone();
+                self.emit_autodim_if_null(&arr, &loc);
+                let is_lower = upper_name == "LBOUND";
 
                 match args.get(1).map(|d| (d, self.const_dim(d))) {
                     // The usual case: a literal or CONST dimension, resolved
-                    // to a fixed descriptor slot.
+                    // to fixed descriptor slots.
                     None | Some((_, Some(_))) => {
                         let dim = args.get(1).and_then(|d| self.const_dim(d)).unwrap_or(1);
-                        emit!(self, "    mov rax, {}", loc.q(dim));
+                        emit!(self, "    mov rax, {}", loc.q(rank + dim));
+                        if !is_lower {
+                            emit!(self, "    add rax, {}", loc.q(dim));
+                            self.emit("    dec rax");
+                        }
                     }
                     // A computed dimension indexes the descriptor at run time.
                     Some((dim, None)) => {
-                        self.gen_dim_index(dim, rank);
+                        self.gen_dim_index(dim, rank as i64);
                         match &loc {
                             Loc::Global(sym) => emit!(self, "    lea rcx, [rip + {}]", sym),
                             Loc::Frame(off) => emit!(self, "    lea rcx, [rbp + {}]", off),
                         }
-                        self.emit("    mov rax, QWORD PTR [rcx + rax*8]");
+                        self.emit("    mov rdx, rax");
+                        emit!(self, "    mov rax, QWORD PTR [rcx + rdx*8 + {}]", 8 * rank);
+                        if !is_lower {
+                            self.emit("    add rax, QWORD PTR [rcx + rdx*8]");
+                            self.emit("    dec rax");
+                        }
                     }
                 }
-                self.emit("    dec rax");
             }
             // File status. All take a file number and return a number.
             "EOF" | "LOF" | "LOC" => {
@@ -6712,13 +6771,14 @@ impl CodeGen {
     ///
     /// A declarator is an array, a typed scalar, or a typed array, and one
     /// statement may mix them.
-    fn gen_declarator(&mut self, decl: &Declarator, preserve: bool) {
+    fn gen_declarator(&mut self, decl: &Declarator, redim: bool, preserve: bool) {
         match (&decl.dimensions, &decl.ty) {
             // An array of records: element size comes from the type.
             (Some(dims), Some(ty)) => {
                 let arr = ArrayDecl {
                     name: decl.name.clone(),
                     dimensions: dims.clone(),
+                    lowers: decl.lowers.clone(),
                 };
                 let words = self.symbols.type_words(ty);
                 let key = decl.name.to_uppercase();
@@ -6727,18 +6787,15 @@ impl CodeGen {
                 } else {
                     self.record_elem_words.insert(key, words);
                 }
-                self.gen_array_alloc(&arr, preserve);
+                self.gen_array_alloc(&arr, redim, preserve);
             }
             (Some(dims), None) => {
                 let arr = ArrayDecl {
                     name: decl.name.clone(),
                     dimensions: dims.clone(),
+                    lowers: decl.lowers.clone(),
                 };
-                if preserve {
-                    self.gen_array_alloc(&arr, true);
-                } else {
-                    self.gen_dim_array(&arr);
-                }
+                self.gen_array_alloc(&arr, redim, preserve);
             }
             // A typed scalar: allocating its storage is all that is needed,
             // since .bss and the frame prologue already zero it.
@@ -6750,20 +6807,19 @@ impl CodeGen {
         }
     }
 
-    fn gen_dim_array(&mut self, arr: &ArrayDecl) {
-        self.gen_array_alloc(arr, false);
-    }
-
     /// Allocate or reallocate an array's storage.
     ///
     /// The descriptor -- word 0 the element pointer, word 1+i dimension i's
-    /// element count -- is reused when the array already exists, so REDIM
-    /// resizes in place rather than orphaning it, and a repeated DIM does not
-    /// leak a second descriptor.
+    /// element count, word 1+n+i its lower bound -- is reused when the array
+    /// already exists, so REDIM resizes in place rather than orphaning it.
+    ///
+    /// A DIM of an array that exists already -- because a DIM ran before, or
+    /// a use created it -- is GW-BASIC's "Duplicate definition" (10). It used
+    /// to reallocate the array silently.
     ///
     /// With `preserve`, the block is grown with realloc and the new tail
     /// zeroed; otherwise fresh zeroed storage is allocated.
-    fn gen_array_alloc(&mut self, arr: &ArrayDecl, preserve: bool) {
+    fn gen_array_alloc(&mut self, arr: &ArrayDecl, redim: bool, preserve: bool) {
         let elem_size = self.elem_size_for(&arr.name);
         let ndims = arr.dimensions.len();
 
@@ -6773,11 +6829,16 @@ impl CodeGen {
         let loc = match self.lookup_array(&arr.name).map(|i| i.loc.clone()) {
             Some(existing) => existing,
             None if self.current_proc.is_some() => {
-                self.stack_offset -= 8 * (1 + ndims as i32);
+                self.stack_offset -= 8 * (1 + 2 * ndims as i32);
                 Loc::Frame(self.stack_offset)
             }
             None => Loc::Global(format!("_arr_{}", mangle(&arr.name))),
         };
+
+        if !redim && self.opts.checks {
+            emit!(self, "    cmp {}, 0", loc.q(0));
+            self.emit_check("jne", RtError::DuplicateDefinition);
+        }
 
         // With PRESERVE, the old element count is needed to know where the
         // newly added tail begins.
@@ -6791,12 +6852,29 @@ impl CodeGen {
             self.emit("    sub rsp, 8"); // keep rsp 16-byte aligned
         }
 
-        // Evaluate and store all dimension bounds.
-        // BASIC DIM A(N) means indices 0..N (N+1 elements), so add 1 to each bound
+        // Evaluate and store all dimension bounds: the lower bound as written,
+        // or the OPTION BASE, and the element count from it to the upper one.
+        // A bound below its lower one leaves no elements, which is Subscript
+        // out of range.
+        let n = ndims as i32;
         for (i, dim) in arr.dimensions.iter().enumerate() {
+            let lower_word = loc.q(1 + n + i as i32);
+            match arr.lowers.get(i).cloned().flatten() {
+                Some(lo) => {
+                    let lo_type = self.gen_expr(&lo);
+                    self.emit_to_int64(lo_type, "rax");
+                    emit!(self, "    mov {}, rax", lower_word);
+                }
+                None => emit!(self, "    mov {}, {}", lower_word, self.symbols.option_base),
+            }
             let dim_type = self.gen_expr(dim);
             self.emit_to_int64(dim_type, "rax");
-            self.emit("    inc rax"); // DIM A(N) has N+1 elements (0 to N)
+            emit!(self, "    sub rax, {}", lower_word);
+            self.emit("    inc rax");
+            if self.opts.checks {
+                self.emit("    cmp rax, 0");
+                self.emit_check("jle", RtError::Subscript);
+            }
             emit!(self, "    mov {}, rax", loc.q(1 + i as i32));
         }
 
@@ -6829,8 +6907,8 @@ impl CodeGen {
             // The new bounds are already in the descriptor, so a *caught* Out
             // of memory would leave them there beside the old element pointer:
             // every later `A(I)` would then pass the bounds check and write
-            // past the end of the old block. Clearing the pointer first makes
-            // the undim check turn that into "Array used before DIM" instead.
+            // past the end of the old block. Clearing the pointer first means
+            // the next use creates the array afresh instead.
             // Only reachable once ON ERROR exists -- before that the error was
             // fatal and nothing could observe the descriptor again.
             emit!(self, "    mov {}, 0", loc.q(0));
@@ -6899,32 +6977,31 @@ impl CodeGen {
         let loc = arr_info.loc.clone();
         let elem_size = self.elem_size_for(name);
 
-        // A module-level array's descriptor lives in .bss, so its element
-        // pointer is null until the DIM executes. Catching that is what turns
-        // "used before DIM at run time" into a diagnosable abort rather than a
-        // null dereference.
-        //
-        // Kept per access rather than hoisted with the pointer: a loop whose
-        // body never runs must not report an array it never touched.
-        if self.opts.checks {
-            let base = self.array_base_operand(name, &loc);
-            emit!(self, "    cmp {}, 0", base);
-            self.emit_check("je", RtError::Undim);
-        }
+        // An array with no storage yet -- never DIMmed, or ERASEd -- is
+        // created by this use, as GW-BASIC does: as many dimensions as it has
+        // subscripts, each from the OPTION BASE to 10. Per access rather than
+        // hoisted with the pointer, so a loop whose body never runs does not
+        // create an array it never touched.
+        self.emit_autodim_if_null(name, &loc);
+
+        let ndims = indices.len() as i32;
+        let has_lower = self.array_has_lower(name);
 
         // Calculate linear index using row-major order:
         // For A(i, j, k): linear = ((i * dim1) + j) * dim2 + k
         // Start with first index
         let idx_type = self.gen_expr(&indices[0]);
         self.emit_to_int64(idx_type, "rax");
-        // One unsigned compare catches both a negative index and one past the
-        // end, since a negative value wraps to a huge unsigned one. The stored
-        // bound is already the element count (declared bound + 1).
+        if has_lower {
+            emit!(self, "    sub rax, {}", loc.q(1 + ndims));
+        }
+        // One unsigned compare catches both a subscript below the lower bound
+        // and one past the end, since a negative offset wraps to a huge
+        // unsigned one. The stored bound is the element count.
         if self.opts.checks {
             let bound = self.array_bound_operand(name, &loc, 0);
             emit!(self, "    cmp rax, {}", bound);
             self.emit_check("jae", RtError::Subscript);
-            self.emit_lower_bound_check("rax");
         }
 
         // For each subsequent index, multiply by dimension bound and add
@@ -6935,11 +7012,13 @@ impl CodeGen {
             // Evaluate next index
             let idx_type = self.gen_expr(idx_expr);
             self.emit_to_int64(idx_type, "rcx");
+            if has_lower {
+                emit!(self, "    sub rcx, {}", loc.q(1 + ndims + i as i32));
+            }
             let bound = self.array_bound_operand(name, &loc, i);
             if self.opts.checks {
                 emit!(self, "    cmp rcx, {}", bound);
                 self.emit_check("jae", RtError::Subscript);
-                self.emit_lower_bound_check("rcx");
             }
             self.emit("    mov rax, QWORD PTR [rsp]");
             emit!(self, "    add rsp, {}", STACK_TEMP_SPACE);
@@ -7186,7 +7265,7 @@ impl CodeGen {
             if let Loc::Global(sym) = &info.loc {
                 // Word 0 is the element pointer (null until DIM runs), then one
                 // word per dimension bound.
-                let bytes = 8 * (1 + info.ndims);
+                let bytes = 8 * (1 + 2 * info.ndims);
                 self.output.push_str(&format!(
                     "{}: .zero {}  # {} ptr + {} dim(s)\n",
                     sym, bytes, name, info.ndims

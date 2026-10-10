@@ -301,6 +301,12 @@ impl RecordInfo {
 pub struct ArrayInfo {
     pub rank: usize,
     pub line: u32,
+    /// Some DIM or REDIM of it gives a lower bound (`1 TO 10`), so a
+    /// subscript has to have the lower bound taken off. Under OPTION BASE 1
+    /// every array has one too; codegen checks that itself.
+    pub has_lower: bool,
+    /// No DIM declares it: it was created by being used, as GW-BASIC does.
+    pub implicit: bool,
 }
 
 /// Which scope a name was declared in.
@@ -392,6 +398,8 @@ pub struct Diagnostic {
     pub message: String,
     /// Optional follow-up line, e.g. a spelling suggestion.
     pub note: Option<String>,
+    /// Worth saying, but the program is still compiled.
+    pub warning: bool,
 }
 
 /// Analyze a program: collect its symbols, resolve `A(1)`, and report problems.
@@ -753,6 +761,7 @@ fn for_each_expr_mut(stmt: &mut Stmt, f: &mut impl FnMut(&mut Expr)) {
                 if let Some(dims) = &mut d.dimensions {
                     dims.iter_mut().for_each(&mut *f);
                 }
+                d.lowers.iter_mut().flatten().for_each(&mut *f);
             }
         }
         StmtKind::Call { args, .. } => args.iter_mut().for_each(&mut *f),
@@ -893,6 +902,7 @@ impl Analyzer {
             line,
             message: message.into(),
             note: None,
+            warning: false,
         });
     }
 
@@ -901,6 +911,21 @@ impl Analyzer {
             line,
             message: message.into(),
             note: Some(note.into()),
+            warning: false,
+        });
+    }
+
+    fn warning_with_note(
+        &mut self,
+        line: u32,
+        message: impl Into<String>,
+        note: impl Into<String>,
+    ) {
+        self.diagnostics.push(Diagnostic {
+            line,
+            message: message.into(),
+            note: Some(note.into()),
+            warning: true,
         });
     }
 
@@ -1081,11 +1106,15 @@ impl Analyzer {
                                 );
                             }
                         }
+                        let has_lower = decl.lowers.iter().any(Option::is_some)
+                            || self.symbols.arrays.get(&key).is_some_and(|a| a.has_lower);
                         self.symbols.arrays.insert(
                             key,
                             ArrayInfo {
                                 rank: dims.len(),
                                 line: stmt.line,
+                                has_lower,
+                                implicit: false,
                             },
                         );
                     }
@@ -1643,12 +1672,15 @@ impl Analyzer {
                     for d in decl.dimensions.iter().flatten() {
                         self.check_expr(d, scope, line);
                     }
+                    for d in decl.lowers.iter().flatten() {
+                        self.check_expr(d, scope, line);
+                    }
                 }
             }
             StmtKind::Redim { decls, preserve } => {
                 for decl in decls {
                     let dims = decl.dimensions.as_deref().unwrap_or(&[]);
-                    for d in dims {
+                    for d in dims.iter().chain(decl.lowers.iter().flatten()) {
                         self.check_expr(d, scope, line);
                     }
                     // Only the last dimension may change under PRESERVE, which
@@ -2429,8 +2461,14 @@ impl Analyzer {
             return;
         }
 
-        // `NAME(...)` is ambiguous between a call and an array reference, so
-        // say both rather than guessing which the user meant.
+        // In an expression, `NAME(...)` that is neither a procedure nor a
+        // builtin is an array -- created by this use if no DIM declares it,
+        // as GW-BASIC does.
+        if !is_stmt && !args.is_empty() {
+            self.check_array_use(&upper, args.len(), scope, line);
+            return;
+        }
+
         let what = if is_stmt {
             "subroutine"
         } else if args.is_empty() {
@@ -2458,7 +2496,7 @@ impl Analyzer {
         match self.symbols.lookup_array(scope, &upper) {
             Some(info) => {
                 if info.rank != given {
-                    let (rank, decl_line) = (info.rank, info.line);
+                    let (rank, decl_line, implicit) = (info.rank, info.line, info.implicit);
                     self.error_with_note(
                         line,
                         format!(
@@ -2469,15 +2507,50 @@ impl Analyzer {
                             given,
                             if given == 1 { " was" } else { "s were" }
                         ),
-                        format!("'{}' is declared on line {}", name, decl_line),
+                        if implicit {
+                            format!(
+                                "'{}' was created by its first use, on line {}",
+                                name, decl_line
+                            )
+                        } else {
+                            format!("'{}' is declared on line {}", name, decl_line)
+                        },
                     );
                 }
             }
+            // An array no DIM declares is created by its first use, with as
+            // many dimensions as that use has subscripts, each 0 (or the
+            // OPTION BASE) to 10 -- GW-BASIC's rule. It belongs to the scope
+            // that uses it. This used to be refused.
+            //
+            // So a mistyped function -- SQRT(4) -- is quietly an array, as it
+            // is in GW-BASIC. A name close to a function or procedure is worth
+            // a warning, though not a refusal.
             None => {
-                self.error_with_note(
-                    line,
-                    format!("array '{}' is used but never declared", name),
-                    format!("add a DIM {}(...) before using it", name),
+                let mut known: Vec<&str> = self.symbols.procs.keys().map(|s| s.as_str()).collect();
+                known.extend(BUILTINS.iter().map(|(n, _, _)| *n));
+                // Short names are left alone: any one-letter array is "close"
+                // to any one-letter procedure.
+                if upper.trim_end_matches(['$', '%', '&', '!', '#']).len() >= 3
+                    && let Some(sug) = closest(&upper, &known).map(str::to_string)
+                {
+                    self.warning_with_note(
+                        line,
+                        format!(
+                            "'{}' is not a function, so it is an array, created by this use",
+                            name
+                        ),
+                        format!("did you mean '{}'?", sug),
+                    );
+                }
+                self.symbols.arrays.insert(
+                    (scope.clone(), upper),
+                    ArrayInfo {
+                        rank: given,
+                        line,
+                        has_lower: false,
+                        implicit: true,
+                    },
                 );
             }
         }

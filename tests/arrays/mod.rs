@@ -234,3 +234,60 @@ PRINT Q
     assert_eq!(lines[0], "5", "the local array works");
     assert_eq!(lines[1], "0", "Q at module level is an untouched scalar");
 }
+
+/// `DIM A(lo TO hi)` gives a dimension its own lower bound, as in QuickBASIC.
+/// A subscript below it or above the upper one is out of range, and LBOUND
+/// and UBOUND report both, whichever dimension is asked for.
+#[test]
+fn test_dim_with_lower_bounds() {
+    let output = crate::common::compile_and_run(
+        r#"
+DIM A(5 TO 8), M$(-2 TO 2, 10 TO 11)
+FOR I = 5 TO 8: A(I) = I * 10: NEXT I
+PRINT A(5); A(8)
+M$(-2, 10) = "lo": M$(2, 11) = "hi"
+PRINT M$(-2, 10); M$(2, 11)
+PRINT LBOUND(A); UBOUND(A); LBOUND(M$, 1); UBOUND(M$, 1); LBOUND(M$, 2); UBOUND(M$, 2)
+D = 2: PRINT LBOUND(M$, D); UBOUND(M$, D)
+REDIM A(1 TO 3)
+PRINT LBOUND(A); UBOUND(A)
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        crate::common::lines(&output),
+        vec!["50  80", "lohi", "5  8 -2  2  10  11", "10  11", "1  3"]
+    );
+    for source in [
+        "DIM A(5 TO 8)\nA(4) = 1\n",
+        "DIM A(5 TO 8)\nA(9) = 1\n",
+        "DIM M(1 TO 2, 3 TO 4)\nPRINT M(1, 2)\n",
+        "DIM A(5 TO 4)\n",
+    ] {
+        let run = crate::common::compile_and_run_raw(source, "").unwrap();
+        assert_eq!(run.exit_code, Some(1), "{source:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("Subscript out of range"),
+            "{source:?}: {}",
+            run.stderr
+        );
+    }
+}
+
+/// Under OPTION BASE 1 a DIM's lower bound is 1, and so is an array created
+/// by its use, which then runs 1 to 10.
+#[test]
+fn test_option_base_one_bounds_and_created_arrays() {
+    let output = crate::common::compile_and_run(
+        "OPTION BASE 1\nDIM A(3)\nA(1) = 7: A(3) = 9\nB(10) = 4\nPRINT A(1); A(3); B(10); LBOUND(B); UBOUND(B); LBOUND(A); UBOUND(A)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "7  9  4  1  10  1  3");
+    let run =
+        crate::common::compile_and_run_raw("OPTION BASE 1\nDIM A(3)\nA(0) = 1\n", "").unwrap();
+    assert!(
+        run.stderr.contains("Subscript out of range"),
+        "{}",
+        run.stderr
+    );
+}

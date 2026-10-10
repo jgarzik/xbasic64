@@ -372,8 +372,11 @@ pub enum CaseClause {
 #[derive(Debug, Clone)]
 pub struct Declarator {
     pub name: String,
-    /// Array bounds, when this declares an array.
+    /// Array bounds, when this declares an array: each dimension's upper bound.
     pub dimensions: Option<Vec<Expr>>,
+    /// Each dimension's lower bound, when written (`DIM A(1 TO 10)`); without
+    /// one it is the OPTION BASE. As long as `dimensions`, or empty.
+    pub lowers: Vec<Option<Expr>>,
     /// Declared type from an `AS` clause.
     pub ty: Option<TypeRef>,
 }
@@ -413,6 +416,8 @@ pub struct LValue {
 pub struct ArrayDecl {
     pub name: String,
     pub dimensions: Vec<Expr>,
+    /// Lower bounds, as in [`Declarator::lowers`].
+    pub lowers: Vec<Option<Expr>>,
 }
 
 /// Where a `RESUME` goes back to.
@@ -2497,9 +2502,28 @@ impl Parser {
                 return err("Expected a variable or array name");
             };
 
+            // Each bound is `upper`, or `lower TO upper` as in QuickBASIC.
+            let mut lowers = Vec::new();
             let dimensions = if matches!(self.peek(), Token::LParen) {
                 self.advance();
-                let dims = self.parse_expr_list()?;
+                let mut dims = Vec::new();
+                // `DIM A()` declares no dimensions; sema says so.
+                while !matches!(self.peek(), Token::RParen) {
+                    let first = self.parse_expression()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                        lowers.push(Some(first));
+                        dims.push(self.parse_expression()?);
+                    } else {
+                        lowers.push(None);
+                        dims.push(first);
+                    }
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
                 self.expect(Token::RParen)?;
                 Some(dims)
             } else {
@@ -2523,6 +2547,7 @@ impl Parser {
             decls.push(Declarator {
                 name,
                 dimensions,
+                lowers,
                 ty,
             });
 

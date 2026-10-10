@@ -26,7 +26,7 @@ _err_typemismatch: .asciz "Type mismatch"
 _err_div0:      .asciz "Division by zero"
 _err_domain:    .asciz "Illegal function call"
 _err_overflow:  .asciz "Overflow"
-_err_undim:     .asciz "Array used before DIM"
+_err_dupdef:    .asciz "Duplicate definition"
 _err_memory:    .asciz "Out of memory"
 _err_gosub:     .asciz "GOSUB stack overflow"
 _err_noreturn:  .asciz "RETURN without GOSUB"
@@ -69,7 +69,7 @@ _err_codes:
     .quad _err_memory,      7
     .quad _err_gosub,       7
     .quad _err_subscript,   9
-    .quad _err_undim,       9
+    .quad _err_dupdef,      10
     .quad _err_div0,        11
     .quad _err_typemismatch, 13
     .quad _err_fieldovf,    50

@@ -235,22 +235,50 @@ fn test_unknown_names_are_diagnosed() {
     expect_rejected("PRIN \"hello\"\n", "unknown subroutine 'PRIN'");
     expect_rejected("PRIN \"hello\"\n", "did you mean 'PRINT'?");
     expect_rejected("NoSuchSub(1)\n", "unknown subroutine 'NOSUCHSUB'");
-    expect_rejected(
-        "PRINT NOSUCHFN(1)\n",
-        "unknown function or array 'NOSUCHFN'",
-    );
-    expect_rejected("PRINT SQRT(4)\n", "did you mean 'SQR'?");
 }
 
-/// Using an array without DIM used to abort the compiler with a Rust panic
-/// ("Array not declared"), as did a subscript-count mismatch.
+/// An array no DIM declares is created by its first use, as in GW-BASIC,
+/// with as many dimensions as that use has subscripts, each 0 to 10. It used
+/// to be refused. A later use with another number of subscripts is still an
+/// error, and so is a subscript past 10.
 #[test]
-fn test_undeclared_array_is_diagnosed() {
-    expect_rejected("A(0) = 1\n", "array 'A' is used but never declared");
+fn test_an_undeclared_array_is_created_by_its_use() {
+    let output = compile_and_run(
+        "A(0) = 1\nA(10) = 2\nB$(3, 4) = \"x\"\nPRINT A(0); A(10); A(5); B$(3, 4); UBOUND(A); UBOUND(B$, 2)\n",
+    )
+    .unwrap();
+    assert_eq!(output.trim(), "1  2  0 x 10  10");
     expect_rejected(
         "DIM M(3,3)\nPRINT M(1)\n",
         "array 'M' has 2 dimensions, but 1 subscript was given",
     );
+    expect_rejected(
+        "N(1) = 0\nPRINT N(1, 2)\n",
+        "'N' was created by its first use, on line 1",
+    );
+    expect_runtime_error("A(11) = 1\n", &[], "Subscript out of range");
+}
+
+/// A mistyped function is an array too, as in GW-BASIC -- but a name close to
+/// a function or a procedure is worth a warning, and the program compiles.
+#[test]
+fn test_an_array_named_like_a_function_is_warned_about() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let bas = tmp.path().join("w.bas");
+    std::fs::write(&bas, "PRINT SQRT(4)\n").unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_xbasic64"))
+        .arg(&bas)
+        .arg("-o")
+        .arg(tmp.path().join("w"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: 'SQRT' is not a function"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("did you mean 'SQR'?"), "{stderr}");
 }
 
 /// Argument counts are checked for both user procedures and builtins.
@@ -403,14 +431,20 @@ fn test_math_domain_is_checked() {
     expect_runtime_error("PRINT LOG(-1)\n", &[], "Illegal function call");
 }
 
-/// An array whose DIM has not executed yet has a null element pointer.
+/// An array used before its DIM runs is created by the use, 0 to 10, as in
+/// GW-BASIC -- and the DIM, finding it there, is "Duplicate definition" (10).
+/// The use used to be the error "Array used before DIM".
 #[test]
-fn test_use_before_dim_is_checked() {
-    expect_runtime_error(
-        "SUB T\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n",
-        &[],
-        "Array used before DIM",
+fn test_use_before_dim_creates_the_array() {
+    let run = compile_and_run_raw("SUB T\nPRINT A(0)\nEND SUB\nT\nDIM A(3)\n", "")
+        .expect("should compile");
+    assert_eq!(run.lines(), vec!["0"]);
+    assert!(
+        run.stderr.contains("Duplicate definition in 5"),
+        "{}",
+        run.stderr
     );
+    assert_eq!(run.exit_code, Some(1));
 }
 
 /// The diagnostic names the BASIC line the fault occurred on.
@@ -516,14 +550,14 @@ fn test_numeric_operands_are_checked_not_panicked_on() {
     for (source, expect) in [
         ("A$ = \"x\"\nERROR A$\n", "ERROR needs a number"),
         ("ERROR \"boom\"\n", "ERROR needs a number"),
-        ("ERROR NoSuchFn(1)\n", "unknown function or array"),
+        ("ERROR NoSuchFn$(1)\n", "ERROR needs a number"),
         // The same hole, and the same fix, for every statement that takes a
         // bare numeric operand. All four were added in the last two batches.
         ("A$ = \"x\"\nLOCATE A$, 1\n", "LOCATE needs a number"),
         ("A$ = \"x\"\nCOLOR 1, A$\n", "COLOR needs a number"),
         ("A$ = \"x\"\nRANDOMIZE A$\n", "RANDOMIZE needs a number"),
-        ("LOCATE NoSuchFn(1), 1\n", "unknown function or array"),
-        ("RANDOMIZE NoSuchFn(1)\n", "unknown function or array"),
+        ("LOCATE NoSuchFn$(1), 1\n", "LOCATE needs a number"),
+        ("RANDOMIZE NoSuchFn$(1)\n", "RANDOMIZE needs a number"),
     ] {
         let err =
             compile_only(source).expect_err(&format!("{} must be refused", source.escape_debug()));
@@ -853,18 +887,29 @@ fn test_whole_record_is_not_a_value_to_a_file() {
     );
 }
 
-/// Using an array before its DIM has executed is a runtime error, not a
-/// compiler panic: the descriptor exists from the start, with a null element
-/// pointer until the DIM runs.
+/// A DIM that runs twice is "Duplicate definition" (10); it used to clear and
+/// reallocate the array silently. After ERASE the array may be DIMmed again,
+/// and REDIM may always resize it.
 #[test]
-fn test_use_before_dim_runs() {
-    let run = compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
+fn test_dim_twice_is_a_duplicate_definition() {
+    let run = compile_and_run_raw("FOR I = 1 TO 2\nDIM A(3)\nA(1) = I\nNEXT I\n", "")
+        .expect("should compile");
     assert!(
-        run.stderr.contains("Array used before DIM"),
-        "expected a runtime diagnostic, got {:?}",
+        run.stderr.contains("Duplicate definition in 2"),
+        "{}",
         run.stderr
     );
-    assert_eq!(run.exit_code, Some(1));
+    let run = compile_and_run_raw(
+        "DIM A(3)\nA(1) = 5\nERASE A\nDIM A(4)\nPRINT A(1); UBOUND(A)\nREDIM A(9)\nPRINT UBOUND(A)\nERROR 10\n",
+        "",
+    )
+    .unwrap();
+    assert_eq!(run.lines(), vec!["0  4", "9"]);
+    assert!(
+        run.stderr.contains("Duplicate definition"),
+        "{}",
+        run.stderr
+    );
 }
 
 /// Anything that is not a record lvalue must be rejected where a record

@@ -122,14 +122,19 @@ fn main() {
     // Semantic analysis: reject bad programs here, with a source line, rather
     // than letting them reach codegen and become a panic or a linker error.
     let (symbols, diagnostics) = sema::analyze(&mut program, !args.no_checks);
-    if !diagnostics.is_empty() {
-        report(
-            input_file,
-            &diagnostics
-                .iter()
-                .map(|d| (d.line, d.message.clone(), d.note.clone()))
-                .collect::<Vec<_>>(),
-        );
+    for d in diagnostics.iter().filter(|d| d.warning) {
+        eprintln!("{}: warning: {}", locate(input_file, d.line), d.message);
+        if let Some(note) = &d.note {
+            eprintln!("{}: note: {}", locate(input_file, d.line), note);
+        }
+    }
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| !d.warning)
+        .map(|d| (d.line, d.message.clone(), d.note.clone()))
+        .collect();
+    if !errors.is_empty() {
+        report(input_file, &errors);
     }
 
     // Generate code

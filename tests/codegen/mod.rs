@@ -968,8 +968,26 @@ PRINT T#
 ";
     let asm = compile_to_asm(src).expect("must compile");
     let body = sole_loop_body(&asm);
+    // The one path that touches the descriptor creates the array when it
+    // has no storage yet, and reloads the registers after; it is not run
+    // once the array exists.
+    let hot: String = {
+        let mut keep = true;
+        let mut out = String::new();
+        for line in body.lines() {
+            if line.contains("jne .Larrok") {
+                keep = false;
+            } else if line.starts_with(".Larrok") {
+                keep = true;
+            } else if keep {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    };
     assert!(
-        !body.contains("_arr_A"),
+        !hot.contains("_arr_A"),
         "the descriptor should be in registers inside the loop:\n{}",
         body
     );
@@ -979,10 +997,11 @@ PRINT T#
 
 /// The null check stays inside the loop even though the pointer is hoisted.
 ///
-/// Hoisting the *check* as well would report an array that a loop running
-/// zero times never touched.
+/// A use of an array with no storage creates it, as GW-BASIC does; hoisting
+/// the check would create an array that a loop running zero times never
+/// touched, and a later DIM of it would then be a Duplicate definition.
 #[test]
-fn test_undim_check_is_not_hoisted_out_of_the_loop() {
+fn test_autodim_check_is_not_hoisted_out_of_the_loop() {
     let src = "\
 DIM A(5)
 T# = 0
@@ -994,15 +1013,16 @@ PRINT T#
     let asm = compile_to_asm(src).expect("must compile");
     let body = sole_loop_body(&asm);
     assert!(
-        body.contains(".Lerr_undim"),
-        "the DIM check belongs with the access:\n{}",
+        body.contains("_rt_array_autodim"),
+        "the check belongs with the access:\n{}",
         body
     );
 
-    // ...and it still fires when it should.
-    let run =
-        crate::common::compile_and_run_raw("PRINT A(0)\nDIM A(3)\n", "").expect("should compile");
-    assert!(run.stderr.contains("Array used before DIM"));
+    let out = crate::common::compile_and_run(
+        "FOR I = 1 TO 0\nB(I) = 1\nNEXT I\nDIM B(3)\nPRINT UBOUND(B)\n",
+    )
+    .expect("a loop that never runs creates nothing");
+    assert_eq!(out.trim(), "3");
 }
 
 /// Bounds checking survives the hoist, against the hoisted bound.

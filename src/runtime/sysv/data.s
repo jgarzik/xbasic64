@@ -160,3 +160,57 @@ _rt_read_string:
 _rt_restore:
     mov QWORD PTR [rip + _data_ptr], rdi
     ret
+
+# _rt_array_autodim - Create an array by using it, as GW-BASIC does
+#
+# Called when an array is reached with no storage: never DIMmed, or ERASEd.
+# Every dimension runs from the OPTION BASE to 10, and the elements start as
+# zeros -- 0 and "" alike. A use of an array before its DIM used to be the
+# error "Array used before DIM".
+#
+# Arguments:
+#   rdi = the descriptor: word 0 the element pointer, word 1+i dimension i's
+#         element count, word 1+n+i its lower bound
+#   rsi = n, the number of dimensions
+#   rdx = element size in bytes
+#   rcx = the OPTION BASE
+# Returns: nothing (Out of memory leaves the pointer null)
+.globl _rt_array_autodim
+_rt_array_autodim:
+    push rbp
+    mov rbp, rsp
+    push rbx
+    push r12
+    mov rbx, rdi            # descriptor
+    mov r12, rdx            # running size: element size * the counts
+    mov eax, 11
+    sub rax, rcx            # elements per dimension: base..10
+    xor r8d, r8d            # dimension
+.Lautodim_dim:
+    cmp r8, rsi
+    jae .Lautodim_alloc
+    mov QWORD PTR [rbx + 8 + r8*8], rax
+    lea r9, [rsi + r8]
+    mov QWORD PTR [rbx + 8 + r9*8], rcx
+    imul r12, rax
+    inc r8
+    jmp .Lautodim_dim
+.Lautodim_alloc:
+    mov edi, 1
+    mov rsi, r12
+    call calloc
+    test rax, rax
+    jz .Lautodim_nomem
+    mov QWORD PTR [rbx], rax
+    pop r12
+    pop rbx
+    leave
+    ret
+.Lautodim_nomem:
+    lea rdi, [rip + _err_memory]
+    xor esi, esi
+    call _rt_error          # returns only when trapped
+    pop r12
+    pop rbx
+    leave
+    ret
