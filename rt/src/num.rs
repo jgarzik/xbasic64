@@ -135,11 +135,13 @@ const EXPONENT_MAX: i64 = 1 << 40;
 /// A number's significant digits, given to strtod as an integer and an
 /// exponent, so that a number of any length keeps its magnitude.
 ///
-/// 800 digits are enough for strtod to round exactly as it would with all of
+/// 767 digits are enough for strtod to round exactly as it would with all of
 /// them: no DOUBLE, nor any point halfway between two, has more than 767
-/// significant digits, and the digits past the 800th, when any is not 0, are
+/// significant digits, and the digits past the 767th, when any is not 0, are
 /// stood for by one sticky 1. So the value is what strtod gives the whole
-/// number.
+/// number. No more than that: UCRT's strtod reads only 768 significant
+/// digits, so a sticky digit any later is ignored there, and a number just
+/// past a halfway point rounded to even.
 struct Decimal {
     /// Sign, digits, sticky digit, 'e', exponent, NUL.
     buf: [u8; Decimal::CAP],
@@ -150,7 +152,7 @@ struct Decimal {
 }
 
 impl Decimal {
-    const DIGITS: usize = 800;
+    const DIGITS: usize = 767;
     const CAP: usize = Decimal::DIGITS + 32;
 
     const EMPTY: Decimal = Decimal {
@@ -192,7 +194,7 @@ impl Decimal {
         if self.len == 0 {
             self.put(&mut at, b'0'); // "-0" is -0, as strtod read it before
         } else {
-            // Past 100000 either way, 800 digits are infinity or 0 alike.
+            // Past 100000 either way, 767 digits are infinity or 0 alike.
             let exponent = exponent.clamp(-100_000, 100_000) - i64::from(self.sticky);
             if self.sticky {
                 self.put(&mut at, b'1');
