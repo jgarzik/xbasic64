@@ -1,6 +1,6 @@
 [package]
 name = "xbasic64-rt"
-version = "1.0.2"
+version = "1.2.0"
 # Also passed to rustc by the compiler's build.rs, which does not read this
 # file: change both together.
 edition = "2024"
