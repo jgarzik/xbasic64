@@ -64,6 +64,16 @@ const NAME_CAP: usize = 4096;
 /// once; LSET and RSET write through the window, so PUT emits what they
 /// wrote. This is why LSET exists at all: plain assignment would allocate a
 /// fresh string and the variable would quietly stop tracking the record.
+///
+/// A window outlives the OPEN that made it: nothing stops a program using a
+/// FIELD variable after CLOSE, or after the number is opened again. So a
+/// number's record buffer, once allocated, is never freed nor moved. It is
+/// MAX_RECLEN bytes, enough for any record, and every later OPEN FOR RANDOM
+/// of the number reuses it; an old window then shows the new file's record
+/// (GW-BASIC calls such a variable undefined), but always names memory the
+/// program may read and write. Freeing it on a re-OPEN, as the assembly
+/// runtime did, left LSET writing freed memory. That is at most 15 buffers,
+/// each allocated only when its number is first opened FOR RANDOM.
 struct Files {
     /// The stream; null when not open. Slot 0 is unused: the console is
     /// always open, as `sys::stdout()`.
@@ -75,7 +85,9 @@ struct Files {
     /// Characters already on the current output line, so that TAB(n) knows
     /// how far to advance. Reset by a newline.
     col: [i64; FILES],
-    /// The record buffer (malloc'd), null unless opened FOR RANDOM.
+    /// The record buffer: MAX_RECLEN bytes, malloc'd by the first OPEN FOR
+    /// RANDOM of the number and never freed (see above). The number is a
+    /// random file only while `mode` says so too: `random_buf`.
     recbuf: [*mut u8; FILES],
     reclen: [i64; FILES],
     /// The last record read or written, 1-based; 0 = none.
@@ -140,6 +152,15 @@ fn col(n: i64) -> i64 {
 fn set_col(n: i64, c: i64) {
     if let Some(i) = slot(n) {
         files().col[i] = c;
+    }
+}
+
+/// The record buffer of file number `n`, if it was last opened FOR RANDOM
+/// (and the buffer could be allocated); null when it was not.
+fn random_buf(n: i64) -> *mut u8 {
+    match slot(n) {
+        Some(i) if files().mode[i] == RANDOM => files().recbuf[i],
+        _ => ptr::null_mut(),
     }
 }
 
@@ -505,9 +526,10 @@ fn open_name(name: Str, n: i64) -> Option<*const c_char> {
     name
 }
 
-/// Record a stream just opened on number `n`. A new file has no WIDTH,
-/// starts at column 1, and is not a random one, whatever the last file on
-/// this number left behind.
+/// Record a stream just opened on number `n`. A new file has no WIDTH and
+/// starts at column 1, whatever the last file on this number left behind;
+/// its `mode` alone says whether it is a random one. The record buffer is
+/// kept, not freed: FIELD variables may still point into it.
 fn bind(n: usize, f: *mut FILE, mode: i64) {
     let n = n % FILES; // what `slot` checked, said so that indexing cannot panic
     let t = files();
@@ -515,13 +537,6 @@ fn bind(n: usize, f: *mut FILE, mode: i64) {
     t.mode[n] = mode;
     t.width[n] = 0;
     t.col[n] = 0;
-    let old = t.recbuf[n];
-    // Cleared before anything can fail, so the slot never holds a pointer
-    // already freed: GET tests it for null to decide "Bad file mode".
-    t.recbuf[n] = ptr::null_mut();
-    if !old.is_null() {
-        unsafe { sys::free(old.cast()) };
-    }
 }
 
 /// Seek file `n` to record `rec` (0 = the one after the last) for GET or
@@ -534,14 +549,18 @@ fn random_prepare(n: i64, rec: i64, line: i64) -> Option<(*mut FILE, usize, *mut
         return None;
     }
     let i = slot(n)?;
-    let t = files();
-    let buf = t.recbuf[i];
+    let buf = random_buf(n);
     if buf.is_null() {
         raise(&error::_err_badmode[..], line);
         return None;
     }
+    let t = files();
     let reclen = t.reclen[i];
-    let rec = if rec > 0 { rec } else { t.recnum[i] + 1 };
+    let rec = if rec > 0 {
+        rec
+    } else {
+        t.recnum[i].wrapping_add(1)
+    };
     t.recnum[i] = rec;
     // Records are 1-based, so record n starts at (n-1) * reclen.
     unsafe { sys::seek(f, (rec - 1).wrapping_mul(reclen), sys::SEEK_SET) };
@@ -677,16 +696,20 @@ export! {
         let i = n as usize % FILES; // what `slot` checked
         bind(i, f, RANDOM);
         files().reclen[i] = reclen;
-        let buf = unsafe { sys::malloc(reclen as usize) }.cast::<u8>();
+        // The number's buffer from an earlier OPEN, or its first one.
+        let mut buf = files().recbuf[i];
         if buf.is_null() {
-            raise(&error::_err_memory[..], 0);
-            return;
+            buf = unsafe { sys::malloc(MAX_RECLEN as usize) }.cast::<u8>();
+            if buf.is_null() {
+                raise(&error::_err_memory[..], 0);
+                return;
+            }
+            files().recbuf[i] = buf;
         }
-        // A fresh buffer reads as blanks, so a field never written holds
-        // spaces rather than whatever the allocator handed back.
+        // A new record reads as blanks, so a field never written holds
+        // spaces rather than whatever the allocator or the last file left.
         unsafe { ptr::write_bytes(buf, b' ', reclen as usize) };
         let t = files();
-        t.recbuf[i] = buf;
         t.recnum[i] = 0;
         t.fieldoff[i] = 0;
     }
@@ -818,7 +841,7 @@ export! {
     /// sequential one the position in 128-byte blocks, as GW-BASIC counts.
     fn _rt_file_loc(n: i64) -> f64 {
         let Some(i) = slot(n) else { return 0.0 };
-        if !files().recbuf[i].is_null() {
+        if !random_buf(n).is_null() {
             return files().recnum[i] as f64;
         }
         let f = stream(n);
@@ -856,16 +879,19 @@ export! {
     /// FIELD's next variable: the next `w` bytes of the record buffer. The
     /// fields of one record must fit inside it.
     fn _rt_field_next(n: i64, w: i64) -> Str {
-        let buf = slot(n).map_or(ptr::null_mut(), |i| files().recbuf[i]);
+        let buf = random_buf(n);
         if buf.is_null() {
             // FIELD on a file not opened FOR RANDOM has no buffer to carve.
             raise(&error::_err_badmode[..], 0);
             return Str::EMPTY;
         }
-        let i = n as usize;
+        let i = n as usize % FILES; // what `random_buf` checked
         let w = w.max(0); // a negative width is empty, not a step back
-        let off = files().fieldoff[i];
-        if off + w > files().reclen[i] {
+        let off = files().fieldoff[i]; // 0..=reclen
+        // Compared as room left, not as `off + w`: a width near 2^63 wrapped
+        // that sum negative, which passed, and handed out a window reaching
+        // far past the buffer. The assembly runtime had the same flaw.
+        if w > files().reclen[i] - off {
             raise(&error::_err_fieldovf[..], 0);
             return Str::EMPTY;
         }
@@ -1226,8 +1252,74 @@ mod tests {
         unsafe { _rt_file_close(5) };
         // Reopened sequentially, the number is not a random file any more.
         open(&path, INPUT, 5);
-        assert!(files().recbuf[5].is_null());
+        assert!(random_buf(5).is_null());
         unsafe { _rt_file_close(5) };
+    }
+
+    /// A FIELD width so large that the offset plus it overflows is a FIELD
+    /// overflow, not a window reaching past the buffer: `off + w` wrapped
+    /// negative and passed the `> reclen` test, handing out a string of
+    /// length 2^63-1 at the buffer, and the next field an offset below it.
+    #[test]
+    fn a_huge_field_width_is_field_overflow() {
+        use crate::num::testing::*;
+        if in_child() {
+            let path = temp("hugefield.dat");
+            unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 6, 8) };
+            unsafe { _rt_field_reset(6) };
+            let a = unsafe { _rt_field_next(6, 3) };
+            assert_eq!(a.len, 3);
+            for w in [i64::MAX, i64::MAX - 2, i64::MAX - 3] {
+                let (s, raised) = trapped(|| unsafe { _rt_field_next(6, w) });
+                assert!(raised, "width {w} was not refused");
+                assert_eq!(s, Str::EMPTY);
+                assert_eq!(files().fieldoff[6], 3);
+            }
+            // What fits still fits, from where the last good field ended.
+            let b = unsafe { _rt_field_next(6, 5) };
+            assert_eq!(unsafe { b.ptr.offset_from(a.ptr) }, 3);
+            unsafe { _rt_field_next(6, i64::MAX) };
+            return;
+        }
+        expect_fatal(
+            "file::tests::a_huge_field_width_is_field_overflow",
+            "?FIELD overflow\n",
+        );
+    }
+
+    /// A FIELD variable is a window onto its file's record buffer, and
+    /// outlives the OPEN that made it: a re-OPEN of the number, sequential or
+    /// RANDOM, freed the buffer, and LSET then wrote freed memory and PRINT
+    /// read it. Valgrind or ASan sees that; the asserts below see that the
+    /// window still names the number's buffer.
+    #[test]
+    fn a_field_window_outlives_its_file() {
+        let _g = serial();
+        let path = temp("window.dat");
+        let _ = std::fs::remove_file(&path);
+        unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 7, 4) };
+        unsafe { _rt_field_reset(7) };
+        let a = unsafe { _rt_field_next(7, 4) };
+        unsafe { _rt_lset(a.ptr as *mut u8, 4, b"ab".as_ptr(), 2) };
+        unsafe { _rt_file_put(7, 1, 0) };
+        unsafe { _rt_file_close(7) };
+        // Reopened sequentially: not a random file, but the window must
+        // still be memory the program may write.
+        open(&path, INPUT, 7);
+        unsafe { _rt_lset(a.ptr as *mut u8, 4, b"cd".as_ptr(), 2) };
+        assert_eq!(unsafe { a.bytes() }, b"cd  ");
+        unsafe { _rt_file_close(7) };
+        // Reopened FOR RANDOM, with a longer record: the old window is still
+        // valid memory, and reads the new (blank) record buffer.
+        unsafe { _rt_file_open_random(path.as_ptr(), path.len() as i64, 7, 64) };
+        assert_eq!(unsafe { a.bytes() }, b"    ");
+        unsafe { _rt_file_get(7, 1, 0) };
+        assert_eq!(unsafe { a.bytes() }, b"ab  ");
+        unsafe { _rt_lset(a.ptr as *mut u8, 4, b"ef".as_ptr(), 2) };
+        unsafe { _rt_file_close(7) };
+        open(&path, OUTPUT, 7);
+        unsafe { _rt_file_close(7) };
+        assert_eq!(unsafe { a.bytes() }, b"ef  ");
     }
 
     #[test]
