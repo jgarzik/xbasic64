@@ -1,8 +1,9 @@
 //! DATA, READ and RESTORE, and creating an array by using it (data.s)
 //!
-//! The compiler collects every DATA item into `_data_table`, which the
-//! program defines along with `_data_count` (its length) and `_data_ptr`
-//! (the next item READ takes, from 0). An item is kept as written, because
+//! The compiler collects every DATA item into a table in the program, which
+//! the program hands to `_rt_data_init` as it starts, with its length. The
+//! runtime keeps the next item READ takes, from 0. An item is kept as
+//! written, because
 //! GW-BASIC decides what it is when it is READ: `DATA 007` is the string
 //! "007" to READ A$ and the number 7 to READ A. A quoted item is a string
 //! only.
@@ -24,48 +25,18 @@ pub struct Item {
     pub text: *const c_char,
 }
 
-/// The program's DATA, reached by symbol.
-#[cfg(not(test))]
-mod program {
-    use super::Item;
-    use crate::Word;
-
-    unsafe extern "C" {
-        static _data_table: [Item; 0];
-        static _data_count: u64;
-        static _data_ptr: Word;
-    }
-
-    pub fn item(i: u64) -> *const Item {
-        unsafe { (&raw const _data_table).cast::<Item>().add(i as usize) }
-    }
-    pub fn count() -> u64 {
-        unsafe { _data_count }
-    }
-    pub fn next() -> &'static Word {
-        unsafe { &_data_ptr }
-    }
-}
-
-/// A DATA table of the tests' own, in place of the program's.
-#[cfg(test)]
+/// The program's DATA: where its table is, how long, and what READ takes
+/// next. A program without DATA never sets them, and READ finds nothing.
 mod program {
     use super::Item;
     use crate::{State, Word};
 
-    pub static TABLE: State<[Item; 8]> = State::new(
-        [const {
-            Item {
-                quoted: 0,
-                text: core::ptr::null(),
-            }
-        }; 8],
-    );
+    pub static TABLE: State<*const Item> = State::new(core::ptr::null());
     pub static COUNT: Word = Word::new(0);
     pub static NEXT: Word = Word::new(0);
 
     pub fn item(i: u64) -> *const Item {
-        unsafe { &TABLE.get()[i as usize] }
+        unsafe { TABLE.get().add(i as usize) }
     }
     pub fn count() -> u64 {
         COUNT.get()
@@ -86,6 +57,18 @@ fn take() -> Option<&'static Item> {
 }
 
 export! {
+    /// The program's DATA: `count` items at `table`, which the program
+    /// keeps for as long as it runs (READ returns views of their text).
+    /// Called once, as the program starts, by a program with DATA; it
+    /// passes them rather than the runtime naming them, so that the runtime
+    /// needs nothing of a program to link -- or to run a program compiled
+    /// into the compiler's own process.
+    fn _rt_data_init(table: *const Item, count: i64) {
+        unsafe { *program::TABLE.get() = table };
+        program::COUNT.set(count as u64);
+        program::NEXT.set(0);
+    }
+
     /// READ into a numeric variable. The item's text must be a number and
     /// nothing else but blanks, read as VAL reads one; anything else -- a
     /// quoted item, or text that is not a number -- is GW-BASIC's Syntax
@@ -185,18 +168,21 @@ mod tests {
     /// The table is one, and tests run in parallel.
     static LOCK: Mutex<()> = Mutex::new(());
 
-    /// Make `items` the DATA, and READ from the first.
+    /// Make `items` the DATA, as a program's start does, and READ from the
+    /// first. The table lives on, as a program's does.
     fn data(items: &[(bool, &'static [u8])]) {
-        let t = unsafe { program::TABLE.get() };
-        for (slot, &(quoted, text)) in t.iter_mut().zip(items) {
-            assert_eq!(text.last(), Some(&0));
-            *slot = Item {
-                quoted: quoted as u64,
-                text: text.as_ptr().cast(),
-            };
-        }
-        program::COUNT.set(items.len() as u64);
-        unsafe { _rt_restore(0) };
+        let table: Vec<Item> = items
+            .iter()
+            .map(|&(quoted, text)| {
+                assert_eq!(text.last(), Some(&0));
+                Item {
+                    quoted: quoted as u64,
+                    text: text.as_ptr().cast(),
+                }
+            })
+            .collect();
+        let table = table.leak();
+        unsafe { _rt_data_init(table.as_ptr(), table.len() as i64) };
     }
 
     fn read_s() -> Vec<u8> {
@@ -229,7 +215,7 @@ mod tests {
             // A string READ returns a view of the table's text.
             _rt_restore(1);
             let r = _rt_read_string(10);
-            assert_eq!(r.ptr, program::TABLE.get()[1].text.cast());
+            assert_eq!(r.ptr, (*program::item(1)).text.cast());
         }
     }
 

@@ -17,5 +17,10 @@ rust-version = "1.96"
 path = "src/lib.rs"
 doctest = false
 
+[features]
+# Linked into the compiler, which runs programs in its own process
+# (`xbasic64 run`): std supplies the panic handler there.
+host = []
+
 [dev-dependencies]
 tempfile = "3"

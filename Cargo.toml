@@ -34,5 +34,13 @@ target-lexicon = "0.13"
 [dev-dependencies]
 tempfile = "3"
 
+# The runtime as programs get it -- build.rs builds it optimized, without
+# overflow checks or debug assertions -- even in a debug compiler, which runs
+# it in-process for `xbasic64 run`.
+[profile.dev.package.xbasic64-rt]
+opt-level = 3
+debug-assertions = false
+overflow-checks = false
+
 [profile.release]
 lto = true

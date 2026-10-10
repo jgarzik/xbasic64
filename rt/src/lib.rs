@@ -155,7 +155,9 @@ pub fn alloc_str(len: usize) -> *mut u8 {
     p
 }
 
-#[cfg(not(test))]
+/// A program's: in the compiler's own process (`host`, for `xbasic64 run`)
+/// std's handler is the one, and the unit tests have std's too.
+#[cfg(not(any(test, feature = "host")))]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
     unsafe { sys::abort() }

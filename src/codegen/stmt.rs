@@ -22,6 +22,14 @@ impl FnGen<'_> {
             let sp = self.global_addr("_gosub_sp", 8);
             self.b.ins().store(MemFlagsData::trusted(), top, sp, 0);
         }
+        // The program's DATA, which the runtime's READ walks.
+        let items = self.cg.data_items.len();
+        if items > 0 {
+            let id = self.cg.data_table();
+            let table = self.data_addr(id);
+            let count = self.iconst(types::I64, items as i64);
+            self.call_rt("_rt_data_init", &[table, count]);
+        }
         // The console is file handle 0, and each platform's runtime seeds
         // that slot its own way.
         self.call_rt("_rt_platform_init", &[]);

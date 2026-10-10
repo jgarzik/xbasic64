@@ -688,52 +688,38 @@ impl CodeGen {
         id
     }
 
+    /// The DATA table, declared by `main`, which passes its address to the
+    /// runtime, and defined with its contents by `define_data`.
+    fn data_table(&mut self) -> DataId {
+        self.module
+            .declare_data("_data_table", Linkage::Local, false, false)
+            .expect("the DATA table")
+    }
+
     /// Define every zero-filled data object, and the DATA table.
     fn define_data(&mut self) -> Result<(), String> {
         // The DATA table: (quoted, text) pairs, which the runtime's READ
-        // helpers walk. Always defined, even empty, since they name it.
+        // helpers walk. Only a program with DATA has one; `main` hands it to
+        // the runtime (`_rt_data_init`), which names nothing of a program.
         let items = std::mem::take(&mut self.data_items);
-        let texts: Vec<DataId> = items.iter().map(|i| self.string_literal(&i.text)).collect();
-        let table = self
-            .module
-            .declare_data("_data_table", Linkage::Export, true, false)
-            .map_err(|e| e.to_string())?;
-        let mut desc = DataDescription::new();
-        let mut bytes = vec![0u8; 16 * items.len().max(1)];
-        for (i, item) in items.iter().enumerate() {
-            bytes[16 * i..16 * i + 8].copy_from_slice(&u64::from(item.quoted).to_le_bytes());
+        if !items.is_empty() {
+            let texts: Vec<DataId> = items.iter().map(|i| self.string_literal(&i.text)).collect();
+            let table = self.data_table();
+            let mut desc = DataDescription::new();
+            let mut bytes = vec![0u8; 16 * items.len()];
+            for (i, item) in items.iter().enumerate() {
+                bytes[16 * i..16 * i + 8].copy_from_slice(&u64::from(item.quoted).to_le_bytes());
+            }
+            desc.define(bytes.into_boxed_slice());
+            desc.set_align(8);
+            for (i, id) in texts.iter().enumerate() {
+                let gv = self.module.declare_data_in_data(*id, &mut desc);
+                desc.write_data_addr(16 * i as u32 + 8, gv, 0);
+            }
+            self.module
+                .define_data(table, &desc)
+                .map_err(|e| e.to_string())?;
         }
-        desc.define(bytes.into_boxed_slice());
-        desc.set_align(8);
-        for (i, id) in texts.iter().enumerate() {
-            let gv = self.module.declare_data_in_data(*id, &mut desc);
-            desc.write_data_addr(16 * i as u32 + 8, gv, 0);
-        }
-        self.module
-            .define_data(table, &desc)
-            .map_err(|e| e.to_string())?;
-
-        let count = self
-            .module
-            .declare_data("_data_count", Linkage::Export, true, false)
-            .map_err(|e| e.to_string())?;
-        let mut desc = DataDescription::new();
-        desc.define(Box::new((items.len() as u64).to_le_bytes()));
-        desc.set_align(8);
-        self.module
-            .define_data(count, &desc)
-            .map_err(|e| e.to_string())?;
-
-        let ptr = self
-            .module
-            .declare_data("_data_ptr", Linkage::Export, true, false)
-            .map_err(|e| e.to_string())?;
-        let mut desc = DataDescription::new();
-        desc.define_zeroinit(8);
-        desc.set_align(8);
-        self.module
-            .define_data(ptr, &desc)
-            .map_err(|e| e.to_string())?;
 
         for (id, size) in self.data.values() {
             if *size == 0 {
