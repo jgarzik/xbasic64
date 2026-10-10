@@ -952,7 +952,11 @@ fn test_typed_scalars_in_control_flow() {
         "7.5, 2.25\n",
     )
     .unwrap();
-    assert!(out.ends_with(" 8  2.25 \n"), "{out:?}");
+    // Windows ends the line with CRLF.
+    assert!(
+        out.replace("\r\n", "\n").ends_with(" 8  2.25 \n"),
+        "{out:?}"
+    );
 }
 
 /// Typed scalars something else can reach stay in memory and behave so: one
