@@ -49,8 +49,16 @@ macro_rules! export {
     )*};
 }
 
+pub mod data;
 pub mod error;
+pub mod file;
+pub mod input;
+pub mod math;
+pub mod num;
+pub mod print;
+pub mod string;
 pub mod sys;
+pub mod using;
 
 /// A string as generated code passes it: a pointer and a length, with no
 /// terminator. Returned by value it is two words in two registers.
