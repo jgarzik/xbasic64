@@ -222,11 +222,18 @@ _rt_print_using_num:
     jmp .Luse_num_body
 .Luse_num_body_done:
 
+    # A trailing sign is a column of its own, and a positive number leaves it
+    # blank, as GW-BASIC and QuickBASIC do: "###-" prints 5 as "  5 " beside
+    # -5's "  5-", so the digits line up. Writing nothing there padded the
+    # positive on the left instead, one column out of line.
     test r14, USING_TRAIL_SIGN
     jz .Luse_num_no_trail
-    test r15b, r15b
-    jz .Luse_num_no_trail
-    mov BYTE PTR [rdi + r9], r15b
+    mov al, r15b
+    test al, al
+    jnz .Luse_num_trail_char
+    mov al, ' '
+.Luse_num_trail_char:
+    mov BYTE PTR [rdi + r9], al
     inc r9
 .Luse_num_no_trail:
 
